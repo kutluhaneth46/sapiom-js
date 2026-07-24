@@ -156,17 +156,22 @@ jobs:
         shell: bash
         run: ls -la packages/harness-desktop/release
 
-      # Release gate: launch what we just built, on this OS. A build that merely
-      # compiles proves nothing — asar path resolution, node-pty's ABI, unpacked
-      # dependencies and a package.json mangled by cmd.exe quoting all pass
-      # electron-builder and then fail on a user's machine. Never attach an
-      # artifact to a Release without this passing.
-      # (The PR-time equivalent runs Linux-only in test.yml — same script.)
-      - name: Install xvfb (Electron needs a display)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq xvfb
-
+      # Release gate — macOS and Windows ONLY. Linux is deliberately skipped: the
+      # PR job (test.yml → desktop-smoke) already packages and launches the Linux
+      # app on every pull request, so repeating it here proves nothing new.
+      #
+      # These two are different, and not redundant with the PR:
+      #  - the PR job can't build them at all (each needs its own runner and
+      #    native toolchain), so this is the ONLY launch check they ever get;
+      #  - the macOS artifact here is SIGNED and notarized, which the PR's build
+      #    never is. Signing changes the binary: hardened runtime and entitlements
+      #    can break an app that launches perfectly unsigned (library validation
+      #    vs. node-pty's helper is the classic case). "It ran unsigned" is not
+      #    evidence that the notarized .dmg runs.
+      #
+      # This is the gate that caught Windows building fine while never starting.
       - name: Smoke-launch the packaged app
+        if: runner.os != 'Linux'
         shell: bash
         run: packages/harness-desktop/scripts/smoke.sh
 
