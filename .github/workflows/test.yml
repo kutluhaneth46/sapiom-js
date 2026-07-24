@@ -4,7 +4,14 @@ on:
   pull_request:
     branches: [main]
   push:
-    branches: [main]
+    branches:
+      - main
+      # TEMP (harness-desktop bring-up): also run the test tier on pushes to this
+      # feature branch, so the PR-time jobs (incl. desktop-smoke) are visible
+      # before a PR exists — otherwise a feature-branch push only triggers
+      # Desktop Release and the tests look absent. REMOVE together with the
+      # matching TEMP trigger in desktop-release.yml.
+      - "ewan/feat/harness-desktop"
 
 # Minimal token scope: these jobs only read the checked-out code.
 permissions:
