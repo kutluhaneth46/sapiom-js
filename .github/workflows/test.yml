@@ -89,6 +89,13 @@ jobs:
       - name: Run Playwright mock-mode suite
         run: pnpm --filter @sapiom/harness test:ui
 
+      # The canvas suite renders the generated diagram documents in the same
+      # chromium this job already installed. It was previously opt-in only, so
+      # nothing verified in CI that a canvas the renderer produces actually
+      # paints — a rendering regression could only be caught by hand.
+      - name: Run Playwright canvas suite
+        run: pnpm --filter @sapiom/harness test:canvas
+
       - name: Upload Playwright report
         if: failure()
         uses: actions/upload-artifact@v4
