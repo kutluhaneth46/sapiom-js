@@ -18,6 +18,7 @@ import {
   ensureSpawnHelperExecutable,
   getOrCreateMachineId,
   loadSettings,
+  saveSettings,
   recordRecentDir,
   hasStoredSettings,
   startServer,
@@ -101,10 +102,12 @@ async function decideConsent(
   if (envOff) return { telemetryOptIn: false, consentSource: "env-forced-off" };
 
   if (devMode || !firstRun) {
-    const settings = await loadSettings();
-    const stored = (settings as { telemetryOptIn?: boolean }).telemetryOptIn;
-    if (typeof stored === "boolean") return { telemetryOptIn: stored, consentSource: "stored-explicit" };
-    return { telemetryOptIn: false, consentSource: "default-silent" };
+    const { telemetryOptIn } = await loadSettings();
+    // `!firstRun` means a settings file exists, so its value is what the user
+    // answered. In dev mode we skip the prompt even on a genuine first run —
+    // then the value is loadSettings' default, not an answer, and the SPA needs
+    // "default-silent" to know it may still show its first-run consent notice.
+    return { telemetryOptIn, consentSource: firstRun ? "default-silent" : "stored-explicit" };
   }
 
   // First run, interactive: ask in the setup window and wait for the answer.
@@ -114,6 +117,16 @@ async function decideConsent(
       resolve(Boolean(value));
     });
   });
+  // Persist it, exactly as the CLI's `ensureConsent` does after its Y/n prompt.
+  // Without this the answer only ever lived in memory: `startServer` got the
+  // right value (so telemetry really was on this run), but the settings file —
+  // which is what GET /api/state and GET /api/settings read for the SPA's
+  // "analytics on/off" chip, AND what the next launch resolves consent from —
+  // still said false. So an opt-in showed as "analytics off" in the UI and was
+  // silently lost on the next launch. Written before `recordRecentDir` below,
+  // whose read-modify-write then carries it through.
+  const settings = await loadSettings();
+  await saveSettings({ ...settings, telemetryOptIn: optIn });
   return { telemetryOptIn: optIn, consentSource: "prompted" };
 }
 

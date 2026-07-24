@@ -31,7 +31,10 @@ export type {
 // app) reuse the exact server + setup flow the CLI (`bin.ts`) runs, instead of
 // forking it. `ensureConsent`/`printDoctorReport` are intentionally NOT exported:
 // they are TTY-shaped, and a native host supplies `telemetryOptIn`/`consentSource`
-// to `startServer` directly.
+// to `startServer` directly — which is why `saveSettings` is exported too: a
+// native host that prompts for consent itself must persist the answer the way
+// `ensureConsent` does, or the settings file (the source of truth for the UI's
+// analytics chip and for the next launch) never learns about it.
 export { startServer } from "./server/index.js";
 export type { HarnessServer, HarnessServerOptions } from "./server/index.js";
 export {
@@ -45,4 +48,4 @@ export { ensureAuthenticated } from "./cli/auth.js";
 export type { HarnessIdentity } from "./cli/auth.js";
 export { getOrCreateMachineId } from "./cli/machine-id.js";
 export { ensureSpawnHelperExecutable } from "./core/session-manager.js";
-export { loadSettings, recordRecentDir, hasStoredSettings } from "./cli/settings.js";
+export { loadSettings, saveSettings, recordRecentDir, hasStoredSettings } from "./cli/settings.js";
