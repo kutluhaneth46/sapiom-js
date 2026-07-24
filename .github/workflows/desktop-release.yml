@@ -131,6 +131,47 @@ jobs:
         shell: bash
         run: ls -la packages/harness-desktop/release
 
+      # THE point of building on each OS: launch what we just built. A build
+      # that merely compiles proves nothing — asar path resolution, node-pty's
+      # ABI, unpacked dependencies and a package.json mangled by cmd.exe
+      # quoting all pass `electron-builder` and then fail on a user's machine.
+      # `--smoke` boots the app, checks each of those layers and exits non-zero
+      # on the first that's broken (see src/main/smoke.ts).
+      #
+      # Isolated so a runner's state is never shared between checks: HOME (POSIX)
+      # / USERPROFILE+APPDATA (Windows) point at a temp dir, so ~/.sapiom and
+      # Electron's userData are per-run. Telemetry is forced off — CI is not a user.
+      - name: Smoke-launch the packaged app
+        shell: bash
+        env:
+          SAPIOM_TELEMETRY_DISABLED: "1"
+          # AppImage needs FUSE, which the Ubuntu runner images don't ship;
+          # extract-and-run is the supported fallback. No-op elsewhere.
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: |
+          set -euo pipefail
+          smoke_home="$(mktemp -d)"
+          mkdir -p "$smoke_home/project"
+          export HOME="$smoke_home" USERPROFILE="$smoke_home" APPDATA="$smoke_home/AppData"
+          export SAPIOM_LAUNCH_DIR="$smoke_home/project"
+          rel=packages/harness-desktop/release
+          case "${{ runner.os }}" in
+            Linux)
+              # The AppImage is what a user downloads, so smoke THAT, not linux-unpacked.
+              app="$(ls "$rel"/*.AppImage)"
+              # Electron needs a display; the runner is headless.
+              sudo apt-get update -qq && sudo apt-get install -y -qq xvfb
+              xvfb-run --auto-servernum "$app" --smoke
+              ;;
+            macOS)
+              "$rel"/mac-arm64/Sapiom.app/Contents/MacOS/Sapiom --smoke
+              ;;
+            Windows)
+              # The nsis .exe is an installer; smoke the unpacked app it installs.
+              "$rel/win-unpacked/Sapiom.exe" --smoke
+              ;;
+          esac
+
       # Always upload to the run's Artifacts so workflow_dispatch (untagged)
       # builds are downloadable and testable — this is how you grab the unsigned
       # macOS app to test on a Mac before signing exists. Each OS uploads only

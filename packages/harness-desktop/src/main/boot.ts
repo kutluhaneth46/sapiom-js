@@ -94,18 +94,19 @@ function resolveTargetEnvironment(): string {
 
 async function decideConsent(
   setupWin: BrowserWindow,
-  devMode: boolean,
+  /** Modes that cannot prompt a human: `--dev` and `--smoke`. */
+  skipPrompt: boolean,
   firstRun: boolean,
 ): Promise<{ telemetryOptIn: boolean; consentSource: "env-forced-off" | "stored-explicit" | "prompted" | "default-silent" }> {
   const envOff = ["1", "true"].includes((process.env.SAPIOM_TELEMETRY_DISABLED ?? "").toLowerCase()) ||
     ["1", "true"].includes((process.env.DO_NOT_TRACK ?? "").toLowerCase());
   if (envOff) return { telemetryOptIn: false, consentSource: "env-forced-off" };
 
-  if (devMode || !firstRun) {
+  if (skipPrompt || !firstRun) {
     const { telemetryOptIn } = await loadSettings();
     // `!firstRun` means a settings file exists, so its value is what the user
-    // answered. In dev mode we skip the prompt even on a genuine first run —
-    // then the value is loadSettings' default, not an answer, and the SPA needs
+    // answered. When we skip the prompt on a genuine first run (dev/smoke), the
+    // value is loadSettings' default, not an answer, and the SPA needs
     // "default-silent" to know it may still show its first-run consent notice.
     return { telemetryOptIn, consentSource: firstRun ? "default-silent" : "stored-explicit" };
   }
@@ -226,7 +227,22 @@ async function ensureAgentAvailable(setupWin: BrowserWindow, initialReport: Doct
   return report;
 }
 
-export async function boot(setupWin: BrowserWindow, devMode: boolean): Promise<BootResult> {
+export interface BootMode {
+  /** `--dev`: skips the consent prompt and logs the ready URL. */
+  devMode: boolean;
+  /**
+   * `--smoke`: unattended verification of a *packaged* build (see smoke.ts).
+   * Nothing may block on a human or the network, so this mode never prompts
+   * for consent, never opens a browser for sign-in, and never auto-installs an
+   * agent — it boots as far as it can and lets the checks report. It is NOT a
+   * user-facing mode: no flow is skipped that a real launch would need, so a
+   * smoke pass still exercises PATH, asar paths, the server, and the windows.
+   */
+  smoke: boolean;
+}
+
+export async function boot(setupWin: BrowserWindow, mode: BootMode): Promise<BootResult> {
+  const { devMode, smoke } = mode;
   progress(setupWin, { phase: "starting", message: "Starting Sapiom…", status: "active" });
 
   // 1. PATH — must precede doctor so `which claude` works in a GUI app. Also
@@ -245,8 +261,11 @@ export async function boot(setupWin: BrowserWindow, devMode: boolean): Promise<B
   //    (Claude Code) behind a "Setting up…" screen, then re-run doctor; on
   //    failure, fall back to a retryable guided-install screen. Dev-only
   //    SAPIOM_FORCE_NO_AGENT=1 forces this branch to exercise auto-install.
+  //    Smoke mode never installs: it must not need the network, and its job is
+  //    to prove the packaged bundle boots, not to re-test Phase 3. A missing
+  //    agent there is reported by the checks, not fixed here.
   const forceNoAgent = devMode && process.env.SAPIOM_FORCE_NO_AGENT === "1";
-  if (forceNoAgent || report.availableHarnesses.length === 0) {
+  if (!smoke && (forceNoAgent || report.availableHarnesses.length === 0)) {
     report = await ensureAgentAvailable(setupWin, report);
   }
   progress(setupWin, { phase: "doctor", message: `Found: ${report.availableHarnesses.join(", ")}`, status: "done" });
@@ -268,8 +287,11 @@ export async function boot(setupWin: BrowserWindow, devMode: boolean): Promise<B
   //    one we must open the browser and tell the user to complete sign-in there
   //    (otherwise the window just sits on a vague "Signing you in…").
   progress(setupWin, { phase: "auth", message: "Signing you in…", status: "active" });
+  //    Smoke mode stops at the cached probe: an interactive sign-in would open
+  //    a browser and block forever on a CI runner. Booting unauthenticated is a
+  //    supported state (identity is optional to startServer).
   let identity: HarnessIdentity | null = await ensureAuthenticated({ interactive: false });
-  if (!identity) {
+  if (!identity && !smoke) {
     progress(setupWin, {
       phase: "auth",
       message: "Opening your browser — sign in to Sapiom to continue, then come back here.",
@@ -284,7 +306,7 @@ export async function boot(setupWin: BrowserWindow, devMode: boolean): Promise<B
   });
 
   // 6. Consent (native, not TTY).
-  const { telemetryOptIn, consentSource } = await decideConsent(setupWin, devMode, firstRun);
+  const { telemetryOptIn, consentSource } = await decideConsent(setupWin, devMode || smoke, firstRun);
 
   // 7. Project folder (defaulted under ~/.sapiom — no picker).
   progress(setupWin, { phase: "choosing-folder", message: "Preparing your workspace…", status: "active" });

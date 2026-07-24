@@ -8,8 +8,11 @@
 import { app, dialog, Menu } from "electron";
 import { createSetupWindow } from "./windows.js";
 import { boot, type BootResult } from "./boot.js";
+import { runSmokeChecks, reportSmoke } from "./smoke.js";
 
 const devMode = process.argv.includes("--dev");
+/** `--smoke`: boot, verify the packaged bundle, print results, exit. See smoke.ts. */
+const smokeMode = process.argv.includes("--smoke");
 
 // Use overlay scrollbars (like the browser) instead of Chromium's classic
 // scrollbars. Classic scrollbars reserve layout width, which pushes the
@@ -42,13 +45,32 @@ if (!gotLock) {
     Menu.setApplicationMenu(null);
     const setupWin = createSetupWindow();
     try {
-      bootResult = await boot(setupWin, devMode);
-      if (devMode) {
-        // Dev smoke-test hook: print the tokened URL so a harness can verify
-        // the server booted without driving the GUI.
+      bootResult = await boot(setupWin, { devMode, smoke: smokeMode });
+      if (devMode || smokeMode) {
+        // Dev/smoke hook: print the tokened URL so a harness can verify the
+        // server booted without driving the GUI.
         console.log(`[harness-desktop] ready: ${bootResult.url}`);
       }
+      if (smokeMode) {
+        // Verify the packaged bundle, then leave — never wait for a user. The
+        // exit code is the CI signal. `app.exit` skips the before-quit handler,
+        // so close the server here (it kills any live PTY); don't destroy the
+        // windows first, or window-all-closed → quit → before-quit would close
+        // the server a second time.
+        const code = reportSmoke(await runSmokeChecks(bootResult));
+        await bootResult.server.close().catch(() => {});
+        app.exit(code);
+        return;
+      }
     } catch (err) {
+      if (smokeMode) {
+        // A boot failure IS the smoke result — report it as one and fail fast
+        // rather than showing an error window nobody is watching.
+        console.error(`[smoke] FAIL boot — ${err instanceof Error ? err.message : String(err)}`);
+        console.log("[smoke] FAILED — boot did not complete");
+        app.exit(1);
+        return;
+      }
       const message = err instanceof Error ? err.message : String(err);
       if (!setupWin.isDestroyed()) {
         setupWin.webContents.send("boot:error", {
