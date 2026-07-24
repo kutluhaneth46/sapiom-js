@@ -24,7 +24,7 @@
  * Exit code is 0 only if every check passes; each result is printed as one line
  * so a CI log shows exactly which layer broke.
  */
-import { existsSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import * as path from "node:path";
 import { createSetupWindow } from "./windows.js";
@@ -188,17 +188,32 @@ export async function runSmokeChecks(boot: BootResult): Promise<SmokeCheck[]> {
   ];
 }
 
-/** Prints one line per check plus a verdict. Returns the process exit code. */
+/**
+ * Prints one line per check plus a verdict, and returns the process exit code.
+ *
+ * Also writes the same report to `SAPIOM_SMOKE_OUT` when set. On Windows the
+ * packaged app is a GUI-subsystem executable: it does not attach to the parent
+ * console, so stdout goes nowhere and a CI log shows an exit code with no
+ * explanation. A file survives that.
+ */
 export function reportSmoke(checks: SmokeCheck[]): number {
-  for (const c of checks) {
-    console.log(`[smoke] ${c.ok ? "PASS" : "FAIL"} ${c.name} — ${c.detail}`);
-  }
   const failed = checks.filter((c) => !c.ok);
-  console.log(
+  const lines = [
+    ...checks.map((c) => `[smoke] ${c.ok ? "PASS" : "FAIL"} ${c.name} — ${c.detail}`),
     failed.length === 0
       ? `[smoke] OK — ${checks.length}/${checks.length} checks passed`
       : `[smoke] FAILED — ${failed.length}/${checks.length}: ${failed.map((c) => c.name).join(", ")}`,
-  );
+  ];
+  for (const line of lines) console.log(line);
+
+  const outFile = process.env.SAPIOM_SMOKE_OUT;
+  if (outFile) {
+    try {
+      writeFileSync(outFile, lines.join("\n") + "\n", "utf8");
+    } catch (err) {
+      console.error(`[smoke] could not write ${outFile}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
   return failed.length === 0 ? 0 : 1;
 }
 
