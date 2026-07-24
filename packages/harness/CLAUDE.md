@@ -116,8 +116,14 @@ Packaged check — the only one that proves asar, native modules, and PATH:
 
 ```bash
 pnpm --filter @sapiom/harness-desktop dist   # → packages/harness-desktop/release/
-packages/harness-desktop/release/sapiom-*.AppImage
+packages/harness-desktop/release/sapiom-*.AppImage --smoke   # automated layer checks, exits non-zero
+packages/harness-desktop/release/sapiom-*.AppImage           # or launch it for real
 ```
+
+`--smoke` asserts the layers a harness change can break from a distance — SPA served from inside the
+asar, REST surface + boot-token gate, preload bridge, node-pty spawn, and the on-disk existence of
+what the plain-Node Canvas subprocess imports. If your change adds something the packaged app must
+resolve at runtime, add a check to `harness-desktop/src/main/smoke.ts`.
 
 Simulate a genuine first run (state is **shared with the npx CLI** under `~/.sapiom` — back it up):
 

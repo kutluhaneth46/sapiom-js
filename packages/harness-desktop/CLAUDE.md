@@ -106,6 +106,21 @@ explaining the failure it prevents — don't "modernize" them without reproducin
 
 ## Before claiming an OS works
 
+Run the automated check first — it covers the packaging-specific layers and takes seconds:
+
+```bash
+HOME=$(mktemp -d) SAPIOM_TELEMETRY_DISABLED=1 \
+  ./release/sapiom-*.AppImage --smoke     # or Sapiom.app/Contents/MacOS/Sapiom, win-unpacked/Sapiom.exe
+```
+
+`--smoke` (`src/main/smoke.ts`) boots the app and asserts the SPA is served from inside the asar, the
+REST surface answers and rejects an untokened request, the setup window's preload bridge loaded,
+node-pty loads under Electron's ABI and can spawn, and the plain-Node subprocess's imports exist on
+disk. Exit code is the signal; CI runs it per OS after packaging. **Add a check here whenever you fix
+a packaging bug** — that's what stops it recurring silently.
+
+Then, for anything it can't cover (a real agent, a real workflow, a human flow):
+
 - [ ] Tested the **packaged** artifact, not `pnpm dev` (dev mode also skips the consent prompt)
 - [ ] App launches from a clean state (`mv ~/.sapiom/harness/settings.json` aside to re-arm onboarding)
 - [ ] A terminal session opens — proves the node-pty rebuild and an executable `spawn-helper`
