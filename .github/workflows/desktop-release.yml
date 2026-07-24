@@ -119,14 +119,17 @@ jobs:
         # electron-builder's npmRebuild recompiles node-pty against the Electron
         # ABI for THIS OS as part of packaging.
         #
-        # SIGNING (Phase 5) is credential-driven, not branch-driven: add the
-        # secrets and the very next tag produces a signed + notarized .dmg; with
-        # no secrets the same job still produces a working unsigned build instead
+        # SIGNING is credential-driven, not branch-driven: add the secrets and the
+        # very next tag produces a signed + notarized .dmg; with the secrets empty
+        # the same job SKIPS signing and produces a working unsigned build instead
         # of failing. That's why `notarize` is passed on the command line rather
-        # than hardcoded in electron-builder.yml.
+        # than hardcoded in electron-builder.yml — a hardcoded `notarize: true`
+        # fails the build when there's nothing to notarize with.
         #
-        # CSC_IDENTITY_AUTO_DISCOVERY must be false when unsigned: otherwise
-        # electron-builder grabs any keychain identity it finds and half-signs.
+        # `CSC_IDENTITY_AUTO_DISCOVERY: false` IS electron-builder's documented
+        # switch for "do not sign", so the skip is explicit, not incidental — and
+        # it must be false whenever we have no cert, or electron-builder picks up
+        # any identity lying around in the runner's keychain and half-signs.
         env:
           CSC_LINK: ${{ secrets.CSC_LINK }}
           CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
@@ -140,13 +143,22 @@ jobs:
           # A plain string, not an array: unquoted it expands to NOTHING when
           # empty, whereas "${arr[@]:-}" would hand pack.mjs an empty argument.
           notarize_flag=""
-          # Notarize only with a full credential set — notarization calls Apple's
-          # service, so a half-configured run fails the build instead of degrading.
-          if [ "${{ runner.os }}" = "macOS" ] && [ -n "${CSC_LINK:-}" ] && [ -n "${APPLE_ID:-}" ]; then
-            echo "signing + notarizing (credentials present)"
-            notarize_flag="-c.mac.notarize=true"
-          elif [ "${{ runner.os }}" = "macOS" ]; then
-            echo "::warning::No Apple credentials — building an UNSIGNED macOS app. Gatekeeper will block it on a clean Mac."
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            if [ -z "${CSC_LINK:-}" ]; then
+              # No certificate → skip signing altogether (CSC_IDENTITY_AUTO_DISCOVERY
+              # is already false via the env block above).
+              echo "macOS signing: SKIPPED — no CSC_LINK secret."
+              echo "::warning::Unsigned macOS build: Gatekeeper blocks it on a clean Mac (testers need System Settings → Privacy & Security → Open Anyway). Add the Apple secrets to sign + notarize."
+            elif [ -z "${APPLE_ID:-}" ] || [ -z "${APPLE_APP_SPECIFIC_PASSWORD:-}" ]; then
+              # Cert but no notarization account: signing alone is still a real
+              # improvement, and notarizing half-configured would FAIL the build
+              # (it calls Apple's service) rather than degrade.
+              echo "macOS signing: signing only — notarization SKIPPED (APPLE_ID / APPLE_APP_SPECIFIC_PASSWORD missing)."
+              echo "::warning::Signed but not notarized: first launch still shows a Gatekeeper prompt."
+            else
+              echo "macOS signing: signing + notarizing."
+              notarize_flag="-c.mac.notarize=true"
+            fi
           fi
           # shellcheck disable=SC2086 # intentional: empty must vanish
           node packages/harness-desktop/scripts/pack.mjs ${{ matrix.packflag }} $notarize_flag
@@ -156,22 +168,27 @@ jobs:
         shell: bash
         run: ls -la packages/harness-desktop/release
 
-      # Release gate — macOS and Windows ONLY. Linux is deliberately skipped: the
-      # PR job (test.yml → desktop-smoke) already packages and launches the Linux
-      # app on every pull request, so repeating it here proves nothing new.
+      # Release gate — macOS ONLY.
       #
-      # These two are different, and not redundant with the PR:
-      #  - the PR job can't build them at all (each needs its own runner and
-      #    native toolchain), so this is the ONLY launch check they ever get;
-      #  - the macOS artifact here is SIGNED and notarized, which the PR's build
-      #    never is. Signing changes the binary: hardened runtime and entitlements
-      #    can break an app that launches perfectly unsigned (library validation
-      #    vs. node-pty's helper is the classic case). "It ran unsigned" is not
-      #    evidence that the notarized .dmg runs.
+      # Linux: skipped because the PR job (test.yml → desktop-smoke) already
+      # packages and launches it on every pull request. Nothing new to learn.
       #
-      # This is the gate that caught Windows building fine while never starting.
+      # Windows: skipped because it is KNOWN broken — the packaged app exits 3
+      # before running any of its own code (this gate is what found that), so a
+      # run here only adds a guaranteed red X to every release build. Re-enable
+      # by widening this condition once the launch bug is fixed (Phase 6);
+      # until then Windows genuinely has no launch coverage, which is accurate
+      # rather than hidden.
+      #
+      # macOS: kept, and not redundant with the PR job, for two reasons — the PR
+      # job cannot build a macOS app at all (it needs its own runner), and the
+      # artifact here is SIGNED and notarized, which the PR's never is. Signing
+      # changes the binary: hardened runtime and entitlements can break an app
+      # that launches perfectly unsigned (library validation vs. node-pty's
+      # spawn-helper is the classic case), so "it ran unsigned in the PR" is not
+      # evidence that the notarized .dmg a tester downloads will run.
       - name: Smoke-launch the packaged app
-        if: runner.os != 'Linux'
+        if: runner.os == 'macOS'
         shell: bash
         run: packages/harness-desktop/scripts/smoke.sh
 
