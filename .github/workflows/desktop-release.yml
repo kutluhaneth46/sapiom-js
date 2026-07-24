@@ -176,7 +176,15 @@ jobs:
               ;;
             Windows)
               # The nsis .exe is an installer; smoke the unpacked app it installs.
-              "$rel/win-unpacked/Sapiom.exe" --smoke || status=$?
+              # REDIRECTED to a file, not inherited: a GUI-subsystem exe can't
+              # attach to an existing console (so piping loses everything) but its
+              # handles redirect to a file fine. Without this, a crash before our
+              # own reporting code runs — which is exactly what happens today,
+              # exit 3 = Node's internal JS parse failure, i.e. a module that
+              # fails to load — is just a number with no message.
+              "$rel/win-unpacked/Sapiom.exe" --smoke > "$smoke_home/stdio.txt" 2>&1 || status=$?
+              echo "--- app stdout/stderr ---"
+              cat "$smoke_home/stdio.txt" || true
               ;;
           esac
           # Surface the report even when stdout was swallowed, then fail on the
