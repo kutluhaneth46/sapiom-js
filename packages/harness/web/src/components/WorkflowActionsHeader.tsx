@@ -173,9 +173,11 @@ export function WorkflowActionsHeader({
         data-testid="workflow-actions-header"
       >
         <span className="workflow-actions-name">{workflow.name}</span>
-        <span className="workflow-actions-count" data-testid="canvas-steps-count">
-          {stepsSummary ?? "no steps"}
-        </span>
+        {stepsSummary && (
+          <span className="workflow-actions-count" data-testid="canvas-steps-count">
+            {stepsSummary}
+          </span>
+        )}
         {/* One observed run: a plain status chip. Several: the chip is
             the run picker — any past run is one click away. */}
         {run && runs.length <= 1 && (
