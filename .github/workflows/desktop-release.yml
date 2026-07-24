@@ -131,70 +131,19 @@ jobs:
         shell: bash
         run: ls -la packages/harness-desktop/release
 
-      # THE point of building on each OS: launch what we just built. A build
-      # that merely compiles proves nothing — asar path resolution, node-pty's
-      # ABI, unpacked dependencies and a package.json mangled by cmd.exe
-      # quoting all pass `electron-builder` and then fail on a user's machine.
-      # `--smoke` boots the app, checks each of those layers and exits non-zero
-      # on the first that's broken (see src/main/smoke.ts).
-      #
-      # Isolated so a runner's state is never shared between checks: HOME (POSIX)
-      # / USERPROFILE+APPDATA (Windows) point at a temp dir, so ~/.sapiom and
-      # Electron's userData are per-run. Telemetry is forced off — CI is not a user.
+      # Release gate: launch what we just built, on this OS. A build that merely
+      # compiles proves nothing — asar path resolution, node-pty's ABI, unpacked
+      # dependencies and a package.json mangled by cmd.exe quoting all pass
+      # electron-builder and then fail on a user's machine. Never attach an
+      # artifact to a Release without this passing.
+      # (The PR-time equivalent runs Linux-only in test.yml — same script.)
+      - name: Install xvfb (Electron needs a display)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq xvfb
+
       - name: Smoke-launch the packaged app
         shell: bash
-        env:
-          SAPIOM_TELEMETRY_DISABLED: "1"
-          # Windows: a packaged Electron app is a GUI-subsystem exe that never
-          # attaches to the parent console, so its stdout is lost. Both of these
-          # exist to get the report back — the file is the reliable channel.
-          ELECTRON_ENABLE_LOGGING: "1"
-        run: |
-          set -euo pipefail
-          smoke_home="$(mktemp -d)"
-          mkdir -p "$smoke_home/project"
-          export HOME="$smoke_home" USERPROFILE="$smoke_home" APPDATA="$smoke_home/AppData"
-          export SAPIOM_LAUNCH_DIR="$smoke_home/project"
-          export SAPIOM_SMOKE_OUT="$smoke_home/smoke.txt"
-          rel=packages/harness-desktop/release
-          status=0
-          case "${{ runner.os }}" in
-            Linux)
-              # The *-unpacked dir, not the .AppImage: the AppImage wrapper adds a
-              # runtime layer that needs FUSE (absent on the runners) and whose
-              # extract-and-run fallback both floods the log with an 11k-line file
-              # listing and failed to exec the app at all (exit 127). The unpacked
-              # dir IS the bundle the AppImage wraps, so every layer these checks
-              # cover is identical; the wrapper itself is verified by launching the
-              # .AppImage locally.
-              # --no-sandbox: chrome-sandbox is only setuid-root once installed.
-              sudo apt-get update -qq && sudo apt-get install -y -qq xvfb
-              xvfb-run --auto-servernum "$rel/linux-unpacked/sapiom" --smoke --no-sandbox || status=$?
-              ;;
-            macOS)
-              "$rel"/mac-arm64/Sapiom.app/Contents/MacOS/Sapiom --smoke || status=$?
-              ;;
-            Windows)
-              # The nsis .exe is an installer; smoke the unpacked app it installs.
-              # REDIRECTED to a file, not inherited: a GUI-subsystem exe can't
-              # attach to an existing console (so piping loses everything) but its
-              # handles redirect to a file fine. Without this, a crash before our
-              # own reporting code runs — which is exactly what happens today,
-              # exit 3 = Node's internal JS parse failure, i.e. a module that
-              # fails to load — is just a number with no message.
-              "$rel/win-unpacked/Sapiom.exe" --smoke > "$smoke_home/stdio.txt" 2>&1 || status=$?
-              echo "--- app stdout/stderr ---"
-              cat "$smoke_home/stdio.txt" || true
-              ;;
-          esac
-          # Surface the report even when stdout was swallowed, then fail on the
-          # app's own exit code.
-          if [ -f "$SAPIOM_SMOKE_OUT" ]; then
-            echo "--- smoke report ---"; cat "$SAPIOM_SMOKE_OUT"
-          else
-            echo "--- no smoke report written: the app exited ($status) before reporting ---"
-          fi
-          exit "$status"
+        run: packages/harness-desktop/scripts/smoke.sh
 
       # Always upload to the run's Artifacts so workflow_dispatch (untagged)
       # builds are downloadable and testable — this is how you grab the unsigned
