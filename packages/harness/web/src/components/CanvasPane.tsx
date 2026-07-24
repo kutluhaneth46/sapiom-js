@@ -809,7 +809,7 @@ export function CanvasPane({
         /* Nothing visualized yet, but a run was observed: the live
            per-step data renders instead of "No steps yet". */
         <div className="canvas-steps-surface" data-testid="canvas-steps-surface">
-          <RunStepsList run={run} target={runTarget} />
+          <RunStepsList run={run} target={runTarget} onInjectPrompt={onInjectPrompt} />
         </div>
       ) : !showsContent && sessionExited ? (
         /* nothing was generated and the session is dead — inviting a
@@ -1083,11 +1083,12 @@ export function CanvasPane({
                   expandedId={expandedStepId}
                   onToggle={(id) => setExpandedStepId((cur) => (cur === id ? null : id))}
                   onOpenDetail={setDetailStepId}
+                  onInjectPrompt={onInjectPrompt}
                 />
               ) : run ? (
                 /* No structural graph, but a real run was observed:
                    its per-step truth renders instead of a dead end. */
-                <RunStepsList run={run} target={runTarget} />
+                <RunStepsList run={run} target={runTarget} onInjectPrompt={onInjectPrompt} />
               ) : (
                 /* Same title as the pre-render empty state; the hint names
                    this cause (a rendered canvas that posted no graph). */
@@ -1119,7 +1120,6 @@ export function CanvasPane({
               }}
               onDeselect={() => setSelectedNodeId(null)}
               onCollapse={() => setOverviewOpen(false)}
-              onInjectPrompt={onInjectPrompt}
             />
           )}
           </div>

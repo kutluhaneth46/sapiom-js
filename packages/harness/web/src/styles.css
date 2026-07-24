@@ -3608,6 +3608,51 @@ input {
   word-break: break-word;
 }
 
+/* Debug macros block inside the Steps tab's per-step expanded area.
+   Three preset buttons stack full-width (inherit .btn-ghost / .btn-primary)
+   plus a free-form ask row. Set off from the Logs block by a hairline.
+   All on shared step-expand tokens so it reads as native to the panel. */
+.step-macros {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp1);
+  padding-top: var(--sp2);
+  border-top: 1px solid var(--ui-line);
+}
+
+.step-macro-btn {
+  width: 100%;
+  text-align: left;
+}
+
+.step-macros-freeform {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp1);
+}
+
+.step-macros-freeform-input {
+  width: 100%;
+  resize: vertical;
+  padding: var(--sp1) var(--sp2);
+  font: inherit;
+  font-size: var(--type-label);
+  color: var(--text);
+  background: var(--surface-raised);
+  border: 1px solid var(--ui-line);
+  border-radius: var(--radius-md);
+}
+
+.step-macros-freeform-input:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+  border-color: var(--ui-line-strong);
+}
+
+.step-macros-freeform-ask {
+  align-self: flex-end;
+}
+
 /* Steps subheader run chip: the flat .status-tag recipe — run truth is a
    labeled fact ("prod run completed"), mono because it is data. */
 .canvas-run-chip {
