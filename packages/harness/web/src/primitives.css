@@ -1,0 +1,81 @@
+/* Base element resets + shared button primitives — the product's design
+   system, shared by the harness SPA and the desktop onboarding window.
+   Extracted from styles.css; theme via [data-theme] (set by each host's
+   inline theme script). Requires theme-tokens.css. */
+
+button {
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+
+input {
+  font: inherit;
+  color: inherit;
+}
+
+/* Shared buttons ------------------------------------------------------- */
+
+/* Matches Button variant="outline": persistent border + shadow-xs; hover
+   fills solid accent in light mode (the product's `hover:bg-accent`) but
+   stays a neutral, more restrained hover in dark mode — same asymmetry the
+   real Button component has between its light/dark outline treatments. */
+.btn-ghost {
+  background: transparent;
+  border: 1px solid var(--border-strong);
+  color: var(--text-dim);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-xs);
+  padding: 5px 10px;
+  font-size: 12px;
+  font-weight: 500;
+  transition:
+    background-color var(--transition-fast),
+    border-color var(--transition-fast),
+    color var(--transition-fast);
+}
+
+[data-theme="light"] .btn-ghost:hover:not(:disabled) {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-foreground);
+}
+
+[data-theme="dark"] .btn-ghost:hover:not(:disabled) {
+  color: var(--text);
+  border-color: var(--text-faint);
+}
+
+.btn-ghost:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--focus-ring);
+}
+
+/* Matches Button variant="default": solid accent fill, no border. */
+.btn-primary {
+  background: var(--accent);
+  border: 1px solid transparent;
+  color: var(--accent-foreground);
+  font-weight: 500;
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-xs);
+  padding: 5px 10px;
+  font-size: 12px;
+  transition: background-color var(--transition-fast);
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+
+.btn-primary:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--focus-ring);
+}
+
+.btn-ghost:disabled,
+.btn-primary:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}

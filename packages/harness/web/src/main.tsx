@@ -2,6 +2,12 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App.js";
 import { interceptMockTrack } from "./lib/api.js";
+// Shared design-system layers first (tokens → primitives), then app styles.
+// Composed here via JS imports rather than CSS @import so vite doesn't re-parse
+// styles.css with a stricter (nesting-unaware) pass. Same files are shipped to
+// the desktop onboarding window — single source of truth.
+import "./theme-tokens.css";
+import "./primitives.css";
 import "./styles.css";
 
 // In mock mode, intercept /api/track calls so Playwright tests can assert
