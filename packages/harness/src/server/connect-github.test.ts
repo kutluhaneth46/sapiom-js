@@ -1,0 +1,232 @@
+/**
+ * Unit tests for the POST /api/connect/github handler.
+ *
+ * The git clone is mocked at the `gitClone` function seam — no network calls,
+ * no real git binary required. The workflow registry is a lightweight stub.
+ */
+
+import type { AddressInfo } from "node:net";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import express from "express";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// Mock the execFileAsync used inside gitClone so no real git binary runs.
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  return {
+    ...actual,
+    execFile: vi.fn((_cmd: string, _args: string[], _opts: unknown, callback: (err: unknown, stdout: string, stderr: string) => void) => {
+      // Default: succeed silently. Tests override via mockClone.
+      (callback as (err: null, stdout: string, stderr: string) => void)(null, "", "");
+      return { pid: 1 } as ReturnType<typeof actual.execFile>;
+    }),
+  };
+});
+
+import { createConnectGitHubRouter, gitClone } from "./connect-github.js";
+import type { WorkflowRegistryLike } from "../core/workflow-registry.js";
+import type { WorkflowInfo } from "../shared/types.js";
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function fakeRegistry(overrides: Partial<WorkflowRegistryLike> = {}): WorkflowRegistryLike {
+  return {
+    list: vi.fn().mockResolvedValue([]),
+    scan: vi.fn().mockResolvedValue([]),
+    connectPath: vi.fn().mockImplementation(async (p: string): Promise<WorkflowInfo> => ({
+      name: path.basename(p),
+      path: p,
+      definitionId: null,
+      definitionSlug: null,
+      source: "connect",
+    })),
+    ...overrides,
+  };
+}
+
+function startServer(
+  registry: WorkflowRegistryLike,
+  tmpDir: string,
+): { baseUrl: string; close: () => Promise<void> } {
+  const app = express();
+  app.use(express.json());
+  app.use(
+    createConnectGitHubRouter({
+      registry,
+      defaultCloneParent: tmpDir,
+    }),
+  );
+  const server = app.listen(0);
+  const address = server.address() as AddressInfo;
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  return {
+    baseUrl,
+    close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests for gitClone (isolated, no HTTP)
+// ---------------------------------------------------------------------------
+
+describe("gitClone", () => {
+  it("rejects with a redacted error when the mock simulates a clone failure", async () => {
+    // Arrange: make the promisified execFile reject with a fake stderr.
+    const { promisify } = await import("node:util");
+    const execFile = await import("node:child_process").then((m) => m.execFile);
+    vi.mocked(execFile).mockImplementationOnce(
+      (_cmd, _args, _opts, cb) => {
+        (cb as unknown as (err: Error, stdout: string, stderr: string) => void)(
+          Object.assign(new Error("clone failed"), { stderr: "fatal: repository 'https://user:TOKEN@github.com/x/y.git' not found" }),
+          "",
+          "fatal: repository 'https://user:TOKEN@github.com/x/y.git' not found",
+        );
+        return { pid: 1 } as ReturnType<typeof import("node:child_process").execFile>;
+      },
+    );
+    // The promisify wrapper in the module re-reads the mock on each call.
+    await expect(gitClone("https://github.com/x/y.git", "/tmp/y")).rejects.toThrow(
+      /\*\*\*@github\.com/,
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// HTTP handler tests
+// ---------------------------------------------------------------------------
+
+describe("POST /api/connect/github", () => {
+  let tmpDir: string;
+  let server: { baseUrl: string; close: () => Promise<void> };
+
+  beforeEach(async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "connect-github-test-"));
+  });
+
+  afterEach(async () => {
+    await server?.close();
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it("returns 400 when repoUrl is missing", async () => {
+    const registry = fakeRegistry();
+    server = startServer(registry, tmpDir);
+    const res = await fetch(`${server.baseUrl}/api/connect/github`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toMatch(/repoUrl/i);
+  });
+
+  it("returns 400 for an invalid (non-GitHub) URL", async () => {
+    const registry = fakeRegistry();
+    server = startServer(registry, tmpDir);
+    const res = await fetch(`${server.baseUrl}/api/connect/github`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ repoUrl: "https://gitlab.com/owner/repo" }),
+    });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toMatch(/Invalid GitHub URL/i);
+  });
+
+  it("returns 400 when targetDir already exists and is non-empty", async () => {
+    // Create a non-empty target directory.
+    const existing = path.join(tmpDir, "my-repo");
+    await fs.mkdir(existing, { recursive: true });
+    await fs.writeFile(path.join(existing, "README.md"), "hello");
+
+    const registry = fakeRegistry();
+    server = startServer(registry, tmpDir);
+    const res = await fetch(`${server.baseUrl}/api/connect/github`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ repoUrl: "https://github.com/owner/my-repo", targetDir: existing }),
+    });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toMatch(/not empty/i);
+  });
+
+  it("calls connectPath with the correct targetDir on a successful mock clone", async () => {
+    const registry = fakeRegistry();
+    server = startServer(registry, tmpDir);
+    const expectedDir = path.join(tmpDir, "my-repo");
+
+    const res = await fetch(`${server.baseUrl}/api/connect/github`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ repoUrl: "https://github.com/owner/my-repo" }),
+    });
+
+    // The clone mock succeeds by default; registry.connectPath is called with the derived dir.
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { path: string };
+    expect(body.path).toBe(expectedDir);
+    expect(registry.connectPath).toHaveBeenCalledWith(expectedDir);
+  });
+
+  it("uses the caller-supplied targetDir when provided", async () => {
+    const customDir = path.join(tmpDir, "custom-location");
+    const registry = fakeRegistry();
+    server = startServer(registry, tmpDir);
+
+    const res = await fetch(`${server.baseUrl}/api/connect/github`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ repoUrl: "https://github.com/owner/repo", targetDir: customDir }),
+    });
+    expect(res.status).toBe(200);
+    expect(registry.connectPath).toHaveBeenCalledWith(customDir);
+  });
+
+  it("returns 500 when git clone fails", async () => {
+    // Override the execFile mock to simulate a clone failure.
+    const { execFile } = await import("node:child_process");
+    vi.mocked(execFile).mockImplementationOnce(
+      (_cmd, _args, _opts, cb) => {
+        (cb as unknown as (err: Error, stdout: string, stderr: string) => void)(
+          Object.assign(new Error("git clone failed"), { stderr: "fatal: not found" }),
+          "",
+          "fatal: not found",
+        );
+        return { pid: 1 } as ReturnType<typeof import("node:child_process").execFile>;
+      },
+    );
+
+    const registry = fakeRegistry();
+    server = startServer(registry, tmpDir);
+
+    const res = await fetch(`${server.baseUrl}/api/connect/github`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ repoUrl: "https://github.com/owner/repo" }),
+    });
+    expect(res.status).toBe(500);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toMatch(/git clone failed/i);
+    // connectPath must NOT be called when clone failed.
+    expect(registry.connectPath).not.toHaveBeenCalled();
+  });
+
+  it("accepts SSH-style GitHub URLs", async () => {
+    const registry = fakeRegistry();
+    server = startServer(registry, tmpDir);
+
+    const res = await fetch(`${server.baseUrl}/api/connect/github`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ repoUrl: "git@github.com:owner/my-repo.git" }),
+    });
+    expect(res.status).toBe(200);
+    expect(registry.connectPath).toHaveBeenCalledWith(path.join(tmpDir, "my-repo"));
+  });
+});

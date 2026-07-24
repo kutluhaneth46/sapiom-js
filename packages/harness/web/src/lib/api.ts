@@ -186,6 +186,19 @@ export interface AuthStartResponse {
   started: boolean;
 }
 
+/** Response from POST /api/connect/github — the path of the cloned directory. */
+export interface ConnectGitHubResponse {
+  path: string;
+}
+
+/** Request body for POST /api/connect/github. */
+export interface ConnectGitHubRequest {
+  /** GitHub URL — HTTPS or SSH form. */
+  repoUrl: string;
+  /** Absolute target path for the clone. Derived from repo name when omitted. */
+  targetDir?: string;
+}
+
 export interface HarnessApi {
   /**
    * Kick off the browser OAuth flow (`POST /api/auth/start`). Returns
@@ -263,6 +276,12 @@ export interface HarnessApi {
    * `{ executionId }`, which the caller hands to the run-inspector poller.
    */
   run(req: { definitionId: string; input?: unknown }): Promise<RunResponse>;
+  /**
+   * Clone a GitHub repository using the user's local git credentials and
+   * register the resulting directory in the workspace rail.
+   * POST /api/connect/github.
+   */
+  connectGitHub(req: ConnectGitHubRequest): Promise<ConnectGitHubResponse>;
 }
 
 class RealApi implements HarnessApi {
@@ -456,6 +475,13 @@ class RealApi implements HarnessApi {
 
   async run(req: { definitionId: string; input?: unknown }): Promise<RunResponse> {
     return this.request<RunResponse>("/api/runs", { method: "POST", body: JSON.stringify(req) });
+  }
+
+  connectGitHub(req: ConnectGitHubRequest): Promise<ConnectGitHubResponse> {
+    return this.request<ConnectGitHubResponse>("/api/connect/github", {
+      method: "POST",
+      body: JSON.stringify(req),
+    });
   }
 
   /**
@@ -1107,6 +1133,30 @@ class MockApi implements HarnessApi {
     // A fresh, non-"local" id so the run-state fixture returns the prod
     // steps and the inspector poller has something to follow.
     return { executionId: `exec-mock-prod-${Date.now()}` };
+  }
+
+  async connectGitHub(req: ConnectGitHubRequest): Promise<ConnectGitHubResponse> {
+    await delay(400);
+    // Test-only failure mode: `?mockError=connectGitHub` simulates a clone error.
+    if (mockErrorTargets().has("connectGitHub")) {
+      throw new ApiError(500, "git clone failed: repository not found", "git clone failed: repository not found");
+    }
+    // Test-only success: record the call and add a workflow to the mock state.
+    const repoName = req.repoUrl.split("/").pop()?.replace(/\.git$/, "") ?? "repo";
+    const clonedPath = `/Users/demo/sapiom/${repoName}`;
+    const info = {
+      name: repoName,
+      path: clonedPath,
+      definitionId: null,
+      definitionSlug: null,
+      source: "connect" as const,
+    };
+    this.workflows = [...this.workflows.filter((w) => w.path !== clonedPath), info];
+    if (typeof window !== "undefined") {
+      const win = window as unknown as { __HARNESS_TEST__?: Record<string, unknown> };
+      win.__HARNESS_TEST__ = { ...(win.__HARNESS_TEST__ ?? {}), lastConnectGitHub: req };
+    }
+    return { path: clonedPath };
   }
 
   /** Test-only escape hatch (mock mode only): record a direct-action call so

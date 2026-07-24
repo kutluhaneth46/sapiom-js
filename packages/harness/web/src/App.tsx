@@ -41,6 +41,7 @@ import { TooltipLayer } from "./components/TooltipLayer";
 import { WelcomePanel } from "./components/WelcomePanel";
 import { WorkflowsRail } from "./components/WorkflowsRail";
 import { ApiError, boundWorkflowPathOf } from "./lib/api";
+import type { ConnectGitHubRequest } from "./lib/api";
 import type { CanvasGraph } from "./lib/canvas-graph";
 import { classifyConnectivity, useConnectivity } from "./lib/connectivity";
 import { useTemplatePrompt, type StudioTemplate } from "./lib/templates";
@@ -653,6 +654,13 @@ export const App = (): JSX.Element => {
           onOpenPalette={() => setPaletteOpen(true)}
           onConnect={async (path) => {
             await harness.connectWorkflow(path);
+          }}
+          onConnectGitHub={async (req: ConnectGitHubRequest) => {
+            const res = await harness.api.connectGitHub(req);
+            // Refresh the workflow list so the newly cloned project appears in the rail.
+            const workflow = await harness.connectWorkflow(res.path);
+            setFocusedAgentPath(workflow.path);
+            return res.path;
           }}
           onCollapse={() => setRailCollapsed(true)}
           onSelectSession={openSession}

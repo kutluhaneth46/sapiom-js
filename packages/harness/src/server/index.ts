@@ -108,6 +108,7 @@ import {
   createAuthRouter,
   createMutableAuthState,
 } from "./auth-routes.js";
+import { createConnectGitHubRouter } from "./connect-github.js";
 // resolveAgentsBaseUrl is imported above from definition-slug-resolver.js
 // (an identical helper); the runs router reuses it for its agents base URL.
 
@@ -928,6 +929,7 @@ export const startServer = async (
   );
   app.use(
     createWorkflowsRouter(enrichedWorkflowRegistry),
+    createConnectGitHubRouter({ registry: enrichedWorkflowRegistry }),
     createFsRouter(),
     createMacrosRouter({
       listMacros: () => DEFAULT_MACROS,

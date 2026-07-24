@@ -771,6 +771,84 @@ input {
   overflow-y: auto;
 }
 
+/* "+" add-project menu (AddProjectMenu / ConnectGitHubForm). */
+.add-project-menu {
+  width: min(260px, calc(100vw - var(--sp4)));
+}
+
+/* Menu item buttons — full-width, left-aligned, icon + label. */
+.add-project-menu-item {
+  display: flex;
+  align-items: center;
+  gap: var(--sp2);
+  width: 100%;
+  justify-content: flex-start;
+  padding: var(--sp2) var(--sp3);
+  font-size: var(--type-label);
+  border-radius: var(--radius-sm);
+}
+
+/* GitHub connect form inside the popover. */
+.connect-github-form {
+  display: contents;
+}
+
+.connect-github-body {
+  gap: var(--sp3);
+}
+
+.connect-github-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp1);
+}
+
+.connect-github-label {
+  font-size: var(--type-label);
+  font-weight: 510;
+  color: var(--text-faint);
+}
+
+.connect-github-label-hint {
+  font-weight: 400;
+  color: var(--text-faintest, var(--text-faint));
+}
+
+.connect-github-input {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.connect-github-input.is-error {
+  border-color: var(--red, #e05252);
+  outline-color: var(--red, #e05252);
+}
+
+.connect-github-field-error {
+  font-size: var(--type-label);
+  color: var(--red-text, #d33);
+}
+
+.connect-github-field-hint {
+  font-size: var(--type-label);
+  color: var(--text-faint);
+}
+
+.connect-github-path-preview {
+  font-family: var(--font-mono, monospace);
+  font-size: var(--type-label);
+  background: var(--surface-inset-strong, var(--surface-inset));
+  border-radius: 3px;
+  padding: 0 3px;
+}
+
+.connect-github-actions {
+  display: flex;
+  gap: var(--sp2);
+  justify-content: flex-end;
+  padding-top: var(--sp1);
+}
+
 .rail-list {
   flex: 1;
   min-height: 0;

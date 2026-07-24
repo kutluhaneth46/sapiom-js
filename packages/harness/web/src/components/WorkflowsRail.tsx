@@ -9,8 +9,9 @@ import type {
   WorkflowInfo,
 } from "@shared/types";
 
-import type { AuthStartResponse, FsListResponse } from "../lib/api";
+import type { AuthStartResponse, ConnectGitHubRequest, FsListResponse } from "../lib/api";
 import type { StudioTemplate } from "../lib/templates";
+import { AddProjectMenu } from "./AddProjectMenu";
 import { AnchoredPopover } from "./AnchoredPopover";
 import { BrandHeader } from "./BrandHeader";
 import { EmptyState } from "./EmptyState";
@@ -42,6 +43,8 @@ interface WorkflowsRailProps {
   onFocusAgent: (path: string) => void;
   onOpenPalette: () => void;
   onConnect: (path: string) => Promise<void>;
+  /** Clone a GitHub repo via the user's local git and register it in the workspace. */
+  onConnectGitHub: (req: ConnectGitHubRequest) => Promise<string>;
   /** Collapses the rail — the session bar grows an expand affordance. */
   onCollapse: () => void;
   /** Selects a session from the history menu (a past/exited session). */
@@ -274,6 +277,7 @@ export function WorkflowsRail({
   onFocusAgent,
   onOpenPalette,
   onConnect,
+  onConnectGitHub,
   onCollapse,
   onSelectSession,
   overviewSelected,
@@ -305,6 +309,7 @@ export function WorkflowsRail({
   onSetSettingsOpen,
 }: WorkflowsRailProps): JSX.Element {
   const [addDialogMode, setAddDialogMode] = useState<"session" | "workspace" | null>(null);
+  const [addMenuOpen, setAddMenuOpen] = useState(false);
   const [templatesOpen, setTemplatesOpen] = useState(false);
   const connectTriggerRef = useRef<HTMLButtonElement>(null);
 
@@ -411,10 +416,12 @@ export function WorkflowsRail({
             className="theme-toggle rail-header-btn"
             data-testid="add-workspace"
             aria-label="Add project"
-            title="Register an existing agent project folder (sapiom.json). Its agent appears in the rail."
+            aria-haspopup="menu"
+            aria-expanded={addMenuOpen}
+            title="Add an existing project to the workspace"
             onClick={() => {
               setHistoryOpen(false);
-              setAddDialogMode("workspace");
+              setAddMenuOpen((v) => !v);
             }}
           >
             <Icon name="Plus" size={14} />
@@ -422,6 +429,21 @@ export function WorkflowsRail({
         </div>
       </div>
       <div className="rail-tree">
+        <AddProjectMenu
+          triggerRef={connectTriggerRef}
+          open={addMenuOpen}
+          onDismiss={() => setAddMenuOpen(false)}
+          onOpenFolder={() => {
+            setAddMenuOpen(false);
+            setAddDialogMode("workspace");
+          }}
+          onConnectGitHub={onConnectGitHub}
+          onAfterConnect={(path) => {
+            // The server already registered the path; focus the new entry.
+            void onConnect(path);
+          }}
+        />
+
         <AnchoredPopover
           open={historyOpen}
           anchorRef={historyTriggerRef}
