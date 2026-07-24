@@ -2,8 +2,35 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'"
+    />
     <title>Sapiom</title>
+    <script>
+      // Set the theme before first paint (mirrors the SPA's inline script in
+      // web/index.html). The shared theme-tokens.css keys dark tokens on
+      // [data-theme="dark"], so this window must set the attribute too. This
+      // origin has its own storage, so a fresh window follows the system —
+      // matching the SPA's default for a first-time user.
+      (function () {
+        var stored = null;
+        try {
+          stored = localStorage.getItem("sapiom-harness-theme");
+        } catch (_) {}
+        var theme =
+          stored === "light" || stored === "dark"
+            ? stored
+            : window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches
+              ? "dark"
+              : "light";
+        document.documentElement.dataset.theme = theme;
+      })();
+    </script>
+    <!-- Shared harness design system (copied from @sapiom/harness at build),
+         then this window's own layout. Order: tokens → primitives → layout. -->
+    <link rel="stylesheet" href="./theme-tokens.css" />
+    <link rel="stylesheet" href="./primitives.css" />
     <link rel="stylesheet" href="./setup.css" />
   </head>
   <body>
@@ -17,12 +44,12 @@
           <input type="checkbox" id="telemetry" checked />
           <span>Share anonymous usage data to help improve Sapiom (optional).</span>
         </label>
-        <button id="consent-continue" class="btn">Continue</button>
+        <button id="consent-continue" class="btn-primary">Continue</button>
       </section>
 
       <section id="error" class="error" hidden>
         <pre id="error-message" class="error-message"></pre>
-        <button id="retry" class="btn" hidden>Retry</button>
+        <button id="retry" class="btn-primary" hidden>Retry</button>
       </section>
     </main>
     <script type="module" src="./setup.js"></script>
