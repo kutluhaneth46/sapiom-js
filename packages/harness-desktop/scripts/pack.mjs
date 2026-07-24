@@ -7,7 +7,8 @@
 // node_modules whose symlinks all resolve INSIDE that dir — then run
 // electron-builder there, writing artifacts back to <pkg>/release.
 //
-// Usage: node scripts/pack.mjs [--linux|--mac|--win]   (default --linux)
+// Usage: node scripts/pack.mjs [--linux|--mac|--win] [...electron-builder args]
+//   (default --linux; any further args pass through, e.g. -c.mac.notarize=true)
 import { execFileSync } from "node:child_process";
 import { cpSync, realpathSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -18,6 +19,13 @@ const pkgDir = dirname(dirname(fileURLToPath(import.meta.url))); // packages/har
 const repoRoot = dirname(dirname(pkgDir)); // sapiom-js
 const outputDir = join(pkgDir, "release");
 const platform = process.argv[2] ?? "--linux";
+// Anything after the platform flag goes straight to electron-builder. Signing
+// and notarization are switched on this way (`-c.mac.notarize=true`) rather than
+// hardcoded in electron-builder.yml, so a build without credentials still
+// succeeds unsigned instead of failing.
+// Empty strings filtered out: a shell passing an unset flag as "" would
+// otherwise reach electron-builder as a bogus empty argument.
+const passthrough = process.argv.slice(3).filter((arg) => arg.length > 0);
 const isWindows = process.platform === "win32";
 
 // Deploy-target base. `pnpm deploy` materializes the app's node_modules using
@@ -66,6 +74,6 @@ const electronBuilder = join(
   ".bin",
   isWindows ? "electron-builder.cmd" : "electron-builder",
 );
-run(electronBuilder, [platform, `-c.directories.output=${outputDir}`], deployDir);
+run(electronBuilder, [platform, `-c.directories.output=${outputDir}`, ...passthrough], deployDir);
 
 console.log(`[pack] done → ${outputDir}`);

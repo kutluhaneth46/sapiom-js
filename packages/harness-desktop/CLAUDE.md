@@ -64,12 +64,19 @@ here, each OS builds on its own runner.
 - **Only arm64 is built today.** `macos-14` is Apple Silicon and electron-builder defaults to the
   host arch, so **Intel Macs get no artifact**. Add an `x64`/universal target before GA if Intel users
   are in scope.
-- Phase 5 (signing): `hardenedRuntime` + entitlements are already configured — flip `notarize`, drop
-  the CI `CSC_IDENTITY_AUTO_DISCOVERY: false`, and switch the release job to attach the `.dmg`/`.zip`
-  instead of the raw `.app` (as its own comment warns, `**/*` would upload the bundle's inner files
-  as hundreds of separate release assets).
-- An unsigned CI `.app` needs `chmod -R +x Sapiom.app` (upload-artifact drops the executable bit) and
-  `xattr -dr com.apple.quarantine` before it launches.
+- **Signing is credential-driven, not code-driven.** The CI wiring is done: add the five secrets and
+  the next tag produces a signed + notarized `.dmg`; with no secrets the same job still produces a
+  working unsigned build (a `::warning::` says so) rather than failing. That's why `notarize` is
+  passed as `-c.mac.notarize=true` on the command line instead of being hardcoded in
+  `electron-builder.yml`, and why `CSC_IDENTITY_AUTO_DISCOVERY` is `${{ secrets.CSC_LINK != '' }}` —
+  left on without a cert, electron-builder grabs any keychain identity and half-signs.
+  Secrets: `CSC_LINK` (base64 of the Developer ID `.p12`), `CSC_KEY_PASSWORD`, `APPLE_ID`,
+  `APPLE_APP_SPECIFIC_PASSWORD`, `APPLE_TEAM_ID`.
+- **You do not need a Mac to create the certificate.** Generate the CSR with openssl, upload it at
+  developer.apple.com (Certificates → Developer ID Application), then bundle the `.cer` with the key
+  into a `.p12`. On OpenSSL 3 add `-legacy` to `pkcs12 -export`, or macOS refuses the resulting file.
+- An unsigned `.dmg` needs `xattr -dr com.apple.quarantine` before it opens — which is exactly what
+  signing removes, and the reason a tester build is worth signing.
 
 ### Windows
 
