@@ -42,6 +42,7 @@ import { WelcomePanel } from "./components/WelcomePanel";
 import { WorkflowsRail } from "./components/WorkflowsRail";
 import { ApiError, boundWorkflowPathOf } from "./lib/api";
 import type { ConnectGitHubRequest } from "./lib/api";
+import type { GitHubDeviceApi } from "./components/GitHubDeviceConnect";
 import type { CanvasGraph } from "./lib/canvas-graph";
 import { classifyConnectivity, useConnectivity } from "./lib/connectivity";
 import { useTemplatePrompt, type StudioTemplate } from "./lib/templates";
@@ -662,6 +663,19 @@ export const App = (): JSX.Element => {
             setFocusedAgentPath(workflow.path);
             return res.path;
           }}
+          githubDeviceApi={{
+            deviceStart: () => harness.api.githubDeviceStart(),
+            devicePoll: (code) => harness.api.githubDevicePoll(code),
+            listRepos: () => harness.api.githubListRepos(),
+            status: () => harness.api.githubStatus(),
+            disconnect: () => harness.api.githubDisconnect(),
+            clone: async (req: ConnectGitHubRequest) => {
+              const res = await harness.api.connectGitHub(req);
+              const workflow = await harness.connectWorkflow(res.path);
+              setFocusedAgentPath(workflow.path);
+              return res.path;
+            },
+          } satisfies GitHubDeviceApi}
           onCollapse={() => setRailCollapsed(true)}
           onSelectSession={openSession}
           overviewSelected={overviewSelected}

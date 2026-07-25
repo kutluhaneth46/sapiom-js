@@ -191,6 +191,41 @@ export interface ConnectGitHubResponse {
   path: string;
 }
 
+// ---------------------------------------------------------------------------
+// GitHub Device Flow wire types (matched to src/server/github-device.ts).
+// ---------------------------------------------------------------------------
+
+/** Response from POST /api/github/device/start. */
+export interface GitHubDeviceStartResponse {
+  user_code: string;
+  verification_uri: string;
+  device_code: string;
+  interval: number;
+  expires_in: number;
+}
+
+/** Response from POST /api/github/device/poll. */
+export interface GitHubDevicePollResponse {
+  status: "authorized" | "pending" | "slow_down" | "expired" | "denied";
+  interval?: number;
+}
+
+/** One repo entry from GET /api/github/repos. */
+export interface GitHubApiRepoEntry {
+  fullName: string;
+  cloneUrl: string;
+  private: boolean;
+  description: string | null;
+  updatedAt: string | null;
+}
+
+/** Response from GET /api/github/status. */
+export interface GitHubStatusResponse {
+  connected: boolean;
+  configured?: boolean;
+  login?: string;
+}
+
 /** Request body for POST /api/connect/github. */
 export interface ConnectGitHubRequest {
   /** GitHub URL — HTTPS or SSH form. */
@@ -282,6 +317,19 @@ export interface HarnessApi {
    * POST /api/connect/github.
    */
   connectGitHub(req: ConnectGitHubRequest): Promise<ConnectGitHubResponse>;
+
+  // ── GitHub Device Flow ────────────────────────────────────────────────────
+
+  /** POST /api/github/device/start — begin the Device Flow. */
+  githubDeviceStart(): Promise<GitHubDeviceStartResponse>;
+  /** POST /api/github/device/poll — poll for authorization result. */
+  githubDevicePoll(deviceCode: string): Promise<GitHubDevicePollResponse>;
+  /** GET /api/github/repos — list the authed user's repos. */
+  githubListRepos(): Promise<GitHubApiRepoEntry[]>;
+  /** GET /api/github/status — check whether a GitHub token is stored. */
+  githubStatus(): Promise<GitHubStatusResponse>;
+  /** POST /api/github/disconnect — remove the stored token. */
+  githubDisconnect(): Promise<void>;
 }
 
 class RealApi implements HarnessApi {
@@ -482,6 +530,31 @@ class RealApi implements HarnessApi {
       method: "POST",
       body: JSON.stringify(req),
     });
+  }
+
+  githubDeviceStart(): Promise<GitHubDeviceStartResponse> {
+    return this.request<GitHubDeviceStartResponse>("/api/github/device/start", {
+      method: "POST",
+    });
+  }
+
+  githubDevicePoll(deviceCode: string): Promise<GitHubDevicePollResponse> {
+    return this.request<GitHubDevicePollResponse>("/api/github/device/poll", {
+      method: "POST",
+      body: JSON.stringify({ device_code: deviceCode }),
+    });
+  }
+
+  githubListRepos(): Promise<GitHubApiRepoEntry[]> {
+    return this.request<GitHubApiRepoEntry[]>("/api/github/repos");
+  }
+
+  githubStatus(): Promise<GitHubStatusResponse> {
+    return this.request<GitHubStatusResponse>("/api/github/status");
+  }
+
+  async githubDisconnect(): Promise<void> {
+    await this.request<{ ok: true }>("/api/github/disconnect", { method: "POST" });
   }
 
   /**
@@ -1157,6 +1230,78 @@ class MockApi implements HarnessApi {
       win.__HARNESS_TEST__ = { ...(win.__HARNESS_TEST__ ?? {}), lastConnectGitHub: req };
     }
     return { path: clonedPath };
+  }
+
+  // ---------------------------------------------------------------------------
+  // GitHub Device Flow mocks
+  // ---------------------------------------------------------------------------
+
+  /** Mock GitHub Device Flow state — flipped per-test via mockGitHubConnected. */
+  private _githubConnected = false;
+  private _githubLogin = "mock-user";
+  private _mockRepos: GitHubApiRepoEntry[] = [
+    {
+      fullName: "mock-user/my-agent",
+      cloneUrl: "https://github.com/mock-user/my-agent.git",
+      private: false,
+      description: "A mock public repo",
+      updatedAt: "2026-01-01T00:00:00Z",
+    },
+    {
+      fullName: "mock-user/private-project",
+      cloneUrl: "https://github.com/mock-user/private-project.git",
+      private: true,
+      description: null,
+      updatedAt: "2026-01-02T00:00:00Z",
+    },
+  ];
+
+  async githubDeviceStart(): Promise<GitHubDeviceStartResponse> {
+    await delay(200);
+    if (mockErrorTargets().has("githubNotConfigured")) {
+      throw new ApiError(503, "notConfigured", "notConfigured");
+    }
+    return {
+      user_code: "ABCD-1234",
+      verification_uri: "https://github.com/login/device",
+      device_code: "mock-device-code",
+      interval: 1,
+      expires_in: 900,
+    };
+  }
+
+  async githubDevicePoll(_deviceCode: string): Promise<GitHubDevicePollResponse> {
+    await delay(300);
+    if (mockErrorTargets().has("githubPollDenied")) {
+      return { status: "denied" };
+    }
+    if (mockErrorTargets().has("githubPollExpired")) {
+      return { status: "expired" };
+    }
+    // Default: simulate authorization completing immediately.
+    this._githubConnected = true;
+    return { status: "authorized" };
+  }
+
+  async githubListRepos(): Promise<GitHubApiRepoEntry[]> {
+    await delay(200);
+    return this._mockRepos;
+  }
+
+  async githubStatus(): Promise<GitHubStatusResponse> {
+    await delay(100);
+    if (mockErrorTargets().has("githubNotConfigured")) {
+      return { connected: false, configured: false };
+    }
+    if (this._githubConnected) {
+      return { connected: true, configured: true, login: this._githubLogin };
+    }
+    return { connected: false, configured: true };
+  }
+
+  async githubDisconnect(): Promise<void> {
+    await delay(150);
+    this._githubConnected = false;
   }
 
   /** Test-only escape hatch (mock mode only): record a direct-action call so

@@ -11,6 +11,7 @@ import type {
 
 import type { AuthStartResponse, ConnectGitHubRequest, FsListResponse } from "../lib/api";
 import type { StudioTemplate } from "../lib/templates";
+import type { GitHubDeviceApi } from "./GitHubDeviceConnect";
 import { AddProjectMenu } from "./AddProjectMenu";
 import { AnchoredPopover } from "./AnchoredPopover";
 import { BrandHeader } from "./BrandHeader";
@@ -45,6 +46,12 @@ interface WorkflowsRailProps {
   onConnect: (path: string) => Promise<void>;
   /** Clone a GitHub repo via the user's local git and register it in the workspace. */
   onConnectGitHub: (req: ConnectGitHubRequest) => Promise<string>;
+  /**
+   * GitHub Device Flow API adapter. When provided the Device Flow panel is
+   * offered as the primary GitHub connect experience; the URL-paste form becomes
+   * a fallback. When absent only the URL-paste form is shown.
+   */
+  githubDeviceApi?: GitHubDeviceApi;
   /** Collapses the rail — the session bar grows an expand affordance. */
   onCollapse: () => void;
   /** Selects a session from the history menu (a past/exited session). */
@@ -307,6 +314,7 @@ export function WorkflowsRail({
   onDisconnect,
   settingsOpen,
   onSetSettingsOpen,
+  githubDeviceApi,
 }: WorkflowsRailProps): JSX.Element {
   const [addDialogMode, setAddDialogMode] = useState<"session" | "workspace" | null>(null);
   const [addMenuOpen, setAddMenuOpen] = useState(false);
@@ -442,6 +450,7 @@ export function WorkflowsRail({
             // The server already registered the path; focus the new entry.
             void onConnect(path);
           }}
+          githubDeviceApi={githubDeviceApi}
         />
 
         <AnchoredPopover

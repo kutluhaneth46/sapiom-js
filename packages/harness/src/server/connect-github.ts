@@ -1,12 +1,19 @@
 /**
- * POST /api/connect/github — clone a public or private GitHub repository using
- * the user's local git credentials, then register the cloned directory in the
- * workflow registry so it appears in the Workspace rail.
+ * POST /api/connect/github — clone a public or private GitHub repository and
+ * register the cloned directory in the workflow registry so it appears in the
+ * Workspace rail.
  *
- * Relies entirely on the USER's local git credential store (the same one
- * `git clone` uses from the terminal) — no Sapiom token or GitHub token is
- * minted or required. Public repos work with no credentials; private repos
- * work when the user has SSH keys or a credential helper configured.
+ * Primary path: when a GitHub access token is stored in the session (obtained
+ * via the Device Flow in github-device.ts) the clone URL is rewritten to the
+ * authenticated form `https://x-access-token:<token>@github.com/owner/repo.git`
+ * so private repos clone without requiring the user's local SSH/credential store.
+ * The token is NEVER logged or surfaced in error messages (redacted via
+ * `redactCredentials`).
+ *
+ * Fallback path: when no token is present the clone falls back to the user's
+ * local git credential store — exactly as before. Public repos work with no
+ * credentials; private repos work when the user has SSH keys or a credential
+ * helper configured.
  */
 
 import { execFile } from "node:child_process";
@@ -14,7 +21,7 @@ import { promisify } from "node:util";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { Router, type Router as ExpressRouter } from "express";
+import { Router, type Router as ExpressRouter, type Request } from "express";
 
 import type { WorkflowRegistryLike } from "../core/workflow-registry.js";
 import type { WorkflowInfo } from "../shared/types.js";
@@ -77,6 +84,16 @@ export interface ConnectGitHubRouterOptions {
    * caller does not provide a targetDir. Defaults to `~/sapiom` when omitted.
    */
   defaultCloneParent?: string;
+  /**
+   * Optional seam for retrieving the GitHub access token stored in the Device
+   * Flow session. When provided and the request carries a matching session
+   * cookie, private repos are cloned using the token. When absent (or null for
+   * the request) the clone falls back to the user's local git credentials.
+   *
+   * Accepts the same signature as `getGitHubToken` from github-device.ts so
+   * the production wiring is a one-liner and tests can inject a stub.
+   */
+  getToken?: (req: Request) => string | null;
 }
 
 /**
@@ -105,7 +122,7 @@ export async function gitClone(repoUrl: string, targetDir: string): Promise<void
 }
 
 export function createConnectGitHubRouter(options: ConnectGitHubRouterOptions): ExpressRouter {
-  const { registry, defaultCloneParent } = options;
+  const { registry, defaultCloneParent, getToken } = options;
   const router = Router();
 
   /**
@@ -127,6 +144,9 @@ export function createConnectGitHubRouter(options: ConnectGitHubRouterOptions): 
     const body = req.body as { repoUrl?: unknown; targetDir?: unknown } | undefined;
     const rawUrl = typeof body?.repoUrl === "string" ? body.repoUrl.trim() : "";
     const rawTarget = typeof body?.targetDir === "string" ? body.targetDir.trim() : "";
+
+    // Resolve the GitHub access token for this session (may be null).
+    const githubToken = getToken ? getToken(req) : null;
 
     // --- Validate URL ---
     if (!rawUrl) {
@@ -176,9 +196,21 @@ export function createConnectGitHubRouter(options: ConnectGitHubRouterOptions): 
     }
 
     // --- Clone ---
-    // Use the original URL so SSH transport (git@...) uses the user's SSH key.
+    // When a GitHub token is stored for this session, rewrite the URL to the
+    // authenticated HTTPS form so private repos clone without the user's local
+    // SSH key or credential helper. The token is never logged (redactCredentials
+    // strips it from any error message surfaced to the browser).
+    // Fall back to the original URL (SSH or plain HTTPS) when no token exists.
+    let cloneUrl: string;
+    if (githubToken && parsed) {
+      // Always use the authenticated HTTPS form when we have a token; ignore
+      // whatever transport the user typed (SSH URLs won't accept the header).
+      cloneUrl = `https://x-access-token:${githubToken}@github.com/${parsed.owner}/${parsed.repo}.git`;
+    } else {
+      cloneUrl = rawUrl;
+    }
     try {
-      await gitClone(rawUrl, targetDir);
+      await gitClone(cloneUrl, targetDir);
     } catch (err) {
       res.status(500).json({ error: `git clone failed: ${(err as Error).message}` });
       return;

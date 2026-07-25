@@ -229,4 +229,90 @@ describe("POST /api/connect/github", () => {
     expect(res.status).toBe(200);
     expect(registry.connectPath).toHaveBeenCalledWith(path.join(tmpDir, "my-repo"));
   });
+
+  it("uses the authenticated URL when a token is provided via getToken", async () => {
+    const registry = fakeRegistry();
+    const { execFile } = await import("node:child_process");
+    // Capture what URL git clone was called with.
+    let capturedArgs: string[] = [];
+    vi.mocked(execFile).mockImplementationOnce(
+      (_cmd, args, _opts, cb) => {
+        capturedArgs = args as string[];
+        (cb as unknown as (err: null, stdout: string, stderr: string) => void)(null, "", "");
+        return { pid: 1 } as ReturnType<typeof import("node:child_process").execFile>;
+      },
+    );
+
+    const app = express();
+    app.use(express.json());
+    app.use(
+      createConnectGitHubRouter({
+        registry,
+        defaultCloneParent: tmpDir,
+        // Inject a fixed token — mirrors how getGitHubToken feeds the route.
+        getToken: () => "ghp_test_token",
+      }),
+    );
+    const srv = app.listen(0);
+    const addr = (srv.address() as { port: number });
+    const baseUrl = `http://127.0.0.1:${addr.port}`;
+    server = { baseUrl, close: () => new Promise<void>((r) => srv.close(() => r())) };
+
+    const res = await fetch(`${baseUrl}/api/connect/github`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ repoUrl: "https://github.com/owner/private-repo" }),
+    });
+    expect(res.status).toBe(200);
+    // The clone URL must use the x-access-token form, NOT the original URL.
+    expect(capturedArgs).toContain(
+      "https://x-access-token:ghp_test_token@github.com/owner/private-repo.git",
+    );
+  });
+
+  it("redacts the token from git clone error messages", async () => {
+    const { execFile } = await import("node:child_process");
+    vi.mocked(execFile).mockImplementationOnce(
+      (_cmd, _args, _opts, cb) => {
+        (cb as unknown as (err: Error, stdout: string, stderr: string) => void)(
+          Object.assign(new Error("clone failed"), {
+            stderr:
+              "fatal: repository 'https://x-access-token:ghp_secret@github.com/x/y.git' not found",
+          }),
+          "",
+          "fatal: repo not found",
+        );
+        return { pid: 1 } as ReturnType<typeof import("node:child_process").execFile>;
+      },
+    );
+
+    const registry = fakeRegistry();
+    const app = express();
+    app.use(express.json());
+    app.use(
+      createConnectGitHubRouter({
+        registry,
+        defaultCloneParent: tmpDir,
+        getToken: () => "ghp_secret",
+      }),
+    );
+    const srv = app.listen(0);
+    const addr = (srv.address() as { port: number });
+    server = {
+      baseUrl: `http://127.0.0.1:${addr.port}`,
+      close: () => new Promise<void>((r) => srv.close(() => r())),
+    };
+
+    const res = await fetch(`${server.baseUrl}/api/connect/github`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ repoUrl: "https://github.com/x/y" }),
+    });
+    expect(res.status).toBe(500);
+    const body = (await res.json()) as { error: string };
+    // The error must NOT contain the raw token.
+    expect(body.error).not.toContain("ghp_secret");
+    // The URL should be redacted.
+    expect(body.error).toContain("***@github.com");
+  });
 });

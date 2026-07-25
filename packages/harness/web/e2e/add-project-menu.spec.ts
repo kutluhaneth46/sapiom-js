@@ -3,8 +3,9 @@
  *  - The "+" opens the menu with exactly "Open Folder" and "Connect to GitHub".
  *  - "Open Folder" closes the menu and opens the existing NewSessionModal
  *    (workspace mode).
- *  - "Connect to GitHub" opens the URL form; a successful mock clone adds
- *    the repo to the Workspace rail (MockApi.connectGitHub is already wired).
+ *  - "Connect to GitHub" opens the Device Flow panel (primary path in mock mode).
+ *    The URL-paste form (ConnectGitHubForm) remains as a fallback view accessed
+ *    via the Device Flow's "unconfigured" state — not as the direct click target.
  *
  * Runs against `vite dev` with VITE_MOCK=1 — no server, no real git clone.
  */
@@ -50,78 +51,70 @@ test.describe("add-project menu", () => {
     await expect(modal).toBeVisible();
   });
 
-  test('"Connect to GitHub" shows the URL form inside the menu', async ({
+  test('"Connect to GitHub" shows the Device Flow panel inside the menu', async ({
     page,
   }) => {
     await page.getByTestId("add-workspace").click();
     await page.getByTestId("add-project-connect-github").click();
 
-    // Menu items list is replaced by the form.
-    await expect(page.getByTestId("connect-github-form")).toBeVisible();
-    await expect(page.getByTestId("github-repo-url")).toBeVisible();
-    await expect(page.getByTestId("connect-github-submit")).toBeVisible();
+    // The Device Flow panel is the primary view — not the URL-paste form.
+    await expect(page.getByTestId("github-device-connect")).toBeVisible();
+    // The status check completes quickly in mock mode → "Connect GitHub" button.
+    await expect(page.getByTestId("github-device-start")).toBeVisible({ timeout: 5000 });
   });
 
-  test("Connect to GitHub form: inline URL validation error for non-GitHub URL", async ({
+  test("Connect to GitHub: Device Flow → authorized → browse → clone adds repo to rail", async ({
     page,
   }) => {
     await page.getByTestId("add-workspace").click();
     await page.getByTestId("add-project-connect-github").click();
+    await expect(page.getByTestId("github-device-start")).toBeVisible({ timeout: 5000 });
 
-    await page.getByTestId("github-repo-url").fill("https://gitlab.com/owner/repo");
-    // Validation error appears inline.
-    await expect(page.getByTestId("github-url-error")).toBeVisible();
-    // Submit button stays enabled (text says Connect), but submitting would
-    // show a client-side error.
+    // Start device flow.
+    await page.getByTestId("github-device-start").click();
+    await expect(page.getByTestId("github-device-code")).toBeVisible({ timeout: 5000 });
+
+    // Simulate user clicking the GitHub link → mock poll completes → authorized.
+    await page.getByTestId("github-device-link").click();
+    await expect(page.getByTestId("github-device-connected")).toBeVisible({ timeout: 5000 });
+
+    // Browse repos.
+    await page.getByTestId("github-device-browse").click();
+    await expect(page.getByTestId("github-repo-list")).toBeVisible({ timeout: 5000 });
+
+    // Pick "my-agent" repo.
+    await page.getByTestId("github-repo-item-my-agent").click();
+
+    // Menu closes and repo appears in rail.
+    await expect(page.getByTestId("add-project-menu")).not.toBeVisible({ timeout: 5000 });
+    await expect(page.locator(".rail-tree")).toContainText("my-agent", { timeout: 5000 });
   });
 
-  test("Connect to GitHub: a successful mock clone adds the repo to the Workspace rail", async ({
+  test("Connect to GitHub: unconfigured state shows fallback hint", async ({
     page,
   }) => {
-    await page.getByTestId("add-workspace").click();
-    await page.getByTestId("add-project-connect-github").click();
-
-    await page.getByTestId("github-repo-url").fill("https://github.com/owner/my-test-repo");
-
-    await page.getByTestId("connect-github-submit").click();
-
-    // The form closes and the menu dismisses on success.
-    await expect(page.getByTestId("add-project-menu")).not.toBeVisible();
-
-    // The cloned repo name should appear in the workspace rail.
-    // MockApi derives the name from the URL ("my-test-repo") and registers it.
-    await expect(page.locator(".rail-tree")).toContainText("my-test-repo");
-  });
-
-  test("Connect to GitHub: error from mock is surfaced in the form", async ({
-    page,
-  }) => {
-    // Navigate with the mockError flag so MockApi.connectGitHub rejects.
-    await page.goto("/?seed=0&mockError=connectGitHub");
+    // Navigate with the mockError flag so githubStatus returns configured=false.
+    await page.goto("/?seed=0&mockError=githubNotConfigured");
     await expect(page.locator(".rail-workflows")).toBeVisible();
 
     await page.getByTestId("add-workspace").click();
     await page.getByTestId("add-project-connect-github").click();
 
-    await page.getByTestId("github-repo-url").fill("https://github.com/owner/repo");
-    await page.getByTestId("connect-github-submit").click();
-
-    // Error is shown in the form; menu stays open.
-    await expect(page.getByTestId("connect-github-error")).toBeVisible();
-    await expect(page.getByTestId("connect-github-form")).toBeVisible();
+    // The Device Flow panel shows the unconfigured hint.
+    await expect(page.getByTestId("github-device-unconfigured")).toBeVisible({ timeout: 5000 });
   });
 
-  test("Back button in the form returns to the menu items", async ({ page }) => {
+  test("Back button in the Device Flow panel returns to the menu items", async ({ page }) => {
     await page.getByTestId("add-workspace").click();
     await page.getByTestId("add-project-connect-github").click();
-    await expect(page.getByTestId("connect-github-form")).toBeVisible();
+    await expect(page.getByTestId("github-device-connect")).toBeVisible({ timeout: 5000 });
 
     // Click the Back/ArrowLeft button (aria-label "Back to menu").
     await page.getByRole("button", { name: "Back to menu" }).click();
 
     // Menu items are visible again.
     await expect(page.getByTestId("add-project-menu-items")).toBeVisible();
-    await expect(page.getByTestId("connect-github-form")).not.toBeVisible();
+    await expect(page.getByTestId("github-device-connect")).not.toBeVisible();
   });
 
   test("Escape or outside click dismisses the menu", async ({ page }) => {
