@@ -93,7 +93,7 @@ type View =
   | { kind: "loading" }          // initial status check
   | { kind: "unconfigured" }     // no client ID — show URL-paste fallback hint
   | { kind: "idle" }             // not connected, ready to start
-  | { kind: "awaiting"; userCode: string; verificationUri: string; verificationUriComplete: string; deviceCode: string; intervalSec: number }
+  | { kind: "awaiting"; userCode: string; verificationUri: string; deviceCode: string; intervalSec: number }
   | { kind: "polling" }          // polling after user clicked the link
   | { kind: "error"; message: string }
   | { kind: "connected"; login: string }
@@ -115,14 +115,17 @@ export function GitHubDeviceConnect({
 }: GitHubDeviceConnectProps): JSX.Element {
   const [view, setView] = useState<View>({ kind: "loading" });
   const [cloneError, setCloneError] = useState<string | null>(null);
+  const [codeCopied, setCodeCopied] = useState(false);
   const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const parent = defaultCloneParent ?? FALLBACK_CLONE_PARENT;
 
-  // Clear any pending poll timer on unmount.
+  // Clear any pending timers on unmount.
   useEffect(() => {
     return () => {
       if (pollTimerRef.current !== null) clearTimeout(pollTimerRef.current);
+      if (copyTimerRef.current !== null) clearTimeout(copyTimerRef.current);
     };
   }, []);
 
@@ -196,39 +199,25 @@ export function GitHubDeviceConnect({
   // ── Start Device Flow ────────────────────────────────────────────────────
 
   const handleStart = useCallback(async (): Promise<void> => {
-    // Open a tab SYNCHRONOUSLY inside the click handler so the browser
-    // popup-blocker allows it. We navigate it to the real URL after the
-    // API call resolves.
-    const authWindow = window.open("about:blank", "_blank");
     setView({ kind: "loading" });
     try {
       const res = await api.deviceStart();
-      // 503 when client ID is not configured — surface the fallback.
       const intervalSec = res.interval ?? 5;
-      const verificationUriComplete = `${res.verification_uri}?user_code=${encodeURIComponent(res.user_code)}`;
 
-      // Navigate the pre-opened tab to the pre-filled GitHub device page.
-      if (authWindow) {
-        authWindow.location.href = verificationUriComplete;
-      }
-
-      // Copy the code to the clipboard as a guaranteed fallback — GitHub
-      // may or may not honour the ?user_code= query parameter pre-fill.
+      // Auto-copy the code so the user can paste it on GitHub immediately.
       void navigator.clipboard?.writeText(res.user_code).catch(() => {});
 
       setView({
         kind: "awaiting",
         userCode: res.user_code,
         verificationUri: res.verification_uri,
-        verificationUriComplete,
         deviceCode: res.device_code,
         intervalSec,
       });
 
-      // Auto-start polling immediately — no need for the user to click "Open".
+      // Auto-start polling — Studio connects itself once the user authorizes.
       schedulePoll(res.device_code, intervalSec);
     } catch (err) {
-      authWindow?.close();
       const msg = (err as Error).message ?? "Failed to start GitHub authorization";
       if (msg.includes("notConfigured") || msg.includes("503")) {
         setView({ kind: "unconfigured" });
@@ -364,7 +353,7 @@ export function GitHubDeviceConnect({
         {view.kind === "awaiting" && (
           <div className="github-device-awaiting" data-testid="github-device-awaiting">
             <p className="connect-github-label">
-              GitHub opened in a new tab — confirm the code and click Authorize.
+              Enter this code on GitHub to connect
             </p>
             <div className="github-device-code" data-testid="github-device-code">
               {view.userCode}
@@ -372,21 +361,31 @@ export function GitHubDeviceConnect({
             <p className="connect-github-field-hint github-device-clipboard-hint" data-testid="github-device-clipboard-hint">
               Copied to your clipboard
             </p>
+            <ol className="github-device-steps connect-github-field-hint">
+              <li>Copy this code (done for you ✓)</li>
+              <li>Click <strong>Open GitHub</strong> → click <strong>Continue</strong></li>
+              <li>Paste the code (⌘V / Ctrl+V) and click <strong>Authorize</strong></li>
+            </ol>
             <div className="connect-github-actions github-device-code-actions">
               <button
                 type="button"
                 className="btn-ghost github-device-copy"
                 data-testid="github-device-copy"
-                onClick={() => void navigator.clipboard?.writeText(view.userCode).catch(() => {})}
+                onClick={() => {
+                  void navigator.clipboard?.writeText(view.userCode).catch(() => {});
+                  setCodeCopied(true);
+                  if (copyTimerRef.current !== null) clearTimeout(copyTimerRef.current);
+                  copyTimerRef.current = setTimeout(() => setCodeCopied(false), 2000);
+                }}
               >
                 <Icon name="Copy" size={13} />
-                Copy
+                {codeCopied ? "Copied ✓" : "Copy"}
               </button>
               <a
-                href={view.verificationUriComplete}
+                href={view.verificationUri}
                 target="_blank"
                 rel="noopener noreferrer"
-                className="btn-ghost github-device-link"
+                className="btn-primary github-device-link"
                 data-testid="github-device-link"
               >
                 <Icon name="ExternalLink" size={14} />

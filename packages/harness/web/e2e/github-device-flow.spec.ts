@@ -45,14 +45,15 @@ test.describe("GitHub Device Flow", () => {
 
     await page.getByTestId("github-device-start").click();
 
-    // User code, clipboard hint, Open GitHub fallback, and waiting indicator appear.
+    // User code, clipboard hint, Open GitHub button, and waiting indicator appear.
     await expect(page.getByTestId("github-device-code")).toBeVisible({ timeout: 5000 });
     await expect(page.getByTestId("github-device-code")).toContainText("ABCD-1234");
     await expect(page.getByTestId("github-device-clipboard-hint")).toBeVisible();
+    await expect(page.getByTestId("github-device-copy")).toBeVisible();
     await expect(page.getByTestId("github-device-link")).toBeVisible();
     await expect(page.getByTestId("github-device-waiting")).toBeVisible();
-    // The heading should reflect the new one-click flow.
-    await expect(page.getByTestId("github-device-awaiting")).toContainText("GitHub opened in a new tab");
+    // The heading should set the mental model for the code-first flow.
+    await expect(page.getByTestId("github-device-awaiting")).toContainText("Enter this code on GitHub to connect");
   });
 
   test("polling auto-starts after deviceStart → authorized → shows login + Browse repos (no Open click needed)", async ({
