@@ -6,7 +6,7 @@ import { DEFAULT_MACROS } from "../core/macros.js";
 import { ExternalHarnessError } from "../core/errors.js";
 import { SessionNotReadyError } from "../core/session-manager.js";
 import { TaskAlreadyRunningError, TaskNotSupportedError } from "../core/task-manager.js";
-import type { WorkflowInfo } from "../shared/types.js";
+import type { MacroDef, WorkflowInfo } from "../shared/types.js";
 
 let server: Server;
 let baseUrl: string;
@@ -17,6 +17,20 @@ const workflow: WorkflowInfo = {
   definitionId: 4821,
   definitionSlug: "leasing",
   source: "scan",
+};
+
+/** A custom inject macro used in tests that need an inject-kind macro to exercise the
+ *  PTY path — since deploy/prod_run/run_local are no longer in DEFAULT_MACROS. */
+const CUSTOM_INJECT_MACRO: MacroDef = {
+  id: "test-inject",
+  label: "Test inject",
+  icon: "Play",
+  requiresWorkflow: true,
+  action: {
+    kind: "inject",
+    submit: true,
+    text: "cd {{workflow.path}} && sapiom agents deploy",
+  },
 };
 
 function makeDeps(overrides: Partial<MacrosRouterDeps> = {}): MacrosRouterDeps {
@@ -61,11 +75,108 @@ describe("macros router", () => {
     expect(await res.json()).toEqual(DEFAULT_MACROS);
   });
 
-  it("POST /api/macros/:id/run injects the resolved text for an inject macro", async () => {
+  // ---------------------------------------------------------------------------
+  // Removed PTY-inject macros — must all return 404, never inject
+  // ---------------------------------------------------------------------------
+
+  it("404s POST /api/macros/deploy/run — deploy is no longer in DEFAULT_MACROS", async () => {
+    const deps = makeDeps();
+    await start(deps);
+    const res = await fetch(`${baseUrl}/api/macros/deploy/run`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ harnessSessionId: "sess-1", workflowPath: workflow.path }),
+    });
+    expect(res.status).toBe(404);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toContain("deploy");
+    // Critically: no PTY injection occurred.
+    expect(deps.injectInput).not.toHaveBeenCalled();
+  });
+
+  it("404s POST /api/macros/prod_run/run — prod_run is no longer in DEFAULT_MACROS", async () => {
+    const deps = makeDeps();
+    await start(deps);
+    const res = await fetch(`${baseUrl}/api/macros/prod_run/run`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ harnessSessionId: "sess-1", workflowPath: workflow.path }),
+    });
+    expect(res.status).toBe(404);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toContain("prod_run");
+    expect(deps.injectInput).not.toHaveBeenCalled();
+  });
+
+  it("404s POST /api/macros/run_local/run — run_local is no longer in DEFAULT_MACROS", async () => {
+    const deps = makeDeps();
+    await start(deps);
+    const res = await fetch(`${baseUrl}/api/macros/run_local/run`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ harnessSessionId: "sess-1", workflowPath: workflow.path }),
+    });
+    expect(res.status).toBe(404);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toContain("run_local");
+    expect(deps.injectInput).not.toHaveBeenCalled();
+  });
+
+  // ---------------------------------------------------------------------------
+  // Kept macros — open_prod and visualize still work
+  // ---------------------------------------------------------------------------
+
+  it("opens the resolved URL for open_prod (open-url macro)", async () => {
     const deps = makeDeps();
     await start(deps);
 
-    const res = await fetch(`${baseUrl}/api/macros/deploy/run`, {
+    const res = await fetch(`${baseUrl}/api/macros/open_prod/run`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ harnessSessionId: "sess-1", workflowPath: workflow.path }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(deps.openUrl).toHaveBeenCalledWith("https://app.sapiom.ai/workflows/4821");
+    expect(deps.injectInput).not.toHaveBeenCalled();
+  });
+
+  it("runs visualize with no workflow bound at all — refreshes server-side, never touches the pty", async () => {
+    const deps = makeDeps(); // getBoundWorkflowPath defaults to () => null
+    await start(deps);
+    const res = await fetch(`${baseUrl}/api/macros/visualize/run`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ harnessSessionId: "sess-1" }), // no subject, no workflowPath, no binding
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true });
+    expect(deps.renderCanvas).toHaveBeenCalledWith("sess-1");
+    expect(deps.injectInput).not.toHaveBeenCalled();
+  });
+
+  it("also runs visualize when a workflow IS bound — same server-side refresh either way", async () => {
+    const deps = makeDeps({ getBoundWorkflowPath: (id) => (id === "sess-1" ? workflow.path : null) });
+    await start(deps);
+    const res = await fetch(`${baseUrl}/api/macros/visualize/run`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ harnessSessionId: "sess-1" }),
+    });
+    expect(res.status).toBe(200);
+    expect(deps.renderCanvas).toHaveBeenCalledWith("sess-1");
+    expect(deps.injectInput).not.toHaveBeenCalled();
+  });
+
+  // ---------------------------------------------------------------------------
+  // General router contract
+  // ---------------------------------------------------------------------------
+
+  it("POST /api/macros/:id/run injects the resolved text for a registered inject macro", async () => {
+    const deps = makeDeps({ listMacros: () => [...DEFAULT_MACROS, CUSTOM_INJECT_MACRO] });
+    await start(deps);
+
+    const res = await fetch(`${baseUrl}/api/macros/test-inject/run`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ harnessSessionId: "sess-1", workflowPath: workflow.path }),
@@ -81,24 +192,9 @@ describe("macros router", () => {
     expect(deps.openUrl).not.toHaveBeenCalled();
   });
 
-  it("opens the resolved URL for an open-url macro", async () => {
-    const deps = makeDeps();
-    await start(deps);
-
-    const res = await fetch(`${baseUrl}/api/macros/open_prod/run`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ harnessSessionId: "sess-1", workflowPath: workflow.path }),
-    });
-
-    expect(res.status).toBe(200);
-    expect(deps.openUrl).toHaveBeenCalledWith("https://app.sapiom.ai/workflows/4821");
-    expect(deps.injectInput).not.toHaveBeenCalled();
-  });
-
   it("400s a workflow-required macro run without a workflowPath", async () => {
-    await start(makeDeps());
-    const res = await fetch(`${baseUrl}/api/macros/deploy/run`, {
+    await start(makeDeps({ listMacros: () => [...DEFAULT_MACROS, CUSTOM_INJECT_MACRO] }));
+    const res = await fetch(`${baseUrl}/api/macros/test-inject/run`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ harnessSessionId: "sess-1" }),
@@ -139,10 +235,13 @@ describe("macros router", () => {
   });
 
   it("falls back to the session's bound workflow when the request omits workflowPath", async () => {
-    const deps = makeDeps({ getBoundWorkflowPath: (id) => (id === "sess-1" ? workflow.path : null) });
+    const deps = makeDeps({
+      listMacros: () => [...DEFAULT_MACROS, CUSTOM_INJECT_MACRO],
+      getBoundWorkflowPath: (id) => (id === "sess-1" ? workflow.path : null),
+    });
     await start(deps);
 
-    const res = await fetch(`${baseUrl}/api/macros/deploy/run`, {
+    const res = await fetch(`${baseUrl}/api/macros/test-inject/run`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ harnessSessionId: "sess-1" }), // no workflowPath
@@ -159,12 +258,13 @@ describe("macros router", () => {
   it("prefers an explicit workflowPath on the request over the session's bound workflow", async () => {
     const otherWorkflow: WorkflowInfo = { name: "rfq", path: "/Users/demo/acme-app/rfq", definitionId: 7, definitionSlug: "rfq", source: "scan" };
     const deps = makeDeps({
+      listMacros: () => [...DEFAULT_MACROS, CUSTOM_INJECT_MACRO],
       findWorkflow: (p) => (p === workflow.path ? workflow : p === otherWorkflow.path ? otherWorkflow : null),
       getBoundWorkflowPath: (id) => (id === "sess-1" ? otherWorkflow.path : null),
     });
     await start(deps);
 
-    const res = await fetch(`${baseUrl}/api/macros/deploy/run`, {
+    const res = await fetch(`${baseUrl}/api/macros/test-inject/run`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ harnessSessionId: "sess-1", workflowPath: workflow.path }),
@@ -188,6 +288,7 @@ describe("macros router", () => {
     function makeWithPath(p: string) {
       const evil: WorkflowInfo = { name: "evil", path: p, definitionId: null, definitionSlug: null, source: "scan" };
       return makeDeps({
+        listMacros: () => [...DEFAULT_MACROS, CUSTOM_INJECT_MACRO],
         findWorkflow: (wp) => (wp === p ? evil : null),
         getBoundWorkflowPath: () => p,
       });
@@ -196,7 +297,7 @@ describe("macros router", () => {
     it("wraps a path containing spaces in single quotes (not word-split)", async () => {
       const deps = makeWithPath("/Users/demo/my workflow");
       await start(deps);
-      const res = await fetch(`${baseUrl}/api/macros/deploy/run`, {
+      const res = await fetch(`${baseUrl}/api/macros/test-inject/run`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ harnessSessionId: "sess-1", workflowPath: "/Users/demo/my workflow" }),
@@ -213,7 +314,7 @@ describe("macros router", () => {
       const p = "/Users/demo/$(evil)";
       const deps = makeWithPath(p);
       await start(deps);
-      const res = await fetch(`${baseUrl}/api/macros/deploy/run`, {
+      const res = await fetch(`${baseUrl}/api/macros/test-inject/run`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ harnessSessionId: "sess-1", workflowPath: p }),
@@ -230,7 +331,7 @@ describe("macros router", () => {
       const p = "/Users/demo/`evil`";
       const deps = makeWithPath(p);
       await start(deps);
-      const res = await fetch(`${baseUrl}/api/macros/deploy/run`, {
+      const res = await fetch(`${baseUrl}/api/macros/test-inject/run`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ harnessSessionId: "sess-1", workflowPath: p }),
@@ -247,7 +348,7 @@ describe("macros router", () => {
       const p = '/Users/demo/path"with"quotes';
       const deps = makeWithPath(p);
       await start(deps);
-      const res = await fetch(`${baseUrl}/api/macros/deploy/run`, {
+      const res = await fetch(`${baseUrl}/api/macros/test-inject/run`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ harnessSessionId: "sess-1", workflowPath: p }),
@@ -266,7 +367,7 @@ describe("macros router", () => {
       const p = "/Users/demo/it's here";
       const deps = makeWithPath(p);
       await start(deps);
-      const res = await fetch(`${baseUrl}/api/macros/deploy/run`, {
+      const res = await fetch(`${baseUrl}/api/macros/test-inject/run`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ harnessSessionId: "sess-1", workflowPath: p }),
@@ -281,41 +382,17 @@ describe("macros router", () => {
   });
 
   it("400s a workflow-required macro when both the request and the session binding lack a workflow", async () => {
-    const deps = makeDeps({ getBoundWorkflowPath: () => null });
+    const deps = makeDeps({
+      listMacros: () => [...DEFAULT_MACROS, CUSTOM_INJECT_MACRO],
+      getBoundWorkflowPath: () => null,
+    });
     await start(deps);
-    const res = await fetch(`${baseUrl}/api/macros/deploy/run`, {
+    const res = await fetch(`${baseUrl}/api/macros/test-inject/run`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ harnessSessionId: "sess-1" }),
     });
     expect(res.status).toBe(400);
-  });
-
-  it("runs visualize with no workflow bound at all — refreshes server-side, never touches the pty", async () => {
-    const deps = makeDeps(); // getBoundWorkflowPath defaults to () => null
-    await start(deps);
-    const res = await fetch(`${baseUrl}/api/macros/visualize/run`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ harnessSessionId: "sess-1" }), // no subject, no workflowPath, no binding
-    });
-    expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ ok: true });
-    expect(deps.renderCanvas).toHaveBeenCalledWith("sess-1");
-    expect(deps.injectInput).not.toHaveBeenCalled();
-  });
-
-  it("also runs visualize when a workflow IS bound — same server-side refresh either way", async () => {
-    const deps = makeDeps({ getBoundWorkflowPath: (id) => (id === "sess-1" ? workflow.path : null) });
-    await start(deps);
-    const res = await fetch(`${baseUrl}/api/macros/visualize/run`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ harnessSessionId: "sess-1" }),
-    });
-    expect(res.status).toBe(200);
-    expect(deps.renderCanvas).toHaveBeenCalledWith("sess-1");
-    expect(deps.injectInput).not.toHaveBeenCalled();
   });
 
   it("routes an inject macro marked execution: 'background' to runBackgroundTask, never the pty", async () => {
@@ -406,11 +483,12 @@ describe("macros router", () => {
 
   it("409s with a UI-visible reason when the session isn't ready yet (SessionNotReadyError) — never silently swallows the macro", async () => {
     const deps = makeDeps({
+      listMacros: () => [...DEFAULT_MACROS, CUSTOM_INJECT_MACRO],
       injectInput: vi.fn().mockRejectedValue(new SessionNotReadyError("sess-1")),
     });
     await start(deps);
 
-    const res = await fetch(`${baseUrl}/api/macros/deploy/run`, {
+    const res = await fetch(`${baseUrl}/api/macros/test-inject/run`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ harnessSessionId: "sess-1", workflowPath: workflow.path }),
@@ -424,11 +502,12 @@ describe("macros router", () => {
 
   it("409s when injectInput throws ExternalHarnessError (conductor session — inject not supported)", async () => {
     const deps = makeDeps({
+      listMacros: () => [...DEFAULT_MACROS, CUSTOM_INJECT_MACRO],
       injectInput: vi.fn().mockRejectedValue(new ExternalHarnessError("conductor", "Conductor")),
     });
     await start(deps);
 
-    const res = await fetch(`${baseUrl}/api/macros/deploy/run`, {
+    const res = await fetch(`${baseUrl}/api/macros/test-inject/run`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ harnessSessionId: "sess-1", workflowPath: workflow.path }),
