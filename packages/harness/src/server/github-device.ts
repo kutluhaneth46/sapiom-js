@@ -43,11 +43,21 @@ import { Router, type Request, type Response, type NextFunction } from "express"
 // Client ID — env var, read once.
 // ---------------------------------------------------------------------------
 
-/** Read the GitHub OAuth App Client ID from the environment. Returns null when
- *  unset — the UI falls back to the URL-paste form in that case. */
+/** Sapiom Studio's GitHub OAuth App Client ID. A GitHub *Client ID* is public
+ *  by design — GitHub displays it on the authorization screen every user sees —
+ *  so shipping it as a default is safe and standard (it's how CLI/desktop apps
+ *  distribute a Device Flow app). The paired client *secret* is the sensitive
+ *  half, and Device Flow deliberately uses none. Override per-environment with
+ *  SAPIOM_GITHUB_CLIENT_ID. */
+const DEFAULT_GITHUB_CLIENT_ID = "Ov23lipTPRsJBWBlTxgY";
+
+/** Resolve the GitHub OAuth App Client ID: the env override wins, else the
+ *  shipped default. Null only if the default is blanked AND the env var is
+ *  unset — in which case the UI falls back to the URL-paste form. */
 function readClientId(): string | null {
   const v = process.env.SAPIOM_GITHUB_CLIENT_ID;
-  return v && v.trim() ? v.trim() : null;
+  if (v && v.trim()) return v.trim();
+  return DEFAULT_GITHUB_CLIENT_ID || null;
 }
 
 // ---------------------------------------------------------------------------
