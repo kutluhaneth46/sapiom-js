@@ -121,6 +121,13 @@ export function GitHubDeviceConnect({
 
   const parent = defaultCloneParent ?? FALLBACK_CLONE_PARENT;
 
+  // The parent passes a fresh `api` object on every render (inline literal), and
+  // it re-renders ~every 2s (run polling). Keep the latest api in a ref so the
+  // one-time mount status check never needs `api` in its dep array — otherwise it
+  // would re-fire and reset an in-progress authorization back to idle.
+  const apiRef = useRef(api);
+  apiRef.current = api;
+
   // Clear any pending timers on unmount.
   useEffect(() => {
     return () => {
@@ -129,28 +136,33 @@ export function GitHubDeviceConnect({
     };
   }, []);
 
-  // On mount: check if already connected (or if the feature is unconfigured).
+  // On mount ONLY: resolve the initial state (connected / unconfigured / idle).
+  // Every transition is guarded to fire from "loading" alone, so a late-resolving
+  // status() can never overwrite a flow the user already started (awaiting /
+  // polling / connected). Keyed to [] so it runs exactly once — apiRef holds the
+  // latest api without re-firing this effect on every parent render.
   useEffect(() => {
     let cancelled = false;
     void (async () => {
       try {
-        const s = await api.status();
+        const s = await apiRef.current.status();
         if (cancelled) return;
         if (s.configured === false) {
-          setView({ kind: "unconfigured" });
+          setView((v) => (v.kind === "loading" ? { kind: "unconfigured" } : v));
           return;
         }
         if (s.connected && s.login) {
-          setView({ kind: "connected", login: s.login });
+          const login = s.login;
+          setView((v) => (v.kind === "loading" ? { kind: "connected", login } : v));
         } else {
-          setView({ kind: "idle" });
+          setView((v) => (v.kind === "loading" ? { kind: "idle" } : v));
         }
       } catch {
-        if (!cancelled) setView({ kind: "idle" });
+        if (!cancelled) setView((v) => (v.kind === "loading" ? { kind: "idle" } : v));
       }
     })();
     return () => { cancelled = true; };
-  }, [api]);
+  }, []);
 
   // ── Poll ──────────────────────────────────────────────────────────────────
   // Declared before handleStart so it can be referenced in handleStart's
