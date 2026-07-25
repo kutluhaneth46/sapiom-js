@@ -9,42 +9,6 @@ import type { MacroDef } from "../shared/types.js";
 
 export const DEFAULT_MACROS: MacroDef[] = [
   {
-    id: "run_local",
-    label: "Run local",
-    icon: "Play",
-    requiresWorkflow: true,
-    action: {
-      kind: "inject",
-      submit: true,
-      // {{workflow.path}} is POSIX single-quoted at resolution time (macro-runner.ts
-      // shellQuote), which stops spaces, dollar signs, backticks, and embedded
-      // double-quotes from being interpreted by the shell.
-      text: "cd {{workflow.path}} && sapiom agents run --target local",
-    },
-  },
-  {
-    id: "deploy",
-    label: "Deploy",
-    icon: "Cloud",
-    requiresWorkflow: true,
-    action: {
-      kind: "inject",
-      submit: true,
-      text: "cd {{workflow.path}} && sapiom agents deploy",
-    },
-  },
-  {
-    id: "prod_run",
-    label: "Prod run",
-    icon: "Zap",
-    requiresWorkflow: true,
-    action: {
-      kind: "inject",
-      submit: true,
-      text: "cd {{workflow.path}} && sapiom agents run --target prod",
-    },
-  },
-  {
     id: "open_prod",
     label: "Open prod",
     icon: "ExternalLink",
