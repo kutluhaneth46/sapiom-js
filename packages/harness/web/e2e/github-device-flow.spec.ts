@@ -8,11 +8,11 @@
  *
  * Test scenarios:
  *  1. "Connect to GitHub" button opens the Device Flow panel (not the URL form).
- *  2. Device code and link are displayed after start.
+ *  2. Device code is displayed after start; polling auto-starts (no Open click needed).
  *  3. Polling completes → connected state shows login + Browse repos.
  *  4. Browse repos → pick one → mock clone → repo appears in rail.
  *  5. Disconnect reverts to idle state.
- *  6. Error states: denied / expired.
+ *  6. Error states: denied / expired (errors surface via auto-poll, no Open click needed).
  *  7. Unconfigured (mockError=githubNotConfigured): shows fallback hint.
  */
 
@@ -38,21 +38,24 @@ test.describe("GitHub Device Flow", () => {
     await expect(page.getByTestId("github-device-start")).toBeVisible({ timeout: 5000 });
   });
 
-  test("device start shows user code and link", async ({ page }) => {
+  test("device start shows user code, clipboard hint, and Open GitHub fallback button", async ({ page }) => {
     await page.getByTestId("add-workspace").click();
     await page.getByTestId("add-project-connect-github").click();
     await expect(page.getByTestId("github-device-start")).toBeVisible({ timeout: 5000 });
 
     await page.getByTestId("github-device-start").click();
 
-    // User code and link appear.
+    // User code, clipboard hint, Open GitHub fallback, and waiting indicator appear.
     await expect(page.getByTestId("github-device-code")).toBeVisible({ timeout: 5000 });
     await expect(page.getByTestId("github-device-code")).toContainText("ABCD-1234");
+    await expect(page.getByTestId("github-device-clipboard-hint")).toBeVisible();
     await expect(page.getByTestId("github-device-link")).toBeVisible();
     await expect(page.getByTestId("github-device-waiting")).toBeVisible();
+    // The heading should reflect the new one-click flow.
+    await expect(page.getByTestId("github-device-awaiting")).toContainText("GitHub opened in a new tab");
   });
 
-  test("clicking the link starts polling → authorized → shows login + Browse repos", async ({
+  test("polling auto-starts after deviceStart → authorized → shows login + Browse repos (no Open click needed)", async ({
     page,
   }) => {
     await page.getByTestId("add-workspace").click();
@@ -62,13 +65,8 @@ test.describe("GitHub Device Flow", () => {
     await page.getByTestId("github-device-start").click();
     await expect(page.getByTestId("github-device-code")).toBeVisible({ timeout: 5000 });
 
-    // Click the link (opens in new tab, but we intercept the click handler's
-    // poll scheduling without opening a real tab in the test).
-    // Since window.open is stubbed in headless Playwright, we simulate the
-    // click to trigger the mock poll.
-    await page.getByTestId("github-device-link").click();
-
-    // The mock immediately returns "authorized" on poll → connected state.
+    // Polling auto-starts — no click on "Open GitHub" needed.
+    // The mock returns "authorized" immediately on the first poll.
     await expect(page.getByTestId("github-device-connected")).toBeVisible({ timeout: 5000 });
     await expect(page.getByTestId("github-device-browse")).toBeVisible();
     // Connected state should show the mock login.
@@ -84,7 +82,7 @@ test.describe("GitHub Device Flow", () => {
 
     await page.getByTestId("github-device-start").click();
     await expect(page.getByTestId("github-device-code")).toBeVisible({ timeout: 5000 });
-    await page.getByTestId("github-device-link").click();
+    // Polling auto-starts — connected state arrives without clicking "Open GitHub".
     await expect(page.getByTestId("github-device-connected")).toBeVisible({ timeout: 5000 });
 
     // Click Browse repos.
@@ -108,7 +106,7 @@ test.describe("GitHub Device Flow", () => {
     await expect(page.getByTestId("github-device-start")).toBeVisible({ timeout: 5000 });
     await page.getByTestId("github-device-start").click();
     await expect(page.getByTestId("github-device-code")).toBeVisible({ timeout: 5000 });
-    await page.getByTestId("github-device-link").click();
+    // Polling auto-starts — connected state arrives without clicking "Open GitHub".
     await expect(page.getByTestId("github-device-connected")).toBeVisible({ timeout: 5000 });
     await page.getByTestId("github-device-browse").click();
     await expect(page.getByTestId("github-repo-list")).toBeVisible({ timeout: 5000 });
@@ -131,7 +129,7 @@ test.describe("GitHub Device Flow", () => {
     await expect(page.getByTestId("github-device-start")).toBeVisible({ timeout: 5000 });
     await page.getByTestId("github-device-start").click();
     await expect(page.getByTestId("github-device-code")).toBeVisible({ timeout: 5000 });
-    await page.getByTestId("github-device-link").click();
+    // Polling auto-starts — connected state arrives without clicking "Open GitHub".
     await expect(page.getByTestId("github-device-connected")).toBeVisible({ timeout: 5000 });
     await page.getByTestId("github-device-browse").click();
     await expect(page.getByTestId("github-repo-list")).toBeVisible({ timeout: 5000 });
@@ -154,10 +152,7 @@ test.describe("GitHub Device Flow", () => {
     await page.getByTestId("github-device-start").click();
     await expect(page.getByTestId("github-device-code")).toBeVisible({ timeout: 5000 });
 
-    // Trigger polling.
-    await page.getByTestId("github-device-link").click();
-
-    // Error state: denied message.
+    // Polling auto-starts — no "Open GitHub" click needed to trigger the error.
     await expect(page.getByTestId("github-device-error")).toBeVisible({ timeout: 5000 });
     await expect(page.getByTestId("github-device-error")).toContainText("denied");
     await expect(page.getByTestId("github-device-retry")).toBeVisible();
@@ -172,8 +167,8 @@ test.describe("GitHub Device Flow", () => {
     await expect(page.getByTestId("github-device-start")).toBeVisible({ timeout: 5000 });
     await page.getByTestId("github-device-start").click();
     await expect(page.getByTestId("github-device-code")).toBeVisible({ timeout: 5000 });
-    await page.getByTestId("github-device-link").click();
 
+    // Polling auto-starts — no "Open GitHub" click needed to surface the expiry.
     await expect(page.getByTestId("github-device-error")).toBeVisible({ timeout: 5000 });
     await expect(page.getByTestId("github-device-error")).toContainText("expired");
     await expect(page.getByTestId("github-device-retry")).toBeVisible();
