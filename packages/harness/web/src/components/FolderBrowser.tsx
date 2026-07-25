@@ -1,0 +1,357 @@
+import { useEffect, useRef, useState } from "react";
+import type { JSX } from "react";
+
+import type { FsDirEntry, FsListResponse } from "../lib/api";
+import { Icon } from "./Icon";
+
+// ---------------------------------------------------------------------------
+// Static favorites — Home plus common child directories. The browser
+// attempts to list each one; entries that resolve successfully are shown,
+// entries that 404 (e.g. the user has no ~/Desktop) are silently dropped.
+// ---------------------------------------------------------------------------
+
+const FAVORITES: { label: string; path: string; icon: string }[] = [
+  { label: "Home", path: "~", icon: "Home" },
+  { label: "Desktop", path: "~/Desktop", icon: "Folder" },
+  { label: "Documents", path: "~/Documents", icon: "Folder" },
+  { label: "Downloads", path: "~/Downloads", icon: "Folder" },
+];
+
+// ---------------------------------------------------------------------------
+// Breadcrumb helpers
+// ---------------------------------------------------------------------------
+
+/** Split an absolute path into clickable segments.
+ *  "/Users/demo/acme-app" → [{label:"/", path:"/"}, {label:"Users", path:"/Users"}, …] */
+export function buildBreadcrumbs(absPath: string): { label: string; path: string }[] {
+  if (!absPath || absPath === "/") return [{ label: "/", path: "/" }];
+  const segments = absPath.split("/").filter(Boolean);
+  const crumbs: { label: string; path: string }[] = [{ label: "/", path: "/" }];
+  let running = "";
+  for (const seg of segments) {
+    running = `${running}/${seg}`;
+    crumbs.push({ label: seg, path: running });
+  }
+  return crumbs;
+}
+
+// ---------------------------------------------------------------------------
+// FolderBrowser props
+// ---------------------------------------------------------------------------
+
+export interface FolderBrowserProps {
+  /** Current selected path (controlled by parent). */
+  value: string;
+  onChange: (path: string) => void;
+  /** Called when the user confirms the currently browsed folder (primary CTA). */
+  onOpen: () => void;
+  recentDirs: string[];
+  listDir: (path?: string) => Promise<FsListResponse>;
+}
+
+// ---------------------------------------------------------------------------
+// FolderBrowser
+// ---------------------------------------------------------------------------
+
+/**
+ * Browse-first folder picker for the "Open Folder" (workspace-connect) flow.
+ *
+ * Layout, top to bottom:
+ *   1. Favorites row (Home / Desktop / Documents / Downloads) + Recents chips
+ *   2. Breadcrumb bar — click any ancestor to navigate there
+ *   3. Folder list — click a subfolder to drill in
+ *   4. "Open this folder" primary button
+ *   5. Secondary "or type a path" collapsible input
+ *
+ * This is a SEPARATE component from DirectoryPicker so the other call sites
+ * (new-session modal session mode, command-palette) are not affected.
+ */
+export function FolderBrowser({
+  value,
+  onChange,
+  onOpen,
+  recentDirs,
+  listDir,
+}: FolderBrowserProps): JSX.Element {
+  // Which real directory is currently being shown in the listing.
+  const [browsePath, setBrowsePath] = useState(value || "~");
+  const [parent, setParent] = useState("/");
+  const [dirs, setDirs] = useState<FsDirEntry[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [retryNonce, setRetryNonce] = useState(0);
+
+  // Favorites: after first mount we probe each favorite and keep only the
+  // ones that listed successfully.
+  const [liveFavorites, setLiveFavorites] = useState<typeof FAVORITES>([]);
+
+  // Secondary path input (collapsed by default).
+  const [showTypePath, setShowTypePath] = useState(false);
+  const [typedPath, setTypedPath] = useState("");
+
+  const typePathRef = useRef<HTMLInputElement>(null);
+
+  // Probe favorites on mount — fire all in parallel, keep successes.
+  useEffect(() => {
+    let cancelled = false;
+    Promise.allSettled(
+      FAVORITES.map(async (fav) => {
+        await listDir(fav.path);
+        return fav;
+      }),
+    ).then((results) => {
+      if (cancelled) return;
+      const alive = results
+        .filter((r): r is PromiseFulfilledResult<(typeof FAVORITES)[number]> => r.status === "fulfilled")
+        .map((r) => r.value);
+      setLiveFavorites(alive);
+    });
+    return () => {
+      cancelled = true;
+    };
+    // Only run once on mount — listDir identity is stable.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Fetch listing whenever the browsed path changes.
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    const handle = setTimeout(() => {
+      listDir(browsePath || undefined)
+        .then((res) => {
+          if (cancelled) return;
+          setBrowsePath(res.path);
+          setParent(res.parent);
+          setDirs(res.dirs);
+          // Keep the controlled value in sync so the parent's "Open" action
+          // always uses the currently displayed folder.
+          onChange(res.path);
+        })
+        .catch(() => {
+          if (!cancelled) setError("Couldn't read that directory.");
+        })
+        .finally(() => {
+          if (!cancelled) setLoading(false);
+        });
+    }, 100);
+    return () => {
+      cancelled = true;
+      clearTimeout(handle);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [browsePath, retryNonce]);
+
+  // When the secondary type-path input is revealed, focus it.
+  useEffect(() => {
+    if (showTypePath) typePathRef.current?.focus();
+  }, [showTypePath]);
+
+  const navigateTo = (path: string): void => {
+    setBrowsePath(path);
+    setTypedPath("");
+    // Eagerly sync the controlled value so the parent's onOpen/submit always
+    // sees the current navigation intent — the listing may still be loading.
+    onChange(path);
+  };
+
+  const handleTypePathKeyDown = (e: React.KeyboardEvent<HTMLInputElement>): void => {
+    if (e.key === "Enter" && typedPath.trim()) {
+      navigateTo(typedPath.trim());
+      setShowTypePath(false);
+    }
+  };
+
+  const breadcrumbs = buildBreadcrumbs(browsePath);
+  const atRoot = parent === browsePath;
+
+  return (
+    <div className="folder-browser">
+      {/* ---- Favorites + Recents ---- */}
+      {(liveFavorites.length > 0 || recentDirs.length > 0) && (
+        <div className="folder-browser-quicklinks" data-testid="folder-browser-quicklinks">
+          {liveFavorites.length > 0 && (
+            <div className="folder-browser-favorites" data-testid="folder-browser-favorites">
+              {liveFavorites.map((fav) => (
+                <button
+                  key={fav.path}
+                  type="button"
+                  className="folder-browser-fav-btn"
+                  data-testid={`folder-browser-fav-${fav.label.toLowerCase()}`}
+                  onClick={() => navigateTo(fav.path)}
+                  title={fav.path}
+                >
+                  <Icon name={fav.icon} size={13} />
+                  {fav.label}
+                </button>
+              ))}
+            </div>
+          )}
+          {recentDirs.length > 0 && (
+            <div className="folder-browser-recents" data-testid="folder-browser-recents">
+              <span className="folder-browser-section-label">
+                <Icon name="History" size={11} />
+                Recent
+              </span>
+              {recentDirs.map((dir) => (
+                <button
+                  key={dir}
+                  type="button"
+                  className="folder-browser-recent-btn"
+                  data-testid={`folder-browser-recent-${dir.split("/").pop() ?? dir}`}
+                  title={dir}
+                  onClick={() => navigateTo(dir)}
+                >
+                  {dir.split("/").filter(Boolean).pop() ?? dir}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ---- Breadcrumb bar ---- */}
+      <div className="folder-browser-breadcrumbs" data-testid="folder-browser-breadcrumbs">
+        <button
+          type="button"
+          className="folder-browser-up"
+          data-testid="folder-browser-up"
+          disabled={atRoot}
+          onClick={() => navigateTo(parent)}
+          aria-label="Up to parent directory"
+          title="Up to parent directory"
+        >
+          <Icon name="CornerLeftUp" size={13} />
+        </button>
+        <div className="folder-browser-crumb-row" role="navigation" aria-label="Current path">
+          {breadcrumbs.map((crumb, i) => (
+            <span key={crumb.path} className="folder-browser-crumb-segment">
+              {i > 0 && (
+                <span className="folder-browser-crumb-sep" aria-hidden="true">
+                  <Icon name="ChevronRight" size={11} />
+                </span>
+              )}
+              <button
+                type="button"
+                className={
+                  "folder-browser-crumb-btn" + (i === breadcrumbs.length - 1 ? " is-current" : "")
+                }
+                data-testid={`folder-browser-crumb-${crumb.label}`}
+                onClick={() => {
+                  if (i < breadcrumbs.length - 1) navigateTo(crumb.path);
+                }}
+                disabled={i === breadcrumbs.length - 1}
+                aria-current={i === breadcrumbs.length - 1 ? "location" : undefined}
+              >
+                {crumb.label}
+              </button>
+            </span>
+          ))}
+        </div>
+      </div>
+
+      {/* ---- Folder listing ---- */}
+      <div className="folder-browser-listing" data-testid="folder-browser-listing">
+        {loading && <div className="dir-picker-empty">Loading…</div>}
+        {!loading && error && (
+          <div className="dir-picker-error" data-testid="folder-browser-error" role="alert">
+            <Icon name="TriangleAlert" size={14} />
+            <span>{error}</span>
+            <button
+              type="button"
+              className="btn-ghost dir-picker-retry"
+              data-testid="folder-browser-retry"
+              onClick={() => setRetryNonce((n) => n + 1)}
+            >
+              Retry
+            </button>
+          </div>
+        )}
+        {!loading && !error && dirs.length === 0 && (
+          <div className="dir-picker-empty">No subfolders</div>
+        )}
+        {!loading &&
+          !error &&
+          dirs.map((entry) => (
+            <button
+              key={entry.path}
+              type="button"
+              className="dir-picker-item"
+              data-testid={`folder-browser-item-${entry.name}`}
+              onClick={() => navigateTo(entry.path)}
+            >
+              <Icon name="Folder" size={13} />
+              {entry.name}
+            </button>
+          ))}
+      </div>
+
+      {/* ---- "Open this folder" primary CTA ---- */}
+      <div className="folder-browser-actions" data-testid="folder-browser-actions">
+        <button
+          type="button"
+          className="btn-primary folder-browser-open-btn"
+          data-testid="folder-browser-open"
+          onClick={onOpen}
+          disabled={!value.trim()}
+        >
+          <Icon name="Folder" size={14} />
+          Open this folder
+        </button>
+      </div>
+
+      {/* ---- Secondary: type a path ---- */}
+      <div className="folder-browser-type-path" data-testid="folder-browser-type-path-area">
+        {!showTypePath ? (
+          <button
+            type="button"
+            className="btn-ghost folder-browser-type-toggle"
+            data-testid="folder-browser-type-toggle"
+            onClick={() => {
+              setTypedPath(browsePath);
+              setShowTypePath(true);
+            }}
+          >
+            or type a path…
+          </button>
+        ) : (
+          <div className="folder-browser-type-row">
+            <input
+              ref={typePathRef}
+              className="modal-input dir-picker-input folder-browser-type-input"
+              data-testid="folder-browser-type-input"
+              aria-label="Type a path"
+              placeholder="/path/to/project"
+              value={typedPath}
+              onChange={(e) => setTypedPath(e.target.value)}
+              onKeyDown={handleTypePathKeyDown}
+            />
+            <button
+              type="button"
+              className="btn-ghost folder-browser-type-go"
+              data-testid="folder-browser-type-go"
+              disabled={!typedPath.trim()}
+              onClick={() => {
+                if (typedPath.trim()) {
+                  navigateTo(typedPath.trim());
+                  setShowTypePath(false);
+                }
+              }}
+            >
+              Go
+            </button>
+            <button
+              type="button"
+              className="btn-ghost folder-browser-type-cancel"
+              data-testid="folder-browser-type-cancel"
+              onClick={() => setShowTypePath(false)}
+            >
+              <Icon name="X" size={13} />
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}

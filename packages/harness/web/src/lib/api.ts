@@ -27,7 +27,7 @@ import type {
 
 import type { LocalStepTrace, LocalRunOutcome } from "@sapiom/agent-core";
 
-import { MOCK_FS_TREE, MOCK_HARNESSES, MOCK_HISTORY, MOCK_LAUNCH_DIR, MOCK_MACROS, MOCK_SAMPLE_PROJECT_ROOT, MOCK_SESSIONS, MOCK_SETTINGS, MOCK_WORKFLOWS } from "./mock-data";
+import { MOCK_FS_TREE, MOCK_HARNESSES, MOCK_HISTORY, MOCK_HOME, MOCK_LAUNCH_DIR, MOCK_MACROS, MOCK_SAMPLE_PROJECT_ROOT, MOCK_SESSIONS, MOCK_SETTINGS, MOCK_WORKFLOWS } from "./mock-data";
 
 /**
  * Body for `POST /api/runs/local` — run the agent project at `sourceDir`
@@ -1006,7 +1006,11 @@ class MockApi implements HarnessApi {
     if (mockErrorTargets().has("listDir")) {
       throw new ApiError(500, "GET /api/fs → 500 (mock)", "Could not read that directory");
     }
-    const requested = path && path.trim() ? path.trim() : MOCK_LAUNCH_DIR;
+    const raw = path && path.trim() ? path.trim() : MOCK_LAUNCH_DIR;
+    // Expand ~ the same way the real server does (os.homedir()), so the
+    // FolderBrowser's favorites (~/Desktop etc.) resolve correctly in mock mode.
+    const expanded = raw === "~" ? MOCK_HOME : raw.startsWith("~/") ? `${MOCK_HOME}/${raw.slice(2)}` : raw;
+    const requested = expanded;
     // Walk up to the nearest ancestor the fixture tree actually has — lets the
     // caller distinguish "you're browsing X" from "you typed part of a name
     // inside X" by comparing the response's `path` to what it asked for.

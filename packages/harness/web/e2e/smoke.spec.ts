@@ -432,8 +432,12 @@ test.describe("three-zone IA (rail explorer, tab strip, right pane)", () => {
   });
 });
 
-test("add project: the rail's + opens the same directory-picker dialog and registers the path", async ({ page }) => {
+test("add project: the rail's + opens the browse-first folder dialog and registers the path", async ({ page }) => {
+  // Open via the add-project menu → "Open Folder".
   await page.getByTestId("add-workspace").click();
+  await expect(page.getByTestId("add-project-menu")).toBeVisible();
+  await page.getByTestId("add-project-open-folder").click();
+  await expect(page.getByTestId("add-project-menu")).not.toBeVisible();
 
   // Same dialog anatomy as new-session, its own identity: no harness picker,
   // workspace title and CTA.
@@ -442,9 +446,23 @@ test("add project: the rail's + opens the same directory-picker dialog and regis
   await expect(modal).toContainText("Add project");
   await expect(modal.getByTestId("harness-select")).toHaveCount(0);
 
-  const input = modal.getByTestId("dir-picker-input");
-  await input.fill("/Users/demo/scratch");
-  await modal.getByRole("button", { name: "Add project" }).click();
+  // Workspace mode now shows the browse-first FolderBrowser — no text input
+  // by default. Navigate to "/Users/demo" via the "up" breadcrumb from the
+  // initial launchDir "/Users/demo/acme-app", then pick "scratch".
+  const browser = modal.getByTestId("folder-browser-listing");
+  await expect(browser).toBeVisible({ timeout: 3000 });
+
+  // Navigate up to /Users/demo (parent of acme-app).
+  await modal.getByTestId("folder-browser-up").click();
+  await expect(modal.getByTestId("folder-browser-item-scratch")).toBeVisible({ timeout: 3000 });
+
+  // Click "scratch" to navigate into it.
+  await modal.getByTestId("folder-browser-item-scratch").click();
+  // Wait until the breadcrumb confirms we're at scratch (listing resolved).
+  await expect(modal.getByTestId("folder-browser-crumb-scratch")).toBeVisible({ timeout: 3000 });
+
+  // Now "Open this folder" confirms the current path.
+  await modal.getByTestId("folder-browser-open").click();
 
   await expect(modal).toBeHidden();
   // The connected path joins the rail as a workspace-owned workflow row.

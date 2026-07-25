@@ -6718,3 +6718,278 @@ input {
     transition: none;
   }
 }
+
+/* FolderBrowser — browse-first Open Folder picker (workspace mode only) --- */
+
+.folder-browser {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+/* Quick-links area: favorites + recents stacked in one block */
+.folder-browser-quicklinks {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  margin-inline: calc(-1 * var(--modal-pad-x, var(--sp5)));
+  border-bottom: 1px solid var(--ui-line);
+}
+
+/* Favorites row */
+.folder-browser-favorites {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp1);
+  padding: var(--sp2) var(--modal-pad-x, var(--sp5));
+  border-bottom: 1px solid var(--border);
+}
+
+.folder-browser-fav-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp1);
+  height: var(--control-h-xs);
+  padding: 0 var(--sp2);
+  background: var(--bg-3);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  color: var(--text-dim);
+  font-size: var(--type-meta);
+  transition:
+    color var(--transition-fast),
+    border-color var(--transition-fast),
+    background-color var(--transition-fast);
+  white-space: nowrap;
+}
+
+.folder-browser-fav-btn:hover {
+  color: var(--text);
+  border-color: var(--accent);
+  background: var(--surface-hover);
+}
+
+.folder-browser-fav-btn:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+/* Recents row */
+.folder-browser-recents {
+  display: flex;
+  align-items: center;
+  gap: var(--sp1);
+  padding: var(--sp2) var(--modal-pad-x, var(--sp5));
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.folder-browser-recents::-webkit-scrollbar {
+  display: none;
+}
+
+.folder-browser-section-label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp1);
+  flex: 0 0 auto;
+  font-size: var(--type-micro);
+  color: var(--text-faint);
+  white-space: nowrap;
+  margin-right: var(--sp1);
+}
+
+.folder-browser-recent-btn {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  height: var(--control-h-xs);
+  padding: 0 var(--sp2);
+  background: var(--bg-3);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  color: var(--text-dim);
+  font-size: var(--type-meta);
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transition:
+    color var(--transition-fast),
+    border-color var(--transition-fast);
+}
+
+.folder-browser-recent-btn:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+.folder-browser-recent-btn:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+/* Breadcrumb bar */
+.folder-browser-breadcrumbs {
+  display: flex;
+  align-items: center;
+  gap: var(--sp1);
+  height: var(--pane-header-h);
+  margin-inline: calc(-1 * var(--modal-pad-x, var(--sp5)));
+  padding-inline: var(--modal-pad-x, var(--sp5));
+  border-bottom: 1px solid var(--ui-line);
+  background: var(--bg-3);
+}
+
+.folder-browser-up {
+  flex: 0 0 auto;
+  width: var(--control-h-xs);
+  height: var(--control-h-xs);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  color: var(--text-dim);
+  transition:
+    background-color var(--transition-fast),
+    border-color var(--transition-fast),
+    color var(--transition-fast);
+}
+
+.folder-browser-up:hover:not(:disabled) {
+  background: var(--surface-hover);
+  border-color: var(--ui-line-strong);
+  color: var(--text);
+}
+
+.folder-browser-up:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.folder-browser-up:disabled {
+  opacity: 0.42;
+  cursor: default;
+}
+
+.folder-browser-crumb-row {
+  display: flex;
+  align-items: center;
+  flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+  gap: 0;
+}
+
+.folder-browser-crumb-row::-webkit-scrollbar {
+  display: none;
+}
+
+.folder-browser-crumb-segment {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+}
+
+.folder-browser-crumb-sep {
+  display: inline-flex;
+  align-items: center;
+  color: var(--text-faint);
+  margin: 0 1px;
+}
+
+.folder-browser-crumb-btn {
+  background: transparent;
+  border: none;
+  padding: 2px var(--sp1);
+  font-family: var(--font-mono);
+  font-size: var(--type-micro);
+  color: var(--text-dim);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color var(--transition-fast);
+}
+
+.folder-browser-crumb-btn:not(:disabled):hover {
+  color: var(--text);
+  background: var(--surface-hover);
+}
+
+.folder-browser-crumb-btn.is-current {
+  color: var(--text);
+  cursor: default;
+  font-weight: 500;
+}
+
+.folder-browser-crumb-btn:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+/* Folder listing — reuses dir-picker-* item styles */
+.folder-browser-listing {
+  margin-inline: calc(-1 * var(--modal-pad-x, var(--sp5)));
+  border-bottom: 1px solid var(--ui-line);
+  background: var(--surface-inset);
+  min-height: 100px;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+/* Primary "Open this folder" button area */
+.folder-browser-actions {
+  display: flex;
+  justify-content: flex-end;
+  padding-block: var(--sp3);
+}
+
+.folder-browser-open-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp2);
+}
+
+/* Secondary "or type a path" toggle and input row */
+.folder-browser-type-path {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp1);
+  padding-bottom: var(--sp1);
+}
+
+.folder-browser-type-toggle {
+  align-self: flex-start;
+  font-size: var(--type-meta);
+  color: var(--text-faint);
+  text-decoration: none;
+  padding: 0;
+  border: none;
+  background: none;
+}
+
+.folder-browser-type-toggle:hover {
+  color: var(--text-dim);
+}
+
+.folder-browser-type-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp2);
+}
+
+.folder-browser-type-input {
+  flex: 1;
+  font-family: var(--font-mono);
+  font-size: var(--type-label);
+}
+
+.folder-browser-type-go,
+.folder-browser-type-cancel {
+  flex: 0 0 auto;
+}
+
