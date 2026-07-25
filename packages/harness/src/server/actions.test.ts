@@ -102,6 +102,9 @@ class FakeChild extends EventEmitter implements RunLocalChildProcess {
     }
   })(this);
 
+  /** Signals received via kill() — inspectable in lifecycle tests. */
+  readonly killSignals: Array<NodeJS.Signals | number | undefined> = [];
+
   /** Emit a line on stdout (the route reads it via readline). */
   emitLine(obj: unknown): void {
     this.stdout.write(JSON.stringify(obj) + "\n");
@@ -116,6 +119,15 @@ class FakeChild extends EventEmitter implements RunLocalChildProcess {
     this.stderr.end();
     // Let the readline "line" handlers drain before the exit handler runs.
     setImmediate(() => this.emit("exit", code));
+  }
+  /**
+   * Satisfy the RunLocalChildProcess.kill() contract. Records the signal for
+   * assertion and optionally auto-exits the child so tests can assert the
+   * response settles after a kill.
+   */
+  kill(signal?: NodeJS.Signals | number): boolean {
+    this.killSignals.push(signal);
+    return true;
   }
 }
 
@@ -968,6 +980,162 @@ describe("createActionsRouter", () => {
           error: "node binary not found",
         },
       ]);
+    });
+
+    // ── lifecycle hardening ──────────────────────────────────────────────────
+
+    it("kills the child with SIGTERM on client disconnect, response settles, no orphan", async () => {
+      // Use fake timers scoped to setTimeout/clearTimeout only — preserving
+      // setImmediate so spawnFake's whenSpawned promise resolves correctly.
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      const { child, spawn, whenSpawned } = spawnFake();
+      start({ apiKey: null, resolveWorkflow: () => null, runLocalSpawn: spawn });
+
+      // Start the fetch but don't await — we need to drive the child first.
+      const controller = new AbortController();
+      const resPromise = fetch(`${baseUrl}/api/runs/local`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ sourceDir: "/proj/agent" }),
+        signal: controller.signal,
+      }).catch(() => null); // AbortError is expected when we abort below
+
+      await whenSpawned;
+
+      // Simulate client navigating away — abort the fetch. This closes the
+      // underlying TCP connection, causing the server's `res.on("close")` to
+      // fire with res.writableEnded === false (the run was still in progress).
+      controller.abort();
+
+      // Give the server's res.on("close") handler time to fire. Use a real
+      // setImmediate + a small poll loop since we only fake setTimeout.
+      await new Promise<void>((resolve) => {
+        const check = (): void => {
+          if (child.killSignals.length > 0) { resolve(); return; }
+          setImmediate(check);
+        };
+        setImmediate(check);
+      });
+
+      // The child must have received SIGTERM.
+      expect(child.killSignals).toContain("SIGTERM");
+
+      // Now let the child exit so the response stream closes and the test server
+      // can shut down cleanly in afterEach.
+      child.finish(null);
+      await resPromise;
+
+      vi.useRealTimers();
+    }, 10_000);
+
+    it("sends SIGKILL after the grace period when the child ignores SIGTERM on disconnect", async () => {
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      const { child, spawn, whenSpawned } = spawnFake();
+      start({ apiKey: null, resolveWorkflow: () => null, runLocalSpawn: spawn });
+
+      const controller = new AbortController();
+      const resPromise = fetch(`${baseUrl}/api/runs/local`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ sourceDir: "/proj/agent" }),
+        signal: controller.signal,
+      }).catch(() => null);
+
+      await whenSpawned;
+
+      controller.abort();
+
+      // Wait for SIGTERM to be sent.
+      await new Promise<void>((resolve) => {
+        const check = (): void => {
+          if (child.killSignals.length > 0) { resolve(); return; }
+          setImmediate(check);
+        };
+        setImmediate(check);
+      });
+
+      // SIGTERM should already be queued.
+      expect(child.killSignals).toContain("SIGTERM");
+
+      // Advance past the SIGKILL grace period (3 s).
+      await vi.advanceTimersByTimeAsync(3_500);
+
+      // SIGKILL must follow SIGTERM.
+      expect(child.killSignals).toContain("SIGKILL");
+      expect(child.killSignals.indexOf("SIGTERM")).toBeLessThan(
+        child.killSignals.indexOf("SIGKILL"),
+      );
+
+      child.finish(null);
+      await resPromise;
+
+      vi.useRealTimers();
+    }, 10_000);
+
+    it("kills the child and writes a timed-out terminal line when the wall-clock limit expires", async () => {
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      const { child, spawn, whenSpawned } = spawnFake();
+      start({ apiKey: null, resolveWorkflow: () => null, runLocalSpawn: spawn });
+
+      const resPromise = fetch(`${baseUrl}/api/runs/local`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ sourceDir: "/proj/agent" }),
+      });
+
+      await whenSpawned;
+
+      // Advance past the 5-minute wall-clock timeout.
+      await vi.advanceTimersByTimeAsync(5 * 60 * 1_000 + 500);
+
+      // The handler kills the child and settle() writes the terminal error and
+      // calls res.end(). The fetch() will resolve once it reads the ended stream.
+      // The child's stdout and stderr are still open — end them so Node.js
+      // doesn't leave open handles dangling after the response has settled.
+      child.stdout.end();
+      child.stderr.end();
+
+      const res = await resPromise;
+      expect(res.status).toBe(200);
+      const lines = parseNdjson(await res.text());
+      // The wall-clock timer must have sent SIGTERM.
+      expect(child.killSignals).toContain("SIGTERM");
+      // Exactly one terminal line whose message mentions "timed out".
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toMatchObject({ kind: "error", outcome: "failed" });
+      expect(String(lines[0].error)).toMatch(/timed out/i);
+
+      vi.useRealTimers();
+    }, 10_000);
+
+    it("swallows a stdin EPIPE / write error without crashing the server", async () => {
+      const { child, spawn, whenSpawned } = spawnFake();
+      start({ apiKey: null, resolveWorkflow: () => null, runLocalSpawn: spawn });
+
+      const resPromise = fetch(`${baseUrl}/api/runs/local`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ sourceDir: "/proj/agent" }),
+      });
+
+      await whenSpawned;
+
+      // Emit an "error" on the child's stdin (simulates EPIPE — child exited
+      // before the route finished writing). This must NOT propagate as an
+      // uncaughtException; the route catches and swallows it.
+      const epipe = Object.assign(new Error("write EPIPE"), { code: "EPIPE" });
+      child.stdin.emit("error", epipe);
+
+      // The run still completes normally — emit a summary and finish.
+      child.emitLine({ kind: "summary", outcome: "completed", unusedStubs: [], stubWarnings: [] });
+      child.finish(0);
+
+      const res = await resPromise;
+      expect(res.status).toBe(200);
+      const lines = parseNdjson(await res.text());
+      // The summary (not a synthesized error) must be the terminal line.
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toMatchObject({ kind: "summary", outcome: "completed" });
     });
   });
 

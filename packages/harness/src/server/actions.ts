@@ -102,6 +102,8 @@ export interface RunLocalChildProcess {
   stderr: NodeJS.ReadableStream | null;
   on(event: "exit", listener: (code: number | null) => void): unknown;
   on(event: "error", listener: (err: Error) => void): unknown;
+  /** Send a signal to the child process (mirrors node's ChildProcess.kill). */
+  kill(signal?: NodeJS.Signals | number): boolean;
 }
 
 /** Spawn the run-local bootstrap child. Test seam — defaults to `node`ing the
@@ -142,6 +144,22 @@ function defaultRunLocalSpawn(): RunLocalChildProcess {
 
 /** Bounded stderr tail kept per run-local child for failure display. */
 const RUN_LOCAL_STDERR_TAIL_CHARS = 2_000;
+
+/**
+ * Maximum wall-clock time a run-local child is allowed to run before being
+ * forcefully terminated. After this limit the child receives SIGTERM (then
+ * SIGKILL after a short grace) and a terminal error line is written to the
+ * response stream so the UI displays a clear "timed out" message.
+ */
+const RUN_LOCAL_MAX_DURATION_MS = 5 * 60 * 1_000; // 5 minutes
+
+/**
+ * Grace period between the initial SIGTERM and the hard SIGKILL when killing
+ * a run-local child (client disconnect or wall-clock timeout). Long enough for
+ * the child to flush and exit cleanly, short enough that an unresponsive child
+ * does not orphan for long.
+ */
+const RUN_LOCAL_KILL_GRACE_MS = 3_000; // 3 seconds
 
 /**
  * The run-local request body the SPA POSTs. `sourceDir` is required; the rest
@@ -490,8 +508,18 @@ export function createActionsRouter(opts: ActionsRouterOpts): Router {
     res.setHeader("Cache-Control", "no-store");
 
     // Hand the request to the child, then close its stdin so the bootstrap's
-    // read-to-EOF completes.
-    child.stdin?.end(JSON.stringify(request));
+    // read-to-EOF completes. Guard the write against an EPIPE (child exits
+    // before draining stdin) — without an "error" listener the writable stream
+    // would emit an unhandled-error event and crash the long-lived server.
+    if (child.stdin) {
+      child.stdin.on("error", (err: Error) => {
+        // EPIPE / ERR_STREAM_DESTROYED — the child is already gone; the exit
+        // handler below will settle the response. Swallow so it never becomes
+        // an uncaughtException.
+        console.error("[run-local] stdin write error (swallowed):", err.message);
+      });
+      child.stdin.end(JSON.stringify(request));
+    }
 
     // Forward each well-formed JSON line straight through — the bootstrap emits
     // exactly the wire shapes, so no re-shaping happens here. A line that isn't
@@ -529,9 +557,12 @@ export function createActionsRouter(opts: ActionsRouterOpts): Router {
     // deferred to `settle()` so a still-buffered summary line is never clobbered.
     let settled = false;
     let crashReason: string | null = null;
-    const settle = (): void => {
+    const settle = (terminalErrorMessage?: string): void => {
       if (settled) return;
       settled = true;
+      // Clear lifecycle resources so nothing fires after the response is done.
+      clearTimeout(wallClockTimer);
+      res.off("close", onClientClose);
       // Only synthesize a terminal line when the child produced none — otherwise
       // the stream already ended well-formed with the bootstrap's own summary.
       if (!sawTerminalLine) {
@@ -540,12 +571,48 @@ export function createActionsRouter(opts: ActionsRouterOpts): Router {
             kind: "error",
             outcome: "failed",
             error:
-              stderrTail.trim() || crashReason || "run-local produced no output",
+              terminalErrorMessage ||
+              stderrTail.trim() ||
+              crashReason ||
+              "run-local produced no output",
           }) + "\n",
         );
       }
       res.end();
     };
+
+    /**
+     * Send SIGTERM to the child, then SIGKILL after the grace period if it has
+     * not exited. Safe to call after the child has already exited — kill() on a
+     * dead process is a no-op (returns false) and the SIGKILL timer is cleared
+     * by the exit handler or settle().
+     */
+    let killTimer: ReturnType<typeof setTimeout> | undefined;
+    const killChild = (): void => {
+      child.kill("SIGTERM");
+      killTimer = setTimeout(() => child.kill("SIGKILL"), RUN_LOCAL_KILL_GRACE_MS);
+    };
+
+    // Wall-clock timeout — kill the child and write a terminal error line so
+    // the UI shows a clear "timed out" message rather than a hung spinner.
+    const wallClockTimer = setTimeout(() => {
+      killChild();
+      settle("run-local timed out — the workflow exceeded the maximum allowed run duration");
+    }, RUN_LOCAL_MAX_DURATION_MS);
+
+    // Client disconnect before the run settled — kill the child so no orphan
+    // process is left running after the user navigates away or closes the tab.
+    // `res.on("close")` fires when the response is closed; `res.writableEnded`
+    // distinguishes a server-initiated close (normal completion, already settled)
+    // from a client-initiated close (navigation away, connection drop). Using
+    // `res` rather than `req` avoids the false-positive where `req`'s IncomingMessage
+    // stream emits "close" once its body has been fully consumed by body-parser.
+    const onClientClose = (): void => {
+      if (settled || res.writableEnded) return;
+      killChild();
+      settle();
+    };
+    res.on("close", onClientClose);
 
     // Drive the terminal decision off stdout's close (readline "close" fires
     // only after every line has been emitted), so a summary line buffered when
@@ -554,19 +621,25 @@ export function createActionsRouter(opts: ActionsRouterOpts): Router {
     if (child.stdout) {
       const lines = createInterface({ input: child.stdout });
       lines.on("line", onLine);
-      lines.on("close", settle);
+      lines.on("close", () => {
+        clearTimeout(killTimer);
+        settle();
+      });
       child.on("error", (err) => {
         crashReason = err.message;
       });
       child.on("exit", (code) => {
+        clearTimeout(killTimer);
         crashReason ??= `run-local process exited with code ${code ?? "null"}`;
       });
     } else {
       child.on("error", (err) => {
+        clearTimeout(killTimer);
         crashReason = err.message;
         settle();
       });
       child.on("exit", (code) => {
+        clearTimeout(killTimer);
         crashReason ??= `run-local process exited with code ${code ?? "null"}`;
         settle();
       });
