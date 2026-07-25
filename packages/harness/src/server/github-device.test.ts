@@ -159,6 +159,48 @@ describe("POST /api/github/device/start", () => {
     });
     expect(res.status).toBe(502);
   });
+
+  it("replaces a non-github.com verification_uri with the safe fallback (A5)", async () => {
+    const mockFetch = vi.fn().mockResolvedValue(
+      jsonResponse({
+        user_code: "ABCD-1234",
+        verification_uri: "https://evil.example.com/phish",
+        device_code: "ghu_abc",
+        interval: 5,
+        expires_in: 900,
+      }),
+    );
+    server = startServer(mockFetch);
+    const res = await globalThis.fetch(`${server.baseUrl}/api/github/device/start`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    // Must NOT forward the attacker-controlled URI.
+    expect(body.verification_uri).not.toBe("https://evil.example.com/phish");
+    // Must fall back to the canonical GitHub device URI.
+    expect(body.verification_uri).toBe("https://github.com/login/device");
+  });
+
+  it("preserves a legitimate github.com verification_uri unchanged (A5)", async () => {
+    const mockFetch = vi.fn().mockResolvedValue(
+      jsonResponse({
+        user_code: "WXYZ-5678",
+        verification_uri: "https://github.com/login/device",
+        device_code: "ghu_def",
+        interval: 5,
+        expires_in: 900,
+      }),
+    );
+    server = startServer(mockFetch);
+    const res = await globalThis.fetch(`${server.baseUrl}/api/github/device/start`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+    });
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body.verification_uri).toBe("https://github.com/login/device");
+  });
 });
 
 describe("POST /api/github/device/poll", () => {
@@ -260,7 +302,7 @@ describe("POST /api/github/device/poll", () => {
     expect(bodyStr).not.toContain("access_token");
   });
 
-  it("sets an HttpOnly session cookie on authorization", async () => {
+  it("sets an HttpOnly session cookie on authorization with Path=/api/", async () => {
     const mockFetch = vi
       .fn()
       .mockResolvedValueOnce(jsonResponse({ access_token: "ghp_tok" }))
@@ -274,6 +316,10 @@ describe("POST /api/github/device/poll", () => {
     const cookie = res.headers.get("set-cookie") ?? "";
     expect(cookie).toContain("gh_sess=");
     expect(cookie).toContain("HttpOnly");
+    // Path must be /api/ so the cookie is sent to /api/connect/github too.
+    expect(cookie).toContain("Path=/api/");
+    // Must NOT be the old narrower path that excluded /api/connect/github.
+    expect(cookie).not.toContain("Path=/api/github");
   });
 });
 

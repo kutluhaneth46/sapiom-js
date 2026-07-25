@@ -26,6 +26,10 @@ vi.mock("node:child_process", async (importOriginal) => {
 });
 
 import { createConnectGitHubRouter, gitClone } from "./connect-github.js";
+import {
+  createGitHubDeviceRouter,
+  _clearTokenStoreForTest,
+} from "./github-device.js";
 import type { WorkflowRegistryLike } from "../core/workflow-registry.js";
 import type { WorkflowInfo } from "../shared/types.js";
 
@@ -314,5 +318,192 @@ describe("POST /api/connect/github", () => {
     expect(body.error).not.toContain("ghp_secret");
     // The URL should be redacted.
     expect(body.error).toContain("***@github.com");
+  });
+
+  it("redacts the token from err.message when stderr is empty", async () => {
+    const { execFile } = await import("node:child_process");
+    vi.mocked(execFile).mockImplementationOnce(
+      (_cmd, _args, _opts, cb) => {
+        // stderr empty — error is only surfaced via err.message.
+        (cb as unknown as (err: Error, stdout: string, stderr: string) => void)(
+          Object.assign(
+            new Error(
+              "Command failed: git clone -- https://x-access-token:ghp_secret@github.com/x/y.git /tmp/y",
+            ),
+            { stderr: "" },
+          ),
+          "",
+          "",
+        );
+        return { pid: 1 } as ReturnType<typeof import("node:child_process").execFile>;
+      },
+    );
+
+    const registry = fakeRegistry();
+    const app = express();
+    app.use(express.json());
+    app.use(
+      createConnectGitHubRouter({
+        registry,
+        defaultCloneParent: tmpDir,
+        getToken: () => "ghp_secret",
+      }),
+    );
+    const srv = app.listen(0);
+    const addr = (srv.address() as { port: number });
+    server = {
+      baseUrl: `http://127.0.0.1:${addr.port}`,
+      close: () => new Promise<void>((r) => srv.close(() => r())),
+    };
+
+    const res = await fetch(`${server.baseUrl}/api/connect/github`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ repoUrl: "https://github.com/x/y" }),
+    });
+    expect(res.status).toBe(500);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).not.toContain("ghp_secret");
+    expect(body.error).toContain("***@github.com");
+  });
+
+  it("returns 400 for https://github.com/owner/..git (repo would be '.')", async () => {
+    const registry = fakeRegistry();
+    server = startServer(registry, tmpDir);
+    const res = await fetch(`${server.baseUrl}/api/connect/github`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ repoUrl: "https://github.com/owner/..git" }),
+    });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toMatch(/Invalid GitHub URL/i);
+  });
+
+  it("returns 400 when targetDir escapes the home directory", async () => {
+    const registry = fakeRegistry();
+    server = startServer(registry, tmpDir);
+    const res = await fetch(`${server.baseUrl}/api/connect/github`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        repoUrl: "https://github.com/owner/repo",
+        targetDir: "/Library/LaunchAgents/evil",
+      }),
+    });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toMatch(/home directory/i);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A6: Integration test — Device Flow cookie reaches /api/connect/github
+//
+// This test mounts BOTH routers on one Express app, obtains a gh_sess cookie
+// via the device poll endpoint (with the corrected Path=/api/ scope), then
+// calls /api/connect/github WITH that cookie and asserts the authenticated
+// (token) clone URL is used.  It would have caught A1 directly.
+// ---------------------------------------------------------------------------
+
+describe("GitHub Device Flow + clone integration (A6)", () => {
+  let server: { baseUrl: string; close: () => Promise<void> };
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    _clearTokenStoreForTest();
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "gh-device-clone-test-"));
+  });
+
+  afterEach(async () => {
+    await server?.close();
+    _clearTokenStoreForTest();
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it("uses the authenticated clone URL when the gh_sess cookie is forwarded from /api/github to /api/connect/github", async () => {
+    // Capture the URL that git clone was invoked with.
+    const { execFile } = await import("node:child_process");
+    let capturedArgs: string[] = [];
+    vi.mocked(execFile).mockImplementationOnce(
+      (_cmd, args, _opts, cb) => {
+        capturedArgs = args as string[];
+        (cb as unknown as (err: null, stdout: string, stderr: string) => void)(null, "", "");
+        return { pid: 1 } as ReturnType<typeof import("node:child_process").execFile>;
+      },
+    );
+
+    // Build a mock fetch that simulates GitHub's Device Flow responses.
+    const mockFetch = vi
+      .fn()
+      // poll: token endpoint
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ access_token: "ghp_integration_token" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      )
+      // poll: /user endpoint for login
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ login: "testuser" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+
+    const registry = fakeRegistry();
+
+    // Mount BOTH routers on one Express app — exactly the production wiring.
+    const { getGitHubToken } = await import("./github-device.js");
+    const app = express();
+    app.use(express.json());
+    app.use(
+      createGitHubDeviceRouter({ fetchImpl: mockFetch as typeof fetch, clientId: "test-client" }),
+    );
+    app.use(
+      createConnectGitHubRouter({
+        registry,
+        defaultCloneParent: tmpDir,
+        getToken: getGitHubToken,
+      }),
+    );
+
+    const srv = app.listen(0);
+    const addr = srv.address() as AddressInfo;
+    const baseUrl = `http://127.0.0.1:${addr.port}`;
+    server = { baseUrl, close: () => new Promise<void>((r) => srv.close(() => r())) };
+
+    // Step 1: Poll the device endpoint to get the gh_sess cookie.
+    const pollRes = await globalThis.fetch(`${baseUrl}/api/github/device/poll`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ device_code: "ghu_test_code" }),
+    });
+    expect(pollRes.status).toBe(200);
+    const pollBody = (await pollRes.json()) as { status: string };
+    expect(pollBody.status).toBe("authorized");
+
+    // Extract the Set-Cookie header — this is the gh_sess with Path=/api/
+    const setCookie = pollRes.headers.get("set-cookie") ?? "";
+    expect(setCookie).toContain("gh_sess=");
+    expect(setCookie).toContain("Path=/api/");
+    const sessionCookie = setCookie.split(";")[0]; // "gh_sess=<value>"
+
+    // Step 2: Call /api/connect/github WITH the cookie — the route is under
+    // Path=/api/ so the browser would include it; we forward it explicitly here.
+    const cloneRes = await globalThis.fetch(`${baseUrl}/api/connect/github`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Cookie: sessionCookie,
+      },
+      body: JSON.stringify({ repoUrl: "https://github.com/owner/private-repo" }),
+    });
+    expect(cloneRes.status).toBe(200);
+
+    // Step 3: The clone URL must use the authenticated form, not the raw URL.
+    expect(capturedArgs).toContain(
+      "https://x-access-token:ghp_integration_token@github.com/owner/private-repo.git",
+    );
   });
 });

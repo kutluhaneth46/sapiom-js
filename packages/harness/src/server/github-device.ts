@@ -99,7 +99,7 @@ function issueSessionKey(res: Response): string {
   const key = crypto.randomBytes(32).toString("hex");
   res.setHeader(
     "Set-Cookie",
-    `${SESSION_COOKIE}=${encodeURIComponent(key)}; HttpOnly; SameSite=Strict; Path=/api/github`,
+    `${SESSION_COOKIE}=${encodeURIComponent(key)}; HttpOnly; SameSite=Strict; Path=/api/`,
   );
   return key;
 }
@@ -254,9 +254,15 @@ export function createGitHubDeviceRouter(
         return;
       }
       const data = (await ghRes.json()) as Record<string, unknown>;
+      // Only forward verification_uri when it is a well-known GitHub device URL
+      // to prevent open-redirect via a tampered response.
+      const GITHUB_DEVICE_URI = "https://github.com/login/device";
+      const rawUri = typeof data.verification_uri === "string" ? data.verification_uri : "";
+      const safeUri =
+        rawUri.startsWith("https://github.com/") ? rawUri : GITHUB_DEVICE_URI;
       res.json({
         user_code: data.user_code,
-        verification_uri: data.verification_uri,
+        verification_uri: safeUri,
         device_code: data.device_code,
         interval: data.interval,
         expires_in: data.expires_in,

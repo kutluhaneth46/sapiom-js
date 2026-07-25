@@ -261,7 +261,6 @@ export function GitHubDeviceConnect({
       setCloneError(null);
       setView({ kind: "cloning", repoFullName: repo.fullName });
       try {
-        const repoName = repo.fullName.split("/").pop() ?? "repo";
         const path = await api.clone({
           repoUrl: repo.cloneUrl,
           // targetDir left absent → server derives from repo name under the parent

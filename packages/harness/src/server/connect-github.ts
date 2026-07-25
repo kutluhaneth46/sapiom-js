@@ -61,6 +61,9 @@ function parseGitHubUrl(raw: string): ParsedGitHubUrl | null {
   }
 
   if (!owner || !repo) return null;
+  // Reject degenerate names that would cause `git clone` to write into an
+  // unintended directory (e.g. "..git" → repo="." → clone into parent).
+  if (repo === "." || repo === "..") return null;
   return {
     owner,
     repo,
@@ -115,9 +118,9 @@ export async function gitClone(repoUrl: string, targetDir: string): Promise<void
       encoding: "utf8",
     });
   } catch (err) {
-    const stderr = (err as { stderr?: string }).stderr ?? "";
-    const raw = stderr.trim() || (err instanceof Error ? err.message : String(err));
-    throw new Error(redactCredentials(raw));
+    const stderr = redactCredentials((err as { stderr?: string }).stderr ?? "");
+    const msg = redactCredentials(err instanceof Error ? err.message : String(err));
+    throw new Error(stderr.trim() || msg);
   }
 }
 
@@ -164,9 +167,24 @@ export function createConnectGitHubRouter(options: ConnectGitHubRouterOptions): 
 
     // --- Resolve targetDir ---
     const parent = defaultCloneParent ?? path.join(os.homedir(), "sapiom");
-    const targetDir = rawTarget
+    const resolvedTarget = rawTarget
       ? path.resolve(rawTarget)
       : path.join(parent, parsed.repo);
+
+    // Guard against path traversal: the target must be within an allowed root
+    // (the clone parent or the user's home directory).
+    if (rawTarget) {
+      const allowedRoots = [parent, os.homedir()];
+      const withinAllowed = allowedRoots.some(
+        (r) => resolvedTarget === r || resolvedTarget.startsWith(r + path.sep),
+      );
+      if (!withinAllowed) {
+        res.status(400).json({ error: "targetDir must be within the home directory" });
+        return;
+      }
+    }
+
+    const targetDir = resolvedTarget;
 
     // Ensure the parent directory exists before checking for collisions.
     try {

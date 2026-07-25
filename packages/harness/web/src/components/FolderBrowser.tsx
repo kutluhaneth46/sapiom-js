@@ -137,6 +137,15 @@ export function FolderBrowser({
     let cancelled = false;
     setLoading(true);
     setError(null);
+
+    /** Compute the parent of a path (mirrors DirectoryPicker's parentOf). */
+    const parentOf = (p: string): string | null => {
+      const trimmed = p.replace(/\/+$/, "");
+      const cut = trimmed.slice(0, trimmed.lastIndexOf("/"));
+      if (!trimmed.includes("/") || cut === trimmed) return null;
+      return cut || "/";
+    };
+
     const handle = setTimeout(() => {
       listDir(browsePath || undefined)
         .then((res) => {
@@ -163,8 +172,45 @@ export function FolderBrowser({
           }
           if (onNewDirChange) onNewDirChange(isNew);
         })
-        .catch(() => {
-          if (!cancelled) setError("Couldn't read that directory.");
+        .catch(async () => {
+          // B1: The real server returns 404 for non-existent paths (unlike the
+          // mock which walks up itself).  Mirror DirectoryPicker's ancestor
+          // fallback: retry the parent so a typed new-folder path still shows
+          // the scaffold CTA instead of an error.
+          if (requestedTypedPath == null) {
+            // Not a typed navigation — show the error as-is.
+            if (!cancelled) {
+              setError("Couldn't read that directory.");
+              // B2: clear any stale new-dir flag so the parent doesn't keep
+              // the "Add project" button disabled.
+              onNewDirChange?.(false);
+            }
+            return;
+          }
+          const up = parentOf(browsePath);
+          if (!up || cancelled) {
+            if (!cancelled) {
+              setError("Couldn't read that directory.");
+              onNewDirChange?.(false); // B2
+            }
+            return;
+          }
+          try {
+            const res = await listDir(up);
+            if (cancelled) return;
+            // Parent exists — the typed path is a new directory.
+            setBrowsePath(res.path);
+            setParent(res.parent);
+            setDirs(res.dirs);
+            setNewDirTyped(true);
+            onChange(requestedTypedPath);
+            onNewDirChange?.(true);
+          } catch {
+            if (!cancelled) {
+              setError("Couldn't read that directory.");
+              onNewDirChange?.(false); // B2
+            }
+          }
         })
         .finally(() => {
           if (!cancelled) setLoading(false);
