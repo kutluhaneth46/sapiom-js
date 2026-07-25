@@ -255,6 +255,7 @@ export function NewSessionModal({
                 onOpen={() => void submit()}
                 recentDirs={recentDirs}
                 listDir={listDir}
+                onNewDirChange={setNewDirTyped}
               />
             ) : (
               <DirectoryPicker

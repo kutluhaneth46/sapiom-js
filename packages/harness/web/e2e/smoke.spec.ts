@@ -177,9 +177,13 @@ test("Overview heads the account menu, shows the intro panel, and any session le
 test("creation IA: the rail + adds projects; the tab strip + adds a session to the focused agent", async ({
   page,
 }) => {
-  // The rail's + is the PROJECT entry: the dialog opens in Project mode with
-  // no mode tabs at all — the entry point fixed the intent (docs/IA.md).
+  // The rail's + opens the AddProjectMenu first; "Open Folder" then opens
+  // the dialog in Project mode (no mode tabs — the entry point fixes intent).
   await page.getByTestId("add-workspace").click();
+  await expect(page.getByTestId("add-project-menu")).toBeVisible();
+  await page.getByTestId("add-project-open-folder").click();
+  await expect(page.getByTestId("add-project-menu")).not.toBeVisible();
+
   const modal = page.locator(".modal-add-workspace");
   await expect(modal).toBeVisible();
   await expect(modal.locator(".modal-header")).toContainText("Add project");

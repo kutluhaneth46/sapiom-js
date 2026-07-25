@@ -47,6 +47,15 @@ export interface FolderBrowserProps {
   onOpen: () => void;
   recentDirs: string[];
   listDir: (path?: string) => Promise<FsListResponse>;
+  /**
+   * Called whenever the "or type a path" secondary input names a directory
+   * that doesn't exist yet (the server walked up to the nearest ancestor).
+   * Pass `true` when the typed path is new (parent exists, leaf doesn't),
+   * `false` when the typed path resolved to itself or the input was cleared.
+   * This mirrors DirectoryPicker's `onNewDirChange` so the parent can gate
+   * scaffold / scan / "Add project" actions the same way.
+   */
+  onNewDirChange?: (isNew: boolean) => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -72,6 +81,7 @@ export function FolderBrowser({
   onOpen,
   recentDirs,
   listDir,
+  onNewDirChange,
 }: FolderBrowserProps): JSX.Element {
   // Which real directory is currently being shown in the listing.
   const [browsePath, setBrowsePath] = useState(value || "~");
@@ -80,6 +90,9 @@ export function FolderBrowser({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [retryNonce, setRetryNonce] = useState(0);
+  // Tracks whether the currently selected path is a new (non-existent)
+  // directory typed by the user — mirrors DirectoryPicker's newDirTyped signal.
+  const [newDirTyped, setNewDirTyped] = useState(false);
 
   // Favorites: after first mount we probe each favorite and keep only the
   // ones that listed successfully.
@@ -88,6 +101,12 @@ export function FolderBrowser({
   // Secondary path input (collapsed by default).
   const [showTypePath, setShowTypePath] = useState(false);
   const [typedPath, setTypedPath] = useState("");
+
+  // When the user types a path via "or type a path", we remember the raw
+  // request so we can detect whether it resolved (exists) or walked up
+  // (doesn't exist yet).  null means the last navigation was via the browser
+  // (click/favorite/breadcrumb), not a typed submission.
+  const [requestedTypedPath, setRequestedTypedPath] = useState<string | null>(null);
 
   const typePathRef = useRef<HTMLInputElement>(null);
 
@@ -125,9 +144,24 @@ export function FolderBrowser({
           setBrowsePath(res.path);
           setParent(res.parent);
           setDirs(res.dirs);
-          // Keep the controlled value in sync so the parent's "Open" action
-          // always uses the currently displayed folder.
-          onChange(res.path);
+
+          // Detect whether the user typed a path that doesn't exist yet: the
+          // server walks up to the nearest real ancestor, so res.path will
+          // differ from the originally requested path when the leaf is new.
+          const isNew = requestedTypedPath != null && res.path !== requestedTypedPath;
+          if (isNew) {
+            // The typed path is new — keep the original typed value as the
+            // controlled value so the parent's submit / scaffold use it, while
+            // the browser shows the resolved ancestor's listing.
+            setNewDirTyped(true);
+            onChange(requestedTypedPath);
+          } else {
+            // Resolved to an existing directory (browse navigation or typed
+            // path that already exists) — sync normally.
+            setNewDirTyped(false);
+            onChange(res.path);
+          }
+          if (onNewDirChange) onNewDirChange(isNew);
         })
         .catch(() => {
           if (!cancelled) setError("Couldn't read that directory.");
@@ -148,7 +182,15 @@ export function FolderBrowser({
     if (showTypePath) typePathRef.current?.focus();
   }, [showTypePath]);
 
+  // Browse navigation (favorites / breadcrumbs / folder list / recents) —
+  // always navigates to an existing directory.
   const navigateTo = (path: string): void => {
+    setRequestedTypedPath(null);
+    // Clear any new-dir flag from a previous typed path navigation.
+    if (newDirTyped) {
+      setNewDirTyped(false);
+      if (onNewDirChange) onNewDirChange(false);
+    }
     setBrowsePath(path);
     setTypedPath("");
     // Eagerly sync the controlled value so the parent's onOpen/submit always
@@ -156,9 +198,21 @@ export function FolderBrowser({
     onChange(path);
   };
 
+  // "Or type a path" submission — may name a new (non-existent) directory.
+  const navigateToTyped = (path: string): void => {
+    const trimmed = path.trim();
+    if (!trimmed) return;
+    setRequestedTypedPath(trimmed);
+    // Eagerly set the controlled value to the typed path so the parent's
+    // submit action works even before the listing resolves.
+    onChange(trimmed);
+    setBrowsePath(trimmed);
+    setTypedPath("");
+  };
+
   const handleTypePathKeyDown = (e: React.KeyboardEvent<HTMLInputElement>): void => {
     if (e.key === "Enter" && typedPath.trim()) {
-      navigateTo(typedPath.trim());
+      navigateToTyped(typedPath.trim());
       setShowTypePath(false);
     }
   };
@@ -334,7 +388,7 @@ export function FolderBrowser({
               disabled={!typedPath.trim()}
               onClick={() => {
                 if (typedPath.trim()) {
-                  navigateTo(typedPath.trim());
+                  navigateToTyped(typedPath.trim());
                   setShowTypePath(false);
                 }
               }}

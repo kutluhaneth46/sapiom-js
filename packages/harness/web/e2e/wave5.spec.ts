@@ -67,11 +67,20 @@ test.describe("add dialog (Project mode)", () => {
   test("a non-existent folder offers the scaffold action, which starts a session and prompts the agent", async ({
     page,
   }) => {
+    // The rail's + opens AddProjectMenu; "Open Folder" enters the workspace dialog.
     await page.getByTestId("add-workspace").click();
+    await expect(page.getByTestId("add-project-menu")).toBeVisible();
+    await page.getByTestId("add-project-open-folder").click();
+    await expect(page.getByTestId("add-project-menu")).not.toBeVisible();
     const modal = page.locator(".modal-add-workspace");
     await expect(modal).toBeVisible();
 
-    await modal.getByTestId("dir-picker-input").fill("/Users/demo/brand-new-agent");
+    // Workspace mode uses the browse-first FolderBrowser. Use the secondary
+    // "or type a path" input to enter a non-existent folder path.
+    await modal.getByTestId("folder-browser-type-toggle").click();
+    await modal.getByTestId("folder-browser-type-input").fill("/Users/demo/brand-new-agent");
+    await modal.getByTestId("folder-browser-type-input").press("Enter");
+
     const cta = modal.getByTestId("modal-scaffold-cta");
     await expect(cta).toBeVisible();
     await expect(modal.getByRole("button", { name: "Add project" })).toBeDisabled();
@@ -89,9 +98,19 @@ test.describe("add dialog (Project mode)", () => {
   });
 
   test("scan folder for agents registers everything under the root and toasts the count", async ({ page }) => {
+    // The rail's + opens AddProjectMenu; "Open Folder" enters the workspace dialog.
     await page.getByTestId("add-workspace").click();
+    await expect(page.getByTestId("add-project-menu")).toBeVisible();
+    await page.getByTestId("add-project-open-folder").click();
+    await expect(page.getByTestId("add-project-menu")).not.toBeVisible();
     const modal = page.locator(".modal-add-workspace");
-    await modal.getByTestId("dir-picker-input").fill("/Users/demo");
+    await expect(modal).toBeVisible();
+
+    // Workspace mode uses FolderBrowser. Navigate up from the initial
+    // launchDir (/Users/demo/acme-app) to /Users/demo via the Up button.
+    await modal.getByTestId("folder-browser-up").click();
+    // Wait for the breadcrumb to confirm we are at /Users/demo.
+    await expect(modal.getByTestId("folder-browser-crumb-demo")).toBeVisible({ timeout: 3000 });
 
     await modal.getByTestId("modal-scan-btn").click();
     await expect(modal).toBeHidden();
@@ -101,7 +120,11 @@ test.describe("add dialog (Project mode)", () => {
 
   test("the MCP setup prompts are copyable and fire mcp.install", async ({ page, context }) => {
     await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+    // The rail's + opens AddProjectMenu first; "Open Folder" enters the dialog.
     await page.getByTestId("add-workspace").click();
+    await expect(page.getByTestId("add-project-menu")).toBeVisible();
+    await page.getByTestId("add-project-open-folder").click();
+    await expect(page.getByTestId("add-project-menu")).not.toBeVisible();
     const block = page.getByTestId("mcp-install");
     await expect(block).toBeVisible();
 

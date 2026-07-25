@@ -159,7 +159,12 @@ test("the add-project dialog hands off to templates (the 'I don't have a project
 }) => {
   await page.goto("/");
   await expect(page.locator(".rail-workflows")).toBeVisible();
+  // The rail's + opens AddProjectMenu first; "Open Folder" enters the dialog.
   await page.getByTestId("add-workspace").click();
+  await expect(page.getByTestId("add-project-menu")).toBeVisible();
+  await page.getByTestId("add-project-open-folder").click();
+  await expect(page.getByTestId("add-project-menu")).not.toBeVisible();
+  await expect(page.locator(".modal-add-workspace")).toBeVisible();
   await page.getByTestId("modal-browse-templates").click();
   // One dialog at a time: the add dialog yields to the templates browser.
   await expect(page.getByTestId("templates-dialog")).toBeVisible();
