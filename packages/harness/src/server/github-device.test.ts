@@ -35,7 +35,10 @@ function startServer(
 ): { baseUrl: string; close: () => Promise<void> } {
   const app = express();
   app.use(express.json());
-  app.use("/api", createGitHubDeviceRouter({ fetchImpl: fetchImpl as typeof fetch, clientId }));
+  // Mount at root — exactly as production (server/index.ts) does — so each
+  // route's own "/api/..." prefix is exercised. Mounting under "/api" here
+  // would double-prefix and hide a missing prefix in the routes.
+  app.use(createGitHubDeviceRouter({ fetchImpl: fetchImpl as typeof fetch, clientId }));
   const server = app.listen(0);
   const addr = server.address() as AddressInfo;
   return {

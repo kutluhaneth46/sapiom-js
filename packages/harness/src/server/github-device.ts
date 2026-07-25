@@ -237,7 +237,7 @@ export function createGitHubDeviceRouter(
 
   // ── POST /api/github/device/start ─────────────────────────────────────────
 
-  router.post("/github/device/start", requireClientId, async (_req, res) => {
+  router.post("/api/github/device/start", requireClientId, async (_req, res) => {
     try {
       const ghRes = await fetchImpl("https://github.com/login/device/code", {
         method: "POST",
@@ -270,7 +270,7 @@ export function createGitHubDeviceRouter(
 
   // ── POST /api/github/device/poll ──────────────────────────────────────────
 
-  router.post("/github/device/poll", requireClientId, async (req, res) => {
+  router.post("/api/github/device/poll", requireClientId, async (req, res) => {
     const body = req.body as { device_code?: unknown } | undefined;
     const deviceCode =
       typeof body?.device_code === "string" ? body.device_code.trim() : "";
@@ -341,7 +341,7 @@ export function createGitHubDeviceRouter(
 
   // ── GET /api/github/repos ─────────────────────────────────────────────────
 
-  router.get("/github/repos", async (req, res) => {
+  router.get("/api/github/repos", async (req, res) => {
     const session = getSession(req);
     if (!session) {
       res.status(401).json({ error: "not connected" });
@@ -384,7 +384,7 @@ export function createGitHubDeviceRouter(
 
   // ── GET /api/github/status ────────────────────────────────────────────────
 
-  router.get("/github/status", async (req, res) => {
+  router.get("/api/github/status", async (req, res) => {
     // When no client ID is set we still respond (no requireClientId middleware)
     // so the UI can immediately know to show the fallback.
     if (!clientId) {
@@ -427,7 +427,7 @@ export function createGitHubDeviceRouter(
 
   // ── POST /api/github/disconnect ───────────────────────────────────────────
 
-  router.post("/github/disconnect", (req, res) => {
+  router.post("/api/github/disconnect", (req, res) => {
     const key = readSessionKey(req);
     if (key) tokenStore.delete(key);
     res.json({ ok: true });
