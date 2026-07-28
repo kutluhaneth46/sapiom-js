@@ -112,6 +112,24 @@ describe("resolveSpawnTarget", () => {
     expect(target.args).toEqual(["-v"]);
   });
 
+  it("resolves the REAL Claude Code shim, whose target is a native .exe", () => {
+    // Verbatim from a user's machine (npm-global install of @anthropic-ai/claude-code).
+    // Claude Code ships a native launcher, not a JS entry — keying the parser on
+    // `.js` missed it completely and we refused to spawn a perfectly good .exe.
+    const exe = "C:\\npm\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe";
+    const deps = windowsWithNpmShim({
+      "C:\\npm\\claude.cmd":
+        "@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\n" +
+        'CALL :find_dp0\r\n"%dp0%\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe"   %*\r\n',
+      [exe]: "",
+    });
+    // Straight to the executable: no interpreter, no shell, nothing to quote.
+    expect(resolveSpawnTarget("claude", ["--settings", "C:\\s.json"], deps)).toEqual({
+      command: exe,
+      args: ["--settings", "C:\\s.json"],
+    });
+  });
+
   it("prefers claude.cmd over the extensionless sh script npm installs beside it", () => {
     // The exact shape that failed on a user's machine: the harness passed the
     // ABSOLUTE, extensionless path `…\npm-global\claude`. npm installs three

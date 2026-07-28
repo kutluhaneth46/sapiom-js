@@ -121,28 +121,46 @@ function readShimTarget(
 
   const shimDir = win32.dirname(shim);
 
-  // Two passes rather than one, because shim text varies by npm version (and by
-  // package manager): first the canonical `"%dp0%\…\cli.js"` form, then ANY quoted
-  // .js/.cjs/.mjs token resolved relative to the shim. The existence check is what
-  // keeps the looser pass honest — a path that isn't there isn't the target.
-  const candidateScripts = [
-    ...[...contents.matchAll(/"%~?dp0%?[\\/]([^"]+\.[cm]?js)"/gi)].map((m) => m[1]),
-    ...[...contents.matchAll(/"([^"]+\.[cm]?js)"/gi)].map((m) => m[1]?.replace(/^%~?dp0%?[\\/]/i, "")),
-  ];
-  const script = candidateScripts
-    .filter((rel): rel is string => Boolean(rel))
-    .map((rel) => (win32.isAbsolute(rel) ? rel : win32.join(shimDir, rel)))
+  // Structural, NOT extension-based. A shim's target is whatever it quotes on the
+  // line it ends with `%*`, and that is not always a script: Claude Code ships a
+  // native launcher, so its real shim reads
+  //   "%dp0%\node_modules\@anthropic-ai\claude-code\bin\claude.exe"   %*
+  // while a plain npm package yields "%_prog%" "%dp0%\…\cli.js" %*. Keying on
+  // `.js` missed the former entirely — the mistake this now avoids by collecting
+  // every quoted token and letting the filesystem decide which is real.
+  const lines = contents.split(/\r?\n/);
+  const quotedIn = (src: readonly string[]): string[] =>
+    src.flatMap((line) => [...line.matchAll(/"([^"]+)"/g)].map((m) => m[1] ?? ""));
+
+  const target = [
+    ...quotedIn(lines.filter((line) => line.includes("%*"))), // the exec line first
+    ...quotedIn(lines),
+  ]
+    // Skip bare variable references like "%_prog%" — that's the interpreter the
+    // shim picks for itself, not a path we can resolve.
+    .filter((token) => token && !/^%[^%]*%$/.test(token))
+    // `%~dp0` carries a trailing separator, so replacing the variable alone
+    // leaves the following backslash in place.
+    .map((token) => token.replace(/%~?dp0%?/i, shimDir))
+    .map((token) => win32.normalize(win32.isAbsolute(token) ? token : win32.join(shimDir, token)))
     .find(deps.fileExists);
-  if (!script) return null;
+  if (!target) return null;
 
-  // npm prefers a node.exe sitting next to the shim; otherwise PATH's node.
-  const adjacentNode = win32.join(shimDir, "node.exe");
-  const interpreter = deps.fileExists(adjacentNode)
-    ? adjacentNode
-    : findOnPath("node", deps);
-  if (!interpreter) return null;
+  const lower = target.toLowerCase();
 
-  return { command: interpreter, args: [script] };
+  // A real executable: spawn it directly. No interpreter, no shell — exactly what
+  // CreateProcess wants, and the best possible outcome.
+  if (DIRECTLY_EXECUTABLE.some((ext) => lower.endsWith(ext))) return { command: target, args: [] };
+
+  // A script: run it under node — the one npm placed beside the shim if present,
+  // otherwise PATH's.
+  if (/\.[cm]?js$/.test(lower)) {
+    const adjacentNode = win32.join(shimDir, "node.exe");
+    const interpreter = deps.fileExists(adjacentNode) ? adjacentNode : findOnPath("node", deps);
+    return interpreter ? { command: interpreter, args: [target] } : null;
+  }
+
+  return null;
 }
 
 export function resolveSpawnTarget(
