@@ -262,6 +262,18 @@ jobs:
       # that launches perfectly unsigned (library validation vs. node-pty's
       # spawn-helper is the classic case), so "it ran unsigned in the PR" is not
       # evidence that the notarized .dmg a tester downloads will run.
+      # Windows only, and only to check shim FIDELITY: the smoke run spawns a stub
+      # shim we wrote ourselves, which proves the mechanism but validates our own
+      # assumption about npm's shim format. With a real `claude.cmd` on disk, the
+      # `agent-shim` check asserts our parser handles the genuine article — the
+      # difference between "our test passes" and "users can start a session".
+      # Installing needs no auth. continue-on-error: a registry hiccup must not
+      # fail a release; the check then reports SKIPPED instead.
+      - name: Install a real coding agent (Windows shim fidelity)
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        run: npm install -g @anthropic-ai/claude-code
+
       - name: Smoke-launch the packaged app
         if: runner.os != 'Linux'
         shell: bash

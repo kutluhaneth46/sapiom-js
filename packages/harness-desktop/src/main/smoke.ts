@@ -176,6 +176,40 @@ async function checkNodePty(): Promise<string> {
 }
 
 /**
+ * Can we resolve a REAL npm-generated agent shim?
+ *
+ * The session-create check spawns a stub shim that we wrote ourselves — which
+ * proves the mechanism but validates our own assumption about npm's shim format.
+ * If a real `claude.cmd` is shaped differently than resolveSpawnTarget's parser
+ * expects, that check passes while every real user still fails. This closes the
+ * loop: CI installs Claude Code for real (installing needs no auth) and we assert
+ * the actual file on disk resolves to an interpreter plus a script.
+ *
+ * Windows-only by nature — POSIX spawns the binary directly, so there is no shim
+ * to see through. Skips rather than fails when no agent is installed, so the
+ * check is meaningful where it runs and silent where it can't.
+ */
+async function checkAgentShim(): Promise<string> {
+  if (process.platform !== "win32") {
+    return "SKIPPED — Windows-only (POSIX spawns the agent binary directly)";
+  }
+  let target;
+  try {
+    target = resolveSpawnTarget("claude", ["--version"]);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    // No agent on this runner is a skip. A shim we cannot parse is a FAILURE —
+    // that is the whole point of this check.
+    if (/not found on PATH/i.test(message)) return "SKIPPED — no agent installed on this runner";
+    throw err;
+  }
+  if (/\.(cmd|bat)$/i.test(target.command)) {
+    throw new Error(`resolved to a shim CreateProcess cannot execute: ${target.command}`);
+  }
+  return `real npm shim resolves to ${path.basename(target.command)} + ${path.basename(target.args[0] ?? "?")}`;
+}
+
+/**
  * Create a REAL session through the REAL server: POST /api/sessions, which
  * scaffolds/binds the workspace and spawns the agent in a pty. This is the step
  * a user hits when they click "Start session" or "Use template" — both funnel
@@ -291,6 +325,7 @@ export async function runSmokeChecks(boot: BootResult): Promise<SmokeCheck[]> {
       return "/api rejects a request with no boot token";
     }),
     await check("session-create", () => checkSessionCreate(base, token)),
+    await check("agent-shim", checkAgentShim),
     await check("preload-bridge", checkPreloadBridge),
     await check("node-pty", checkNodePty),
     await check("unpacked-deps", checkUnpackedDeps),
@@ -307,10 +342,19 @@ export async function runSmokeChecks(boot: BootResult): Promise<SmokeCheck[]> {
  */
 export function reportSmoke(checks: SmokeCheck[]): number {
   const failed = checks.filter((c) => !c.ok);
+  // A skip is NOT a pass. Labelling it "PASS" would hide the case this matters
+  // most in: the Windows agent install failing, `agent-shim` skipping, and the
+  // log claiming full coverage it didn't have. Skips don't fail the run, but they
+  // are visibly distinct.
+  const isSkip = (c: SmokeCheck): boolean => c.ok && c.detail.startsWith("SKIPPED");
+  const skipped = checks.filter(isSkip);
+  const passed = checks.filter((c) => c.ok && !isSkip(c));
+
   const lines = [
-    ...checks.map((c) => `[smoke] ${c.ok ? "PASS" : "FAIL"} ${c.name} — ${c.detail}`),
+    ...checks.map((c) => `[smoke] ${!c.ok ? "FAIL" : isSkip(c) ? "SKIP" : "PASS"} ${c.name} — ${c.detail}`),
     failed.length === 0
-      ? `[smoke] OK — ${checks.length}/${checks.length} checks passed`
+      ? `[smoke] OK — ${passed.length} passed` +
+        (skipped.length ? `, ${skipped.length} skipped (${skipped.map((c) => c.name).join(", ")})` : "")
       : `[smoke] FAILED — ${failed.length}/${checks.length}: ${failed.map((c) => c.name).join(", ")}`,
   ];
   for (const line of lines) console.log(line);
