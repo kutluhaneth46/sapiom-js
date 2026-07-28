@@ -9,7 +9,7 @@
     "email": "team@sapiom.ai"
   },
   "type": "module",
-  "main": "./dist/main/index.js",
+  "main": "./dist/main/bootstrap.cjs",
   "scripts": {
     "build": "tsc -p tsconfig.build.json && node scripts/copy-renderer.mjs",
     "dev": "pnpm run build && electron . --dev",

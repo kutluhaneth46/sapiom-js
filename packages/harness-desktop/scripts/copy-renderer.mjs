@@ -53,6 +53,11 @@ for (const file of ["setup.html", "setup.css"]) {
   await cp(join(srcDir, file), join(outDir, file));
 }
 
+// The CommonJS entry point. tsc does not emit .cjs files, so the build copies it:
+// Electron cannot load an ESM main on Windows (exit 3, before any logging), and
+// this hands off to ./index.js via import(). See src/main/bootstrap.cjs.
+await cp(join(root, "src", "main", "bootstrap.cjs"), join(root, "dist", "main", "bootstrap.cjs"));
+
 // Flattened on the way out (no themes/ subdir) so setup.html's CSP-safe
 // same-origin <link href="./…"> stays a single flat directory.
 const { dir: dsDir, seam } = resolveDesignSystemDir();
