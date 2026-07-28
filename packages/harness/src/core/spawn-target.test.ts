@@ -112,6 +112,35 @@ describe("resolveSpawnTarget", () => {
     expect(target.args).toEqual(["-v"]);
   });
 
+  it("prefers claude.cmd over the extensionless sh script npm installs beside it", () => {
+    // The exact shape that failed on a user's machine: the harness passed the
+    // ABSOLUTE, extensionless path `…\npm-global\claude`. npm installs three
+    // files — claude.cmd, claude.ps1 and an extensionless `claude` (a POSIX sh
+    // script for Git Bash). Trying the literal name first found that sh script,
+    // which Windows cannot execute, and we refused to spawn while claude.cmd sat
+    // next to it. CreateProcess and `where` both prefer PATHEXT; so must we.
+    const deps = windowsWithNpmShim({ "C:\\npm\\claude": "#!/bin/sh\nexec node …\n" });
+    const target = resolveSpawnTarget("C:\\npm\\claude", ["--settings", "C:\\s.json"], deps);
+    expect(target.command.toLowerCase()).toBe("c:\\nodejs\\node.exe");
+    expect(target.args).toEqual([
+      "C:\\npm\\node_modules\\@anthropic-ai\\claude-code\\cli.js",
+      "--settings",
+      "C:\\s.json",
+    ]);
+  });
+
+  it("reads a shim whose script reference omits the %dp0% prefix", () => {
+    // Shim text varies by npm version and package manager; the existence check is
+    // what keeps the looser match honest.
+    const deps = windowsWithNpmShim({
+      "C:\\npm\\claude.cmd":
+        '@ECHO off\r\n"%_prog%" "node_modules\\@anthropic-ai\\claude-code\\cli.js" %*\r\n',
+    });
+    expect(resolveSpawnTarget("claude", [], deps).args[0]).toBe(
+      "C:\\npm\\node_modules\\@anthropic-ai\\claude-code\\cli.js",
+    );
+  });
+
   it("refuses a shim it cannot read, rather than falling back to a shell", () => {
     // A pnpm/yarn/hand-written shim we don't understand. Failing loudly is the
     // point: a cmd.exe fallback here would reintroduce the injection path.

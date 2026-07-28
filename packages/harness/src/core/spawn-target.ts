@@ -64,10 +64,26 @@ function hasExtension(file: string, extensions: readonly string[]): boolean {
   return extensions.some((ext) => lower.endsWith(ext));
 }
 
-/** Windows' own lookup rules: the literal name first, then each PATHEXT. */
+/**
+ * Windows' own lookup rules: PATHEXT variants take precedence over a literal
+ * extensionless name.
+ *
+ * This ordering is the whole ballgame. npm installs THREE files for a CLI —
+ * `claude.cmd`, `claude.ps1`, and an extensionless `claude` (a POSIX sh script,
+ * there for Git Bash). Trying the literal name first finds that sh script, which
+ * Windows cannot execute and which is not a shim we can read — so we'd refuse to
+ * spawn while `claude.cmd` sat right next to it. `CreateProcess` and `where`
+ * both prefer PATHEXT, so we must too.
+ */
 function findOnPath(command: string, deps: Required<Pick<SpawnTargetDeps, "env" | "fileExists">>): string | null {
   const pathExt = (deps.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean);
-  const candidates = (base: string): string[] => [base, ...pathExt.map((ext) => base + ext)];
+  const candidates = (base: string): string[] => {
+    const lower = base.toLowerCase();
+    // Already carries an extension we know how to handle: use it as given.
+    if ([...DIRECTLY_EXECUTABLE, ...SHIM_EXTENSIONS].some((ext) => lower.endsWith(ext))) return [base];
+    // Otherwise PATHEXT first, the bare name only as a last resort.
+    return [...pathExt.map((ext) => base + ext), base];
+  };
 
   // An explicit path (absolute, or containing a separator) is not PATH-searched.
   if (win32.isAbsolute(command) || /[\\/]/.test(command)) {
@@ -103,12 +119,21 @@ function readShimTarget(
     return null;
   }
 
-  const scriptRef = /"%~?dp0%?\\([^"]+\.[cm]?js)"/i.exec(contents);
-  if (!scriptRef?.[1]) return null;
-
   const shimDir = win32.dirname(shim);
-  const script = win32.join(shimDir, scriptRef[1]);
-  if (!deps.fileExists(script)) return null;
+
+  // Two passes rather than one, because shim text varies by npm version (and by
+  // package manager): first the canonical `"%dp0%\…\cli.js"` form, then ANY quoted
+  // .js/.cjs/.mjs token resolved relative to the shim. The existence check is what
+  // keeps the looser pass honest — a path that isn't there isn't the target.
+  const candidateScripts = [
+    ...[...contents.matchAll(/"%~?dp0%?[\\/]([^"]+\.[cm]?js)"/gi)].map((m) => m[1]),
+    ...[...contents.matchAll(/"([^"]+\.[cm]?js)"/gi)].map((m) => m[1]?.replace(/^%~?dp0%?[\\/]/i, "")),
+  ];
+  const script = candidateScripts
+    .filter((rel): rel is string => Boolean(rel))
+    .map((rel) => (win32.isAbsolute(rel) ? rel : win32.join(shimDir, rel)))
+    .find(deps.fileExists);
+  if (!script) return null;
 
   // npm prefers a node.exe sitting next to the shim; otherwise PATH's node.
   const adjacentNode = win32.join(shimDir, "node.exe");
