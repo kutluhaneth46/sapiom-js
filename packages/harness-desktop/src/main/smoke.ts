@@ -24,9 +24,11 @@
  * Exit code is 0 only if every check passes; each result is printed as one line
  * so a CI log shows exactly which layer broke.
  */
-import { existsSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
+import { tmpdir } from "node:os";
 import * as path from "node:path";
+import { resolveSpawnTarget } from "@sapiom/harness";
 import { createSetupWindow } from "./windows.js";
 import { resolveWebDir } from "./paths.js";
 import type { BootResult } from "./boot.js";
@@ -123,23 +125,93 @@ async function checkPreloadBridge(): Promise<string> {
 /**
  * node-pty is the only native module and the one thing that has to be rebuilt
  * against Electron's ABI per platform. Loading it proves the rebuild; spawning
- * a trivial process proves the unpacked spawn-helper is present and executable.
- * Uses the OS's own shell, so this needs no coding agent installed.
+ * proves the unpacked spawn-helper is present and executable.
+ *
+ * Deliberately spawns a SCRIPT (`.cmd` on Windows, a `#!/bin/sh` file elsewhere)
+ * rather than the OS shell binary, and routes it through the harness's own
+ * `resolveSpawnTarget` — because a coding agent installed by npm IS a script
+ * (`claude.cmd`), and that is the case that broke. Spawning `cmd.exe` directly
+ * passed happily on Windows while every real session failed with
+ * `Cannot create process, error code: 2`: CreateProcess does no PATHEXT lookup
+ * and cannot execute a .cmd. This check now exercises the same path a session
+ * does, still without needing an agent installed.
  */
 async function checkNodePty(): Promise<string> {
   const pty = (await import("node-pty")) as typeof import("node-pty");
   const isWindows = process.platform === "win32";
-  const [file, args] = isWindows ? ["cmd.exe", ["/c", "exit", "0"]] : ["/bin/sh", ["-c", "exit 0"]];
-  const proc = pty.spawn(file, args, { cwd: process.cwd(), env: process.env as Record<string, string> });
-  const code = await new Promise<number>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("pty process did not exit in 10s")), 10_000);
-    proc.onExit(({ exitCode }) => {
-      clearTimeout(timer);
-      resolve(exitCode);
+
+  const dir = mkdtempSync(path.join(tmpdir(), "sapiom-smoke-pty-"));
+  // A bare stand-in for the agent: same shape (a script on PATHEXT/shebang),
+  // none of the weight.
+  const script = path.join(dir, isWindows ? "agent-probe.cmd" : "agent-probe.sh");
+  writeFileSync(script, isWindows ? "@echo off\r\nexit /b 0\r\n" : "#!/bin/sh\nexit 0\n");
+  if (!isWindows) chmodSync(script, 0o755);
+
+  try {
+    const target = resolveSpawnTarget(script, []);
+    const proc = pty.spawn(target.command, target.args, {
+      cwd: dir,
+      env: process.env as Record<string, string>,
     });
-  });
-  if (code !== 0) throw new Error(`pty child exited ${code}`);
-  return `spawned ${file} via node-pty, exit 0`;
+    const code = await new Promise<number>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("pty process did not exit in 10s")), 10_000);
+      proc.onExit(({ exitCode }) => {
+        clearTimeout(timer);
+        resolve(exitCode);
+      });
+    });
+    if (code !== 0) throw new Error(`pty child exited ${code}`);
+    return `spawned ${path.basename(script)} via node-pty (as ${target.command}), exit 0`;
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Create a REAL session through the REAL server: POST /api/sessions, which
+ * scaffolds/binds the workspace and spawns the agent in a pty. This is the step
+ * a user hits when they click "Start session" or "Use template" — both funnel
+ * through this one endpoint — and it is where Windows failed with a 500
+ * (`Cannot create process, error code: 2`) while every test tier stayed green:
+ * the mock-mode e2e never reaches a server, the integration tests inject a fake
+ * pty spawner, and CI ran the real thing on Linux only.
+ *
+ * Needs no coding agent installed: smoke.sh writes a stub script and boot.ts
+ * points the claude-code adapter at it (SAPIOM_SMOKE_STUB_AGENT), so the whole
+ * path — HTTP, session record, pty spawn — is exercised for real on every OS.
+ * Skipped, loudly, if the stub wasn't provided rather than silently passing.
+ */
+async function checkSessionCreate(base: string, token: string | null): Promise<string> {
+  if (!token) throw new Error("boot url carried no token");
+  const stub = process.env.SAPIOM_SMOKE_STUB_AGENT;
+  if (!stub) return "SKIPPED — no SAPIOM_SMOKE_STUB_AGENT (run via scripts/smoke.sh)";
+
+  const cwd = mkdtempSync(path.join(tmpdir(), "sapiom-smoke-ws-"));
+  try {
+    const res = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "X-Harness-Token": token, "content-type": "application/json" },
+      body: JSON.stringify({ cwd, harness: "claude-code" }),
+    });
+    const body = await res.text();
+    if (res.status !== 201) {
+      throw new Error(`POST /api/sessions → ${res.status}: ${body.slice(0, 200)}`);
+    }
+    const session = JSON.parse(body) as { id?: string; status?: string; cwd?: string };
+    if (!session.id) throw new Error(`no session id in response: ${body.slice(0, 120)}`);
+
+    // The record must be visible in state too — a session that spawned but never
+    // registered would leave the UI with nothing to attach to.
+    const state = (await (
+      await fetch(`${base}/api/state`, { headers: { "X-Harness-Token": token } })
+    ).json()) as { sessions?: Array<{ id: string; status?: string }> };
+    const found = state.sessions?.find((s) => s.id === session.id);
+    if (!found) throw new Error(`session ${session.id} missing from /api/state`);
+
+    return `spawned a session in ${path.basename(cwd)} (status ${found.status ?? session.status ?? "?"})`;
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
 }
 
 /**
@@ -201,6 +273,7 @@ export async function runSmokeChecks(boot: BootResult): Promise<SmokeCheck[]> {
       await fetchOk(`${base}/api/state`, null, 401);
       return "/api rejects a request with no boot token";
     }),
+    await check("session-create", () => checkSessionCreate(base, token)),
     await check("preload-bridge", checkPreloadBridge),
     await check("node-pty", checkNodePty),
     await check("unpacked-deps", checkUnpackedDeps),

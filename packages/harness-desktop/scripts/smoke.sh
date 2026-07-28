@@ -20,6 +20,22 @@ mkdir -p "$smoke_home/project"
 export HOME="$smoke_home" USERPROFILE="$smoke_home" APPDATA="$smoke_home/AppData"
 export SAPIOM_LAUNCH_DIR="$smoke_home/project"
 export SAPIOM_SMOKE_OUT="$smoke_home/smoke.txt"
+
+# A stand-in for the coding agent, so the smoke run can create a REAL session
+# (POST /api/sessions → pty spawn) on a machine with no agent installed. It is
+# deliberately a SCRIPT, not an .exe: npm installs `claude.cmd` on Windows, and
+# spawning that is what failed there — CreateProcess does no PATHEXT lookup and
+# cannot execute a .cmd. A stub that was an .exe would pass while the real thing
+# broke. It just idles briefly so the session is genuinely running.
+if [ "$(uname -s)" != "Linux" ] && [ "$(uname -s)" != "Darwin" ]; then
+  stub="$smoke_home/stub-agent.cmd"
+  printf '@echo off\r\nping -n 4 127.0.0.1 >nul\r\nexit /b 0\r\n' > "$stub"
+else
+  stub="$smoke_home/stub-agent.sh"
+  printf '#!/bin/sh\nsleep 3\nexit 0\n' > "$stub"
+  chmod +x "$stub"
+fi
+export SAPIOM_SMOKE_STUB_AGENT="$stub"
 # CI is not a user.
 export SAPIOM_TELEMETRY_DISABLED=1
 # Windows: makes Electron log rather than swallow.
