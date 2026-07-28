@@ -249,12 +249,11 @@ jobs:
       # Linux: skipped because the PR job (test.yml → desktop-smoke) already
       # packages and launches it on every pull request. Nothing new to learn.
       #
-      # Windows: skipped because it is KNOWN broken — the packaged app exits 3
-      # before running any of its own code (this gate is what found that), so a
-      # run here only adds a guaranteed red X to every release build. Re-enable
-      # by widening this condition once the launch bug is fixed (Phase 6);
-      # until then Windows genuinely has no launch coverage, which is accurate
-      # rather than hidden.
+      # Windows: re-enabled. It was skipped while the packaged app exited 3
+      # before running any of its own code — a guaranteed red X on every build.
+      # That is fixed (win.asar: false; an ESM entry cannot load from inside
+      # app.asar on Windows), so the gate is back on and Windows has real launch
+      # coverage again.
       #
       # macOS: kept, and not redundant with the PR job, for two reasons — the PR
       # job cannot build a macOS app at all (it needs its own runner), and the
@@ -264,7 +263,7 @@ jobs:
       # spawn-helper is the classic case), so "it ran unsigned in the PR" is not
       # evidence that the notarized .dmg a tester downloads will run.
       - name: Smoke-launch the packaged app
-        if: runner.os == 'macOS'
+        if: runner.os != 'Linux'
         shell: bash
         run: packages/harness-desktop/scripts/smoke.sh
 
