@@ -210,7 +210,16 @@ async function checkSessionCreate(base: string, token: string | null): Promise<s
 
     return `spawned a session in ${path.basename(cwd)} (status ${found.status ?? session.status ?? "?"})`;
   } finally {
-    rmSync(cwd, { recursive: true, force: true });
+    // Best-effort ONLY, and deliberately so: this directory is the live pty's
+    // cwd, and Windows refuses to delete a directory that is a running
+    // process's current directory. A throw here would fail the very check it is
+    // cleaning up after — reporting a Windows bug that doesn't exist. The
+    // server's own shutdown kills the pty, and the OS reclaims its temp dir.
+    try {
+      rmSync(cwd, { recursive: true, force: true });
+    } catch {
+      /* the pty still holds it; nothing to do and nothing worth reporting */
+    }
   }
 }
 
