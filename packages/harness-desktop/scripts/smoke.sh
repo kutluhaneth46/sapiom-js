@@ -78,6 +78,11 @@ case "$(uname -s)" in
     echo "--- windows startup probes ---"
     ELECTRON_RUN_AS_NODE=1 "$exe_probe" -e "console.log('runtime ok:', process.versions.node)" 2>&1 | head -3
     echo "app dir contents:"; ls "$app_dir" 2>&1 | head -6
+    # Is the entry Electron is told to load actually IN the package? A missing
+    # bootstrap.cjs and an unloadable one look identical from outside (exit 3,
+    # no output), so distinguish them before theorising further.
+    echo "packaged main:"; grep -o '"main":[^,]*' "$app_dir/package.json" 2>&1 | head -1
+    echo "dist/main contents:"; ls "$app_dir/dist/main" 2>&1 | head -8
     echo "harness package present:"; ls "$app_dir/node_modules/@sapiom/harness/package.json" 2>&1 | head -2
     # The decisive one: load our own entry the way Electron would and print the
     # real error instead of a bare exit code. `require('electron')` will fail
