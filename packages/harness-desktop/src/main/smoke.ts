@@ -141,11 +141,19 @@ async function checkNodePty(): Promise<string> {
   const isWindows = process.platform === "win32";
 
   const dir = mkdtempSync(path.join(tmpdir(), "sapiom-smoke-pty-"));
-  // A bare stand-in for the agent: same shape (a script on PATHEXT/shebang),
-  // none of the weight.
+  // Shaped like the real thing: on Windows an npm shim (a `.cmd` that runs
+  // `node <script>`), which is what `claude.cmd` is and what resolveSpawnTarget
+  // must see through; elsewhere a shebang script. Spawning `cmd.exe`/`/bin/sh`
+  // directly — as this check used to — passed on Windows while every real
+  // session failed, because those are executable images and an agent is not.
   const script = path.join(dir, isWindows ? "agent-probe.cmd" : "agent-probe.sh");
-  writeFileSync(script, isWindows ? "@echo off\r\nexit /b 0\r\n" : "#!/bin/sh\nexit 0\n");
-  if (!isWindows) chmodSync(script, 0o755);
+  if (isWindows) {
+    writeFileSync(path.join(dir, "agent-probe.js"), "process.exit(0);\n");
+    writeFileSync(script, '@echo off\r\n"%dp0%\\node.exe" "%dp0%\\agent-probe.js" %*\r\n');
+  } else {
+    writeFileSync(script, "#!/bin/sh\nexit 0\n");
+    chmodSync(script, 0o755);
+  }
 
   try {
     const target = resolveSpawnTarget(script, []);

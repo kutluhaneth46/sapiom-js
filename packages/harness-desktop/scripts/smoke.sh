@@ -28,8 +28,13 @@ export SAPIOM_SMOKE_OUT="$smoke_home/smoke.txt"
 # cannot execute a .cmd. A stub that was an .exe would pass while the real thing
 # broke. It just idles briefly so the session is genuinely running.
 if [ "$(uname -s)" != "Linux" ] && [ "$(uname -s)" != "Darwin" ]; then
+  # Shaped like an npm shim on purpose — a `.cmd` that runs `node <script>` — because
+  # that is exactly what `claude.cmd` is, and it's the shape resolveSpawnTarget has
+  # to see through. A stub that were a plain .cmd (or an .exe) would exercise a path
+  # real agents never take, and is now correctly refused rather than shelled out.
   stub="$smoke_home/stub-agent.cmd"
-  printf '@echo off\r\nping -n 4 127.0.0.1 >nul\r\nexit /b 0\r\n' > "$stub"
+  printf 'setTimeout(() => process.exit(0), 3000);\n' > "$smoke_home/stub-agent.js"
+  printf '@echo off\r\n"%%dp0%%\\node.exe" "%%dp0%%\\stub-agent.js" %%*\r\n' > "$stub"
 else
   stub="$smoke_home/stub-agent.sh"
   printf '#!/bin/sh\nsleep 3\nexit 0\n' > "$stub"
