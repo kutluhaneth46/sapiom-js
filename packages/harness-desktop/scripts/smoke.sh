@@ -83,10 +83,22 @@ case "$(uname -s)" in
     # real error instead of a bare exit code. `require('electron')` will fail
     # under RUN_AS_NODE — that failure is EXPECTED and tells us the module graph
     # itself resolved; anything else (ERR_MODULE_NOT_FOUND, SyntaxError) is the bug.
-    ELECTRON_RUN_AS_NODE=1 "$exe_probe" -e "
-      const url = require('url').pathToFileURL('$app_dir/dist/main/index.js'.replace(/\\\\/g,'/')).href;
-      import(url).then(() => console.log('entry imported cleanly')).catch((e) => console.log('IMPORT ERROR:', e.code || e.name, '|', String(e.message).split('\n')[0]));
-    " 2>&1 | head -6
+    #
+    # Run FROM the app dir with a relative specifier: `$app_dir` here is a git-bash
+    # path (/d/a/…), and handing that to pathToFileURL produced "D:\d\a\…" — the
+    # probe's own bug, diagnosing nothing. A relative import resolves against cwd,
+    # so no path translation is involved at all.
+    exe_abs="$(cd "$(dirname "$exe_probe")" && pwd)/Sapiom.exe"
+    ( cd "$app_dir" && ELECTRON_RUN_AS_NODE=1 "$exe_abs" -e "
+        import('./node_modules/@sapiom/harness/dist/index.js')
+          .then(() => console.log('harness index: loaded'))
+          .catch((e) => console.log('harness index FAILED:', e.code || e.name, '|', String(e.message).split('\n')[0]));
+      " 2>&1 | head -4 )
+    ( cd "$app_dir" && ELECTRON_RUN_AS_NODE=1 "$exe_abs" -e "
+        import('./dist/main/index.js')
+          .then(() => console.log('entry imported cleanly'))
+          .catch((e) => console.log('ENTRY FAILED:', e.code || e.name, '|', String(e.message).split('\n')[0]));
+      " 2>&1 | head -6 )
     echo "--- end probes ---"
 
     # The nsis .exe is an installer; smoke the unpacked app it installs.
