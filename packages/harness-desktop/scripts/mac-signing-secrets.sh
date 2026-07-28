@@ -19,7 +19,10 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cert_dir="$here/../.cert"
+# Overridable so the certificate material can live outside the repo, and so this
+# script's success path can be exercised against a throwaway cert without
+# touching the real .cert/ directory.
+cert_dir="${SAPIOM_CERT_DIR:-$here/../.cert}"
 key="$cert_dir/devid.key"
 
 die() { echo "error: $*" >&2; exit 1; }
@@ -68,7 +71,10 @@ echo "expires     : $(openssl x509 -inform DER -in "$cer" -noout -enddate | cut 
 # without it the archive uses AES-256, which macOS's keychain refuses to import.
 p12="$cert_dir/devid.p12"
 pem="$cert_dir/.cert.pem.tmp"
-p12_password="$(openssl rand -base64 24)"
+# Exported, not interpolated: openssl reads it via `env:` below so the password
+# never appears in argv, where `ps` would expose it to any other local user
+# for the duration of the call.
+export P12_PASSWORD="$(openssl rand -base64 24)"
 trap 'rm -f "$pem"' EXIT
 
 openssl x509 -inform DER -in "$cer" -out "$pem"
@@ -77,15 +83,23 @@ openssl pkcs12 -export -legacy \
   -inkey "$key" \
   -in "$pem" \
   -name "Sapiom Developer ID Application" \
-  -passout pass:"$p12_password"
+  -passout env:P12_PASSWORD
 chmod 600 "$p12"
-echo "wrote       : $p12 (gitignored)"
+
+# Read the archive back BEFORE it becomes a secret. A .p12 that is unreadable or
+# carries no private key still uploads fine and then fails in CI minutes later
+# with a cryptic codesign error — and by then the useless value is already stored.
+verify_subject="$(openssl pkcs12 -in "$p12" -nokeys -legacy -passin env:P12_PASSWORD 2>/dev/null | openssl x509 -noout -subject 2>/dev/null || true)"
+[ "$verify_subject" = "$subject" ] || die "the .p12 does not read back as the certificate it was built from"
+openssl pkcs12 -in "$p12" -nocerts -nodes -legacy -passin env:P12_PASSWORD >/dev/null 2>&1 ||
+  die "the .p12 contains no private key"
+echo "wrote       : $p12 (gitignored, verified readable with a private key)"
 
 command -v gh >/dev/null || die "gh CLI not found — cannot set secrets"
 
 # Nothing sensitive is echoed: values go to gh over stdin.
 base64 -w0 "$p12" | gh secret set CSC_LINK
-printf '%s' "$p12_password" | gh secret set CSC_KEY_PASSWORD
+printf '%s' "$P12_PASSWORD" | gh secret set CSC_KEY_PASSWORD
 printf '%s' "$team_id" | gh secret set APPLE_TEAM_ID
 echo "set secrets : CSC_LINK, CSC_KEY_PASSWORD, APPLE_TEAM_ID"
 
@@ -101,8 +115,13 @@ if [ -n "${APPLE_APP_SPECIFIC_PASSWORD:-}" ]; then
 fi
 
 echo
-echo "Remaining, if not listed above:"
-echo "  gh secret set APPLE_ID                       # the Apple ID email on the developer account"
-echo "  gh secret set APPLE_APP_SPECIFIC_PASSWORD    # appleid.apple.com → Sign-In and Security"
-echo
+if [ -z "${APPLE_ID:-}" ] || [ -z "${APPLE_APP_SPECIFIC_PASSWORD:-}" ]; then
+  echo "Still needed for NOTARIZATION (signing alone works without them, but the"
+  echo "first launch still shows a Gatekeeper prompt):"
+  [ -n "${APPLE_ID:-}" ] || echo "  gh secret set APPLE_ID                     # Apple ID email on the developer account"
+  [ -n "${APPLE_APP_SPECIFIC_PASSWORD:-}" ] || echo "  gh secret set APPLE_APP_SPECIFIC_PASSWORD  # appleid.apple.com → Sign-In and Security"
+  echo
+else
+  echo "All signing + notarization secrets are set."
+fi
 echo "Then tag to ship:  git tag harness-desktop-v0.1.0 && git push origin harness-desktop-v0.1.0"
