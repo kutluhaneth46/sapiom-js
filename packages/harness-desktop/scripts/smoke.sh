@@ -12,14 +12,32 @@ set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 rel="${SMOKE_RELEASE_DIR:-$here/../release}"
 
+smoke_home="$(mktemp -d)"
+mkdir -p "$smoke_home/project" "$smoke_home/AppData"
+
+# The app is a NATIVE process, so every path handed to it must be native too.
+# git-bash's mktemp returns a POSIX path (/tmp/tmp.XXXX) with no drive letter, and
+# Windows cannot use it: exporting that as APPDATA made Electron fail while
+# creating its userData directory — before logging existed — which is the "exit 3
+# with no output on any channel" we spent several CI rounds chasing. It was this
+# script breaking the app, not the app. `cygpath -w` converts; a no-op elsewhere.
+native() {
+  case "$(uname -s)" in
+    MINGW* | MSYS* | CYGWIN*) cygpath -w "$1" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+app_home="$(native "$smoke_home")"
+
 # Never touch the developer's (or the runner's) real state: ~/.sapiom is shared
 # with the npx CLI. HOME covers POSIX, USERPROFILE+APPDATA cover Windows
 # (os.homedir and Electron's userData read those).
-smoke_home="$(mktemp -d)"
-mkdir -p "$smoke_home/project"
-export HOME="$smoke_home" USERPROFILE="$smoke_home" APPDATA="$smoke_home/AppData"
-export SAPIOM_LAUNCH_DIR="$smoke_home/project"
-export SAPIOM_SMOKE_OUT="$smoke_home/smoke.txt"
+export HOME="$app_home" USERPROFILE="$app_home" APPDATA="$(native "$smoke_home/AppData")"
+export SAPIOM_LAUNCH_DIR="$(native "$smoke_home/project")"
+# Two forms of the report path: the app writes to the native one, this script
+# reads the POSIX one.
+report_file="$smoke_home/smoke.txt"
+export SAPIOM_SMOKE_OUT="$(native "$report_file")"
 
 # A stand-in for the coding agent, so the smoke run can create a REAL session
 # (POST /api/sessions → pty spawn) on a machine with no agent installed. It is
@@ -40,7 +58,9 @@ else
   printf '#!/bin/sh\nsleep 3\nexit 0\n' > "$stub"
   chmod +x "$stub"
 fi
-export SAPIOM_SMOKE_STUB_AGENT="$stub"
+# Native, because resolveSpawnTarget resolves this inside the app: a POSIX
+# path has no drive letter, so the Windows lookup would never find it.
+export SAPIOM_SMOKE_STUB_AGENT="$(native "$stub")"
 # CI is not a user.
 export SAPIOM_TELEMETRY_DISABLED=1
 # Windows: makes Electron log rather than swallow.
@@ -68,44 +88,6 @@ case "$(uname -s)" in
     "$rel"/mac-arm64/Sapiom.app/Contents/MacOS/Sapiom --smoke || status=$?
     ;;
   MINGW* | MSYS* | CYGWIN*)
-    # TEMPORARY (Phase 6): the Windows app exits 3 with no output on any channel,
-    # even redirected — so before launching it, ask the bundled runtime what it can
-    # and cannot load. Exit 3 is Node's "Internal JavaScript Parse Failure", i.e. a
-    # module that fails before our code runs, and these probes name which one.
-    # Remove once Windows launches.
-    exe_probe="$rel/win-unpacked/Sapiom.exe"
-    app_dir="$rel/win-unpacked/resources/app"
-    echo "--- windows startup probes ---"
-    ELECTRON_RUN_AS_NODE=1 "$exe_probe" -e "console.log('runtime ok:', process.versions.node)" 2>&1 | head -3
-    echo "app dir contents:"; ls "$app_dir" 2>&1 | head -6
-    # Is the entry Electron is told to load actually IN the package? A missing
-    # bootstrap.cjs and an unloadable one look identical from outside (exit 3,
-    # no output), so distinguish them before theorising further.
-    echo "packaged main:"; grep -o '"main":[^,]*' "$app_dir/package.json" 2>&1 | head -1
-    echo "dist/main contents:"; ls "$app_dir/dist/main" 2>&1 | head -8
-    echo "harness package present:"; ls "$app_dir/node_modules/@sapiom/harness/package.json" 2>&1 | head -2
-    # The decisive one: load our own entry the way Electron would and print the
-    # real error instead of a bare exit code. `require('electron')` will fail
-    # under RUN_AS_NODE — that failure is EXPECTED and tells us the module graph
-    # itself resolved; anything else (ERR_MODULE_NOT_FOUND, SyntaxError) is the bug.
-    #
-    # Run FROM the app dir with a relative specifier: `$app_dir` here is a git-bash
-    # path (/d/a/…), and handing that to pathToFileURL produced "D:\d\a\…" — the
-    # probe's own bug, diagnosing nothing. A relative import resolves against cwd,
-    # so no path translation is involved at all.
-    exe_abs="$(cd "$(dirname "$exe_probe")" && pwd)/Sapiom.exe"
-    ( cd "$app_dir" && ELECTRON_RUN_AS_NODE=1 "$exe_abs" -e "
-        import('./node_modules/@sapiom/harness/dist/index.js')
-          .then(() => console.log('harness index: loaded'))
-          .catch((e) => console.log('harness index FAILED:', e.code || e.name, '|', String(e.message).split('\n')[0]));
-      " 2>&1 | head -4 )
-    ( cd "$app_dir" && ELECTRON_RUN_AS_NODE=1 "$exe_abs" -e "
-        import('./dist/main/index.js')
-          .then(() => console.log('entry imported cleanly'))
-          .catch((e) => console.log('ENTRY FAILED:', e.code || e.name, '|', String(e.message).split('\n')[0]));
-      " 2>&1 | head -6 )
-    echo "--- end probes ---"
-
     # The nsis .exe is an installer; smoke the unpacked app it installs.
     # REDIRECTED to a file, not inherited: a GUI-subsystem exe cannot attach to
     # an existing console (piping loses everything) but its handles redirect to a
@@ -121,9 +103,9 @@ case "$(uname -s)" in
     ;;
 esac
 
-if [ -f "$SAPIOM_SMOKE_OUT" ]; then
+if [ -f "$report_file" ]; then
   echo "--- smoke report ---"
-  cat "$SAPIOM_SMOKE_OUT"
+  cat "$report_file"
 elif [ "$status" -ne 0 ]; then
   # No file AND a bad exit: the app died before it could report — which is the
   # one case where the exit code is all we have (see the Windows exit-3 bug).
