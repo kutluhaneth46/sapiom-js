@@ -9,7 +9,7 @@ The path is five steps:
 
 1. **[Develop](#1-develop)** — write the agent and its manifest in a new directory.
 2. **[Build & test](#2-build--test)** — compile it, trace a run for free, and validate the files.
-3. **[Categorize](#3-categorize)** — set its category, cadence, and step kinds.
+3. **[Categorize](#3-categorize)** — set its category, cadence, complexity, and step kinds.
 4. **[Write the copy](#4-write-the-copy)** — the words a user reads. This is most of the work.
 5. **[Submit](#5-submit)** — open a PR; once merged, Sapiom picks it up automatically.
 
@@ -54,11 +54,15 @@ authors don't need this — the published `@sapiom/*` versions are enough.
    whole graph locally and traces every step without spending anything, so you can watch the
    flow before you deploy. The lifecycle is `check → run_local → link → deploy → run`; each
    template's `README.md` shows it.
-3. **Validate the registry.** Run `pnpm examples:check` from the repo root. It checks that
-   `registry.json` matches the schema (including a valid `category`, `cadence`, and step
-   `kind`), is sorted by `id`, that every `sourcePath` points at a real directory with a
-   `template.json`, and that any `checkpoint` is a single genuine human gate. Run
-   `pnpm examples:sort` first to put your entry in order.
+3. **Validate the registry and your manifest.** Run `pnpm examples:check` from the repo root.
+   It checks that `registry.json` matches the schema (including a valid `category`, `cadence`,
+   `complexity`, and step `kind`), is sorted by `id`, that every `sourcePath` points at a real
+   directory with a `template.json`, that any `checkpoint` is a single genuine human gate, that
+   your `complexity` doesn't sit 2+ bands from the one derived from your declared shape, and
+   that **each `template.json` matches `template.schema.json`**. The manifest schema is
+   `additionalProperties: false`, so a mistyped field name fails here rather than being
+   silently dropped by the backend parser. Run `pnpm examples:sort` first to put your entry in
+   order.
 4. **Get the capability ids right.** The `capabilities` array and each `steps[].capability`
    must be the exact `ctx.sapiom.*` ids your code actually calls — see
    [Capability ids](#capability-ids-correctness-not-style). The LLM path is `models.run`
@@ -68,8 +72,9 @@ authors don't need this — the published `@sapiom/*` versions are enough.
 
 ## 3. Categorize
 
-Set three things in your `registry.json` entry: one `category`, one `cadence`, and a `kind` on
-every step. They drive how the gallery groups, filters, and describes your template.
+Set four things in your `registry.json` entry: one `category`, one `cadence`, one `complexity`,
+and a `kind` on every step. They drive how the gallery groups, filters, and describes your
+template.
 
 ### `category` — the outcome, not the mechanism
 
@@ -108,6 +113,47 @@ This describes the **entry only**, not what happens mid-run. `wait-for-webhook` 
 you start it, and it pauses for a callback partway through. `pr-review-bot` is `on-webhook`:
 the PR event itself is what starts it.
 
+### `complexity` — how much judgment is in the output
+
+**The axis is variance and judgment, not graph size.** A deterministic saga with a wide
+fan-out is `simple` — `approval-chain` declares seven steps, two durable pauses, a reminder
+loop and a compensation branch, but every branch is a state check and the answer is always
+approve or reject. Two chained model steps are not simple, however short the graph: each one's
+output is the next one's input, so drift compounds and there is no single place to inspect the
+result. Steps, capabilities and fan-out are a **tiebreak**, never the reason for a band.
+
+To pick a band, count the template's **judgment points** — the places where something
+non-deterministic is produced:
+
+- a step with `kind: "llm"` (a model call — `models.run`, `models.coding`),
+- a generated image or video (`content.generation.*`),
+- a capability that synthesizes prose for you, e.g. `web.search`'s `answer` field. It counts
+  even with no `llm` step in the graph, because the user still reads model-written output.
+
+| `complexity` | Use when |
+|---|---|
+| `minimal` | **No judgment points.** Re-run it with the same input and you get the same output. A greeting, a Slack post, a health check. |
+| `simple` | **One judgment point**, and you can read the output and tell at a glance whether it's right. Also: any fully deterministic template whose scaffolding is substantial — durable checkpoints, a compensation branch, several capabilities. |
+| `moderate` | **Two judgment points**, or one whose output then drives structured work — a branch, a database write, a rendered artifact — so a bad generation has a consequence past the text itself. |
+| `involved` | **Three judgment points**, or one to two whose output drives something **irreversible or outward-facing**: mail to a real prospect, SQL against your database, a deployed endpoint, a filed attestation. Checking it means checking each stage. |
+| `advanced` | **Chained judgment** — a model consuming another model's output, or a coding agent whose artifact is then built and deployed. Error compounds across stages. Three or more chained generative stages land here regardless of graph size. |
+
+Then apply the nudge, **at most one band, and only upward**: raise it if the deterministic
+scaffolding around those judgment points is heavy (many distinct capabilities, a resumable
+loop, a saga rollback), or if a judgment point's output drives something you can't take back.
+Don't nudge for step count alone. If two bands still feel equally right, pick the lower one —
+the gallery over-promising difficulty costs a user a template they could have used.
+
+`pnpm examples:check` validates the enum, and warns when your band sits **2+ bands** from the
+score derived from `steps[].kind` and `capabilities`. That gap means one of two things, and
+both want a human: your label is wrong, or your **declared shape** is wrong — a step that
+calls a model but says `kind: "compute"` also draws the wrong glyph in the gallery graph. Fix
+whichever is actually untrue; don't inflate the label to silence the warning.
+
+One band apart is expected and prints as a `note:`, not a warning. That is where the rubric
+and the scorer legitimately disagree — the scorer can't see a synthesizing capability, so
+`web-research-digest` derives `minimal` while its authored band is `simple`. Leave those alone.
+
 ### `kind` and `checkpoint` — what each step is
 
 Set `kind` on every step:
@@ -142,17 +188,37 @@ choosing whether to use your template.
 Two files per template feed the UI. Keep them consistent — the same template, described
 the same way, at two levels of depth.
 
+### House-style limits (`pnpm examples:check` enforces)
+
+The gallery card has finite room, and the rules below are sized from it — a name that wraps the
+title or a use case that can't sit on a chip is a layout bug, not a matter of taste.
+
+| Field | Limit |
+|---|---|
+| `name` | ≤ 32 chars. No `→`, no `/`, no parentheticals, no mechanism word (`saga`, `engine`, `pipeline`, `runner`, `endpoint`, `gate`, `durable`, `keep-alive`, …). |
+| `description` | ≤ 160 chars — one plain sentence. |
+| `whatItDoes` | ≤ 320 chars, and **lead with the verb**. "Create a cited account brief…", not "For turning a…". |
+| `useCases[]` | ≤ 40 chars each — a short noun phrase ("Relationship graph"), not a sentence. |
+
+**Name the outcome, not the machinery.** This is the same rule `category` already follows: the axis
+is *"what am I trying to produce?"* Mechanism words belong in `tags`, which is what drives search —
+putting one in the name doesn't make it more findable, it just spends the title on it.
+
+All 26 templates meet these, so they are hard failures — the lengths come from the schemas
+(`maxLength`, reported with a JSON pointer) and the style rules from the check, which names the
+offending word.
+
 ### `examples/registry.json` — the gallery index (one entry per template)
 
 | Field | Shows up as | Write it as |
 |---|---|---|
-| `name` | Card title, detail H1 | Title Case, human. "Human-in-the-Loop Approval", not the slug. |
+| `name` | Card title, detail H1 | Title Case, human, ≤32 chars. Name the **outcome**: "Approval Before Action", not "Human-in-the-Loop Approval" and not the slug. |
 | `description` | Card subtitle, detail subtitle | **One sentence.** What it does, in plain words. See "The tagline" below. |
 | `tags` | Chips under the title | 3–4 lowercase, kebab or single words. Concrete, searchable ("approval", "hitl", "fallback"). This is where mechanism words go. |
 | `category` | Which gallery group it files under | One id from the enum. The **outcome**, not the mechanism — see [Categorize](#3-categorize). |
 | `cadence` | The "Trigger" fact | One id from the enum. What **starts** a run, not what it does mid-run — see [Categorize](#3-categorize). |
+| `complexity` | The "Complexity" band | One id from the enum. Variance and judgment in the output, **not** graph size — see [Categorize](#3-categorize). |
 | `capabilities` | Capability chips + est. cost | The exact `ctx.sapiom.*` capability ids the source calls. Must match the code (see "Capability ids"). |
-| `whatItDoes` | "What it does" (Overview tab) | **The beats.** 3–6 short sentences, capability-first, no jargon headline. See "What it does". |
 | `steps[].description` | Node labels in the Definition graph | One plain sentence per step: what THIS step does. Preserve `name`/`next`/`terminal`/`capability` exactly. |
 | `steps[].kind` | The step's glyph in the graph | `capability` / `llm` / `compute` / `pause`, one per step — see [Categorize](#3-categorize). |
 | `steps[].checkpoint` | The "Checkpoint" fact | `true` on the single step where a **person** approves, or omit. Never on a machine wait. |
@@ -161,11 +227,49 @@ the same way, at two levels of depth.
 
 | Field | Shows up as | Write it as |
 |---|---|---|
+| `whatItDoes` | "What it does" (the card's lead) | ≤320 chars, about three sentences, **verb first**. "Create a cited account brief…", never "For turning a…". See "What it does". |
 | `longDescription` | "About" | 2–4 short paragraphs. The fuller story. Plain first; name the mechanism once, casually. |
-| `useCases` | "Use cases" (bullets) | 3 bullets. Each starts with a verb. Concrete situations, not features. |
+| `useCases` | "Use cases" (chips) | Exactly 3, each ≤40 chars. Short noun phrases — "Relationship graph", not a sentence. |
 | `notes` | "Notes" | **How to run it.** Easy path first (Use this template), advanced path second. See "How to run it". |
 | `examples` | "Examples" | Real `{ input, output }` pairs. Keep these accurate to the code; don't invent fields. |
 | `author` | "By …" | `{ "name": "Sapiom", "url": "https://sapiom.ai/" }` for first-party. |
+
+#### What the template needs to run (all optional, all machine-read)
+
+These four say what a run requires **before** anyone clicks Run, so the UI can be honest about it.
+A declaration says what a thing **is**, never where it is stored — there is no `vaultRef`, no
+`connectorId`, no `store`, and there never will be. Storage belongs to the resolver, which is what
+lets it change without touching your template.
+
+| Field | Shows up as | Write it as |
+|---|---|---|
+| `resources` | "Sapiom will provision" in the setup panel, and the cost/lifetime line on the card | The managed things a run creates — a Postgres, a sandbox, a repo, an inbox. Each needs a `kind` and a `handle` (the slug your step code passes to `ctx.sapiom.database.get()`; unique within a template). `duration` is postgres-only, caps at **7d, and there is no renew verb** — if your template needs state that outlives that, say so in `notes` and set `ephemeral: false`. `seed` is read-side only; see below. |
+| `requiredSecrets` | The credential dialog on "Use this template" | Only credentials **Sapiom cannot broker** — a Slack token, the customer's own DB. Never a Sapiom API key, never a non-secret value. Each needs `key`, `label`, `provider`; `key` follows process-env rules — not `PATH`, not `SAPIOM_*`, not `WORKFLOWS_*`. Mark `optional: true` only when the run still reaches a terminal state without it and says what it skipped. |
+| `settings` | Ordinary form fields, merged into the run input | Non-secret config — a recipient, a lookback window, a row cap. **This is where a `RECIPIENT` belongs, not the vault**, which can't be listed, validated, or prompted for. `default` is required: a setting without one can't support a zero-interaction run, which is the point. |
+| `defaultInput` | The one-click Run path | The input a run starts with when the user supplies nothing. Merged **under** the user's input and under `settings` defaults, so an explicit value always wins. **Not the same as `examples[0].input`**, which is documentation and may legitimately hold a repo slug or a live URL that won't work on a fresh tenant. It never overrides your code's own defaults. |
+| `zeroSetup` | The shelf's "runs with no setup" claim | What an unconfigured run actually reaches: a `terminalState`, optional `expect[]` assertions over the terminal artifact (`nonEmptyArray`, `nonEmptyString`, `minLength`, `matches`, `equals`, `absent`), and a one-sentence `narrative`. Assert that the pattern **demonstrably ran and the output is honest about it** — not that the result is production-grade. The narrative renders verbatim, so it must never imply a send that won't happen. |
+
+#### `seed`: only seed what your template READS
+
+A freshly-provisioned database is empty, so a template that reads from one runs green and
+produces nothing — terminal, honest-looking, and useless as a first impression. `seed` fixes
+exactly that case and no other.
+
+**The rule is not "give every resource a seed."** Look at what the table is *for*:
+
+| Your table is… | Seed it? | Why |
+|---|---|---|
+| **Input** the template reads and did not write — a leads list, a metrics table, a corpus to query | **Yes** | Otherwise the first run has nothing to work on. `nl-db-query-endpoint`, `scheduled-db-insight-report`, `personalized-media-at-scale`, `durable-backfill`. |
+| **Output** the template itself writes — a log, a CRM store, a dedupe index, an audit trail | **No** | Seeding fabricates records a user might act on. `approval-chain`, `cold-outreach-engine`, `error-triage-digest`, `meeting-notes-crm`, `the-brain` all create and insert their own tables; an empty one on the first run is correct. |
+
+If you're unsure, ask whether a user reading the row would think a real thing happened. If yes,
+don't seed it.
+
+This is **not** canned capability responses. Sample mode was cut, and deliberately: a run
+labelled "sample" that really posts to Slack is a hazard. A real resource with real seed data
+means a real run — nothing pretends.
+
+`pnpm examples:check` fails if a declared `seed` file isn't in the example directory.
 
 ---
 
@@ -201,10 +305,21 @@ The shape that works: **[what it does], [notable trait]**.
 
 ## What it does (`whatItDoes`)
 
-The Overview. 3–6 short sentences. Open with who it's for or when to reach for it, then walk
-the flow in plain terms. Name capabilities in passing, never as the lead.
+The card's lead. **≤320 characters, about three sentences, and it opens with a verb.** Say what
+it produces, then walk the flow in plain terms. Name capabilities in passing, never as the lead.
+
+**Do not open with the audience.** "For work where an agent can…" spends the first and most-read
+words on who it's for instead of what it makes. 19 of the original 26 did this; none do now, and
+`pnpm examples:check` rejects a leading "For".
 
 Think of it as **named beats** — each sentence is one move the workflow makes:
+
+> Do the legwork, then wait for a person before spending money or doing anything irreversible.
+> It ranks your candidates by fit and emails the top pick for approval, falling to the next on
+> the list if that one declines, and hands off to a human rather than failing quietly.
+
+The longer form below shows the same template written before the cap — useful for seeing which
+detail belongs in `longDescription` instead:
 
 > For work where an agent can do the legwork but a human makes the final call. It reads the
 > request, ranks your options, and emails the approver its recommendation — then pauses and
@@ -274,7 +389,8 @@ Never present the MCP path as the only way to build and run — the webapp does 
 2. **Add your directory** under `examples/` and your **one entry** in `examples/registry.json`.
 3. **Sort and validate** locally: `pnpm examples:sort`, then `pnpm examples:check`. Both must be
    clean — the same check runs in CI and blocks the merge if the registry is invalid, unsorted,
-   or points at a directory with no `template.json`.
+   points at a directory with no `template.json`, or your `template.json` doesn't match the
+   manifest schema.
 4. **Open a pull request.** CI validates the registry and builds the SDK; an automated review
    runs too. Keep the PR to one template.
 5. **On merge, it goes live.** The Sapiom backend reads `registry.json` at a pinned commit of
@@ -291,17 +407,19 @@ Never present the MCP path as the only way to build and run — the webapp does 
 - [ ] `npm run typecheck` passes in the template directory.
 - [ ] Traced a `run_local` end to end (free) before deploying.
 - [ ] One `category` (the outcome, not the mechanism) and one `cadence`; `tags` kept freeform.
+- [ ] One `complexity`, picked by counting judgment points — not by counting steps.
 - [ ] A `kind` on every step, and `checkpoint: true` only on a real human approval gate.
 - [ ] `pnpm examples:sort` then `pnpm examples:check` both clean.
 
 **Copy**
 
-- [ ] `description`: one plain sentence, no internal jargon.
-- [ ] `whatItDoes`: 3–6 short sentences, capability named in passing, no pitch words.
+- [ ] `name`: ≤32 chars, names the outcome; no arrow, slash, parenthetical, or mechanism word.
+- [ ] `description`: one plain sentence, ≤160 chars, no internal jargon.
+- [ ] `whatItDoes`: ≤320 chars, verb-first, capability named in passing, no pitch words.
 - [ ] `steps[].description`: one plain sentence each; `name`/`next`/`terminal`/`capability` unchanged.
 - [ ] `capabilities`: exactly the `ctx.sapiom.*` ids the source calls (`models.run`, not `llm.generate`).
 - [ ] `longDescription`: 2–4 short paragraphs; cost stated simply at the end.
-- [ ] `useCases`: 3 verb-first bullets, concrete situations.
+- [ ] `useCases`: exactly 3, each ≤40 chars, short noun phrases.
 - [ ] `notes`: Use-this-template first; template-specific gotcha; advanced local path last.
 - [ ] `examples`: accurate `{ input, output }`, no invented fields.
 - [ ] Read it back out loud. If a sentence sounds like a release note or a pitch, rewrite it.

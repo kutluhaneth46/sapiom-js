@@ -8,9 +8,20 @@
 //
 // Checks:
 //   1. registry.json validates against examples/registry.schema.json
-//      (draft-07, includes the `category` enum).
+//      (draft-07, includes the `category` and `complexity` enums).
 //   2. `templates` is sorted by `id` ascending  (run `pnpm examples:sort` to fix).
 //   3. every `sourcePath` dir exists and contains a `template.json`.
+//   4. checkpoint discipline (human gates only, at most one per template).
+//   5. every template.json validates against examples/template.schema.json,
+//      including the declaration surface (requiredSecrets, settings,
+//      defaultInput, zeroSetup) — see scripts/examples-manifest-check.mjs.
+//   6. house-style copy rules the schemas cannot express — see
+//      scripts/examples-copy-check.mjs. (The length caps ARE in the schemas,
+//      as `maxLength`, so they surface through checks 1 and 5.)
+//   6b. setup.provisions[] matches the kinds derived from the manifest's
+//      resources[]; a declared resources[].seed file exists.
+//   7. the authored `complexity` band against the one DERIVED from the declared
+//      shape; a 2+ band gap warns (see the divergence section for why).
 //
 // Exits non-zero with a readable report on the first category of failure it
 // finds, so a bad registry fails CI before it reaches the backend.
@@ -22,16 +33,28 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import Ajv from "ajv";
+import {
+  checkResourceSeeds,
+  checkSetupProvisions,
+  createManifestChecker,
+} from "./examples-manifest-check.mjs";
+import { checkCopy } from "./examples-copy-check.mjs";
+import {
+  complexityBandScore,
+  scoreTemplateComplexity,
+} from "./lib/template-complexity.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const EXAMPLES_DIR = path.join(ROOT, "examples");
 const REGISTRY_PATH = path.join(EXAMPLES_DIR, "registry.json");
 const SCHEMA_PATH = path.join(EXAMPLES_DIR, "registry.schema.json");
+const MANIFEST_SCHEMA_PATH = path.join(EXAMPLES_DIR, "template.schema.json");
 
 const errors = [];
 
 const registry = JSON.parse(readFileSync(REGISTRY_PATH, "utf8"));
 const schema = JSON.parse(readFileSync(SCHEMA_PATH, "utf8"));
+const manifestSchema = JSON.parse(readFileSync(MANIFEST_SCHEMA_PATH, "utf8"));
 
 // 1. Schema validation. The schema carries its own `$schema`/`$id`; strip the
 // data's own `$schema` pointer so ajv validates the payload, not the reference.
@@ -58,7 +81,13 @@ for (let i = 0; i < ids.length; i++) {
   }
 }
 
-// 3. Every sourcePath dir exists and has a template.json.
+// 3. Every sourcePath dir exists and has a template.json, and 5. that manifest
+// validates against template.schema.json. Folded into one pass because the
+// manifest check needs the same resolved path — and because a manifest that only
+// had to *exist* is how `repoSlug: "my-app"` shipped.
+const checkManifest = createManifestChecker(ajv, manifestSchema);
+const manifests = new Map(); // id -> parsed manifest, reused by the copy check
+let manifestsChecked = 0;
 for (const t of templates) {
   if (!t.sourcePath) continue; // required-ness is a schema concern (check 1).
   const dir = path.join(ROOT, t.sourcePath);
@@ -68,9 +97,31 @@ for (const t of templates) {
     );
     continue;
   }
-  if (!existsSync(path.join(dir, "template.json"))) {
+  const manifestPath = path.join(dir, "template.json");
+  if (!existsSync(manifestPath)) {
     errors.push(`sourcePath: "${t.sourcePath}" is missing a template.json.`);
+    continue;
   }
+
+  let manifest;
+  try {
+    manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+  } catch (e) {
+    errors.push(
+      `manifest-parse: "${t.id}" template.json is not valid JSON: ${e.message}`,
+    );
+    continue;
+  }
+  errors.push(...checkManifest(t.id, manifest));
+
+  errors.push(
+    ...checkResourceSeeds(t.id, manifest, (seed) =>
+      existsSync(path.join(dir, seed)),
+    ),
+  );
+
+  manifests.set(t.id, manifest);
+  manifestsChecked++;
 }
 
 // 4. Checkpoint discipline. `checkpoint` marks a HUMAN approval gate and the
@@ -94,19 +145,88 @@ for (const t of templates) {
   }
 }
 
+// 5. House-style copy rules the schemas cannot express. The length caps live in
+// the schemas as `maxLength` and are reported by check 1/3; these are the two
+// rules a `pattern` could reject but could not explain — naming the offending
+// word is the whole value of the message. See scripts/examples-copy-check.mjs.
+for (const t of templates) {
+  errors.push(...checkCopy(t, manifests.get(t.id) ?? null));
+}
+
+// 6b. `setup.provisions[]` is DERIVED from the manifest's `resources[]`, so it
+// gets verified rather than trusted. An author-declared mirror with no source of
+// truth is the drift that let `capabilities[]` fill up with SDK method paths
+// instead of catalog ids; this is the same field shape, so it gets a check
+// before it can acquire the same problem.
+for (const t of templates) {
+  errors.push(...checkSetupProvisions(t, manifests.get(t.id) ?? null));
+}
+
 if (errors.length > 0) {
-  console.error(
-    `examples/registry.json failed validation (${errors.length} problem(s)):\n`,
-  );
+  console.error(`examples/ failed validation (${errors.length} problem(s)):\n`);
   for (const e of errors) console.error(`  - ${e}`);
   process.exit(1);
 }
 
+// 7. Complexity divergence. The `complexity` enum itself is hard-validated by
+// the schema (check 1); this compares the AUTHORED band against the one derived
+// from `steps[].kind` / `capabilities` and warns at a 2+ band gap.
+//
+// The derived score is the guardrail here, not the answer. It is a proxy for
+// what the band communicates — how much variation and judgment is in the
+// output — and it reads only what the author declared, so a wide gap means one
+// of two things, both worth a human look: the label is wrong, or the declared
+// shape is wrong. The second case is the valuable one: a step that calls a model
+// but says `kind: "compute"` also draws the wrong glyph in the gallery graph, so
+// catching it pays for itself beyond this field.
+//
+// A warning and not an error on purpose. An author who has read the rubric and
+// still disagrees with the scorer should be able to land that; a hard gate would
+// make the proxy authoritative again, which is exactly what authoring this field
+// was meant to stop.
+const divergences = [];
+for (const t of templates) {
+  const authored = complexityBandScore(t.complexity);
+  // Unset or unknown: the schema owns invalid values, the nudge below owns absent ones.
+  if (authored === null) continue;
+  const derived = scoreTemplateComplexity(t);
+  const gap = Math.abs(authored - derived.score);
+  if (gap > 0)
+    divergences.push({ id: t.id, authored: t.complexity, derived, gap });
+}
+
+for (const d of divergences.filter((x) => x.gap >= 2)) {
+  const { basis, raw, label } = d.derived;
+  console.warn(
+    `warning: complexity: "${d.id}" declares "${d.authored}" but its declared shape derives ` +
+      `"${label}" (raw ${raw}: llm=${basis.llmSteps} chained=${basis.chainedLlmSteps} ` +
+      `media=${basis.mediaCapabilities} caps=${basis.capabilityCount} steps=${basis.stepCount} ` +
+      `fanOut=${basis.maxFanOut}) — a ${d.gap}-band gap. Either the band is wrong, or a ` +
+      `\`steps[].kind\` is (a model step declared "compute" also draws the wrong glyph). ` +
+      `See AUTHORING.md §3.`,
+  );
+}
+
+// One band apart is expected and fine — the rubric's nudge is a whole band wide.
+// Reported as a single line so a day-one divergence stays visible without
+// becoming noise that trains authors to ignore the warnings above.
+const nearMisses = divergences.filter((x) => x.gap === 1);
+if (nearMisses.length > 0) {
+  console.log(
+    `note: ${nearMisses.length} template(s) one band from the derived score (authored → derived): ` +
+      nearMisses
+        .map((d) => `${d.id} ${d.authored}→${d.derived.label}`)
+        .join(", "),
+  );
+}
+
 const uncategorized = templates.filter((t) => !t.category).map((t) => t.id);
 const noCadence = templates.filter((t) => !t.cadence).map((t) => t.id);
+const noComplexity = templates.filter((t) => !t.complexity).map((t) => t.id);
 for (const [label, ids] of [
   ["category", uncategorized],
   ["cadence", noCadence],
+  ["complexity", noComplexity],
 ]) {
   // Both are optional in the schema, so this is a nudge, not a gate — flip to
   // `errors.push` once every template carries them and the field goes required.
@@ -118,5 +238,5 @@ for (const [label, ids] of [
 }
 
 console.log(
-  `examples/registry.json OK — ${templates.length} templates, sorted, schema-valid, all sourcePaths present.`,
+  `examples/registry.json OK — ${templates.length} templates, sorted, schema-valid, all sourcePaths present; ${manifestsChecked} template.json manifest(s) schema-valid.`,
 );
