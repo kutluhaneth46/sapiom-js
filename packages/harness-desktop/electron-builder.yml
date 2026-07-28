@@ -1,0 +1,80 @@
+appId: ai.sapiom.harness
+productName: Sapiom
+copyright: Copyright © Sapiom
+# Pinned because packaging runs against a `pnpm deploy --prod` dir that has no
+# `electron` devDep for electron-builder to infer the version from. Keep in sync
+# with the `electron` devDependency.
+electronVersion: 33.4.11
+
+directories:
+  output: release
+  buildResources: assets
+
+# Default file globbing packs production node_modules + package.json. We add
+# our built output explicitly and keep source/maps out of the bundle.
+files:
+  - "dist/**/*"
+  - "package.json"
+  - "!**/*.map"
+  - "!**/*.ts"
+
+asar: true
+# Unpack ALL node_modules. The harness's Canvas check spawns a subprocess under
+# ELECTRON_RUN_AS_NODE=1 — plain Node with NO asar support — that imports
+# @sapiom/agent-core and its full transitive tree (@sapiom/agent, zod, esbuild,
+# …) and bundles the workflow. Plain Node can only resolve files that exist on
+# disk, so the entire dependency tree must be unpacked, not just @sapiom/*.
+# (Also covers node-pty's spawn-helper, which must be chmod'd +x / exec'd, and
+# makes packageRoot()/webDir real on-disk dirs.) The app's own dist/ stays
+# packed in app.asar.
+asarUnpack:
+  - "**/node_modules/**"
+
+# Rebuild node-pty against Electron's ABI during packaging.
+npmRebuild: true
+electronLanguages:
+  - en-US
+
+linux:
+  target:
+    - AppImage
+    - deb
+  category: Development
+  icon: assets/icon.png
+  # Clean artifact + package name (the npm name "@sapiom/harness-desktop" is an
+  # invalid .deb name and produces a bad "release/@sapiom/…" path).
+  artifactName: sapiom-${version}-${arch}.${ext}
+  executableName: sapiom
+  maintainer: Sapiom <team@sapiom.ai>
+  synopsis: One-click Sapiom harness — run your coding agent on Sapiom.
+
+mac:
+  # dmg only. electron-builder also emits a `zip` for macOS auto-update
+  # (Squirrel.Mac consumes zips, not dmgs), but no updater is wired up yet
+  # (Phase 4: unsigned, no publish provider), so the zip was a second full copy
+  # of the same .app — doubling the artifact a tester downloads for nothing.
+  # Re-add `zip` here (and to the upload glob in desktop-release.yml) when macOS
+  # auto-update ships in Phase 5+.
+  target:
+    - dmg
+  category: public.app-category.developer-tools
+  # macOS gets its own artwork: the same mark inset to ~82% of the canvas with a
+  # transparent margin, per Apple's icon grid, so the app sits the same visual
+  # size as its neighbours in the Dock. A full-bleed tile (correct on Linux and
+  # Windows) reads as conspicuously oversized next to system apps.
+  icon: assets/icon-mac.png
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  entitlements: assets/entitlements.mac.plist
+  entitlementsInherit: assets/entitlements.mac.plist
+  # notarize: set true + APPLE_ID/APPLE_APP_SPECIFIC_PASSWORD/APPLE_TEAM_ID in Phase 5.
+
+win:
+  target:
+    - nsis
+  icon: assets/icon.png
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true

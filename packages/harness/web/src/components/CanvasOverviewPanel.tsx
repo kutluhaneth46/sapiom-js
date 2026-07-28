@@ -29,8 +29,6 @@ interface CanvasOverviewPanelProps {
   run: RunView | null;
   workflows: WorkflowInfo[];
   onOpenWorkflow: (path: string) => void;
-  /** Retargets the selection (a transition row picks a neighbor step). */
-  onSelectStep: (id: string) => void;
   /** The full-pane drill: opens the selected step in the Steps tab. */
   onOpenSteps: () => void;
   /** Clears the selection — back to the overview. */
@@ -57,7 +55,6 @@ export function CanvasOverviewPanel({
   run,
   workflows,
   onOpenWorkflow,
-  onSelectStep,
   onOpenSteps,
   onDeselect,
   onCollapse,
@@ -211,7 +208,7 @@ export function CanvasOverviewPanel({
               data-tooltip="Full details in the Steps tab"
               onClick={onOpenSteps}
             >
-              Open in Steps <Icon name="ArrowRight" size={12} />
+              Open step <Icon name="ArrowRight" size={12} />
             </button>
             <button
               className="theme-toggle canvas-overview-close"
@@ -260,14 +257,15 @@ export function CanvasOverviewPanel({
               graph={graph}
               node={selectedNode}
               run={run}
-              onSelectStep={onSelectStep}
               workflows={workflows}
               onOpenWorkflow={onOpenWorkflow}
             />
           ) : (
             overview && (
               <>
-                <p className="canvas-overview-desc">{overview.description}</p>
+                {overview.description && (
+                  <p className="canvas-overview-desc">{overview.description}</p>
+                )}
                 {overview.notes.length > 0 && (
                   <ul className="canvas-overview-notes">
                     {overview.notes.map((note) => (

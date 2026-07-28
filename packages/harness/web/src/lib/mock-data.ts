@@ -2,7 +2,7 @@
  * Fixture data for `VITE_MOCK=1` — lets the SPA render fully without a
  * running harness server (see MockApi in ./api).
  */
-import type { HarnessEntry, HarnessSession, HarnessSettings, MacroDef, SessionSummary, WorkflowInfo } from "@shared/types";
+import type { HarnessEntry, HarnessSession, HarnessSettings, MacroDef, SessionRecord, SessionSummary, TemplateDetailView, TemplateSummary, WorkflowInfo } from "@shared/types";
 
 const now = Date.now();
 const minutesAgo = (n: number): string => new Date(now - n * 60_000).toISOString();
@@ -41,9 +41,269 @@ export function hasMockCanvasDoc(sessionId: string): boolean {
   return MOCK_CANVAS_SESSIONS.includes(sessionId);
 }
 
-/** Where MockApi.seedSampleProject pretends the example project landed —
- *  mirrors the real HARNESS_PATHS.sampleProject location. */
-export const MOCK_SAMPLE_PROJECT_ROOT = "/Users/demo/.sapiom/harness/sample-project";
+/**
+ * A slice of the real template catalog for mock mode. Spans several categories
+ * on purpose — the dialog groups by category — and, since SAP-2088, one template
+ * per complexity band.
+ *
+ * The set was previously picked for COST-state coverage (an estimate, a sub-cent
+ * estimate, a null). Core no longer serves a cost, so the axis is the band:
+ * Minimal through Advanced, plus `complexity: null` on `web-research-digest` to
+ * exercise the absent-payload em dash. That null is not a claim about that
+ * template — it genuinely scores Minimal, which `hello-agent` already covers, so
+ * it is the one entry that can carry the "response predates the field" state
+ * without costing band coverage.
+ *
+ * Every `complexity` here is what core's `scoreTemplateComplexity` actually
+ * returns for the shape declared alongside it — the weights are `llmStep` 4,
+ * `chainedLlmStep` 3, `mediaCapability` 3, `capability` 0.4, `step` 0.2,
+ * `fanOut` 0.2 over `maxFanOut - 1`, banded at 1.5 / 4 / 7 / 11. Each `basis`
+ * agrees with the `stepCount` and `capabilities` on the same object, so the
+ * detail pane's explanation never contradicts the card above it. Change one and
+ * you must re-derive the other.
+ *
+ * Each band also matches what `examples/registry.json` now AUTHORS for that
+ * template (SAP-2086). Worth keeping true: once the backend prefers an authored
+ * band over a derived one (SAP-2087), a fixture that only satisfied the scorer
+ * would start disagreeing with the live catalog for the same id.
+ *
+ * Note `approval-chain`: 7 steps and a fan-out of 5, and still `Simple`. That
+ * ordering is the scorer's whole point, not a mistake in this fixture — the band
+ * tracks judgment and variance, not graph size, so a deterministic saga sits
+ * below a two-model pipeline.
+ */
+export const MOCK_TEMPLATES: TemplateSummary[] = [
+  {
+    id: "hello-agent",
+    name: "Hello Agent",
+    description: "The minimal single-step agent: a smoke test for the build, deploy, run path.",
+    tags: ["starter", "minimal"],
+    category: "starter",
+    cadence: "on-demand",
+    stepCount: 1,
+    capabilities: [],
+    // raw 0.2 → Minimal.
+    complexity: {
+      score: 1,
+      label: "Minimal",
+      basis: {
+        llmSteps: 0,
+        chainedLlmSteps: 0,
+        mediaCapabilities: 0,
+        capabilityCount: 0,
+        stepCount: 1,
+        maxFanOut: 0,
+      },
+    },
+  },
+  {
+    id: "web-research-digest",
+    name: "Web Research Digest",
+    description: "Search the web for a topic and return a concise, sourced digest.",
+    tags: ["research", "search"],
+    category: "data-knowledge",
+    cadence: "on-demand",
+    stepCount: 2,
+    capabilities: ["web.search"],
+    // The absent-payload case: a backend older than the complexity field. Renders
+    // an em dash on the card and an honest "no band" line in the detail pane —
+    // the guard that keeps an old Studio pointed at an old stack from throwing.
+    complexity: null,
+  },
+  {
+    id: "approval-chain",
+    name: "Multi-Party Approval Chain (Saga)",
+    description:
+      "A durable sequential sign-off chain — pause-per-gate approvals with reminders, timeout escalation, and compensation on rejection.",
+    tags: ["approval", "saga", "pause-resume", "durable"],
+    category: "reliability-governance",
+    cadence: "on-demand",
+    stepCount: 7,
+    capabilities: ["email.send", "database.create"],
+    // raw 3.0 → Simple. Wholly deterministic despite being the largest graph here.
+    complexity: {
+      score: 2,
+      label: "Simple",
+      basis: {
+        llmSteps: 0,
+        chainedLlmSteps: 0,
+        mediaCapabilities: 0,
+        capabilityCount: 2,
+        stepCount: 7,
+        maxFanOut: 5,
+      },
+    },
+  },
+  {
+    id: "scheduled-research-brief",
+    name: "Scheduled Research Brief",
+    description: "On a schedule, research a topic and deliver a written brief.",
+    tags: ["research", "scheduled", "llm"],
+    category: "data-knowledge",
+    cadence: "scheduled",
+    stepCount: 4,
+    capabilities: ["web.search", "models.run"],
+    // raw 5.6 → Moderate. One model step over a small graph: the mid-scale shape,
+    // and the band a reader is most likely to meet.
+    complexity: {
+      score: 3,
+      label: "Moderate",
+      basis: {
+        llmSteps: 1,
+        chainedLlmSteps: 0,
+        mediaCapabilities: 0,
+        capabilityCount: 2,
+        stepCount: 4,
+        maxFanOut: 1,
+      },
+    },
+  },
+  {
+    id: "cold-outreach-engine",
+    name: "Cold Outreach Personalization Engine",
+    description:
+      "Enrich a lead list, write a personalized first line for each prospect, verify deliverability, then drip the sends.",
+    tags: ["outreach", "email", "fan-out"],
+    category: "revenue-marketing",
+    cadence: "scheduled",
+    stepCount: 6,
+    capabilities: ["web.search", "email.send"],
+    // raw 10.2 → Involved. Two model steps — enrichment and the per-prospect
+    // rewrite — are what lift it well past the saga above.
+    complexity: {
+      score: 4,
+      label: "Involved",
+      basis: {
+        llmSteps: 2,
+        chainedLlmSteps: 0,
+        mediaCapabilities: 0,
+        capabilityCount: 2,
+        stepCount: 6,
+        maxFanOut: 2,
+      },
+    },
+  },
+  {
+    id: "dependency-upgrade",
+    name: "Dependency Upgrade",
+    description:
+      "On a schedule, a coding agent bumps a repo's dependencies in a sandbox, runs the tests, and opens a PR.",
+    tags: ["coding-agent", "scheduled"],
+    category: "product-engineering",
+    cadence: "scheduled",
+    stepCount: 5,
+    capabilities: ["sandbox.run"],
+    // raw 12.6 → Advanced. Two model steps, one feeding the other: chained
+    // judgment is the heaviest signal in the scorer.
+    complexity: {
+      score: 5,
+      label: "Advanced",
+      basis: {
+        llmSteps: 2,
+        chainedLlmSteps: 1,
+        mediaCapabilities: 0,
+        capabilityCount: 1,
+        stepCount: 5,
+        maxFanOut: 2,
+      },
+    },
+  },
+];
+
+/**
+ * Real per-template graphs for mock mode, keyed by template id. Step NAMES are
+ * the registry's actual ones (`search`/`summarize`, `greet`) because the e2e
+ * suite addresses nodes by name — and because a synthesized `step-2` teaches a
+ * reader nothing about what the preview looks like.
+ *
+ * `kind`/`sublabel` are what the server's `classifyStepKind` produces for each
+ * shape, so mock mode renders the same branches live mode does. Note a
+ * single-step template's one step is the ENTRY (entry outranks terminal in the
+ * precedence), which is why `greet` is not an exit node.
+ */
+export const MOCK_TEMPLATE_GRAPHS: Record<
+  string,
+  Pick<TemplateDetailView, "steps" | "transitions">
+> = {
+  "hello-agent": {
+    steps: [
+      { name: "greet", description: "Validate the input and return a greeting.", capabilities: [], kind: "entry", sublabel: "entry" },
+    ],
+    transitions: [],
+  },
+  "web-research-digest": {
+    steps: [
+      { name: "search", description: "Query the web for the topic.", capabilities: ["web.search"], kind: "entry", sublabel: "entry" },
+      {
+        name: "summarize",
+        description: "Condense the results into a sourced digest.",
+        capabilities: [],
+        kind: "terminal-success",
+        sublabel: "terminal · success",
+      },
+    ],
+    transitions: [{ from: "search", to: "summarize", label: null, kind: "continue" }],
+  },
+  "dependency-upgrade": {
+    steps: [
+      { name: "scan", description: "List outdated dependencies.", capabilities: ["sandbox.run"], kind: "entry", sublabel: "entry" },
+      { name: "bump", description: "Apply the upgrades in a sandbox.", capabilities: [], kind: "step", sublabel: "step" },
+      { name: "test", description: "Run the suite against the bumped tree.", capabilities: [], kind: "step", sublabel: "step · can also terminate" },
+      { name: "open_pr", description: "Open a PR with the passing upgrade.", capabilities: [], kind: "terminal-success", sublabel: "terminal · success" },
+      // A fail-only sink: amber "needs attention", NOT a green success exit.
+      { name: "give_up", description: "Tests still failing after retries.", capabilities: [], kind: "terminal-warn", sublabel: "terminal · needs attention" },
+    ],
+    transitions: [
+      { from: "scan", to: "bump", label: null, kind: "continue" },
+      { from: "bump", to: "test", label: null, kind: "continue" },
+      { from: "test", to: "open_pr", label: null, kind: "continue" },
+      { from: "test", to: "give_up", label: null, kind: "continue" },
+    ],
+  },
+  "approval-chain": {
+    steps: [
+      { name: "start", description: "Record the request.", capabilities: ["database.create"], kind: "entry", sublabel: "entry" },
+      { name: "present", description: "Email the current gate's approver.", capabilities: ["email.send"], kind: "step", sublabel: "step" },
+      // A pause step shows the signal it waits for.
+      { name: "decide", description: "Wait for the approver's answer.", capabilities: [], kind: "pause", sublabel: "pause · approval.decided" },
+      { name: "finalize", description: "All gates passed.", capabilities: ["email.send"], kind: "terminal-success", sublabel: "terminal · success" },
+      { name: "compensate", description: "Roll back on rejection.", capabilities: ["email.send"], kind: "terminal-warn", sublabel: "terminal · needs attention" },
+    ],
+    transitions: [
+      { from: "start", to: "present", label: null, kind: "continue" },
+      { from: "present", to: "decide", label: null, kind: "continue" },
+      { from: "decide", to: "finalize", label: "approval.decided", kind: "pause" },
+      { from: "decide", to: "compensate", label: null, kind: "continue" },
+    ],
+  },
+  "cold-outreach-engine": {
+    steps: [
+      { name: "enrich", description: "Enrich the lead list.", capabilities: ["web.search"], kind: "entry", sublabel: "entry" },
+      { name: "personalize", description: "Write a first line per prospect.", capabilities: [], kind: "step", sublabel: "step" },
+      { name: "send", description: "Drip the sends.", capabilities: ["email.send"], kind: "terminal-success", sublabel: "terminal · success" },
+    ],
+    transitions: [
+      { from: "enrich", to: "personalize", label: null, kind: "continue" },
+      { from: "personalize", to: "send", label: null, kind: "continue" },
+    ],
+  },
+  // Four steps, matching this template's `stepCount` and the `basis.stepCount`
+  // its band was derived from — the linear search → summarize → deliver shape the
+  // registry declares, with the one model step the Moderate band turns on.
+  "scheduled-research-brief": {
+    steps: [
+      { name: "search", description: "Gather sources on the topic.", capabilities: ["web.search"], kind: "entry", sublabel: "entry" },
+      { name: "summarize", description: "Draft the brief from the sources.", capabilities: ["models.run"], kind: "step", sublabel: "step" },
+      { name: "review", description: "Check the brief covers the ask.", capabilities: [], kind: "step", sublabel: "step" },
+      { name: "deliver", description: "Send the finished brief.", capabilities: [], kind: "terminal-success", sublabel: "terminal · success" },
+    ],
+    transitions: [
+      { from: "search", to: "summarize", label: null, kind: "continue" },
+      { from: "summarize", to: "review", label: null, kind: "continue" },
+      { from: "review", to: "deliver", label: null, kind: "continue" },
+    ],
+  },
+};
 
 export const MOCK_SESSIONS: HarnessSession[] = [
   {
@@ -86,6 +346,24 @@ export const MOCK_SESSIONS: HarnessSession[] = [
     createdAt: daysAgo(2),
     lastActiveAt: daysAgo(1),
     exitCode: 0,
+    ready: false,
+  },
+  {
+    // A PHANTOM: the SessionStart hook gave us an agentSessionId, but the user
+    // never submitted a prompt, so Claude Code wrote no transcript and
+    // `--resume` would exit 1. The registry can't tell this apart from a real
+    // session on its own — only the server's canResume probe can, which is why
+    // MOCK_HISTORY reports this row as `rehydrate`.
+    id: "sess-phantom",
+    agentSessionId: "7e5f4d3c-2b1a-4098-8765-4321fedcba98",
+    boundWorkflowPath: null,
+    harness: "claude-code",
+    cwd: "/Users/demo/acme-app",
+    title: "acme-app",
+    status: "exited",
+    createdAt: daysAgo(1),
+    lastActiveAt: daysAgo(1),
+    exitCode: 1,
     ready: false,
   },
   {
@@ -154,6 +432,13 @@ export const MOCK_FS_TREE: Record<string, string[]> = {
   "/Users/demo/scratch": [],
 };
 
+/**
+ * `resumeMode` on every row is what the real server resolves by probing the
+ * agent's own store (`HarnessAdapter.canResume`), never something the client
+ * derives — so the fixtures carry all three interesting shapes: a registry row
+ * the agent still holds, a registry row it doesn't (the phantom), and a
+ * transcript-only row that is genuinely resumable via adopt.
+ */
 export const MOCK_HISTORY: Record<string, SessionSummary[]> = {
   "/Users/demo/acme-app": [
     {
@@ -164,6 +449,20 @@ export const MOCK_HISTORY: Record<string, SessionSummary[]> = {
       title: "Build the leasing pipeline",
       lastActiveAt: minutesAgo(1),
       source: "registry",
+      resumeMode: "agent-resume",
+    },
+    {
+      // The phantom's history row: we hold its agentSessionId, the agent holds
+      // no conversation for it. This is the row that used to render
+      // "resumable" and hand the user a guaranteed exit-1.
+      harnessSessionId: "sess-phantom",
+      agentSessionId: "7e5f4d3c-2b1a-4098-8765-4321fedcba98",
+      harness: "claude-code",
+      cwd: "/Users/demo/acme-app",
+      title: "acme-app",
+      lastActiveAt: daysAgo(1),
+      source: "registry",
+      resumeMode: "rehydrate",
     },
     {
       agentSessionId: "2b6d9e10-7711-4c2a-8b0a-9e4f2d1c5a33",
@@ -172,10 +471,34 @@ export const MOCK_HISTORY: Record<string, SessionSummary[]> = {
       title: "Wire the screening webhook",
       lastActiveAt: daysAgo(1),
       source: "transcript",
+      // Transcript-only, but the transcript really is there — so it adopts
+      // into the registry and resumes for real rather than opening a fresh
+      // session, which is what the hardcoded `resumable={false}` forced.
+      resumeMode: "agent-resume",
       // Rich-meta fields: present on this entry (exercises the rich meta
       // line), absent on the others (exercises the graceful degradation).
       gitBranch: "feat/screening-webhook",
       messageCount: 12,
+      // turnCount comes from OUR event index and wins over messageCount when
+      // both are present — the two disagreeing here is deliberate.
+      turnCount: 3,
+    },
+    {
+      // A session the Studio never ran: the agent's own transcript knows it,
+      // our event log doesn't. No turnCount, and no record — the review pane's
+      // honest "nothing recorded" state (see MOCK_SESSION_RECORDS).
+      //
+      // `agent-resume` alongside no record is the combination worth having a
+      // fixture for: the agent can continue this conversation, and we still
+      // can't show it, because resumability and readability come from two
+      // different stores.
+      agentSessionId: "5e7a0c94-3f22-4d18-b6e1-77c0a9b12d40",
+      harness: "claude-code",
+      cwd: "/Users/demo/acme-app",
+      title: "Poke at the credit model",
+      lastActiveAt: daysAgo(6),
+      source: "transcript",
+      resumeMode: "agent-resume",
     },
   ],
   "/Users/demo/rfq-workflows": [
@@ -187,8 +510,176 @@ export const MOCK_HISTORY: Record<string, SessionSummary[]> = {
       title: "rfq-workflows",
       lastActiveAt: daysAgo(1),
       source: "registry",
+      resumeMode: "agent-resume",
+      turnCount: 1,
     },
   ],
+};
+
+/**
+ * Reconstructed transcripts for the past-session review pane, keyed by the id
+ * the pane asks with (harnessSessionId when the registry tracked the session,
+ * else the agent's own session id).
+ *
+ * Deliberately covers the honest-gap cases the real fold produces, so the mock
+ * UI shows what a user will actually see: a truncated tool result, a turn with
+ * tool calls plus only a final assistant message, a Codex session with no
+ * assistant text at all, and a trailing turn that never completed.
+ */
+export const MOCK_SESSION_RECORDS: Record<string, SessionRecord> = {
+  "sess-leasing": {
+    harnessSessionId: "sess-leasing",
+    mergedSessionIds: ["sess-leasing"],
+    agentSessionId: "8f2b1c6a-4d3e-4a11-9c2f-1a2b3c4d5e6f",
+    harness: "claude-code",
+    cwd: "/Users/demo/acme-app",
+    startedAt: minutesAgo(48),
+    endedAt: minutesAgo(1),
+    turnCount: 2,
+    eventCount: 9,
+    reconstructed: true,
+    limitations: ["truncated-tool-output", "assistant-narration-gap", "incomplete-final-turn"],
+    turns: [
+      {
+        index: 1,
+        prompt: "Add the screening step to the leasing workflow and wire it to the credit check.",
+        promptAt: minutesAgo(48),
+        toolCalls: [
+          {
+            name: "Read",
+            input: '{"file_path":"/Users/demo/acme-app/leasing/index.ts"}',
+            responseSummary: "export const leasing = defineWorkflow({ … })",
+            responseTruncated: false,
+            at: minutesAgo(47),
+          },
+          {
+            name: "Edit",
+            input: '{"file_path":"/Users/demo/acme-app/leasing/index.ts","old_string":"steps: [apply]","new_string":"steps: [apply, screening]"}',
+            responseSummary: "Applied 1 edit to /Users/demo/acme-app/leasing/index.ts\n…[truncated 2048 chars]",
+            responseTruncated: true,
+            at: minutesAgo(46),
+          },
+        ],
+        assistantText:
+          "Added a `screening` step between `apply` and `creditCheck`, and wired its output into the credit check's input. Run it locally to confirm the new edge.",
+        model: "claude-opus-4-6",
+        usage: { inputTokens: 18420, outputTokens: 612 },
+        completedAt: minutesAgo(45),
+        incomplete: false,
+      },
+      {
+        index: 2,
+        prompt: "Now deploy it.",
+        promptAt: minutesAgo(3),
+        toolCalls: [
+          {
+            name: "Bash",
+            input: '{"command":"sapiom agents deploy"}',
+            responseSummary: "building…",
+            responseTruncated: false,
+            at: minutesAgo(2),
+          },
+        ],
+        assistantText: null,
+        model: null,
+        usage: null,
+        completedAt: null,
+        incomplete: true,
+      },
+    ],
+  },
+  "2b6d9e10-7711-4c2a-8b0a-9e4f2d1c5a33": {
+    harnessSessionId: "sess-webhook",
+    mergedSessionIds: ["sess-webhook"],
+    agentSessionId: "2b6d9e10-7711-4c2a-8b0a-9e4f2d1c5a33",
+    harness: "claude-code",
+    cwd: "/Users/demo/acme-app",
+    startedAt: daysAgo(1),
+    endedAt: daysAgo(1),
+    turnCount: 3,
+    eventCount: 11,
+    reconstructed: true,
+    limitations: ["assistant-narration-gap"],
+    turns: [
+      {
+        index: 1,
+        prompt: "Wire the screening webhook to the applicant queue.",
+        promptAt: daysAgo(1),
+        toolCalls: [
+          {
+            name: "Grep",
+            input: '{"pattern":"applicantQueue"}',
+            responseSummary: "leasing/queue.ts:12\nleasing/screening.ts:44",
+            responseTruncated: false,
+            at: daysAgo(1),
+          },
+        ],
+        assistantText: "Wired it through `applicantQueue.publish()` and added the retry policy.",
+        model: "claude-opus-4-6",
+        usage: { inputTokens: 9120, outputTokens: 340 },
+        completedAt: daysAgo(1),
+        incomplete: false,
+      },
+      {
+        index: 2,
+        prompt: "Add a test for the retry path.",
+        promptAt: daysAgo(1),
+        toolCalls: [],
+        assistantText: "Added `screening.retry.test.ts` covering the 5xx-then-success path.",
+        model: "claude-opus-4-6",
+        usage: { inputTokens: 10240, outputTokens: 210 },
+        completedAt: daysAgo(1),
+        incomplete: false,
+      },
+      {
+        index: 3,
+        prompt: "Ship it.",
+        promptAt: daysAgo(1),
+        toolCalls: [],
+        assistantText: "Pushed to `feat/screening-webhook`.",
+        model: "claude-opus-4-6",
+        usage: { inputTokens: 11010, outputTokens: 96 },
+        completedAt: daysAgo(1),
+        incomplete: false,
+      },
+    ],
+  },
+  "sess-rfq": {
+    harnessSessionId: "sess-rfq",
+    mergedSessionIds: ["sess-rfq"],
+    agentSessionId: "9c1a2b3d-4e5f-4061-8a7b-6c5d4e3f2a10",
+    harness: "codex",
+    cwd: "/Users/demo/rfq-workflows",
+    startedAt: daysAgo(1),
+    endedAt: null,
+    turnCount: 1,
+    eventCount: 4,
+    reconstructed: true,
+    // Codex's rollout carries no equivalent of the Stop hook's final assistant
+    // message, so a Codex record has the chronology but none of the prose.
+    limitations: ["missing-assistant-text"],
+    turns: [
+      {
+        index: 1,
+        prompt: "Summarize what the rfq workflow does.",
+        promptAt: daysAgo(1),
+        toolCalls: [
+          {
+            name: "shell",
+            input: '{"command":["cat","README.md"]}',
+            responseSummary: "# rfq-workflows\nRequest-for-quote intake and routing.",
+            responseTruncated: false,
+            at: daysAgo(1),
+          },
+        ],
+        assistantText: null,
+        model: null,
+        usage: null,
+        completedAt: daysAgo(1),
+        incomplete: false,
+      },
+    ],
+  },
 };
 
 export const MOCK_WORKFLOWS: WorkflowInfo[] = [

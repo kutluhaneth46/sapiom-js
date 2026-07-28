@@ -83,7 +83,7 @@ test.describe("add dialog (Project mode)", () => {
 
     const cta = modal.getByTestId("modal-scaffold-cta");
     await expect(cta).toBeVisible();
-    await expect(modal.getByRole("button", { name: "Add project" })).toBeDisabled();
+    await expect(modal.getByRole("button", { name: "Add workspace" })).toBeDisabled();
 
     await cta.click();
     await expect(modal).toBeHidden();

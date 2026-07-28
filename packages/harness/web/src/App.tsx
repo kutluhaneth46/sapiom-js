@@ -155,6 +155,10 @@ export const App = (): JSX.Element => {
   const [rightCollapsed, setRightCollapsed] = useState(
     () => isMobileShell() || (loadUiPrefs().rightCollapsed ?? false),
   );
+  // Canvas full-screen expand — lifted here so its control sits next to the
+  // collapse-panel toggle in the right-pane tab bar (the frame itself lives in
+  // CanvasPane, which reads these props).
+  const [canvasExpanded, setCanvasExpanded] = useState(false);
   const isMobile = useMobileShell();
 
   const { widths, startRailDrag, startCanvasDrag, resetRail, resetCanvas } = usePaneWidths();
@@ -227,6 +231,29 @@ export const App = (): JSX.Element => {
   useEffect(() => {
     saveUiPrefs({ rightTab });
   }, [rightTab]);
+
+  // The dead pane's Resume button has to be as honest as a history row's tag,
+  // and only the server can say whether the agent still holds the
+  // conversation. Its verdict rides on the history row for this session, so
+  // fetch this directory's history when we don't already have it. Safe to ask
+  // for one directory: `loadHistory` replaces only the rows of the directories
+  // it loaded and retains the rest, so this can't evict the rail's rows.
+  //
+  // Declared here, above this component's early returns, so the hook list
+  // stays stable regardless of boot state.
+  const activeExitedSession =
+    harness.state?.sessions.find(
+      (session) => session.id === harness.activeSessionId && session.status === "exited",
+    ) ?? null;
+  const deadResumeMode = activeExitedSession?.agentSessionId
+    ? harness.history.find((summary) => summary.agentSessionId === activeExitedSession.agentSessionId)?.resumeMode
+    : "rehydrate";
+  const deadCwdNeedingHistory =
+    activeExitedSession?.agentSessionId != null && deadResumeMode === undefined ? activeExitedSession.cwd : null;
+  const loadHistory = harness.loadHistory;
+  useEffect(() => {
+    if (deadCwdNeedingHistory) void loadHistory([deadCwdNeedingHistory]);
+  }, [deadCwdNeedingHistory, loadHistory]);
 
   if (harness.loading) {
     return <div className="app-status">Loading Sapiom Studio…</div>;
@@ -696,6 +723,8 @@ export const App = (): JSX.Element => {
           onScaffoldSession={handleScaffoldSession}
           onScaffoldInSession={handleScaffoldInSession}
           onUseTemplate={handleUseTemplate}
+          listTemplates={harness.listTemplates}
+          getTemplate={harness.getTemplate}
           onScanWorkflows={handleScanWorkflows}
           onOpenInEditor={openInEditor}
           onToast={harness.showToast}
@@ -819,23 +848,14 @@ export const App = (): JSX.Element => {
                   onCreateSession={handleCreateSession}
                   listHarnesses={harness.listHarnesses}
                   onUseTemplate={handleUseTemplate}
-                  onRunSample={async () => {
-                    const session = await harness.createSampleSession();
-                    setOverviewSelected(false);
-                    setReviewSummary(null);
-                    setFocusedAgentPath(session.cwd);
-                  }}
+                  listTemplates={harness.listTemplates}
+                  getTemplate={harness.getTemplate}
+                  firstRun={state.firstRun === true}
                 />
               ) : showReview && reviewSummary ? (
                 <PastSessionPane
                   summary={reviewSummary}
-                  resumable={
-                    (reviewSummary.harnessSessionId != null &&
-                      state.sessions.some((s) => s.id === reviewSummary.harnessSessionId)) ||
-                    state.sessions.some(
-                      (s) => s.agentSessionId != null && s.agentSessionId === reviewSummary.agentSessionId,
-                    )
-                  }
+                  loadRecord={harness.sessionRecord}
                   onStart={() => {
                     const summary = reviewSummary;
                     setReviewSummary(null);
@@ -846,6 +866,8 @@ export const App = (): JSX.Element => {
               ) : showDead && activeSession ? (
                 <DeadSessionPane
                   session={activeSession}
+                  resumeMode={deadResumeMode}
+                  loadRecord={harness.sessionRecord}
                   onResume={() => void harness.resumeSession(activeSession.id)}
                   onClose={() => void harness.closeSession(activeSession.id)}
                 />
@@ -949,15 +971,46 @@ export const App = (): JSX.Element => {
               >
                 Code
               </button>
-              <button
-                className="theme-toggle right-pane-collapse"
-                data-testid="right-collapse"
-                aria-label="Collapse canvas panel"
-                title="Collapse canvas panel"
-                onClick={() => setRightCollapsed(true)}
-              >
-                <Icon name="PanelRightClose" size={15} />
-              </button>
+              <div className="right-pane-corner">
+                {/* Deployed pill → dashboard. The board has no subheader now, so
+                    its deploy status lives here in the tab bar (Tidjane's design:
+                    nothing sits between the tabs and the canvas). */}
+                {rightTab === "canvas" && rightPaneWorkflow?.definitionId != null && (
+                  <a
+                    className="status-tag status-tag-action workflow-deployed-tag right-pane-deployed"
+                    data-testid="workflow-dashboard-link"
+                    href={`https://app.sapiom.ai/workflows/${rightPaneWorkflow.definitionId}`}
+                    target="_blank"
+                    rel="noreferrer"
+                    aria-label="Deployed — open in the Sapiom dashboard"
+                    data-tooltip="Open this workflow in the Sapiom dashboard"
+                  >
+                    <Icon name="Cloud" size={12} />
+                    deployed
+                  </a>
+                )}
+                {/* Canvas expand sits right beside the collapse-panel toggle. */}
+                {rightTab === "canvas" && (
+                  <button
+                    className="theme-toggle"
+                    data-testid="canvas-expand"
+                    aria-label={canvasExpanded ? "Exit expanded canvas" : "Expand canvas"}
+                    title={canvasExpanded ? "Exit expanded canvas" : "Expand canvas"}
+                    onClick={() => setCanvasExpanded((v) => !v)}
+                  >
+                    <Icon name={canvasExpanded ? "Minimize2" : "Maximize2"} size={15} />
+                  </button>
+                )}
+                <button
+                  className="theme-toggle right-pane-collapse"
+                  data-testid="right-collapse"
+                  aria-label="Collapse canvas panel"
+                  title="Collapse canvas panel"
+                  onClick={() => setRightCollapsed(true)}
+                >
+                  <Icon name="PanelRightClose" size={15} />
+                </button>
+              </div>
             </div>
 
             <div
@@ -969,9 +1022,10 @@ export const App = (): JSX.Element => {
                 lastMessage={harness.lastMessage}
                 boundWorkflow={rightPaneWorkflow}
                 noSessionAgent={noSessionAgentName}
-                activeSessionId={harness.activeSessionId}
                 overviewActive={showWelcome}
                 sessionExited={showDead}
+                expanded={canvasExpanded}
+                onToggleExpanded={() => setCanvasExpanded((v) => !v)}
                 macros={state.macros}
                 tasks={harness.tasks}
                 surface={rightTab === "steps" ? "steps" : "board"}
@@ -1037,6 +1091,8 @@ export const App = (): JSX.Element => {
           launchDir={activeSession?.cwd ?? state.launchDir ?? null}
           onClose={() => setTemplatesOpen(false)}
           onUse={handleUseTemplate}
+          listTemplates={harness.listTemplates}
+          getTemplate={harness.getTemplate}
         />
       )}
 

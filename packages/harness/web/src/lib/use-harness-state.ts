@@ -8,11 +8,12 @@ import type {
   HarnessSession,
   HarnessSettings,
   RunMacroRequest,
+  SessionRecord,
   SessionSummary,
   WorkflowInfo,
 } from "@shared/types";
 
-import type { HarnessEntry } from "@shared/types";
+import type { HarnessEntry, TemplateDetailView, TemplateListResponse } from "@shared/types";
 
 import {
   ApiError,
@@ -25,6 +26,7 @@ import {
   type RunLocalLine,
 } from "./api";
 import { type ConnectivityErrorInput } from "./connectivity";
+import { mergeHistory } from "./history-meta";
 import { subscribeEvents } from "./events";
 import { renderLocalRun } from "@shared/render-local-run";
 import type { LocalStepTrace, LocalRunOutcome } from "@sapiom/agent-core";
@@ -87,9 +89,14 @@ export interface HarnessStateHook {
    *  resume view, not one directory at a time). */
   loadHistory: (cwds: string[]) => Promise<void>;
   createSession: (req: CreateSessionRequest) => Promise<HarnessSession>;
-  /** Welcome panel's "Run the sample project": seeds (or reuses) the bundled
-   *  example, then opens a normal session in it with the default harness. */
-  createSampleSession: () => Promise<HarnessSession>;
+  /** The live template gallery + one template's detail (server relays core;
+   *  the API key never reaches the browser). Surfaced here so components stay
+   *  prop-driven rather than reaching for a module-level api singleton. */
+  listTemplates: () => Promise<TemplateListResponse>;
+  getTemplate: (id: string) => Promise<TemplateDetailView>;
+  /** A past session's reconstructed transcript (null when nothing was
+   *  recorded for it). Stable identity — safe as an effect dependency. */
+  sessionRecord: (id: string) => Promise<SessionRecord | null>;
   resumeSession: (harnessSessionId: string) => Promise<HarnessSession>;
   resumeFromHistory: (summary: SessionSummary) => Promise<HarnessSession>;
   /** Dismisses an exited session (DELETE): drops it from the list and, if it was active, falls back to another running session or clears the pane. */
@@ -642,23 +649,28 @@ export function useHarnessState(): HarnessStateHook {
     });
   }, [refreshWorkflows, startRunPolling]);
 
+  /**
+   * Loads history for `cwds` and folds it into the store via `mergeHistory`,
+   * which replaces only the rows of the directories that answered — see there
+   * for why a whole-store replace is wrong when callers request different
+   * scopes (the popover asks for up to twelve directories, the dead pane for
+   * one).
+   */
   const loadHistory = useCallback(async (cwds: string[]) => {
     setHistoryLoading(true);
     try {
       // Fan out per directory; one failing dir never hides the others'
-      // history. Dedupe by agentSessionId (a dir can repeat across sources)
-      // and sort newest first — the menu renders one flat, global list.
+      // history — and, since only fulfilled cwds count as refreshed, never
+      // evicts what we already had for it either.
       const results = await Promise.allSettled(cwds.map((cwd) => api.sessionHistory(cwd)));
-      const byAgentId = new Map<string, SessionSummary>();
-      for (const result of results) {
-        if (result.status !== "fulfilled") continue;
-        for (const summary of result.value) {
-          if (!byAgentId.has(summary.agentSessionId)) byAgentId.set(summary.agentSessionId, summary);
-        }
-      }
-      setHistory(
-        Array.from(byAgentId.values()).sort((a, b) => b.lastActiveAt.localeCompare(a.lastActiveAt)),
-      );
+      const refreshed: SessionSummary[] = [];
+      const refreshedCwds = new Set<string>();
+      results.forEach((result, index) => {
+        if (result.status !== "fulfilled") return;
+        refreshedCwds.add(cwds[index]!);
+        refreshed.push(...result.value);
+      });
+      setHistory((prev) => mergeHistory(prev, refreshed, refreshedCwds));
     } finally {
       setHistoryLoading(false);
     }
@@ -696,14 +708,11 @@ export function useHarnessState(): HarnessStateHook {
     return session;
   }, [selectSession]);
 
-  const createSampleSession = useCallback(async (): Promise<HarnessSession> => {
-    const seeded = await api.seedSampleProject();
-    // Same default-harness choice the auto-created boot session uses:
-    // doctor()'s preference order, falling back to claude-code when the
-    // server didn't report availability (see AppState.availableHarnesses).
-    const harness = state?.availableHarnesses?.[0] ?? "claude-code";
-    return createSession({ cwd: seeded.root, harness });
-  }, [state?.availableHarnesses, createSession]);
+  const listTemplates = useCallback((): Promise<TemplateListResponse> => api.listTemplates(), []);
+  const getTemplate = useCallback((id: string): Promise<TemplateDetailView> => api.getTemplate(id), []);
+  // Stable identity matters here: the past-session pane fetches from an effect
+  // keyed on this callback, so a fresh closure per render would refetch forever.
+  const sessionRecord = useCallback((id: string): Promise<SessionRecord | null> => api.sessionRecord(id), []);
 
   const resumeSession = useCallback(
     async (harnessSessionId: string): Promise<HarnessSession> => {
@@ -728,11 +737,19 @@ export function useHarnessState(): HarnessStateHook {
   );
 
   /**
-   * Resumes a history entry. Prefers the registry's own harnessSessionId back-reference;
-   * falls back to matching agentSessionId against live sessions for older/partial data,
-   * and — for transcript-sourced entries the harness never tracked at all — starts a
-   * fresh session in the same directory rather than blocking on a resume path that
-   * doesn't exist for them.
+   * Resumes a history entry, in the order that preserves the most context:
+   *
+   *  1. A row the registry already tracks → resume that record.
+   *  2. A transcript-only row the agent still holds (`resumeMode:
+   *     "agent-resume"`, verified server-side) → adopt it into the registry
+   *     and resume for real. This is the case that used to silently start a
+   *     fresh session and throw the conversation away.
+   *  3. Anything else (`rehydrate`) → a fresh session in the same directory,
+   *     which is all that's possible until H3 lands portable continue.
+   *
+   * A failed adopt does NOT fall through to a fresh session: it surfaces the
+   * server's reason as a toast, because quietly starting something different
+   * from what the button promised is the behaviour this replaces.
    */
   const resumeFromHistory = useCallback(
     async (summary: SessionSummary): Promise<HarnessSession> => {
@@ -740,9 +757,35 @@ export function useHarnessState(): HarnessStateHook {
         summary.harnessSessionId ??
         state?.sessions.find((session) => session.agentSessionId === summary.agentSessionId)?.id;
       if (harnessSessionId) return resumeSession(harnessSessionId);
+      if (summary.resumeMode === "agent-resume") {
+        try {
+          const adopted = await api.adoptSession({
+            agentSessionId: summary.agentSessionId,
+            harness: summary.harness,
+            cwd: summary.cwd,
+            title: summary.title,
+            lastActiveAt: summary.lastActiveAt,
+          });
+          // Upsert: the adopted record is new to the registry in the normal
+          // case, but the server resumes an existing one when the row was
+          // already tracked, and then this response is the fresher copy.
+          setState((prev) => {
+            if (!prev) return prev;
+            const sessions = prev.sessions.some((s) => s.id === adopted.id)
+              ? prev.sessions.map((s) => (s.id === adopted.id ? adopted : s))
+              : [...prev.sessions, adopted];
+            return { ...prev, sessions };
+          });
+          selectSession(adopted.id);
+          return adopted;
+        } catch (err) {
+          setToast(err instanceof ApiError && err.reason ? err.reason : (err as Error).message);
+          throw err;
+        }
+      }
       return createSession({ cwd: summary.cwd, harness: summary.harness });
     },
-    [state, resumeSession, createSession],
+    [state, resumeSession, createSession, selectSession],
   );
 
   const closeSession = useCallback(
@@ -962,7 +1005,9 @@ export function useHarnessState(): HarnessStateHook {
     historyLoading,
     loadHistory,
     createSession,
-    createSampleSession,
+    listTemplates,
+    getTemplate,
+    sessionRecord,
     resumeSession,
     resumeFromHistory,
     closeSession,

@@ -36,10 +36,47 @@ const loadApp = async (page: Page): Promise<void> => {
   await expect(page.locator(".rail-workflows")).toBeVisible();
 };
 
+/**
+ * Navigate to a clean slate, trigger a canvas.reload so the board mounts,
+ * and wait for the iframe. The chat panel and board-pick tests need a live
+ * board with a posted graph before they can interact.
+ */
+const loadBoard = async (page: Page): Promise<void> => {
+  await loadApp(page);
+  await page.evaluate(() => {
+    (window as unknown as { __HARNESS_TEST__: { publish: (m: unknown) => void } }).__HARNESS_TEST__.publish({
+      type: "canvas.reload",
+      harnessSessionId: "sess-boot",
+    });
+  });
+  await expect(page.locator(".canvas-iframe")).toBeVisible();
+};
+
+/**
+ * Click the board node with the given id via the gesture layer's pick message,
+ * then wait for the inspector to show (canvas-inspector-title matches the label).
+ */
+const pickNode = async (page: Page, nodeId: string): Promise<void> => {
+  const boardFrame = page.frameLocator(".canvas-frame-wrap iframe");
+  const node = boardFrame.locator(`[data-node-id="${nodeId}"]`);
+  await expect(node).toBeVisible();
+  const box = await node.boundingBox();
+  if (!box) throw new Error(`node ${nodeId} has no bounding box`);
+  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+  await expect(page.getByTestId("canvas-inspector-title")).toHaveText(new RegExp(nodeId));
+};
+
 /** Switch to the Steps tab. */
 const openStepsTab = async (page: Page): Promise<void> => {
   await page.getByTestId("right-tab-steps").click();
   await expect(page.getByTestId("right-tab-steps")).toHaveClass(/is-active/);
+};
+
+/** Open the standalone chat panel (macros + ask) via the 💬 toggle — closed by
+ *  default now, independent of the step inspector. */
+const openChat = async (page: Page): Promise<void> => {
+  await page.getByTestId("canvas-chat-toggle").click();
+  await expect(page.getByTestId("canvas-chat-panel")).toBeVisible();
 };
 
 /** Poll for the last inject recorded by MockApi.injectInput (mock delay is ~180ms). */
@@ -140,6 +177,49 @@ test.describe("macro bar visibility in Steps tab", () => {
     }
     // The macro block must not appear without run data.
     await expect(page.getByTestId("step-macros")).toHaveCount(0);
+  });
+});
+
+test.describe("chat panel visibility", () => {
+  test.beforeEach(async ({ page }) => {
+    await loadBoard(page);
+  });
+
+  test("the chat is closed by default and opens via the 💬 toggle", async ({ page }) => {
+    // Closed by default — no chat/macros on load.
+    await expect(page.getByTestId("canvas-chat-panel")).toHaveCount(0);
+    await expect(page.getByTestId("canvas-inspector-macros")).toHaveCount(0);
+
+    await openChat(page);
+    // With no step selected the chat is a general ask — freeform only, no
+    // step-specific macros.
+    await expect(page.getByTestId("canvas-freeform-input")).toBeVisible();
+    await expect(page.getByTestId("canvas-macro-debug")).toHaveCount(0);
+  });
+
+  test("picking a step surfaces the step macros in the chat", async ({ page }) => {
+    await openChat(page);
+    await pickNode(page, "intake");
+    await expect(page.getByTestId("canvas-inspector-title")).toHaveText("intake");
+
+    const macros = page.getByTestId("canvas-inspector-macros");
+    await expect(macros.getByTestId("canvas-macro-debug")).toBeVisible();
+    await expect(macros.getByTestId("canvas-macro-slow")).toBeVisible();
+    await expect(macros.getByTestId("canvas-macro-explain")).toBeVisible();
+    await expect(macros.getByTestId("canvas-freeform-input")).toBeVisible();
+  });
+
+  test("the chat closes on its own X — independent of the step inspector", async ({ page }) => {
+    await pickNode(page, "intake");
+    await openChat(page);
+    // Both open at once: the step inspector (info) AND the chat.
+    await expect(page.getByTestId("canvas-step-inspector")).toBeVisible();
+    await expect(page.getByTestId("canvas-chat-panel")).toBeVisible();
+
+    // Closing the chat leaves the inspector untouched.
+    await page.getByTestId("canvas-chat-close").click();
+    await expect(page.getByTestId("canvas-chat-panel")).toHaveCount(0);
+    await expect(page.getByTestId("canvas-step-inspector")).toBeVisible();
   });
 });
 
@@ -299,5 +379,46 @@ test.describe("debug macros — prod run data enriches the context", () => {
     // The other macros stay ghost.
     await expect(page.getByTestId("step-macro-slow").first()).toHaveClass(/btn-ghost/);
     await expect(page.getByTestId("step-macro-explain").first()).toHaveClass(/btn-ghost/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Macro inject — offline stub run (canvas chat panel path)
+// ---------------------------------------------------------------------------
+
+test.describe("debug macros — offline stub run", () => {
+  test("the macro bar appears after a local stub run and includes run status", async ({ page }) => {
+    await page.goto("/?seed=0");
+    await expect(page.locator(".rail-workflows")).toBeVisible();
+    await page.getByTestId("right-tab-steps").click();
+
+    // Trigger the local run.
+    const btn = page.getByTestId("session-step-local");
+    await expect(btn).toBeEnabled();
+    await btn.click();
+
+    // Wait for the run to complete.
+    const chip = page.getByTestId("canvas-run-chip");
+    await expect(chip).toBeVisible({ timeout: 8000 });
+    await expect(chip).toContainText("local run completed", { timeout: 8000 });
+
+    // Switch to the Canvas tab. The board is already mounted (mock auto-shows
+    // the frame for sess-boot); no need to re-trigger canvas.reload which would
+    // race with the node pick and clear the run from the inspector.
+    await page.getByTestId("right-tab-canvas").click();
+    await pickNode(page, "intake");
+    await openChat(page);
+    await expect(page.getByTestId("canvas-inspector-macros")).toBeVisible();
+    // Run data is in state (chip confirmed above); inspector must show it.
+    await expect(page.getByTestId("canvas-inspector-run")).toBeVisible({ timeout: 5000 });
+    await clearLastInject(page);
+
+    await page.getByTestId("canvas-macro-debug").click();
+
+    const inject = await lastInject(page);
+    expect(inject.req.text).toContain("Step: intake");
+    // Local run sets status: "passed" for intake.
+    expect(inject.req.text).toContain("Status: passed");
+    expect(inject.req.text).not.toContain("$");
   });
 });

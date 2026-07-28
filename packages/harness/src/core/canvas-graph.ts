@@ -11,7 +11,11 @@
  */
 import type { AgentManifest, AgentStepManifest } from "@sapiom/agent";
 import { runManifestCheck } from "./canvas-manifest-check.js";
-import { detectWorkflowLaunches, type DetectedLaunch } from "./canvas-interconnections.js";
+import {
+  scanWorkflowSources,
+  type DetectedLaunch,
+  type DetectedCapability,
+} from "./canvas-interconnections.js";
 
 export type CanvasNodeKind = "entry" | "step" | "pause" | "terminal-success" | "terminal-warn" | "launched-workflow";
 export type CanvasEdgeKind = "sequential" | "branching" | "cross" | "launch";
@@ -21,6 +25,14 @@ export interface CanvasNode {
   kind: CanvasNodeKind;
   label: string;
   sublabel?: string;
+  /** Human-authored step description from the manifest (Option A); "" when none. */
+  description?: string;
+  /** The step's declared input contract (JSON Schema) from the manifest. */
+  inputSchema?: Record<string, unknown> | null;
+  /** Author-declared Sapiom capabilities the step calls. */
+  capabilities?: readonly string[];
+  /** The step's declared dispatch timeout (ms); null when unset. */
+  timeoutMs?: number | null;
 }
 
 export interface CanvasEdge {
@@ -35,6 +47,8 @@ export interface CanvasGraph {
   /** The manifest's own name — used both as a display title fallback and as
    *  the match key for cross-workflow interconnection detection. */
   manifestName: string;
+  /** Human-authored workflow description from the manifest (Option A); "" when none. */
+  description?: string;
   entry: string;
   nodes: CanvasNode[];
   edges: CanvasEdge[];
@@ -78,10 +92,33 @@ function classifyNode(
   entry: string,
   step: AgentStepManifest,
 ): { kind: CanvasNodeKind; sublabel: string } {
-  const continueTargets = step.transitions.filter((t) => t.kind === "continue");
-  const pause = step.transitions.find((t) => t.kind === "pause");
-  const hasTerminate = step.transitions.some((t) => t.kind === "terminate");
-  const hasFail = step.transitions.some((t) => t.kind === "fail");
+  return classifyStepKind({ name, entry, transitions: step.transitions });
+}
+
+/**
+ * The precedence table above, over nothing but a step's declared transition
+ * kinds — so a caller that has transitions from somewhere OTHER than a local
+ * `AgentManifest` classifies identically.
+ *
+ * Exported because the Studio's template preview projects the SAME graph from
+ * core's relayed `DefinitionTransitionDto[]` (see `core/template-catalog.ts`).
+ * That preview claims parity with the canvas, so it must not re-derive this:
+ * a second copy of the rule is a second answer to "what kind of node is this",
+ * and the two surfaces disagreeing is the exact class of bug the template work
+ * set out to remove. Collapsing the four kinds into a single `terminal` boolean
+ * (as the first cut of that preview did) renders a fail-only sink as a green
+ * success exit and a `continue`-plus-`terminate` gate as a terminal.
+ */
+export function classifyStepKind(input: {
+  name: string;
+  entry: string;
+  transitions: ReadonlyArray<{ kind: string; signal?: string | null }>;
+}): { kind: CanvasNodeKind; sublabel: string } {
+  const { name, entry, transitions } = input;
+  const continueTargets = transitions.filter((t) => t.kind === "continue");
+  const pause = transitions.find((t) => t.kind === "pause");
+  const hasTerminate = transitions.some((t) => t.kind === "terminate");
+  const hasFail = transitions.some((t) => t.kind === "fail");
 
   if (name === entry) return { kind: "entry", sublabel: "entry" };
   if (pause) return { kind: "pause", sublabel: `pause · ${pause.signal}` };
@@ -116,12 +153,28 @@ function edgesForStep(name: string, step: AgentStepManifest): CanvasEdge[] {
 export function graphFromManifest(manifest: AgentManifest, warnings: string[]): CanvasGraph {
   const nodes: CanvasNode[] = Object.entries(manifest.steps).map(([name, step]) => {
     const { kind, sublabel } = classifyNode(name, manifest.entry, step);
-    return { id: name, kind, label: name, sublabel };
+    return {
+      id: name,
+      kind,
+      label: name,
+      sublabel,
+      description: step.description ?? "",
+      inputSchema: step.inputSchema ?? null,
+      capabilities: step.capabilities ?? [],
+      timeoutMs: step.timeoutMs ?? null,
+    };
   });
   const edges: CanvasEdge[] = Object.entries(manifest.steps).flatMap(([name, step]) =>
     edgesForStep(name, step),
   );
-  return { manifestName: manifest.name, entry: manifest.entry, nodes, edges, warnings };
+  return {
+    manifestName: manifest.name,
+    description: manifest.description ?? "",
+    entry: manifest.entry,
+    nodes,
+    edges,
+    warnings,
+  };
 }
 
 /**
@@ -155,6 +208,31 @@ export function mergeLaunchesIntoGraph(graph: CanvasGraph, launches: readonly De
   return { ...graph, nodes, edges };
 }
 
+/** Fills each step node's `capabilities` from statically-detected
+ *  `ctx.sapiom.*` calls, unless the manifest already declared them (authored
+ *  capabilities win). Pure — returns a new graph. */
+export function mergeCapabilitiesIntoGraph(
+  graph: CanvasGraph,
+  detected: readonly DetectedCapability[],
+): CanvasGraph {
+  if (detected.length === 0) return graph;
+  const byStep = new Map<string, Set<string>>();
+  for (const d of detected) {
+    if (!d.fromStepId) continue;
+    const set = byStep.get(d.fromStepId) ?? new Set<string>();
+    set.add(d.capability);
+    byStep.set(d.fromStepId, set);
+  }
+  return {
+    ...graph,
+    nodes: graph.nodes.map((n) => {
+      if ((n.capabilities?.length ?? 0) > 0) return n; // authored capabilities win
+      const caps = byStep.get(n.id);
+      return caps ? { ...n, capabilities: [...caps].sort() } : n;
+    }),
+  };
+}
+
 /**
  * Extracts a workflow's step graph from its project directory, with detected
  * cross-workflow launches merged in as dashed nodes. Never throws: any
@@ -168,6 +246,10 @@ export async function extractWorkflowGraph(sourceDir: string): Promise<Extractio
   const result = await runManifestCheck(sourceDir);
   if (!result.ok) return { ok: false, reason: result.reason };
   const graph = graphFromManifest(result.manifest as AgentManifest, result.warnings);
-  const launches = await detectWorkflowLaunches(sourceDir, new Set(graph.nodes.map((n) => n.id)));
-  return { ok: true, graph: mergeLaunchesIntoGraph(graph, launches) };
+  const stepIds = new Set(graph.nodes.map((n) => n.id));
+  // One walk over the sources yields both — halves the I/O on the auto-render
+  // hot path (this runs on every workflow-source save).
+  const { launches, capabilities } = await scanWorkflowSources(sourceDir, stepIds);
+  const withLaunches = mergeLaunchesIntoGraph(graph, launches);
+  return { ok: true, graph: mergeCapabilitiesIntoGraph(withLaunches, capabilities) };
 }

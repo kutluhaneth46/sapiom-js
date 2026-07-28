@@ -28,7 +28,6 @@ import type {
 } from "../shared/types.js";
 import { JSON_BODY_LIMIT_BYTES } from "../shared/types.js";
 import { resolveStatePaths } from "../core/paths.js";
-import { seedExampleProject } from "../core/example-seed.js";
 import {
   SessionManager,
   type LaunchOptsBuilder,
@@ -43,6 +42,10 @@ import {
 } from "../core/workflow-registry.js";
 import { DEFAULT_MACROS } from "../core/macros.js";
 import { createEventStore } from "../core/collector/store.js";
+import {
+  createClaudeTranscriptEnricher,
+  createSessionRecordReader,
+} from "../core/session-record.js";
 import { createHarnessEmitter } from "../core/collector/analytics-emitter.js";
 import { migrateHarnessIdentity } from "../core/collector/identity-migration.js";
 import { normalizeHookEvent } from "../core/collector/normalizer.js";
@@ -100,6 +103,7 @@ import { createCanvasRenderRouter } from "./canvas-render.js";
 import { createMacrosRouter } from "./macros.js";
 import { createFsRouter } from "./fs.js";
 import { createRunsRouter } from "./runs.js";
+import { createTemplatesRouter } from "./templates.js";
 import { createActionsRouter } from "./actions.js";
 import {
   createAuthRouter,
@@ -214,9 +218,6 @@ export interface HarnessServerOptions {
    * Passed through into AppState.consentEnvReason.
    */
   consentEnvReason?: string | null;
-  /** Where POST /api/sample-project seeds the bundled example. Defaults to
-   *  `<stateRoot>/sample-project`. */
-  sampleProjectRoot?: string;
 }
 
 export interface HarnessServer {
@@ -240,6 +241,9 @@ function workflowListsEqual(
   b: readonly WorkflowInfo[],
 ): boolean {
   if (a.length !== b.length) return false;
+  // NUL separates the fields because it can't occur in any of them. Keep it
+  // written as the escape `\u0000` — a literal NUL byte in the source makes
+  // grep and ripgrep classify this whole file as binary and silently skip it.
   const key = (w: WorkflowInfo): string =>
     `${w.path}\u0000${w.name}\u0000${w.definitionId ?? ""}\u0000${w.source}`;
   const setA = new Set(a.map(key));
@@ -640,6 +644,15 @@ export const startServer = async (
         void rescanWorkspaceForSession(session.id).catch((err: unknown) => {
           console.error("[harness] initial workspace rescan failed:", err);
         });
+        // A resumed/already-bound session skips the rescan's auto-bind render
+        // (guarded by !boundWorkflowPath), so render it here — a reopened
+        // workflow shows its diagram on start without any manual trigger, now
+        // that the empty-state render button is gone.
+        if (session.boundWorkflowPath) {
+          void autoRenderCanvas(session).catch((err: unknown) => {
+            console.error("[harness] on-start canvas render failed:", err);
+          });
+        }
       }
     } else if (session.status === "exited") {
       canvasWatcher.stop(session.id);
@@ -731,6 +744,15 @@ export const startServer = async (
 
   const eventStorePath = options.eventStorePath ?? statePaths.events;
   const eventStore = createEventStore(eventStorePath);
+
+  // Past-session transcripts, rebuilt from the events above rather than from
+  // any vendor's history file — the same code path for claude-code and codex.
+  // The claude enricher is a pure bonus on top: when that transcript happens
+  // to still exist, the final turn gains its model/usage; when it doesn't, the
+  // record renders unchanged.
+  const sessionRecordReader = createSessionRecordReader(eventStore, {
+    enrichFinalTurn: createClaudeTranscriptEnricher(),
+  });
 
   // Boot-time retention sweep: keeps events.ndjson within the 50 MB / 30-day
   // caps even on long-lived installs. Runs through the store's exclusive queue
@@ -845,6 +867,7 @@ export const startServer = async (
       firstRun: options.firstRun,
       consentSource: options.consentSource,
       consentEnvReason: options.consentEnvReason,
+      sessionRecords: sessionRecordReader,
       uiTrack: {
         store: eventStore,
         batcher,
@@ -852,12 +875,6 @@ export const startServer = async (
         machineId,
         userId: identity?.userId ?? null,
         tenantId: identity?.tenantId ?? null,
-      },
-      seedSampleProject: async () => {
-        const { root, projectDir, created } = await seedExampleProject({
-          targetRoot: options.sampleProjectRoot ?? statePaths.sampleProject,
-        });
-        return { root, projectDir, created };
       },
       settingsPath: statePaths.settings,
     }),
@@ -884,6 +901,14 @@ export const startServer = async (
       // the API key on a 401 and retry, recovering instead of locking.
       apiKey: apiKeyProvider,
       baseUrl: resolveAgentsBaseUrl(),
+    }),
+  );
+  // The template gallery, relayed from CORE (not the agents surface) so the
+  // Studio's picker and the dashboard's Template library read one catalog.
+  // baseUrl omitted: the router self-defaults via resolveCoreBaseUrl().
+  app.use(
+    createTemplatesRouter({
+      apiKey: apiKeyProvider,
     }),
   );
   // Direct action macros (Deploy / Prod-run) — server-side, key never reaches
@@ -1271,12 +1296,32 @@ export const startServer = async (
       // linger ref'd in the background after shutdown completes.
       if (shutdownTimerHandle !== undefined) clearTimeout(shutdownTimerHandle);
       void batcher.close();
+      // wss.close() stops NEW upgrades but never terminates the connections
+      // already open — and httpServer.close() then waits indefinitely for those
+      // sockets to drain. The main window's live /ws/events and /ws/terminal
+      // connections (plus any keep-alive HTTP socket) would therefore hang
+      // close() forever, so Electron's before-quit never reaches app.quit() and
+      // the process lingers as a zombie still holding the single-instance lock —
+      // which blocks the next launch (it hangs on "Starting Sapiom…"). Force
+      // each client shut, drop keep-alive HTTP conns, and bound the final wait
+      // so shutdown always completes.
+      for (const client of terminalWss.clients) client.terminate();
+      for (const client of eventsWss.clients) client.terminate();
       terminalWss.close();
       eventsWss.close();
-      await new Promise<void>((resolve, reject) => {
+      httpServer.closeAllConnections?.();
+      const HTTP_CLOSE_TIMEOUT_MS = 3_000;
+      await new Promise<void>((resolve) => {
+        let httpCloseTimer: ReturnType<typeof setTimeout> | undefined =
+          setTimeout(() => {
+            httpCloseTimer = undefined;
+            resolve();
+          }, HTTP_CLOSE_TIMEOUT_MS);
+        httpCloseTimer.unref?.();
         httpServer.close((err) => {
-          if (err) reject(err);
-          else resolve();
+          if (err) console.error("[harness] httpServer.close error:", err);
+          if (httpCloseTimer !== undefined) clearTimeout(httpCloseTimer);
+          resolve();
         });
       });
     },

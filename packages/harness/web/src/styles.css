@@ -3022,6 +3022,85 @@ input {
   color: var(--text-dim);
 }
 
+/* ── Returning user: Overview, not a pitch ──
+   The first-run card is a centered hero. This one is a working surface — a list
+   you scan and click — so it left-aligns and grows with the recents rather than
+   holding hero proportions with no hero in it. */
+.welcome-card--returning {
+  width: 560px;
+}
+
+.welcome-copy--returning {
+  align-items: stretch;
+  text-align: left;
+  gap: var(--sp2);
+}
+
+.welcome-title--returning {
+  font-size: var(--type-title);
+}
+
+.welcome-recents-title {
+  margin: var(--sp2) 0 0;
+  font-size: var(--type-micro);
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  color: var(--text-faint);
+}
+
+.welcome-recents {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.welcome-recent {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp2);
+  width: 100%;
+  padding: var(--sp2);
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  text-align: left;
+  color: var(--text);
+  transition: background-color var(--transition-fast);
+}
+
+.welcome-recent:hover {
+  background: var(--surface-hover);
+}
+
+.welcome-recent:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: -2px;
+}
+
+.welcome-recent-name {
+  font-size: var(--type-ui);
+  font-weight: 550;
+  flex: 0 0 auto;
+}
+
+/* The full path is the disambiguator when two workspaces share a folder name,
+   so it stays visible — truncated from the LEFT, since the tail is what
+   identifies it. */
+.welcome-recent-path {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: var(--type-micro);
+  color: var(--text-faint);
+  direction: rtl;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 /* Bottom-anchored action BAND: full-bleed against the card's own edges
    (negative inline/bottom margins swallow the card padding), hairline on
    top — the same dialog-footer anatomy as .modal-actions. Docs link far
@@ -3161,6 +3240,35 @@ input {
   text-align: center;
 }
 
+.dead-session-summary {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+}
+
+/* With a transcript below it, the metadata card stops being the whole pane:
+   the column starts at the top and the transcript takes the rest, scrolling
+   on its own (the app shell itself never scrolls). Without one, the pane is
+   unchanged — vertically centred, metadata only. */
+.dead-session-pane[data-has-record="true"] {
+  justify-content: flex-start;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.dead-session-record {
+  flex: 1;
+  align-self: stretch;
+  min-height: 0;
+  overflow-y: auto;
+  margin-top: var(--sp3);
+  padding-top: var(--sp3);
+  border-top: 1px solid var(--ui-line);
+  text-align: left;
+}
+
 .dead-session-title {
   color: var(--text);
   font-size: var(--type-ui);
@@ -3185,6 +3293,288 @@ input {
   max-width: 300px;
   line-height: 1.4;
   margin-top: 4px;
+}
+
+/* Past session: the reconstructed transcript ---------------------------
+   Unlike .dead-session-pane (a centred metadata card), this one is a
+   document: a fixed header with the actions, and a scrolling body. The
+   shell is viewport-locked, so the body — never the page — is what
+   scrolls (min-height: 0 on the column is what allows that). */
+.past-session-pane {
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-0);
+}
+
+.past-session-header {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--sp4);
+  padding: var(--sp3) var(--pane-pad-x);
+  border-bottom: 1px solid var(--ui-line);
+  background: var(--surface-raised);
+}
+
+.past-session-heading {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp1);
+  text-align: left;
+}
+
+.past-session-pane .dead-session-meta {
+  margin-bottom: 0;
+  overflow-wrap: anywhere;
+}
+
+.past-session-pane .dead-session-actions {
+  flex: 0 0 auto;
+}
+
+.past-session-pane .dead-session-resume-reason {
+  flex: 0 0 auto;
+  max-width: none;
+  margin: 0;
+  padding: var(--sp2) var(--pane-pad-x);
+  border-bottom: 1px solid var(--ui-line);
+}
+
+.past-session-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--sp4) var(--pane-pad-x);
+}
+
+.past-session-status {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--sp2);
+  max-width: 44ch;
+  margin: var(--sp6) auto;
+  color: var(--text-faint);
+  font-size: var(--type-label);
+  line-height: 1.5;
+  text-align: center;
+}
+
+/* ── The transcript itself ── */
+.transcript {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp4);
+  max-width: var(--assistant-measure);
+  margin: 0 auto;
+}
+
+/* The honesty label. Deliberately at the top of the document and not
+   dismissible: this view is rebuilt from our event log, and a reader must
+   never take it for a verbatim replay of their terminal. */
+.transcript-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp3);
+  padding: var(--sp3);
+  border: 1px solid var(--ui-line);
+  border-radius: var(--radius-md);
+  background: var(--bg-2);
+}
+
+.transcript-badge {
+  flex: 0 0 auto;
+  padding: 2px var(--sp2);
+  border-radius: var(--r-sm);
+  background: var(--surface-inset);
+  border: 1px solid var(--ui-line-strong);
+  color: var(--text-dim);
+  font-size: var(--type-micro);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.transcript-notice-body {
+  min-width: 0;
+}
+
+.transcript-notice-lead {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: var(--type-label);
+  line-height: 1.5;
+}
+
+.transcript-notice-list {
+  margin: var(--sp1) 0 0;
+  padding-left: var(--sp4);
+  color: var(--text-faint);
+  font-size: var(--type-meta);
+  line-height: 1.5;
+}
+
+.transcript-turns {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp5);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.transcript-turn {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp2);
+}
+
+.transcript-role {
+  display: flex;
+  align-items: center;
+  gap: var(--sp2);
+  font-size: var(--type-micro);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.transcript-role-label {
+  font-weight: 600;
+}
+
+.transcript-model,
+.transcript-usage,
+.transcript-time {
+  font-family: var(--font-mono);
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.transcript-prompt {
+  padding: var(--sp2) var(--sp3);
+  border-radius: var(--radius-md);
+  background: var(--surface-inset);
+  color: var(--text);
+  font-size: var(--type-ui);
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.transcript-assistant {
+  color: var(--text-dim);
+  font-size: var(--type-ui);
+  line-height: 1.6;
+}
+
+.transcript-assistant p,
+.transcript-assistant ul,
+.transcript-assistant pre {
+  margin: 0 0 var(--sp2);
+}
+
+.transcript-assistant > :last-child {
+  margin-bottom: 0;
+}
+
+.transcript-assistant pre,
+.transcript-tool-pre {
+  padding: var(--sp2);
+  border-radius: var(--r-sm);
+  background: var(--surface-inset);
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: var(--type-meta);
+  line-height: 1.5;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* "We don't have this" — the one thing this view must never fake. */
+.transcript-absent {
+  color: var(--text-faint);
+  font-size: var(--type-meta);
+  font-style: italic;
+  line-height: 1.5;
+}
+
+.transcript-incomplete {
+  align-self: flex-start;
+  padding: 1px var(--sp2);
+  border: 1px solid var(--amber);
+  border-radius: var(--r-sm);
+  color: var(--amber-text);
+  font-size: var(--type-micro);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+/* Tool calls: collapsed by default — a long session is mostly tool
+   traffic, and the conversation is what this pane is for. */
+.transcript-tools {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp1);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.transcript-tool details {
+  border: 1px solid var(--ui-line);
+  border-radius: var(--r-sm);
+  background: var(--surface-raised);
+}
+
+.transcript-tool-summary {
+  display: flex;
+  align-items: center;
+  gap: var(--sp2);
+  padding: var(--sp1) var(--sp2);
+  cursor: pointer;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: var(--type-meta);
+}
+
+.transcript-tool-summary:hover {
+  background: var(--surface-hover);
+}
+
+.transcript-tool-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.transcript-tool-truncated {
+  flex: 0 0 auto;
+  color: var(--amber-text);
+  font-size: var(--type-micro);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.transcript-tool-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp1);
+  padding: 0 var(--sp2) var(--sp2);
+}
+
+.transcript-tool-heading {
+  color: var(--text-faint);
+  font-size: var(--type-micro);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
 }
 
 /* Canvas pane ---------------------------------------------------------- */
@@ -3601,8 +3991,7 @@ input {
 }
 
 .canvas-step-row:focus-visible,
-.canvas-step-open:focus-visible,
-.canvas-detail-edge:focus-visible {
+.canvas-step-open:focus-visible {
   outline: 1.5px solid var(--brand);
   outline-offset: 1px;
 }
@@ -4160,6 +4549,9 @@ input {
   border-top: 1px solid var(--ui-line);
 }
 
+/* Read-only lineage rows: "Leads to" / "Reached from" show a step's real
+   edges and branch conditions as reference. Navigation is the chart's job, so
+   no hover/press/link affordances here. */
 .canvas-detail-edge {
   display: flex;
   align-items: center;
@@ -4167,24 +4559,8 @@ input {
   width: 100%;
   min-height: 40px;
   padding: var(--sp1) var(--sp3);
-  border: 0;
-  background: transparent;
   color: var(--text-dim);
   text-align: left;
-  transition: background-color var(--transition-fast);
-}
-
-.canvas-detail-edge:hover {
-  background: var(--surface-hover);
-  color: var(--text);
-}
-
-.canvas-detail-edge:active {
-  background: var(--surface-selected);
-}
-
-.canvas-detail-edge:focus-visible {
-  outline-offset: -2px;
 }
 
 .canvas-detail-edge > svg {
@@ -4205,10 +4581,6 @@ input {
   background: var(--surface-inset);
   font-size: var(--type-micro);
   color: var(--text-faint);
-}
-
-.canvas-detail-edge:hover .canvas-detail-edge-target {
-  text-decoration: underline;
 }
 
 .canvas-detail-edge-cond {
@@ -4325,38 +4697,6 @@ input {
   margin: 0;
 }
 
-/* Transition rows double as links in the inspector: same elbow anatomy,
-   plus real interaction states on the target's name. */
-.canvas-step-transition.is-link {
-  border: 0;
-  background: none;
-  /* A little inset padding gives the soft-shade hover something to fill. */
-  padding: 2px var(--sp1);
-  text-align: left;
-  cursor: pointer;
-  border-radius: var(--radius-sm);
-  transition: background-color var(--transition-fast);
-}
-
-/* Selectable inspector rows get the same soft-shade language as the board's
-   selected node when they are the interaction target. */
-.canvas-step-transition.is-link:hover,
-.canvas-step-transition.is-link:active {
-  background: var(--active-shade);
-}
-
-.canvas-step-transition.is-link:hover .canvas-step-transition-target,
-.canvas-step-transition.is-link:active .canvas-step-transition-target {
-  color: var(--text);
-  text-decoration: underline;
-  text-underline-offset: 3px;
-}
-
-.canvas-step-transition.is-link:focus-visible {
-  outline: 2px solid var(--focus);
-  outline-offset: 1px;
-}
-
 /* The selected step's observed run facts: one meta-size row — status ink
    from the shared run-text scale, then duration. */
 .canvas-inspector-run {
@@ -4378,19 +4718,25 @@ input {
    reads as native to the panel above it. */
 .canvas-inspector-macros {
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
+  flex-wrap: wrap;
   gap: var(--sp1);
   margin-top: var(--sp1);
   padding-top: var(--sp2);
   border-top: 1px solid var(--ui-line);
 }
 
+/* The three macros ride as a single wrapping row of pills (they inherit
+   .btn-ghost / .btn-primary); each grows to share the row, wrapping when the
+   drawer is too narrow. */
 .canvas-inspector-macro-btn {
-  width: 100%;
-  text-align: left;
+  flex: 1 1 auto;
+  text-align: center;
 }
 
+/* The free-form ask always drops to its own full-width row below the pills. */
 .canvas-inspector-freeform {
+  flex: 1 0 100%;
   display: flex;
   flex-direction: column;
   gap: var(--sp1);
@@ -4457,13 +4803,59 @@ input {
 
 .canvas-overview-open {
   position: absolute;
-  right: var(--sp3);
+  /* Left of the chat toggle so both corner controls sit side by side. */
+  right: calc(var(--sp3) + 40px);
   bottom: var(--sp3);
   z-index: 3;
   background: var(--surface-raised);
   border: 1px solid var(--ui-line);
   box-shadow: var(--shadow-soft);
   font-weight: 590;
+}
+
+/* Chat toggle — the corner control that opens/closes the standalone chat
+   panel (closed by default), beside the info (ⓘ) reopen affordance. */
+.canvas-chat-toggle {
+  position: absolute;
+  right: var(--sp3);
+  bottom: var(--sp3);
+  z-index: 3;
+  background: var(--surface-raised);
+  border: 1px solid var(--ui-line);
+  box-shadow: var(--shadow-soft);
+}
+.canvas-chat-toggle.is-active {
+  background: var(--active-shade);
+  border-color: var(--ui-line-strong);
+  color: var(--text);
+}
+
+/* Standalone chat panel — its own bottom-drawer section, below the info panel;
+   both can be open at once. Content (macros + ask) is short, so it hugs, capped
+   so it never eats the whole pane. */
+.canvas-chat-panel {
+  flex: 0 0 auto;
+  max-height: 45%;
+  overflow-y: auto;
+  border-top: 1px solid var(--ui-line);
+  background: var(--surface-raised);
+  padding: var(--sp3);
+}
+.canvas-chat-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp2);
+  margin-bottom: var(--sp2);
+}
+.canvas-chat-title {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--type-label);
+  font-weight: 590;
+  color: var(--text);
+}
+.canvas-chat-close {
+  flex: 0 0 auto;
 }
 
 /* Expanded: the same node lifts to a fixed overlay (never remounted, so the
@@ -5005,14 +5397,6 @@ input {
   max-width: 320px;
   color: var(--text-faint);
   font-size: var(--type-meta);
-}
-
-.canvas-visualize-cta {
-  position: relative;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  margin: 4px 0;
 }
 
 /* Background-task states (see CanvasPane) ------------------------------- */
@@ -5903,8 +6287,20 @@ input {
   display: none;
 }
 
-.right-pane-collapse {
+/* The canvas expand + collapse-panel toggles sit together, right-anchored at
+   the end of the tab bar. */
+.right-pane-corner {
   margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: var(--sp1);
+}
+
+/* Deploy pill in the canvas tab bar — the board dropped its subheader, so the
+   deploy status + dashboard link sit up here beside expand/collapse. */
+.right-pane-deployed {
+  flex: 0 0 auto;
+  gap: 4px;
 }
 
 /* The canvas-pane child panel must fill the slot fully. */
@@ -6300,21 +6696,61 @@ input {
   min-height: 0;
 }
 
+/* The sidebar owns the grid column now that a search field sits above the
+   scrolling list — the list alone can't both scroll and pin the input. */
+.templates-sidebar {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-right: 1px solid var(--ui-line);
+}
+
+.templates-search {
+  margin: var(--sp2) var(--sp2) 0;
+  flex: 0 0 auto;
+}
+
 .templates-list {
   display: flex;
   flex-direction: column;
   gap: var(--sp1);
   padding: var(--sp2);
-  border-right: 1px solid var(--ui-line);
   overflow-y: auto;
 }
 
 .templates-list-section {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--sp1);
   padding: var(--sp2) var(--sp2) 0;
   font-size: var(--type-micro);
   font-weight: 700;
   letter-spacing: 0.01em;
   color: var(--text-faint);
+}
+
+/* Per-category count, mirroring the dashboard's Template library sidebar. */
+.templates-list-count {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  color: var(--text-faint);
+}
+
+/* Loading / no-results / degraded-catalog copy. The degraded note is deliberately
+   not styled as an error: a signed-out gallery is a state, not a fault. */
+.templates-list-empty,
+.templates-list-note {
+  padding: var(--sp2);
+  font-size: var(--type-micro);
+  line-height: 1.5;
+  color: var(--text-dim);
+}
+
+.templates-list-note {
+  border: 1px solid var(--ui-line);
+  border-radius: var(--radius-sm);
+  background: var(--surface-hover);
 }
 
 .template-row {
@@ -6364,9 +6800,41 @@ input {
   overflow: hidden;
 }
 
+/* Step count + complexity band on the card: the two facts that change which
+   template you pick. The band may be an em dash when the catalog response
+   carried none — see formatComplexity. */
+.template-row-meta {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--sp1);
+  font-size: var(--type-micro);
+  color: var(--text-faint);
+}
+
+/* The band reads as a WORD plus a score, so it drops the mono face the dollar
+   figure used — mono on "Moderate" reads as a code token. Tabular figures stay:
+   the `n/5` sits in a column down the right edge of the list and should not
+   shimmy between rows. Right-aligned so a one-word band and a two-word one end
+   at the same place. */
+.template-row-complexity {
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
+}
+
 .template-row.is-selected .template-row-name,
-.template-row.is-selected .template-row-desc {
+.template-row.is-selected .template-row-desc,
+.template-row.is-selected .template-row-meta {
   color: var(--accent-foreground);
+}
+
+/* A guarded transition's condition, shown beside the elbow target so a branch
+   reads the same here as it does on the canvas. */
+.canvas-step-transition-label {
+  font-family: var(--font-mono);
+  font-size: var(--type-micro);
+  color: var(--text-faint);
 }
 
 /* ── Preview pane: real manifest fields only ── */
@@ -6486,6 +6954,29 @@ input {
   border: 1px solid var(--ui-line);
   border-radius: var(--radius-sm);
   font-family: var(--font);
+  font-size: var(--type-micro);
+  color: var(--text-faint);
+}
+
+/* A fail-only sink is NOT a success exit — it carries the canvas's amber, the
+   same signal `dot--terminal-warn` gives the node. */
+.template-step-exit--warn {
+  border-color: var(--amber);
+  color: var(--amber);
+}
+
+/* A step that waits for a signal, matching the canvas's dashed pause border. */
+.template-step-pause {
+  padding: 0 var(--sp1);
+  border: 1px dashed var(--text-faint);
+  border-radius: var(--radius-sm);
+  font-family: var(--font);
+  font-size: var(--type-micro);
+  color: var(--text-faint);
+}
+
+/* The classifier's one-line role, beside the step name in the ordered list. */
+.template-step-role {
   font-size: var(--type-micro);
   color: var(--text-faint);
 }
