@@ -20,7 +20,7 @@ async function openFolderBrowserModal(page: import("@playwright/test").Page): Pr
   await expect(page.getByTestId("add-project-menu")).toBeVisible();
   await page.getByTestId("add-project-open-folder").click();
   await expect(page.getByTestId("add-project-menu")).not.toBeVisible();
-  const modal = page.getByRole("dialog", { name: "Add project" });
+  const modal = page.getByRole("dialog", { name: "Add workspace" });
   await expect(modal).toBeVisible();
   // Wait for the listing to load.
   await expect(modal.getByTestId("folder-browser-listing")).toBeVisible({ timeout: 3000 });

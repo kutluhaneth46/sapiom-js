@@ -46,8 +46,8 @@ test.describe("add-project menu", () => {
     // Menu closes.
     await expect(page.getByTestId("add-project-menu")).not.toBeVisible();
 
-    // The "Add project" modal (workspace mode, role=dialog) is open.
-    const modal = page.getByRole("dialog", { name: "Add project" });
+    // The "Add workspace" modal (workspace mode, role=dialog) is open.
+    const modal = page.getByRole("dialog", { name: "Add workspace" });
     await expect(modal).toBeVisible();
   });
 
