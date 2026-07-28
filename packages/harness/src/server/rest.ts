@@ -76,6 +76,7 @@ const createSessionSchema = z.object({
   cwd: z.string().min(1),
   harness: z.enum(SPAWNABLE_HARNESS_KINDS),
   profile: z.string().optional(),
+  rehydrateFrom: z.string().min(1).optional(),
 }) satisfies z.ZodType<CreateSessionRequest>;
 
 const injectInputSchema = z.object({
@@ -95,6 +96,8 @@ const bindWorkflowSchema = z.object({
 const settingsPatchSchema = z.object({
   telemetryOptIn: z.boolean().optional(),
   recentDirs: z.array(z.string()).optional(),
+  projectRoot: z.string().optional(),
+  rollingSummary: z.boolean().optional(),
 }) satisfies z.ZodType<Partial<HarnessSettings>>;
 
 const UI_EVENT_NAMES: readonly UiEventName[] = [
@@ -198,6 +201,10 @@ export interface RestRouterOptions {
   /** The directory the CLI was launched against — surfaced in AppState so the
    * SPA can prefill the new-session modal with it. */
   launchDir: string;
+  /** The host's default parent directory for NEW agent projects. Omitted (the
+   * CLI case), AppState.defaultProjectRoot is absent and the SPA falls back to
+   * `launchDir` — see the field's doc on AppState. */
+  defaultProjectRoot?: string;
   /** The Agents API base URL (env-configurable) — surfaced in AppState so the
    * snippet panel's executions host matches where the server resolves slugs.
    * Omitted by tests, leaving AppState.agentsBaseUrl absent (the SPA then uses
@@ -286,6 +293,9 @@ export function createRestRouter(options: RestRouterOptions): Router {
         workflows: await listWorkflows(),
         macros: listMacros(),
         launchDir: options.launchDir,
+        ...(options.defaultProjectRoot
+          ? { defaultProjectRoot: options.defaultProjectRoot }
+          : {}),
         ...(options.availableHarnesses
           ? { availableHarnesses: options.availableHarnesses }
           : {}),
@@ -458,7 +468,7 @@ export function createRestRouter(options: RestRouterOptions): Router {
         if (!adapter) continue;
         for (const record of await adapter.listPastSessions(cwd)) {
           transcripts.push(record);
-          foundInStore.add(`${record.harness} ${record.agentSessionId}`);
+          foundInStore.add(`${record.harness}\u0000${record.agentSessionId}`);
         }
       }
 
@@ -473,7 +483,7 @@ export function createRestRouter(options: RestRouterOptions): Router {
       // deliberately accepts those). Concurrent, since each is independent.
       const probed = await Promise.all(
         registryRows.map(async (session) =>
-          foundInStore.has(`${session.harness} ${session.agentSessionId!}`)
+          foundInStore.has(`${session.harness}\u0000${session.agentSessionId!}`)
             ? true
             : agentHoldsConversation(adapters, session.harness, session.agentSessionId!, session.cwd),
         ),

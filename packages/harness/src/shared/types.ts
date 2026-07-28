@@ -28,11 +28,28 @@ export const HARNESS_PATHS = {
   settings: `${HARNESS_HOME}/settings.json`,
   /** Generated per-session agent config (claude settings/mcp-config files). */
   generated: `${HARNESS_HOME}/generated`,
-  /** The bundled example project, seeded lazily by POST /api/sample-project
-   *  (the welcome panel's "Run the sample project") — stable so re-running
-   *  the sample reuses the same copy instead of scattering fresh ones. */
+  /**
+   * Archived session records — one compacted `<harnessSessionId>.json` per
+   * conversation (core/record-archive.ts). Deliberately NOT under `generated`:
+   * that directory is deleted the moment a session's pty exits, and these have
+   * to outlive `events.ndjson`'s 30-day retention, not undercut it.
+   */
+  records: `${HARNESS_HOME}/records`,
+  /** Where the bundled example project is seeded. Written ONLY by
+   *  `scripts/seed-example.mjs` (demo prep) since the in-app sample action and
+   *  its `POST /api/sample-project` route were removed — the running Studio
+   *  neither seeds nor reads this path, so a directory here is leftover output.
+   *  Kept stable so re-seeding reuses one copy instead of scattering fresh ones. */
   sampleProject: `${HARNESS_HOME}/sample-project`,
 } as const;
+
+/**
+ * The file that makes a directory an agent project. Canonical home: three
+ * copies of this literal used to live in core/workspace-watcher.ts,
+ * core/workflow-registry.ts and (now) server/fs.ts, the first of which carried
+ * a "kept in sync with" comment admitting the duplication. Import it.
+ */
+export const AGENT_PROJECT_MARKER = "sapiom.json";
 
 /**
  * Canvas convention: agents write static HTML here, relative to the session
@@ -151,6 +168,16 @@ export interface HarnessSession {
    *  HARNESS_CONTEXT_FILE in the session's cwd so the agent can read it. */
   boundWorkflowPath: string | null;
   /**
+   * The prior session this one was seeded from (portable continue — see
+   * core/rehydration.ts), when a brief was ACTUALLY produced and delivered.
+   * Null/absent otherwise, including when the client asked to rehydrate from
+   * an id our event log holds nothing for: this field is the record of what
+   * happened, not of what was requested, so the UI can never present an
+   * empty-handed fresh session as a continuation. Absent on sessions
+   * persisted by builds from before this existed.
+   */
+  rehydratedFrom?: string | null;
+  /**
    * `status === "running"` only means the pty is alive — the agent's TUI
    * can still be sitting on a blocking prompt (most commonly: "trust this
    * directory?") that isn't accepting real input yet. `ready` is the
@@ -215,12 +242,13 @@ export interface SessionSummary {
    */
   messageCount?: number;
   /**
-   * Number of human prompts (turns) recorded in OUR event log for this
-   * session, from the event store's byte-offset index. Exact and cheap at any
+   * Number of human prompts (turns) the harness itself recorded for this
+   * session — from the event store's byte-offset index, or from the archived
+   * record once the events behind it have been swept. Exact and cheap at any
    * file size — unlike {@link messageCount}, which the claude-code adapter
    * leaves undefined above its full-scan cap. Undefined when the harness has
-   * no recorded events for the session (a transcript the Studio never ran).
-   * Prefer this over messageCount when both are present.
+   * neither events nor an archived record for the session (a transcript the
+   * Studio never ran). Prefer this over messageCount when both are present.
    */
   turnCount?: number;
 }
@@ -278,7 +306,32 @@ export interface LaunchOpts {
   /** Only consulted by `launchTask` — hard cap on agent turns
    *  (`--max-turns`), so a bounded task can't run away. */
   maxTurns?: number;
+  /**
+   * Set by the launch-opts builder when this launch's context was seeded from
+   * a prior session's recorded events (portable continue — see
+   * core/rehydration.ts). Carries the id the brief was built from. Adapters
+   * ignore it entirely; `SessionManager.create()` copies it onto
+   * {@link HarnessSession.rehydratedFrom} so the UI can say whether the
+   * continue really carried context instead of implying it did.
+   */
+  rehydratedFrom?: string;
 }
+
+/**
+ * How a harness receives the rehydration brief for a continued session.
+ *
+ * - `launch-flag`: the adapter puts `LaunchOpts.systemPromptFile`'s contents in
+ *   front of the agent at spawn time (claude-code's `--append-system-prompt`,
+ *   codex's `developer_instructions`), so composing the brief into that file is
+ *   the whole delivery.
+ * - `post-ready-injection`: the harness has no such flag, so the brief is sent
+ *   through the ordinary input path once the session reports `ready` — gated on
+ *   readiness so it is never written into a TUI sitting on a trust prompt.
+ *
+ * See `systemPromptDeliveryFor` (core/rehydration.ts) for why the absent case
+ * resolves to the fallback rather than the flag.
+ */
+export type SystemPromptDelivery = "launch-flag" | "post-ready-injection";
 
 /**
  * One implementation per supported coding agent. Implementations must be
@@ -292,6 +345,14 @@ export interface HarnessAdapter {
   resume(agentSessionId: string, opts: LaunchOpts): SpawnSpec;
   /** How analytics events are sourced for this harness. */
   eventSource: "hooks" | "transcript-tail";
+  /**
+   * Whether `launch`/`resume` actually put `LaunchOpts.systemPromptFile` in
+   * front of the agent. Declared rather than inferred, because the alternative
+   * — assuming every adapter honours the field — silently drops a rehydration
+   * brief for one that doesn't. Omitted resolves to `post-ready-injection`
+   * (see `systemPromptDeliveryFor` in core/rehydration.ts).
+   */
+  systemPromptDelivery?: SystemPromptDelivery;
   /** Past sessions this agent recorded for a directory (agent-side history).
    *  Reports what it found; `resumeMode` is the server's call — see
    *  {@link PastSessionRecord}. */
@@ -762,12 +823,20 @@ export interface SessionRecordTurn {
  *   (Codex, whose rollout carries no equivalent of the Stop hook's field).
  * - `incomplete-final-turn`: the last turn never completed — the session
  *   ended mid-turn.
+ * - `compacted-archive`: the record was read from its archived copy, whose
+ *   tool inputs and results are clipped to keep it bounded (see
+ *   core/record-archive.ts). The conversation is whole; the tool payloads
+ *   inside it are excerpts.
+ * - `dropped-early-turns`: the archived copy kept only the most recent turns —
+ *   `turns` holds fewer of them than `turnCount` says happened.
  */
 export type SessionRecordLimitation =
   | "truncated-tool-output"
   | "assistant-narration-gap"
   | "missing-assistant-text"
-  | "incomplete-final-turn";
+  | "incomplete-final-turn"
+  | "compacted-archive"
+  | "dropped-early-turns";
 
 /** `GET /api/sessions/:id/record` response. */
 export interface SessionRecord {
@@ -788,13 +857,29 @@ export interface SessionRecord {
    *  reported ending (killed, or crashed). */
   endedAt: string | null;
   turns: SessionRecordTurn[];
-  /** Human prompts in the record — `turns.filter(t => t.prompt != null).length`. */
+  /**
+   * Human prompts in the CONVERSATION — `turns.filter(t => t.prompt != null)
+   * .length` for a record folded from events, and still that same count for an
+   * archived record whose oldest turns were dropped to fit its size cap. It
+   * describes what happened, not what survived, so a history row's turn count
+   * doesn't change when its events get swept; `dropped-early-turns` in
+   * {@link limitations} is what says `turns` holds fewer than this.
+   */
   turnCount: number;
-  /** Events folded into this record (including ones no turn field shows). */
+  /** Events folded into this record (including ones no turn field shows).
+   *  Like {@link turnCount}, counted before any archive compaction. */
   eventCount: number;
   /** Always true. Present on the wire so no client can mistake a record for a
    *  verbatim replay of what the user saw in their terminal. */
   reconstructed: true;
+  /**
+   * ISO-8601 of when this record was written to the durable archive
+   * (`~/.sapiom/harness/records/`), or null when it was folded from the live
+   * event log. Non-null therefore means "this is the archived copy": bounded,
+   * compacted, and — unlike the events — still here after the analytics sink's
+   * retention sweep. The UI says so where the user reads it.
+   */
+  archivedAt: string | null;
   limitations: SessionRecordLimitation[];
 }
 
@@ -831,6 +916,19 @@ export interface CreateSessionRequest {
   harness: HarnessKind;
   /** Profile id; omit for default. */
   profile?: string;
+  /**
+   * Portable continue: seed this fresh session with a reconstruction of a
+   * prior one instead of asking the vendor to reattach. Accepts either a
+   * `harnessSessionId` or the agent's own session id — whichever the history
+   * row carries — and is what a `resumeMode: "rehydrate"` row posts.
+   *
+   * Best-effort by contract: an id our event log holds nothing for still
+   * creates the session, with `HarnessSession.rehydratedFrom` left null so the
+   * caller can tell that no context came across. Refusing instead would block
+   * the only thing still possible for that row (a fresh session in the same
+   * directory) on a summary that was never going to exist.
+   */
+  rehydrateFrom?: string;
 }
 
 /**
@@ -954,6 +1052,18 @@ export interface AppState {
   /** The directory the CLI was launched against — the SPA prefills the
    *  new-session modal with this instead of recentDirs[0]. */
   launchDir: string;
+  /**
+   * The HOST's default parent directory for NEW agent projects, before the
+   * user's `projectRoot` setting overrides it. The server supplies it because
+   * only the server knows which host it is running under: the Electron app
+   * passes `<launchDir>/projects` (keeping user code out of the state
+   * directory's own listing), while the CLI leaves it as `launchDir` — the
+   * developer `cd`'d somewhere on purpose.
+   *
+   * Optional so existing AppState constructors (tests, mocks) stay valid; the
+   * SPA falls back to `launchDir`, which is the CLI behaviour anyway.
+   */
+  defaultProjectRoot?: string;
   /** Harness kinds with a working binary on PATH at CLI boot (from doctor()),
    *  in default-preference order — `[0]` is what the auto-created boot
    *  session used. Optional: omitted by callers that construct AppState
@@ -1140,6 +1250,24 @@ export interface HarnessSettings {
    * Persisted so the notice never appears again after the first dismiss.
    */
   telemetryNoticeDismissed?: boolean;
+  /**
+   * Where NEW agent projects are created (the add-workspace template and idea
+   * doors). Absent until the user changes it, in which case the host default
+   * (`AppState.defaultProjectRoot`) applies.
+   *
+   * Deliberately the same value the door itself edits: changing the root while
+   * creating a project saves it as the default, so there is one place to set it
+   * rather than a door value that silently diverges from a settings value.
+   */
+  projectRoot?: string;
+  /**
+   * Opt-in: periodically fold a live session's record into a ≤500-word rolling
+   * summary (see core/rolling-summary.ts), which a later portable continue
+   * reads to explain what the session was *for* rather than only what it last
+   * did. Off by default because it spends tokens on a background LLM call the
+   * user never asked for. With it off, briefs degrade to last-N-turns.
+   */
+  rollingSummary?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -1149,6 +1277,21 @@ export interface HarnessSettings {
 export interface FsDirEntry {
   name: string;
   path: string;
+  /**
+   * Whether this directory directly contains AGENT_PROJECT_MARKER.
+   *
+   * Load-bearing, not decorative: without it a picker cannot tell an agent
+   * project from any other folder, so it has to offer every escape hatch
+   * (register / scaffold / template / bulk-scan / install-MCP) at all times —
+   * which is exactly what made the old add-workspace dialog unusable. With it,
+   * those become outcomes of what we found rather than permanent options.
+   *
+   * Only ONE level deep, matching this endpoint's contract. A `false` here does
+   * not mean the subtree is empty of projects — a container folder whose
+   * children are projects reports `false` (the rail's recursive scan is the
+   * thing that answers "anything under here?").
+   */
+  hasAgentProject: boolean;
 }
 
 /**

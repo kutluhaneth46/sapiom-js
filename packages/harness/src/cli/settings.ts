@@ -6,6 +6,10 @@ import { expandHome } from "./paths.js";
 const DEFAULT_SETTINGS: HarnessSettings = {
   telemetryOptIn: false,
   recentDirs: [],
+  // Opt-in: the rolling summary spends tokens on a background LLM call the
+  // user never asked for. Off, portable continue still works — its brief just
+  // degrades to the last N turns. See core/rolling-summary.ts.
+  rollingSummary: false,
 };
 
 const MAX_RECENT_DIRS = 8;
@@ -35,6 +39,24 @@ async function normalizeRecentDir(candidate: string): Promise<string | null> {
     return null;
   }
   return resolved;
+}
+
+/**
+ * Normalize a `projectRoot`: expand `~`, require absolute, resolve.
+ *
+ * Deliberately does NOT require the directory to exist, unlike
+ * normalizeRecentDir. A recent dir is a place something already happened; a
+ * project root is a place things WILL happen, and it is created when the first
+ * project lands there. Requiring existence would silently reset the user's
+ * chosen default the moment they picked a folder they hadn't made yet.
+ *
+ * Returns undefined for junk so the field simply falls back to the host default.
+ */
+function normalizeProjectRoot(candidate: unknown): string | undefined {
+  if (typeof candidate !== "string" || !candidate.trim()) return undefined;
+  const expanded = expandHome(candidate.trim());
+  if (!path.isAbsolute(expanded)) return undefined;
+  return path.resolve(expanded);
 }
 
 /**
@@ -71,7 +93,14 @@ export async function loadSettings(settingsPath: string = defaultSettingsFilePat
   try {
     const raw = await fs.readFile(settingsPath, "utf-8");
     const parsed = { ...DEFAULT_SETTINGS, ...(JSON.parse(raw) as Partial<HarnessSettings>) };
-    return { ...parsed, recentDirs: await sanitizeRecentDirs(parsed.recentDirs) };
+    const projectRoot = normalizeProjectRoot(parsed.projectRoot);
+    return {
+      ...parsed,
+      recentDirs: await sanitizeRecentDirs(parsed.recentDirs),
+      // Omit rather than store undefined, so JSON.stringify on the way back out
+      // doesn't leave a dangling `"projectRoot": null`-shaped hole.
+      ...(projectRoot ? { projectRoot } : { projectRoot: undefined }),
+    };
   } catch {
     return { ...DEFAULT_SETTINGS };
   }
@@ -81,9 +110,11 @@ export async function saveSettings(
   settings: HarnessSettings,
   settingsPath: string = defaultSettingsFilePath(),
 ): Promise<void> {
+  const normalizedRoot = normalizeProjectRoot(settings.projectRoot);
   const sanitized: HarnessSettings = {
     ...settings,
     recentDirs: await sanitizeRecentDirs(settings.recentDirs),
+    ...(normalizedRoot ? { projectRoot: normalizedRoot } : { projectRoot: undefined }),
   };
   await fs.mkdir(path.dirname(settingsPath), { recursive: true });
   await fs.writeFile(settingsPath, JSON.stringify(sanitized, null, 2) + "\n");

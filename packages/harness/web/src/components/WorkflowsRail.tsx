@@ -7,24 +7,21 @@ import type {
   HarnessSession,
   SessionResumeMode,
   SessionSummary,
-  TemplateDetailView,
-  TemplateListResponse,
   WorkflowInfo,
 } from "@shared/types";
 
 import type { AuthStartResponse, FsListResponse } from "../lib/api";
-import type { StudioTemplate } from "../lib/templates";
 import { AnchoredPopover } from "./AnchoredPopover";
 import { BrandHeader } from "./BrandHeader";
 import { EmptyState } from "./EmptyState";
 import { HarnessBrandIcon } from "./HarnessBrandIcon";
 import { Icon } from "./Icon";
+import { AddWorkspaceDialog } from "./AddWorkspaceDialog";
 import { NewSessionModal } from "./NewSessionModal";
 import { SettingsPopover } from "./SettingsPopover";
-import { TemplatesDialog } from "./TemplatesDialog";
 import { WorkflowRow } from "./WorkflowRow";
 import { isMockMode } from "../lib/api";
-import { HARNESS_LABELS, historyRowMeta } from "../lib/history-meta";
+import { HARNESS_LABELS, historyDirs, historyRowMeta } from "../lib/history-meta";
 import { loadUiPrefs, saveUiPrefs } from "../lib/ui-prefs";
 import { buildWorkspaceTree } from "../lib/workspace-tree";
 
@@ -64,26 +61,33 @@ interface WorkflowsRailProps {
   onCreateSession: (cwd: string, harness: HarnessKind) => Promise<void>;
   /** Adapter registry fetch — the add dialog's picker and MCP setup block. */
   listHarnesses: () => Promise<HarnessEntry[]>;
-  /** Session-plus-scaffold-prompt at a folder that doesn't exist yet. */
-  onScaffoldSession: (cwd: string, harness: HarnessKind) => Promise<void>;
+  /** Session-plus-scaffold-prompt at a folder that doesn't exist yet. `idea`
+   *  is the "start from an idea" door's text, passed verbatim to the agent. */
+  onScaffoldSession: (cwd: string, harness: HarnessKind, idea?: string) => Promise<void>;
+  /** Where NEW projects are created (resolveProjectRoot in App). */
+  projectRoot: string | null;
+  /** Persist a changed project root as the user's default. */
+  onSaveProjectRoot: (root: string) => Promise<void>;
   /** Bare-scaffold folder affordance: ask the folder's live session to
    *  scaffold its first agent (sapiom.json) in place. */
   onScaffoldInSession: (sessionId: string) => void;
-  onUseTemplate: (dir: string, template: StudioTemplate) => Promise<void>;
-  /** Forwarded to TemplatesDialog — the live catalog fetchers. */
-  listTemplates: () => Promise<TemplateListResponse>;
-  getTemplate: (id: string) => Promise<TemplateDetailView>;
+  /** Navigate to the templates destination (App owns the center view). */
+  onBrowseTemplates: () => void;
+  /** True while that destination is the visible view, so the nav row can say so. */
+  templatesActive: boolean;
   onScanWorkflows: (root: string) => Promise<number>;
   /** Opens a project in the user's editor — URL scheme, cwd-scoped. */
   onOpenInEditor: (path: string) => void;
   /** Push a message onto the app's toast rail (copy confirmations etc.). */
   onToast: (message: string) => void;
   telemetryOptIn: boolean;
+  rollingSummary: boolean;
   consentSource?: AppState["consentSource"];
   consentEnvReason?: string | null;
   authenticated: boolean;
   organizationName: string | null;
   onToggleTelemetry: (next: boolean) => Promise<void>;
+  onToggleRollingSummary: (next: boolean) => Promise<void>;
   /** Kick off the browser OAuth flow for the in-app Connect button. */
   onStartAuth: () => Promise<AuthStartResponse>;
   /** Sign out and clear credentials. */
@@ -309,25 +313,27 @@ export function WorkflowsRail({
   listHarnesses,
   onScaffoldSession,
   onScaffoldInSession,
-  onUseTemplate,
-  listTemplates,
-  getTemplate,
+  projectRoot,
+  onSaveProjectRoot,
+  onBrowseTemplates,
+  templatesActive,
   onScanWorkflows,
   onOpenInEditor,
   onToast,
   telemetryOptIn,
+  rollingSummary,
   consentSource,
   consentEnvReason,
   authenticated,
   organizationName,
   onToggleTelemetry,
+  onToggleRollingSummary,
   onStartAuth,
   onDisconnect,
   settingsOpen,
   onSetSettingsOpen,
 }: WorkflowsRailProps): JSX.Element {
   const [addDialogMode, setAddDialogMode] = useState<"session" | "workspace" | null>(null);
-  const [templatesOpen, setTemplatesOpen] = useState(false);
   const connectTriggerRef = useRef<HTMLButtonElement>(null);
 
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -356,14 +362,8 @@ export function WorkflowsRail({
     const next = !historyOpen;
     setHistoryOpen(next);
     if (next) {
-      const dirs: string[] = [];
-      const push = (dir?: string | null): void => {
-        if (dir && !dirs.includes(dir)) dirs.push(dir);
-      };
-      push(sessions.find((session) => session.id === activeSessionId)?.cwd);
-      sessions.forEach((session) => push(session.cwd));
-      recentDirs.forEach((dir) => push(dir));
-      if (dirs.length > 0) onOpenHistory(dirs.slice(0, 12));
+      const dirs = historyDirs(sessions, recentDirs, activeSessionId);
+      if (dirs.length > 0) onOpenHistory(dirs);
     }
   };
 
@@ -417,6 +417,22 @@ export function WorkflowsRail({
           <span className="palette-trigger-hint">{SHORTCUT_HINT}</span>
         </button>
       </div>
+
+      {/* Templates is a destination the rail navigates to, so it gets a nav row
+          of its own above the tree rather than hiding behind the "+" — the
+          catalog is how someone with an empty rail gets their first workflow,
+          and a surface reachable only from inside a dialog was the reason it
+          went unfound. */}
+      <button
+        type="button"
+        className={"rail-nav-row" + (templatesActive ? " is-selected" : "")}
+        data-testid="rail-templates"
+        aria-current={templatesActive ? "page" : undefined}
+        onClick={onBrowseTemplates}
+      >
+        <Icon name="LayoutTemplate" size={14} />
+        <span>Templates</span>
+      </button>
 
       <div className="rail-header">
         Workspaces
@@ -621,9 +637,11 @@ export function WorkflowsRail({
           authenticated={authenticated}
           organizationName={organizationName}
           telemetryOptIn={telemetryOptIn}
+          rollingSummary={rollingSummary}
           consentSource={consentSource}
           consentEnvReason={consentEnvReason}
           onToggleTelemetry={onToggleTelemetry}
+          onToggleRollingSummary={onToggleRollingSummary}
           onStartAuth={onStartAuth}
           onDisconnect={onDisconnect}
           settingsOpen={settingsOpen}
@@ -633,38 +651,43 @@ export function WorkflowsRail({
         />
       </div>
 
-      {addDialogMode && (
+      {/* Two intents, two dialogs — deliberately not one component with a
+          `mode`. The workspace intent is three doors (AddWorkspaceDialog); a
+          session is one question (which folder) plus which agent. They shared
+          375 lines and almost no UI, which is how the workspace side ended up
+          showing five jobs at once. */}
+      {addDialogMode === "workspace" && (
+        <AddWorkspaceDialog
+          recentDirs={recentDirs}
+          projectRoot={projectRoot}
+          listDir={listDir}
+          onClose={() => setAddDialogMode(null)}
+          onConnect={async (cwd) => {
+            await onConnect(cwd);
+          }}
+          onScan={onScanWorkflows}
+          onScaffold={onScaffoldSession}
+          onSaveProjectRoot={onSaveProjectRoot}
+          listHarnesses={listHarnesses}
+          onBrowseTemplates={() => {
+            setAddDialogMode(null);
+            onBrowseTemplates();
+          }}
+          triggerRef={connectTriggerRef}
+        />
+      )}
+      {addDialogMode === "session" && (
         <NewSessionModal
-          mode={addDialogMode}
           recentDirs={recentDirs}
           launchDir={launchDir}
           listDir={listDir}
           onClose={() => setAddDialogMode(null)}
           onCreate={onCreateSession}
           listHarnesses={listHarnesses}
-          onScaffold={onScaffoldSession}
-          onScan={onScanWorkflows}
-          onConnect={async (cwd) => {
-            await onConnect(cwd);
-          }}
-          onBrowseTemplates={() => {
-            setAddDialogMode(null);
-            setTemplatesOpen(true);
-          }}
-          triggerRef={addDialogMode === "workspace" ? connectTriggerRef : historyTriggerRef}
+          triggerRef={historyTriggerRef}
         />
       )}
 
-      {templatesOpen && (
-        <TemplatesDialog
-          launchDir={launchDir}
-          onClose={() => setTemplatesOpen(false)}
-          onUse={onUseTemplate}
-          listTemplates={listTemplates}
-          getTemplate={getTemplate}
-          triggerRef={connectTriggerRef}
-        />
-      )}
     </aside>
   );
 }
@@ -684,9 +707,11 @@ function ProfileRow({
   authenticated,
   organizationName,
   telemetryOptIn,
+  rollingSummary,
   consentSource,
   consentEnvReason,
   onToggleTelemetry,
+  onToggleRollingSummary,
   onStartAuth,
   onDisconnect,
   settingsOpen,
@@ -697,9 +722,11 @@ function ProfileRow({
   authenticated: boolean;
   organizationName: string | null;
   telemetryOptIn: boolean;
+  rollingSummary: boolean;
   consentSource?: AppState["consentSource"];
   consentEnvReason?: string | null;
   onToggleTelemetry: (next: boolean) => Promise<void>;
+  onToggleRollingSummary: (next: boolean) => Promise<void>;
   onStartAuth: () => Promise<AuthStartResponse>;
   onDisconnect: () => Promise<void>;
   settingsOpen: boolean;
@@ -785,9 +812,11 @@ function ProfileRow({
           authenticated={authenticated}
           organizationName={organizationName}
           telemetryOptIn={telemetryOptIn}
+          rollingSummary={rollingSummary}
           consentSource={consentSource}
           consentEnvReason={consentEnvReason}
           onToggleTelemetry={onToggleTelemetry}
+          onToggleRollingSummary={onToggleRollingSummary}
           onStartAuth={onStartAuth}
           onDisconnect={onDisconnect}
         />

@@ -24,6 +24,8 @@ import type {
   HarnessAdapter,
   HarnessKind,
   HarnessSession,
+  SessionRecord,
+  SystemPromptDelivery,
   WorkflowInfo,
 } from "../shared/types.js";
 import { JSON_BODY_LIMIT_BYTES } from "../shared/types.js";
@@ -46,6 +48,18 @@ import {
   createClaudeTranscriptEnricher,
   createSessionRecordReader,
 } from "../core/session-record.js";
+import {
+  buildRehydrationBrief,
+  systemPromptDeliveryFor,
+} from "../core/rehydration.js";
+import {
+  createRollingSummarizer,
+  readRollingSummary,
+} from "../core/rolling-summary.js";
+import {
+  backfillSessionRecords,
+  createRecordArchive,
+} from "../core/record-archive.js";
 import { createHarnessEmitter } from "../core/collector/analytics-emitter.js";
 import { migrateHarnessIdentity } from "../core/collector/identity-migration.js";
 import { normalizeHookEvent } from "../core/collector/normalizer.js";
@@ -57,7 +71,7 @@ import {
   type CodexTailerHandle,
 } from "../core/collector/codex-tailer.js";
 import { getOrCreateMachineId } from "../cli/machine-id.js";
-import { pruneDeadRecentDirs } from "../cli/settings.js";
+import { loadSettings, pruneDeadRecentDirs } from "../cli/settings.js";
 import type { HarnessIdentity } from "../cli/auth.js";
 import { generateClaudeSettings } from "../core/inject/claude-settings.js";
 import { generateMcpConfig } from "../core/inject/mcp-config.js";
@@ -169,6 +183,10 @@ export interface HarnessServerOptions {
    *  and cleaned up from (exit-time delete + boot-time sweep, see
    *  core/inject/retention.ts). Defaults to `<stateRoot>/generated`. */
   generatedRoot?: string;
+  /** Root directory archived session records are written under — the copies
+   *  that outlive events.ndjson's retention (see core/record-archive.ts).
+   *  Defaults to `<stateRoot>/records`. */
+  recordsRoot?: string;
   collectorUrl?: string;
   /** Workflow registry file. Defaults to `<stateRoot>/workflows.json`. */
   workflowsRegistryPath?: string;
@@ -188,6 +206,14 @@ export interface HarnessServerOptions {
    *  boot so the rail isn't empty until a manual "+ Connect", and (unless
    *  autoCreateSession is false) where the boot session is created. */
   launchDir?: string;
+  /** The host's default parent directory for NEW agent projects (the
+   *  add-workspace template and idea doors), before the user's `projectRoot`
+   *  setting overrides it. Defaults to `launchDir` — correct for the CLI, where
+   *  the developer chose that directory deliberately. The Electron host passes
+   *  `<launchDir>/projects` so user code doesn't land in the state directory's
+   *  own listing. Only the host knows which it is, which is why this is an
+   *  option rather than something the SPA infers. */
+  projectRoot?: string;
   /** Auto-create a session in launchDir once the server is listening, so the
    *  app doesn't open empty. Defaults to true; the CLI's --no-session flag
    *  sets this to false. Uses `defaultHarnessKind` for which agent to launch. */
@@ -274,8 +300,38 @@ function readVersion(): string {
 function createDefaultBuildLaunchOpts(
   apiKey: string | null,
   generatedRoot?: string,
+  rehydration?: {
+    /** Brief text for a prior session id, or null when nothing was recorded. */
+    buildBrief: (rehydrateFrom: string) => Promise<string | null>;
+    /** Which channel this harness receives a brief on. */
+    deliveryFor: (harness: HarnessKind) => SystemPromptDelivery;
+  },
 ): LaunchOptsBuilder {
-  return async (harnessSessionId) => {
+  return async (harnessSessionId, req) => {
+    // Portable continue (SAP-2059). Resolved before the prompt file is
+    // written, because for a `launch-flag` harness the brief IS part of that
+    // file. Best-effort throughout: a brief that can't be assembled leaves
+    // `rehydratedFrom` unset and the session launches as an ordinary fresh
+    // one rather than failing — see CreateSessionRequest.rehydrateFrom.
+    //
+    // Only ever set on create(): resume() calls this builder with the persisted
+    // HarnessSession, which carries no `rehydrateFrom`, so a rehydrated session
+    // that is later resumed does not get the brief a second time (the agent's
+    // own conversation already holds it).
+    const rehydrateFrom = req.rehydrateFrom;
+    const brief =
+      rehydrateFrom && rehydration
+        ? await rehydration.buildBrief(rehydrateFrom).catch((err: unknown) => {
+            console.error("[harness] rehydration brief failed:", err);
+            return null;
+          })
+        : null;
+    // The other channel (post-ready injection, for a harness with no prompt
+    // flag) is driven from the session status handler in startServer — the
+    // brief must not go into a file that adapter never reads.
+    const viaSystemPrompt =
+      brief !== null && rehydration?.deliveryFor(req.harness) === "launch-flag";
+
     const [settings, mcpConfigFile, systemPromptFile, pluginDir] =
       await Promise.all([
         generateClaudeSettings({ harnessSessionId, generatedRoot }),
@@ -284,7 +340,10 @@ function createDefaultBuildLaunchOpts(
           apiKey,
           generatedRoot,
         }),
-        generateSystemPromptFile(harnessSessionId, { generatedRoot }),
+        generateSystemPromptFile(harnessSessionId, {
+          generatedRoot,
+          ...(viaSystemPrompt ? { appendix: brief } : {}),
+        }),
         generateSkillsPlugin(harnessSessionId, { generatedRoot }),
       ]);
     return {
@@ -292,6 +351,9 @@ function createDefaultBuildLaunchOpts(
       mcpConfigFile,
       systemPromptFile,
       ...(pluginDir ? { pluginDir } : {}),
+      // Set on BOTH channels: the post-ready path hasn't delivered yet, but a
+      // brief exists and will, and this is the flag that tells it to.
+      ...(brief !== null && rehydrateFrom ? { rehydratedFrom: rehydrateFrom } : {}),
     };
   };
 }
@@ -483,6 +545,56 @@ export const startServer = async (
     await writeHarnessContext(session, boundWorkflow, workflowsCache);
   };
 
+  // Declared before the launch-opts builder (rather than beside the ingest
+  // pipeline, where the rest of the event wiring lives) because portable
+  // continue resolves a rehydration brief from this reader at session-create
+  // time — see createDefaultBuildLaunchOpts below.
+  const eventStorePath = options.eventStorePath ?? statePaths.events;
+  const eventStore = createEventStore(eventStorePath);
+
+  // Archived session records — the copies that survive events.ndjson's 50 MB /
+  // 30-day retention (core/record-archive.ts). Declared here, above the session
+  // manager, because the "exited" handler archives through it.
+  const recordsRoot = options.recordsRoot ?? statePaths.records;
+  const recordArchive = createRecordArchive({ root: recordsRoot });
+
+  // Past-session transcripts, rebuilt from the events above rather than from
+  // any vendor's history file — the same code path for claude-code and codex.
+  // The claude enricher is a pure bonus on top: when that transcript happens
+  // to still exist, the final turn gains its model/usage; when it doesn't, the
+  // record renders unchanged.
+  const sessionRecordReader = createSessionRecordReader(eventStore, {
+    enrichFinalTurn: createClaudeTranscriptEnricher(),
+    archive: recordArchive,
+  });
+
+  /**
+   * Fold a session's record from the events and archive it — the write that
+   * makes its history outlive the log. Idempotent (it replaces any earlier
+   * archive of the same conversation), detached, and silent about nothing: a
+   * failure is logged and never propagated, because a session's exit must not
+   * fail over its bookkeeping.
+   *
+   * Folded via `readFromEvents`, deliberately not `read`: re-archiving whatever
+   * `read` returned would compact an already-compacted excerpt and re-stamp it
+   * with a fresh `archivedAt`, making a stale copy look current.
+   *
+   * The sweep runs right after a write because a write is the only thing that
+   * grows the store — enforcing the caps at the moment they can be exceeded
+   * beats waiting for the next boot.
+   */
+  const archiveSessionRecord = async (harnessSessionId: string): Promise<void> => {
+    const record = await sessionRecordReader.readFromEvents(harnessSessionId);
+    if (!record) return;
+    if (!(await recordArchive.write(record))) return;
+    await recordArchive.sweep();
+  };
+  const archiveSessionRecordDetached = (harnessSessionId: string): void => {
+    void archiveSessionRecord(harnessSessionId).catch((err: unknown) => {
+      console.error("[harness] session record archive failed:", err);
+    });
+  };
+
   // Exit-time deletion of generated/<id> (see the onStatusChange handler
   // below) can race a fast resume(): resume regenerates the dir via
   // buildLaunchOpts, and the rm scheduled at the previous exit could still
@@ -490,9 +602,67 @@ export const startServer = async (
   // before (re)generating its files.
   const generatedRoot = options.generatedRoot ?? statePaths.generated;
   const pendingGeneratedRemovals = new Map<string, Promise<void>>();
+
+  /**
+   * The git branch the PRIOR session was last on, from whichever adapter
+   * recorded it — our own events never carry one. One adapter history scan per
+   * rehydrate, which is a user-initiated "continue this session" click rather
+   * than a hot path (the reason `GET /sessions/history` avoids per-row probes
+   * doesn't apply to a single deliberate action). Null for a harness whose
+   * transcript doesn't record a branch, and never throws.
+   */
+  const priorGitBranch = async (record: SessionRecord): Promise<string | null> => {
+    if (!record.cwd || !record.agentSessionId) return null;
+    const adapter = adapters[record.harness];
+    if (!adapter) return null;
+    try {
+      const rows = await adapter.listPastSessions(record.cwd);
+      return rows.find((row) => row.agentSessionId === record.agentSessionId)?.gitBranch ?? null;
+    } catch {
+      return null;
+    }
+  };
+
+  /**
+   * Portable continue: the brief text for a `rehydrateFrom` id, or null when
+   * our event log holds nothing for it.
+   *
+   * Closes over `sessionManager` (declared just below, since it consumes the
+   * builder this feeds) for the prior session's title and workflow binding —
+   * safe because nothing can create a session before the manager that creates
+   * them exists.
+   */
+  const resolveRehydrationBrief = (rehydrateFrom: string): Promise<string | null> =>
+    buildRehydrationBrief(rehydrateFrom, {
+      readRecord: (id) => sessionRecordReader.read(id),
+      readSummary: (harnessSessionId) => readRollingSummary(generatedRoot, harnessSessionId),
+      resolveContext: async (record) => {
+        // The earliest merged session the registry still knows — the record's
+        // own primary id first, so a conversation that spans a resume reports
+        // where it began rather than whichever segment happens to be indexed.
+        const prior = record.mergedSessionIds
+          .map((id) => sessionManager.get(id))
+          .find((session) => session !== undefined);
+        const workflowPath = prior?.boundWorkflowPath ?? null;
+        const workflow = workflowPath
+          ? (workflowsCache.find((w) => w.path === workflowPath) ?? null)
+          : null;
+        return {
+          title: prior?.title ?? null,
+          gitBranch: await priorGitBranch(record),
+          workflow: workflow
+            ? { name: workflow.name, path: workflow.path, definitionId: workflow.definitionId }
+            : null,
+        };
+      },
+    });
+
   const innerBuildLaunchOpts =
     options.buildLaunchOpts ??
-    createDefaultBuildLaunchOpts(identity?.apiKey ?? null, generatedRoot);
+    createDefaultBuildLaunchOpts(identity?.apiKey ?? null, generatedRoot, {
+      buildBrief: resolveRehydrationBrief,
+      deliveryFor: (harness) => systemPromptDeliveryFor(adapters[harness]),
+    });
   const buildLaunchOpts: LaunchOptsBuilder = async (harnessSessionId, req) => {
     await pendingGeneratedRemovals.get(harnessSessionId);
     return innerBuildLaunchOpts(harnessSessionId, req);
@@ -519,6 +689,38 @@ export const startServer = async (
   );
   sessionSweepTimer.unref?.();
 
+  // Portable continue, second channel: for a harness whose adapter never puts
+  // `systemPromptFile` in front of the agent, the brief is injected once the
+  // session reports `ready` — not merely "running", which for a TUI sitting on
+  // a "trust this directory?" prompt would feed the brief to the prompt. No
+  // adapter shipped today needs this (both declare `launch-flag`), so it is
+  // dormant rather than dead: a new harness with no prompt flag gets working
+  // rehydration from one line in its adapter.
+  const briefsDelivered = new Set<string>();
+  sessionManager.onStatusChange((session) => {
+    if (session.status === "exited") {
+      briefsDelivered.delete(session.id);
+      return;
+    }
+    const rehydratedFrom = session.rehydratedFrom;
+    if (!session.ready || !rehydratedFrom) return;
+    if (systemPromptDeliveryFor(adapters[session.harness]) !== "post-ready-injection") return;
+    if (briefsDelivered.has(session.id)) return;
+    // Claimed before the await so a burst of status frames can't double-inject.
+    briefsDelivered.add(session.id);
+    void (async () => {
+      const brief = await resolveRehydrationBrief(rehydratedFrom);
+      if (!brief) return;
+      // submit:true — the brief has to enter the conversation to be context at
+      // all; left unsubmitted it would just sit in the composer as a wall of
+      // text the user has to deal with before they can type.
+      await sessionManager.submitInput(session.id, brief, true);
+    })().catch((err: unknown) => {
+      briefsDelivered.delete(session.id);
+      console.error("[harness] post-ready rehydration injection failed:", err);
+    });
+  });
+
   // Background tasks (canvas enrichment today): headless one-shot agent
   // runs that never touch a user's interactive session. They
   // reuse the exact same per-id config generation as sessions — a task's
@@ -542,6 +744,25 @@ export const startServer = async (
   taskManager.onStatusChange((task) => {
     bus.publish({ type: "task.status", task });
   });
+
+  // Rolling summary (opt-in, `HarnessSettings.rollingSummary`): folds a live
+  // session's record into a ≤500-word summary.md that a later portable
+  // continue reads. Everything about it is detached from the session's own
+  // path — `noteEvent` is synchronous and the fold is a separate headless
+  // process — so a turn is never slower or riskier for it being on. A codex
+  // session produces none (no `launchTask`); its briefs degrade to
+  // last-N-turns, which is also the default for everyone with the setting off.
+  const rollingSummarizer = createRollingSummarizer({
+    generatedRoot,
+    enabled: async () => (await loadSettings(statePaths.settings)).rollingSummary === true,
+    readRecord: (harnessSessionId) => sessionRecordReader.read(harnessSessionId),
+    getSession: (harnessSessionId) => {
+      const session = sessionManager.get(harnessSessionId);
+      return session ? { harness: session.harness, cwd: session.cwd } : undefined;
+    },
+    runTask: (req) => taskManager.run(req),
+  });
+  taskManager.onStatusChange((task) => rollingSummarizer.noteTaskStatus(task));
 
   // One boot-time sweep for generated dirs the exit-time cleanup below never
   // reached (crashes, force-kills, accumulation from before retention
@@ -659,6 +880,13 @@ export const startServer = async (
       executionDetector.reset(session.id);
       // Let a resumed session get a fresh on-start rescan.
       rescannedOnStart.delete(session.id);
+      // Archive the record now the session is over, so its history survives
+      // events.ndjson's retention. This path is what covers a session that
+      // exited WITHOUT a SessionEnd hook (killed pty, crashed agent) and so
+      // never produced the `session.end` event the ingest path archives on;
+      // when both fire, the second write simply replaces the first with the
+      // fuller record.
+      archiveSessionRecordDetached(session.id);
       // The generated config dir is dead once the pty is: every file in it
       // is regenerated by buildLaunchOpts on resume, and the agent's last
       // emit.cjs execution (SessionEnd) happens before its process exits.
@@ -740,18 +968,6 @@ export const startServer = async (
     },
   );
 
-  const eventStorePath = options.eventStorePath ?? statePaths.events;
-  const eventStore = createEventStore(eventStorePath);
-
-  // Past-session transcripts, rebuilt from the events above rather than from
-  // any vendor's history file — the same code path for claude-code and codex.
-  // The claude enricher is a pure bonus on top: when that transcript happens
-  // to still exist, the final turn gains its model/usage; when it doesn't, the
-  // record renders unchanged.
-  const sessionRecordReader = createSessionRecordReader(eventStore, {
-    enrichFinalTurn: createClaudeTranscriptEnricher(),
-  });
-
   // Boot-time retention sweep: keeps events.ndjson within the 50 MB / 30-day
   // caps even on long-lived installs. Runs through the store's exclusive queue
   // so the sweep's read→filter→rename window never races a concurrent append.
@@ -769,6 +985,40 @@ export const startServer = async (
     NDJSON_RETENTION_SWEEP_MS,
   );
   ndjsonRetentionTimer.unref?.();
+
+  // One boot-time pass that archives conversations the log still holds but the
+  // archive doesn't, then sweeps the archive's own caps. This is what covers the
+  // two cases archiving-at-exit can't: a harness that was force-killed (no exit
+  // transition, no session.end), and every session that ended before this
+  // existed — whose history would otherwise vanish at its 30-day mark.
+  //
+  // It races the ndjson sweep queued above, and deliberately doesn't wait for
+  // it: reads run outside the store's exclusive queue by design (see store.ts),
+  // and either order is correct here — win the race and the record is archived
+  // from bytes retention was about to delete, lose it and the record is archived
+  // from what survived. Both beat not archiving it.
+  //
+  // Fire-and-forget: boot must not wait on it. The cost is one full index build
+  // (~130 ms against a 50 MB log), which the first history open would have paid
+  // anyway.
+  void backfillSessionRecords({
+    conversationIds: () => sessionRecordReader.conversationIds(),
+    readFromEvents: (id) => sessionRecordReader.readFromEvents(id),
+    archive: recordArchive,
+    isLiveSession: (harnessSessionId) => {
+      const session = sessionManager.get(harnessSessionId);
+      return session !== undefined && session.status !== "exited";
+    },
+    onCapped: (remaining) => {
+      console.error(
+        `[harness] session record backfill hit its per-boot cap; ${remaining} conversation(s) left for the next boot`,
+      );
+    },
+  })
+    .then(() => recordArchive.sweep())
+    .catch((err: unknown) => {
+      console.error("[harness] session record backfill failed:", err);
+    });
 
   const harnessVersion = readVersion();
   const batcher = createHarnessEmitter({
@@ -859,6 +1109,7 @@ export const startServer = async (
           });
       },
       launchDir,
+      defaultProjectRoot: options.projectRoot ?? launchDir,
       agentsBaseUrl: resolveAgentsBaseUrl(),
       availableHarnesses: options.availableHarnesses,
       listTasks: () => taskManager.list(),
@@ -1010,6 +1261,9 @@ export const startServer = async (
     batcher,
     enrichFromTranscript: enrichTurnCompleted,
     onNormalizedEvent: (event: AnalyticsEvent) => {
+      // Synchronous and total — it counts turns and detaches any fold it
+      // decides to start, so the ingest path never waits on a summary.
+      rollingSummarizer.noteEvent(event);
       if (event.type !== "tool.call") return;
       const { toolInput, toolResponseSummary } = event.payload as {
         toolInput?: unknown;
@@ -1031,6 +1285,13 @@ export const startServer = async (
         executionDetector.feed(toolResponseSummary, event.harnessSessionId);
         executionDetector.flush(event.harnessSessionId);
       }
+    },
+    onEventPersisted: (event: AnalyticsEvent) => {
+      // The normal end of a session: the SessionEnd hook's event is in the
+      // store, so the archived record carries the whole conversation including
+      // its `endedAt`. (The "exited" status handler archives too, for sessions
+      // that never get here.)
+      if (event.type === "session.end") archiveSessionRecordDetached(event.harnessSessionId);
     },
     onError: (err) => console.error("[harness] ingest processing error:", err),
     seqCounter,

@@ -153,19 +153,29 @@ test("Overview heads the account menu, shows the intro panel, and any session le
   await expect(item).toBeVisible();
   await item.click();
 
-  // Selection closes the menu and swaps the main slot to the intro.
+  // Selection closes the menu and raises the intro OVER the shell.
   await expect(page.getByTestId("profile-menu")).toHaveCount(0);
   await expect(page.getByTestId("welcome-panel")).toBeVisible();
-  await expect(page.getByTestId("session-context-title")).toHaveText("Overview");
-  // No session options while the intro is up — destructive actions beside
-  // "Overview" would read as closing the view.
-  await expect(page.getByTestId("session-menu")).toHaveCount(0);
+  // The session bar keeps describing the session behind the card. It used to
+  // read "Overview" and drop its menu, because Overview replaced the slot; as an
+  // overlay it takes nothing away, so the work behind it stays addressable and
+  // re-reading what Studio is never costs you your place.
+  await expect(page.getByTestId("session-context-title")).not.toHaveText("Overview");
 
-  // Reopening the menu shows the current selection, then Escape closes it.
-  await page.getByTestId("brand-identity").click();
-  await expect(page.getByTestId("rail-overview")).toHaveClass(/is-selected/);
+  // It is a real modal: the scrim owns the pointer, so nothing behind it can be
+  // clicked through. This replaced a step that reopened the account menu while
+  // the intro was up to inspect its selected state — reachable back when
+  // Overview was a view occupying the slot, impossible for a card on top of it.
+  const blocked = await page
+    .getByTestId("brand-identity")
+    .click({ timeout: 700 })
+    .then(() => false)
+    .catch(() => true);
+  expect(blocked).toBe(true);
+
+  // Escape puts it away and hands the shell straight back.
   await page.keyboard.press("Escape");
-  await expect(page.getByTestId("profile-menu")).toHaveCount(0);
+  await expect(page.getByTestId("welcome-panel")).toHaveCount(0);
 
   // Opening the leasing agent returns to the terminal — acme-app's one live
   // session is bound to it, so opening the agent attaches to that session.
@@ -174,20 +184,49 @@ test("Overview heads the account menu, shows the intro panel, and any session le
   await expect(page.getByTestId("session-context")).toHaveAttribute("data-session-id", "sess-boot");
 });
 
+test("Overview is dismissable — scrim, close button, and Escape all put it away", async ({ page }) => {
+  // An overlay must never be a trap. Three exits, and none of them may disturb
+  // what is behind: the whole reason it is a card on top.
+  const open = async (): Promise<void> => {
+    await page.getByTestId("brand-identity").click();
+    await page.getByTestId("rail-overview").click();
+    await expect(page.getByTestId("welcome-panel")).toBeVisible();
+  };
+
+  await open();
+  await page.getByTestId("welcome-close").click();
+  await expect(page.getByTestId("welcome-panel")).toHaveCount(0);
+
+  await open();
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("welcome-panel")).toHaveCount(0);
+
+  await open();
+  // The scrim, well clear of the card.
+  await page.getByTestId("welcome-panel").click({ position: { x: 8, y: 8 } });
+  await expect(page.getByTestId("welcome-panel")).toHaveCount(0);
+  // The session it was covering is untouched.
+  await expect(page.getByTestId("session-context")).toHaveAttribute("data-session-id", "sess-boot");
+});
+
 test("creation IA: the rail + adds projects; the tab strip + adds a session to the focused agent", async ({
   page,
 }) => {
-  // The rail's + is the PROJECT entry: the dialog opens in Project mode with
-  // no mode tabs at all — the entry point fixed the intent (docs/IA.md).
+  // The rail's + is the PROJECT entry: it opens the three-door add-workspace
+  // dialog. No mode tabs (the entry point fixed the intent, docs/IA.md) and no
+  // agent picker — each door asks exactly one question.
   await page.getByTestId("add-workspace").click();
   const modal = page.locator(".modal-add-workspace");
   await expect(modal).toBeVisible();
-  await expect(modal.locator(".modal-header")).toContainText("Add workspace");
+  await expect(modal.locator(".modal-header")).toContainText("Add to Sapiom");
+  await expect(modal.getByTestId("aw-doors")).toBeVisible();
   await expect(modal.getByTestId("add-mode-session")).toHaveCount(0);
   await expect(modal.getByTestId("add-mode-project")).toHaveCount(0);
-  await expect(modal.getByRole("button", { name: "Add workspace" })).toBeVisible();
   await expect(modal.getByTestId("harness-select")).toHaveCount(0);
-  await page.getByRole("button", { name: "Cancel" }).click();
+  // "Add workspace" is now the OUTCOME of picking a folder that holds a
+  // project, not a button offered before anything is known.
+  await expect(modal.getByRole("button", { name: "Add workspace" })).toHaveCount(0);
+  await page.keyboard.press("Escape");
   await expect(modal).toHaveCount(0);
 
   // Session creation lives in the tab strip: the trailing + opens a NEW
@@ -430,19 +469,22 @@ test.describe("three-zone IA (rail explorer, tab strip, right pane)", () => {
   });
 });
 
-test("add project: the rail's + opens the same directory-picker dialog and registers the path", async ({ page }) => {
+test("add project: the rail's + registers a bare folder through the 'I have a project' door", async ({ page }) => {
   await page.getByTestId("add-workspace").click();
 
-  // Same dialog anatomy as new-session, its own identity: no harness picker,
-  // workspace title and CTA.
   const modal = page.locator(".modal-add-workspace");
   await expect(modal).toBeVisible();
-  await expect(modal).toContainText("Add workspace");
   await expect(modal.getByTestId("harness-select")).toHaveCount(0);
 
+  await modal.getByTestId("aw-door-have").click();
   const input = modal.getByTestId("dir-picker-input");
   await input.fill("/Users/demo/scratch");
-  await modal.getByRole("button", { name: "Add workspace" }).click();
+  await modal.getByTestId("aw-have-continue").click();
+
+  // scratch holds no sapiom.json, so detection says so — and registering it as
+  // a bare workspace stays available (the rail supports agent-less folders).
+  await expect(modal.getByTestId("aw-result")).toContainText("No agent project");
+  await modal.getByTestId("aw-add-anyway").click();
 
   await expect(modal).toBeHidden();
   // The connected path joins the rail as a workspace-owned workflow row.

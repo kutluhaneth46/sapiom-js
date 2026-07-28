@@ -367,6 +367,23 @@ export const MOCK_SESSIONS: HarnessSession[] = [
     ready: false,
   },
   {
+    // Exited, and the agent's transcript for it is gone — so its history row
+    // is `rehydrate` even though we recorded the whole conversation (see
+    // MOCK_SESSION_RECORDS["sess-pricing"]). Continuing it starts a fresh
+    // session seeded from that record rather than resuming anything.
+    id: "sess-pricing",
+    agentSessionId: "4d8c1e77-9a03-4b52-8e61-0c2d5f7a1b93",
+    boundWorkflowPath: null,
+    harness: "claude-code",
+    cwd: "/Users/demo/acme-app",
+    title: "Rework the pricing tiers",
+    status: "exited",
+    createdAt: daysAgo(3),
+    lastActiveAt: daysAgo(3),
+    exitCode: 0,
+    ready: false,
+  },
+  {
     id: "sess-leasing-2",
     agentSessionId: "1a2b3c4d-5e6f-4a71-8b2c-3d4e5f6a7b8c",
     // A SECOND live session bound to leasing, so the focused agent's main-panel
@@ -478,6 +495,23 @@ export const MOCK_HISTORY: Record<string, SessionSummary[]> = {
       turnCount: 3,
     },
     {
+      // The row portable continue exists for: the agent's transcript is gone
+      // (rotated, or the machine changed), so nothing can reattach — but WE
+      // recorded the conversation, so continuing it means a fresh session
+      // seeded from our own record. Contrast the phantom above, which is
+      // `rehydrate` with nothing recorded either side.
+      harnessSessionId: "sess-pricing",
+      agentSessionId: "4d8c1e77-9a03-4b52-8e61-0c2d5f7a1b93",
+      harness: "claude-code",
+      cwd: "/Users/demo/acme-app",
+      title: "Rework the pricing tiers",
+      lastActiveAt: daysAgo(3),
+      source: "registry",
+      resumeMode: "rehydrate",
+      gitBranch: "feat/pricing-tiers",
+      turnCount: 2,
+    },
+    {
       // A session the Studio never ran: the agent's own transcript knows it,
       // our event log doesn't. No turnCount, and no record — the review pane's
       // honest "nothing recorded" state (see MOCK_SESSION_RECORDS).
@@ -493,6 +527,21 @@ export const MOCK_HISTORY: Record<string, SessionSummary[]> = {
       lastActiveAt: daysAgo(6),
       source: "transcript",
       resumeMode: "agent-resume",
+    },
+    {
+      // Old enough that its events are long gone from events.ndjson (50 MB /
+      // 30 days) — it renders from its archived record instead, and says so.
+      // Its `turnCount` is the conversation's, not the archive's: the archive
+      // only had room for the last two turns.
+      harnessSessionId: "sess-migration",
+      agentSessionId: "4a1c8e22-9b70-4f35-a1d2-3e4f5a6b7c8d",
+      harness: "claude-code",
+      cwd: "/Users/demo/acme-app",
+      title: "Migrate the applicant schema",
+      lastActiveAt: daysAgo(45),
+      source: "registry",
+      resumeMode: "rehydrate",
+      turnCount: 9,
     },
   ],
   "/Users/demo/rfq-workflows": [
@@ -532,6 +581,8 @@ export const MOCK_SESSION_RECORDS: Record<string, SessionRecord> = {
     turnCount: 2,
     eventCount: 9,
     reconstructed: true,
+    // Folded live from events.ndjson — nothing archived about it yet.
+    archivedAt: null,
     limitations: ["truncated-tool-output", "assistant-narration-gap", "incomplete-final-turn"],
     turns: [
       {
@@ -593,6 +644,7 @@ export const MOCK_SESSION_RECORDS: Record<string, SessionRecord> = {
     turnCount: 3,
     eventCount: 11,
     reconstructed: true,
+    archivedAt: null,
     limitations: ["assistant-narration-gap"],
     turns: [
       {
@@ -638,6 +690,63 @@ export const MOCK_SESSION_RECORDS: Record<string, SessionRecord> = {
       },
     ],
   },
+  // The rehydration fixture: a record whose agent no longer holds the
+  // conversation, so "Continue" seeds a fresh session from this instead of
+  // resuming. See its MOCK_HISTORY row.
+  "sess-pricing": {
+    harnessSessionId: "sess-pricing",
+    mergedSessionIds: ["sess-pricing"],
+    agentSessionId: "4d8c1e77-9a03-4b52-8e61-0c2d5f7a1b93",
+    harness: "claude-code",
+    cwd: "/Users/demo/acme-app",
+    startedAt: daysAgo(3),
+    endedAt: daysAgo(3),
+    turnCount: 2,
+    eventCount: 8,
+    reconstructed: true,
+    archivedAt: null,
+    limitations: ["assistant-narration-gap"],
+    turns: [
+      {
+        index: 1,
+        prompt: "Rework the pricing tiers so the mid tier is usage-metered.",
+        promptAt: daysAgo(3),
+        toolCalls: [
+          {
+            name: "Edit",
+            input: '{"file_path":"/Users/demo/acme-app/src/pricing/tiers.ts"}',
+            responseSummary: "updated 1 hunk",
+            responseTruncated: false,
+            at: daysAgo(3),
+          },
+        ],
+        assistantText: "Mid tier is metered now; the annual discount still needs deciding.",
+        model: "claude-opus-4-6",
+        usage: { inputTokens: 8210, outputTokens: 280 },
+        completedAt: daysAgo(3),
+        incomplete: false,
+      },
+      {
+        index: 2,
+        prompt: "Leave the discount for now — add the migration.",
+        promptAt: daysAgo(3),
+        toolCalls: [
+          {
+            name: "Write",
+            input: '{"file_path":"/Users/demo/acme-app/migrations/0042-pricing.sql"}',
+            responseSummary: "wrote 34 lines",
+            responseTruncated: false,
+            at: daysAgo(3),
+          },
+        ],
+        assistantText: "Migration 0042 added. Not run anywhere yet.",
+        model: "claude-opus-4-6",
+        usage: { inputTokens: 8940, outputTokens: 160 },
+        completedAt: daysAgo(3),
+        incomplete: false,
+      },
+    ],
+  },
   "sess-rfq": {
     harnessSessionId: "sess-rfq",
     mergedSessionIds: ["sess-rfq"],
@@ -649,6 +758,7 @@ export const MOCK_SESSION_RECORDS: Record<string, SessionRecord> = {
     turnCount: 1,
     eventCount: 4,
     reconstructed: true,
+    archivedAt: null,
     // Codex's rollout carries no equivalent of the Stop hook's final assistant
     // message, so a Codex record has the chronology but none of the prose.
     limitations: ["missing-assistant-text"],
@@ -670,6 +780,60 @@ export const MOCK_SESSION_RECORDS: Record<string, SessionRecord> = {
         model: null,
         usage: null,
         completedAt: daysAgo(1),
+        incomplete: false,
+      },
+    ],
+  },
+  /**
+   * An ARCHIVED record: this session's events aged out of events.ndjson weeks
+   * ago, and what's left is the compacted copy under
+   * `~/.sapiom/harness/records/` (see core/record-archive.ts). Shaped exactly
+   * like the real thing — `archivedAt` set, tool payloads clipped with the
+   * collector's own marker, `turnCount` still 9 while `turns` holds the last
+   * two, and both losses named in `limitations`.
+   */
+  "sess-migration": {
+    harnessSessionId: "sess-migration",
+    mergedSessionIds: ["sess-migration"],
+    agentSessionId: "4a1c8e22-9b70-4f35-a1d2-3e4f5a6b7c8d",
+    harness: "claude-code",
+    cwd: "/Users/demo/acme-app",
+    startedAt: daysAgo(45),
+    endedAt: daysAgo(45),
+    turnCount: 9,
+    eventCount: 61,
+    reconstructed: true,
+    archivedAt: daysAgo(45),
+    limitations: ["truncated-tool-output", "compacted-archive", "dropped-early-turns"],
+    turns: [
+      {
+        index: 8,
+        prompt: "Backfill the applicant rows that predate the schema change.",
+        promptAt: daysAgo(45),
+        toolCalls: [
+          {
+            name: "Bash",
+            input: '{"command":"pnpm migrate:applicants --backfill"}',
+            responseSummary: "migrating 41,203 rows…[truncated 3184 chars]",
+            responseTruncated: true,
+            at: daysAgo(45),
+          },
+        ],
+        assistantText: "Backfilled 41,203 applicant rows; 12 failed validation and are listed in `backfill-errors.json`.",
+        model: "claude-opus-4-6",
+        usage: { inputTokens: 21400, outputTokens: 480 },
+        completedAt: daysAgo(45),
+        incomplete: false,
+      },
+      {
+        index: 9,
+        prompt: "Ship the migration and note the 12 failures in the changelog.",
+        promptAt: daysAgo(45),
+        toolCalls: [],
+        assistantText: "Shipped, with the 12 unmigrated applicants called out under Known issues.",
+        model: "claude-opus-4-6",
+        usage: { inputTokens: 22100, outputTokens: 130 },
+        completedAt: daysAgo(45),
         incomplete: false,
       },
     ],
@@ -781,6 +945,9 @@ export const MOCK_HARNESSES: HarnessEntry[] = [
 export const MOCK_SETTINGS: HarnessSettings = {
   telemetryOptIn: false,
   recentDirs: ["/Users/demo/acme-app", "/Users/demo/rfq-workflows", "/Users/demo/onboarding-flow"],
+  // Matches the real default: opt-in, because it spends tokens on a background
+  // LLM call the user never asked for.
+  rollingSummary: false,
 };
 
 
