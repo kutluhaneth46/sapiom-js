@@ -68,6 +68,27 @@ case "$(uname -s)" in
     "$rel"/mac-arm64/Sapiom.app/Contents/MacOS/Sapiom --smoke || status=$?
     ;;
   MINGW* | MSYS* | CYGWIN*)
+    # TEMPORARY (Phase 6): the Windows app exits 3 with no output on any channel,
+    # even redirected — so before launching it, ask the bundled runtime what it can
+    # and cannot load. Exit 3 is Node's "Internal JavaScript Parse Failure", i.e. a
+    # module that fails before our code runs, and these probes name which one.
+    # Remove once Windows launches.
+    exe_probe="$rel/win-unpacked/Sapiom.exe"
+    app_dir="$rel/win-unpacked/resources/app"
+    echo "--- windows startup probes ---"
+    ELECTRON_RUN_AS_NODE=1 "$exe_probe" -e "console.log('runtime ok:', process.versions.node)" 2>&1 | head -3
+    echo "app dir contents:"; ls "$app_dir" 2>&1 | head -6
+    echo "harness package present:"; ls "$app_dir/node_modules/@sapiom/harness/package.json" 2>&1 | head -2
+    # The decisive one: load our own entry the way Electron would and print the
+    # real error instead of a bare exit code. `require('electron')` will fail
+    # under RUN_AS_NODE — that failure is EXPECTED and tells us the module graph
+    # itself resolved; anything else (ERR_MODULE_NOT_FOUND, SyntaxError) is the bug.
+    ELECTRON_RUN_AS_NODE=1 "$exe_probe" -e "
+      const url = require('url').pathToFileURL('$app_dir/dist/main/index.js'.replace(/\\\\/g,'/')).href;
+      import(url).then(() => console.log('entry imported cleanly')).catch((e) => console.log('IMPORT ERROR:', e.code || e.name, '|', String(e.message).split('\n')[0]));
+    " 2>&1 | head -6
+    echo "--- end probes ---"
+
     # The nsis .exe is an installer; smoke the unpacked app it installs.
     # REDIRECTED to a file, not inherited: a GUI-subsystem exe cannot attach to
     # an existing console (piping loses everything) but its handles redirect to a
