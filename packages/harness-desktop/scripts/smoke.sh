@@ -12,10 +12,6 @@ set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 rel="${SMOKE_RELEASE_DIR:-$here/../release}"
 
-# Kept for the Windows env bisect below: the control launch needs the runner's
-# own values, and we are about to overwrite them.
-ORIG_HOME="${HOME:-}"; ORIG_USERPROFILE="${USERPROFILE:-}"; ORIG_APPDATA="${APPDATA:-}"
-
 smoke_home="$(mktemp -d)"
 mkdir -p "$smoke_home/project" "$smoke_home/AppData"
 
@@ -33,10 +29,24 @@ native() {
 }
 app_home="$(native "$smoke_home")"
 
-# Never touch the developer's (or the runner's) real state: ~/.sapiom is shared
-# with the npx CLI. HOME covers POSIX, USERPROFILE+APPDATA cover Windows
-# (os.homedir and Electron's userData read those).
-export HOME="$app_home" USERPROFILE="$app_home" APPDATA="$(native "$smoke_home/AppData")"
+# Relocate the home dir so a local run cannot touch the developer's ~/.sapiom,
+# which is shared with the npx CLI. HOME covers POSIX; USERPROFILE and APPDATA
+# cover Windows (os.homedir and Electron's userData read those).
+#
+# NOT on CI, and that is the point: a runner is an ephemeral VM destroyed minutes
+# later, so there is nothing to protect — while relocating %USERPROFILE% there
+# BREAKS the app. Chromium derives its profile, cache and crash-handler paths from
+# it, and a bare temp dir has no AppData\Local subtree, so it aborts before
+# Electron initialises logging: an exit code and total silence on every channel.
+# An env bisect pinned it to this exact assignment after several wrong theories
+# (asar, then the ESM entry, then APPDATA's path format).
+if [ -z "${CI:-}" ]; then
+  # A Windows developer needs the real profile shape, not just the directory.
+  mkdir -p "$smoke_home/AppData/Roaming" "$smoke_home/AppData/Local"
+  export HOME="$app_home" USERPROFILE="$app_home" APPDATA="$(native "$smoke_home/AppData/Roaming")"
+else
+  echo "[smoke] CI detected — leaving HOME/USERPROFILE/APPDATA alone (ephemeral runner)"
+fi
 export SAPIOM_LAUNCH_DIR="$(native "$smoke_home/project")"
 # Two forms of the report path: the app writes to the native one, this script
 # reads the POSIX one.
@@ -92,23 +102,6 @@ case "$(uname -s)" in
     "$rel"/mac-arm64/Sapiom.app/Contents/MacOS/Sapiom --smoke || status=$?
     ;;
   MINGW* | MSYS* | CYGWIN*)
-    # TEMPORARY: bisect WHICH environment override kills the app on a Windows
-    # runner. Established facts: the app launches on a real Windows desktop, and
-    # it launched once in CI when run with the runner's own environment — every
-    # isolated launch exits 3 before any output. So an override is responsible,
-    # and guessing which has now been wrong twice (asar, then APPDATA's format).
-    # Each line prints only an exit code, which is all we need. Remove once known.
-    win_exe="$rel/win-unpacked/Sapiom.exe"
-    echo "--- env bisect (exit codes; 0 = launched) ---"
-    ( env -u SAPIOM_SMOKE_OUT -u SAPIOM_SMOKE_STUB_AGENT -u SAPIOM_LAUNCH_DIR \
-          HOME="$ORIG_HOME" USERPROFILE="$ORIG_USERPROFILE" APPDATA="$ORIG_APPDATA" \
-          "$win_exe" --smoke >/dev/null 2>&1; echo "  runner env (control): $?" )
-    ( env HOME="$ORIG_HOME" USERPROFILE="$ORIG_USERPROFILE" APPDATA="$ORIG_APPDATA" \
-          "$win_exe" --smoke >/dev/null 2>&1; echo "  + SAPIOM_* only:      $?" )
-    ( env APPDATA="$ORIG_APPDATA" "$win_exe" --smoke >/dev/null 2>&1; echo "  + HOME/USERPROFILE:   $?" )
-    ( "$win_exe" --smoke >/dev/null 2>&1; echo "  fully isolated:       $?" )
-    echo "--- end bisect ---"
-
     # The nsis .exe is an installer; smoke the unpacked app it installs.
     # REDIRECTED to a file, not inherited: a GUI-subsystem exe cannot attach to
     # an existing console (piping loses everything) but its handles redirect to a
