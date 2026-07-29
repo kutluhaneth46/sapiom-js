@@ -90,7 +90,14 @@ function findOnPath(command: string, deps: Required<Pick<SpawnTargetDeps, "env" 
     return candidates(command).find(deps.fileExists) ?? null;
   }
   // Windows separates PATH with ";" — always, regardless of the host we run on.
-  for (const dir of (deps.env.PATH ?? deps.env.Path ?? "").split(";").filter(Boolean)) {
+  // Entries may be quoted ("C:\\Program Files\\Foo"); cmd and `where` strip those, so
+  // we must too or the directory never resolves and we report "not found" for an
+  // agent `where` finds — reproducing the detect/spawn disagreement this exists to end.
+  const pathEntries = (deps.env.PATH ?? deps.env.Path ?? "")
+    .split(";")
+    .map((dir) => dir.trim().replace(/^"(.*)"$/, "$1"))
+    .filter(Boolean);
+  for (const dir of pathEntries) {
     const hit = candidates(win32.join(dir, command)).find(deps.fileExists);
     if (hit) return hit;
   }
@@ -139,9 +146,17 @@ function readShimTarget(
     // Skip bare variable references like "%_prog%" — that's the interpreter the
     // shim picks for itself, not a path we can resolve.
     .filter((token) => token && !/^%[^%]*%$/.test(token))
-    // `%~dp0` carries a trailing separator, so replacing the variable alone
-    // leaves the following backslash in place.
-    .map((token) => token.replace(/%~?dp0%?/i, shimDir))
+    // `%~dp0` expands WITH a trailing separator while `%dp0%` is usually written
+    // followed by one, so supply a separator only when the token lacks it —
+    // otherwise `%~dp0node_modules\cli.js` concatenates to `C:\npmnode_modules\…`.
+    // The replacement is a FUNCTION, not a string: `$&`, `$$`, `` $` `` and `$'` are
+    // special in a replacement pattern, and `$` is legal in a Windows directory
+    // name, so a path like `C:\a$&b` would otherwise be mangled into nonsense.
+    .map((token) =>
+      token.replace(/%~?dp0%?([\\/])?/i, (_match, sep: string | undefined) =>
+        sep ? `${shimDir}${sep}` : `${shimDir}\\`,
+      ),
+    )
     .map((token) => win32.normalize(win32.isAbsolute(token) ? token : win32.join(shimDir, token)))
     .find(deps.fileExists);
   if (!target) return null;

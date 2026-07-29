@@ -193,20 +193,28 @@ async function checkAgentShim(): Promise<string> {
   if (process.platform !== "win32") {
     return "SKIPPED — Windows-only (POSIX spawns the agent binary directly)";
   }
+  // CI installs a real agent before smoking precisely so this check has a genuine
+  // shim to read, and it is the ONLY thing validating the parser against npm's
+  // actual output. Skipping silently there would ship a green release with zero
+  // real-shim coverage, so on CI a missing agent is a FAILURE, not a skip.
+  const required = process.env.SAPIOM_SMOKE_REQUIRE_AGENT === "1";
   let target;
   try {
     target = resolveSpawnTarget("claude", ["--version"]);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    // No agent on this runner is a skip. A shim we cannot parse is a FAILURE —
-    // that is the whole point of this check.
-    if (/not found on PATH/i.test(message)) return "SKIPPED — no agent installed on this runner";
+    if (/not found on PATH/i.test(message) && !required) {
+      return "SKIPPED — no agent installed on this machine";
+    }
     throw err;
   }
-  if (/\.(cmd|bat)$/i.test(target.command)) {
-    throw new Error(`resolved to a shim CreateProcess cannot execute: ${target.command}`);
-  }
-  return `real npm shim resolves to ${path.basename(target.command)} + ${path.basename(target.args[0] ?? "?")}`;
+  // resolveSpawnTarget throws rather than returning an unspawnable command, so
+  // describe what it DID resolve to: a native launcher (claude.exe, no script) or
+  // an interpreter plus a script.
+  const script = target.args[0];
+  return script
+    ? `real npm shim → ${path.basename(target.command)} + ${path.basename(script)}`
+    : `real npm shim → ${path.basename(target.command)} (native launcher, spawned directly)`;
 }
 
 /**

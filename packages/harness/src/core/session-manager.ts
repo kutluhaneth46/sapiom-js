@@ -888,8 +888,10 @@ export class SessionManager {
 
     // On Windows a bare command name (or a .cmd shim, which is what npm installs
     // for `claude`) cannot be spawned: node-pty uses CreateProcess, which does no
-    // PATHEXT resolution and can't execute a .cmd. See resolveSpawnTarget — it
-    // routes those through cmd.exe. No-op on POSIX.
+    // PATHEXT resolution and can't execute a .cmd. resolveSpawnTarget RESOLVES the
+    // shim to its real target — deliberately NOT via cmd.exe, which would expose
+    // these arguments to shell parsing (command injection; see that module).
+    // No-op on POSIX.
     const target = resolveSpawnTarget(spec.command, spec.args);
 
     // A throw here — spawnFn itself, or loadDefaultSpawn() above (a broken
