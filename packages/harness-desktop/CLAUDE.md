@@ -29,6 +29,21 @@ touching this package, and how to tell whether a change actually works on the OS
   elsewhere (`harness/src/cli/doctor.ts:9`).
 - **Executables aren't interchangeable**: `claude` vs `claude.cmd`. A shim must be a `.cmd` batch file
   on Windows, and `#!/bin/sh` + `chmod 0755` on POSIX (`src/main/runtime-shims.ts`).
+- **You cannot spawn an npm-installed agent by name on Windows.** node-pty uses `CreateProcess`, which
+  does no `PATHEXT` lookup and cannot execute a `.cmd` at all — so a bare `claude` fails with
+  `Cannot create process, error code: 2` while `doctor` reports it present (detection shells `where`,
+  which *does* resolve PATHEXT). `harness/src/core/spawn-target.ts` resolves the shim instead. Three
+  facts that cost a day between them:
+  - npm installs **three** files — `claude.cmd`, `claude.ps1`, and an extensionless `claude` that is a
+    POSIX sh script for Git Bash. Try PATHEXT variants **before** the literal name, or you find the sh
+    script and refuse a perfectly good `.cmd`.
+  - A shim's target is **not always a script**: Claude Code ships `bin\claude.exe`. Match on the
+    structure (the quoted token on the line ending in `%*`) and let the filesystem decide, never on a
+    `.js` extension.
+  - Do **not** "fix" this by wrapping in `cmd.exe /d /s /c`. node-pty escapes `"` as `\"` for
+    `CreateProcess`, but cmd only counts raw quotes, so one embedded quote desynchronises its parser
+    and any `&`/`|` after it becomes a command separator — command injection, CVE-2024-27980's class,
+    reachable on every session (codex passes `JSON.stringify(prompt)`). Resolve the target; don't shell.
 - **Spawning a `.cmd`/`.bat` requires `shell: true`** — Node refuses otherwise (CVE-2024-27980), and
   `execFileSync` does no `PATHEXT` lookup, so a bare `pnpm` is `ENOENT` on Windows. Pattern:
   `shell: isWindows` (`scripts/pack.mjs:45`).
@@ -41,6 +56,13 @@ touching this package, and how to tell whether a change actually works on the OS
 - **Paths contain spaces** (`C:\Program Files`, `/Users/x/My Drive`): prefer argv arrays over shell
   strings, and don't hand-quote.
 - Use `os.homedir()` / `app.getPath("userData")`, never a literal `~` or `%USERPROFILE%`.
+- **A test harness is part of the system under test.** `smoke.sh` exported `HOME`/`USERPROFILE`/
+  `APPDATA` from `mktemp -d`, which under git-bash is a POSIX path (`/tmp/…`) with no drive letter.
+  Electron uses `APPDATA` to compute `userData`, so it died creating those directories *before logging
+  existed* — an exit code and total silence on every channel, including a redirect. Six CI rounds went
+  into diagnosing the app for a fault in the harness, while the developer's own machine (real env
+  vars) launched fine the whole time. Every app-facing path now goes through `cygpath -w` (`native()`
+  in smoke.sh). When CI and a real machine disagree, suspect the harness first.
 
 ## Packaging pitfalls, per OS — each one cost a CI cycle
 

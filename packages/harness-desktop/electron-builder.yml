@@ -73,6 +73,18 @@ win:
   target:
     - nsis
   icon: assets/icon.png
+  # Windows cannot load an ESM entry point from inside app.asar. The app is
+  # `type: module` with `main: dist/main/index.js`, and Electron resolves that
+  # entry as a file URL — which fails under a drive letter, so the process died
+  # with exit 3 (Node's "Internal JavaScript Parse Failure") before any of our
+  # code ran, printing nothing anywhere. Linux and macOS are unaffected and keep
+  # asar on. Confirmed by experiment, not inference: the same build repacked
+  # with `-c.asar=false` launched and passed the full smoke suite 6/6.
+  #
+  # The cost is close to zero: `asarUnpack: **/node_modules/**` already unpacks
+  # everything, so the archive only ever held our own dist/ and package.json —
+  # a few hundred KB, next to 100+ MB of already-unpacked node_modules.
+  asar: false
 
 nsis:
   oneClick: false

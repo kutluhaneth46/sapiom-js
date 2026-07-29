@@ -22,6 +22,7 @@ import {
   recordRecentDir,
   hasStoredSettings,
   startServer,
+  createClaudeCodeAdapter,
   CLAUDE_INSTALL_COMMAND,
   CODEX_INSTALL_COMMAND,
   type HarnessServer,
@@ -320,6 +321,16 @@ export async function boot(setupWin: BrowserWindow, mode: BootMode): Promise<Boo
   });
   const bootToken = randomBytes(32).toString("hex");
   const port = await findFreePort();
+
+  // Test-only seam (smoke mode): point the claude-code adapter at a stub script
+  // so `--smoke` can create a REAL session — spawning a real pty through the
+  // real server — on a machine with no coding agent installed. This is what gives
+  // us per-OS coverage of session creation, the step that broke on Windows while
+  // every green test tier ran on Linux or in mock mode. Ignored outside --smoke.
+  const stubAgent = smoke ? process.env.SAPIOM_SMOKE_STUB_AGENT : undefined;
+  const stubbedHarnesses = stubAgent ? (["claude-code"] as const) : null;
+  if (stubAgent) debug(`smoke: stubbing the claude-code agent with ${stubAgent}`);
+
   const server = await startServer({
     port,
     host: "127.0.0.1",
@@ -343,9 +354,10 @@ export async function boot(setupWin: BrowserWindow, mode: BootMode): Promise<Boo
     // orphan the seeded sample from the rail.
     projectRoot: path.join(launchDir, "projects"),
     autoCreateSession: !firstRun,
-    defaultHarnessKind: pickDefaultHarness(report),
-    availableHarnesses: report.availableHarnesses,
+    defaultHarnessKind: stubbedHarnesses ? "claude-code" : pickDefaultHarness(report),
+    availableHarnesses: stubbedHarnesses ? [...stubbedHarnesses] : report.availableHarnesses,
     firstRun,
+    ...(stubAgent ? { adapters: { "claude-code": createClaudeCodeAdapter({ binary: stubAgent }) } } : {}),
   });
 
   // 9. Load the SPA in the main window; close setup once it renders.

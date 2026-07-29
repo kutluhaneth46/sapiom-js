@@ -24,9 +24,11 @@
  * Exit code is 0 only if every check passes; each result is printed as one line
  * so a CI log shows exactly which layer broke.
  */
-import { existsSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
+import { tmpdir } from "node:os";
 import * as path from "node:path";
+import { resolveSpawnTarget } from "@sapiom/harness";
 import { createSetupWindow } from "./windows.js";
 import { resolveWebDir } from "./paths.js";
 import type { BootResult } from "./boot.js";
@@ -123,23 +125,152 @@ async function checkPreloadBridge(): Promise<string> {
 /**
  * node-pty is the only native module and the one thing that has to be rebuilt
  * against Electron's ABI per platform. Loading it proves the rebuild; spawning
- * a trivial process proves the unpacked spawn-helper is present and executable.
- * Uses the OS's own shell, so this needs no coding agent installed.
+ * proves the unpacked spawn-helper is present and executable.
+ *
+ * Deliberately spawns a SCRIPT (`.cmd` on Windows, a `#!/bin/sh` file elsewhere)
+ * rather than the OS shell binary, and routes it through the harness's own
+ * `resolveSpawnTarget` — because a coding agent installed by npm IS a script
+ * (`claude.cmd`), and that is the case that broke. Spawning `cmd.exe` directly
+ * passed happily on Windows while every real session failed with
+ * `Cannot create process, error code: 2`: CreateProcess does no PATHEXT lookup
+ * and cannot execute a .cmd. This check now exercises the same path a session
+ * does, still without needing an agent installed.
  */
 async function checkNodePty(): Promise<string> {
   const pty = (await import("node-pty")) as typeof import("node-pty");
   const isWindows = process.platform === "win32";
-  const [file, args] = isWindows ? ["cmd.exe", ["/c", "exit", "0"]] : ["/bin/sh", ["-c", "exit 0"]];
-  const proc = pty.spawn(file, args, { cwd: process.cwd(), env: process.env as Record<string, string> });
-  const code = await new Promise<number>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("pty process did not exit in 10s")), 10_000);
-    proc.onExit(({ exitCode }) => {
-      clearTimeout(timer);
-      resolve(exitCode);
+
+  const dir = mkdtempSync(path.join(tmpdir(), "sapiom-smoke-pty-"));
+  // Shaped like the real thing: on Windows an npm shim (a `.cmd` that runs
+  // `node <script>`), which is what `claude.cmd` is and what resolveSpawnTarget
+  // must see through; elsewhere a shebang script. Spawning `cmd.exe`/`/bin/sh`
+  // directly — as this check used to — passed on Windows while every real
+  // session failed, because those are executable images and an agent is not.
+  const script = path.join(dir, isWindows ? "agent-probe.cmd" : "agent-probe.sh");
+  if (isWindows) {
+    writeFileSync(path.join(dir, "agent-probe.js"), "process.exit(0);\n");
+    writeFileSync(script, '@echo off\r\n"%dp0%\\node.exe" "%dp0%\\agent-probe.js" %*\r\n');
+  } else {
+    writeFileSync(script, "#!/bin/sh\nexit 0\n");
+    chmodSync(script, 0o755);
+  }
+
+  try {
+    const target = resolveSpawnTarget(script, []);
+    const proc = pty.spawn(target.command, target.args, {
+      cwd: dir,
+      env: process.env as Record<string, string>,
     });
-  });
-  if (code !== 0) throw new Error(`pty child exited ${code}`);
-  return `spawned ${file} via node-pty, exit 0`;
+    const code = await new Promise<number>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("pty process did not exit in 10s")), 10_000);
+      proc.onExit(({ exitCode }) => {
+        clearTimeout(timer);
+        resolve(exitCode);
+      });
+    });
+    if (code !== 0) throw new Error(`pty child exited ${code}`);
+    return `spawned ${path.basename(script)} via node-pty (as ${target.command}), exit 0`;
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Can we resolve a REAL npm-generated agent shim?
+ *
+ * The session-create check spawns a stub shim that we wrote ourselves — which
+ * proves the mechanism but validates our own assumption about npm's shim format.
+ * If a real `claude.cmd` is shaped differently than resolveSpawnTarget's parser
+ * expects, that check passes while every real user still fails. This closes the
+ * loop: CI installs Claude Code for real (installing needs no auth) and we assert
+ * the actual file on disk resolves to an interpreter plus a script.
+ *
+ * Windows-only by nature — POSIX spawns the binary directly, so there is no shim
+ * to see through. Skips rather than fails when no agent is installed, so the
+ * check is meaningful where it runs and silent where it can't.
+ */
+async function checkAgentShim(): Promise<string> {
+  if (process.platform !== "win32") {
+    return "SKIPPED — Windows-only (POSIX spawns the agent binary directly)";
+  }
+  // CI installs a real agent before smoking precisely so this check has a genuine
+  // shim to read, and it is the ONLY thing validating the parser against npm's
+  // actual output. Skipping silently there would ship a green release with zero
+  // real-shim coverage, so on CI a missing agent is a FAILURE, not a skip.
+  const required = process.env.SAPIOM_SMOKE_REQUIRE_AGENT === "1";
+  let target;
+  try {
+    target = resolveSpawnTarget("claude", ["--version"]);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (/not found on PATH/i.test(message) && !required) {
+      return "SKIPPED — no agent installed on this machine";
+    }
+    throw err;
+  }
+  // resolveSpawnTarget throws rather than returning an unspawnable command, so
+  // describe what it DID resolve to: a native launcher (claude.exe, no script) or
+  // an interpreter plus a script.
+  const script = target.args[0];
+  return script
+    ? `real npm shim → ${path.basename(target.command)} + ${path.basename(script)}`
+    : `real npm shim → ${path.basename(target.command)} (native launcher, spawned directly)`;
+}
+
+/**
+ * Create a REAL session through the REAL server: POST /api/sessions, which
+ * scaffolds/binds the workspace and spawns the agent in a pty. This is the step
+ * a user hits when they click "Start session" or "Use template" — both funnel
+ * through this one endpoint — and it is where Windows failed with a 500
+ * (`Cannot create process, error code: 2`) while every test tier stayed green:
+ * the mock-mode e2e never reaches a server, the integration tests inject a fake
+ * pty spawner, and CI ran the real thing on Linux only.
+ *
+ * Needs no coding agent installed: smoke.sh writes a stub script and boot.ts
+ * points the claude-code adapter at it (SAPIOM_SMOKE_STUB_AGENT), so the whole
+ * path — HTTP, session record, pty spawn — is exercised for real on every OS.
+ * Skipped, loudly, if the stub wasn't provided rather than silently passing.
+ */
+async function checkSessionCreate(base: string, token: string | null): Promise<string> {
+  if (!token) throw new Error("boot url carried no token");
+  const stub = process.env.SAPIOM_SMOKE_STUB_AGENT;
+  if (!stub) return "SKIPPED — no SAPIOM_SMOKE_STUB_AGENT (run via scripts/smoke.sh)";
+
+  const cwd = mkdtempSync(path.join(tmpdir(), "sapiom-smoke-ws-"));
+  try {
+    const res = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "X-Harness-Token": token, "content-type": "application/json" },
+      body: JSON.stringify({ cwd, harness: "claude-code" }),
+    });
+    const body = await res.text();
+    if (res.status !== 201) {
+      throw new Error(`POST /api/sessions → ${res.status}: ${body.slice(0, 200)}`);
+    }
+    const session = JSON.parse(body) as { id?: string; status?: string; cwd?: string };
+    if (!session.id) throw new Error(`no session id in response: ${body.slice(0, 120)}`);
+
+    // The record must be visible in state too — a session that spawned but never
+    // registered would leave the UI with nothing to attach to.
+    const state = (await (
+      await fetch(`${base}/api/state`, { headers: { "X-Harness-Token": token } })
+    ).json()) as { sessions?: Array<{ id: string; status?: string }> };
+    const found = state.sessions?.find((s) => s.id === session.id);
+    if (!found) throw new Error(`session ${session.id} missing from /api/state`);
+
+    return `spawned a session in ${path.basename(cwd)} (status ${found.status ?? session.status ?? "?"})`;
+  } finally {
+    // Best-effort ONLY, and deliberately so: this directory is the live pty's
+    // cwd, and Windows refuses to delete a directory that is a running
+    // process's current directory. A throw here would fail the very check it is
+    // cleaning up after — reporting a Windows bug that doesn't exist. The
+    // server's own shutdown kills the pty, and the OS reclaims its temp dir.
+    try {
+      rmSync(cwd, { recursive: true, force: true });
+    } catch {
+      /* the pty still holds it; nothing to do and nothing worth reporting */
+    }
+  }
 }
 
 /**
@@ -201,6 +332,8 @@ export async function runSmokeChecks(boot: BootResult): Promise<SmokeCheck[]> {
       await fetchOk(`${base}/api/state`, null, 401);
       return "/api rejects a request with no boot token";
     }),
+    await check("session-create", () => checkSessionCreate(base, token)),
+    await check("agent-shim", checkAgentShim),
     await check("preload-bridge", checkPreloadBridge),
     await check("node-pty", checkNodePty),
     await check("unpacked-deps", checkUnpackedDeps),
@@ -217,10 +350,19 @@ export async function runSmokeChecks(boot: BootResult): Promise<SmokeCheck[]> {
  */
 export function reportSmoke(checks: SmokeCheck[]): number {
   const failed = checks.filter((c) => !c.ok);
+  // A skip is NOT a pass. Labelling it "PASS" would hide the case this matters
+  // most in: the Windows agent install failing, `agent-shim` skipping, and the
+  // log claiming full coverage it didn't have. Skips don't fail the run, but they
+  // are visibly distinct.
+  const isSkip = (c: SmokeCheck): boolean => c.ok && c.detail.startsWith("SKIPPED");
+  const skipped = checks.filter(isSkip);
+  const passed = checks.filter((c) => c.ok && !isSkip(c));
+
   const lines = [
-    ...checks.map((c) => `[smoke] ${c.ok ? "PASS" : "FAIL"} ${c.name} — ${c.detail}`),
+    ...checks.map((c) => `[smoke] ${!c.ok ? "FAIL" : isSkip(c) ? "SKIP" : "PASS"} ${c.name} — ${c.detail}`),
     failed.length === 0
-      ? `[smoke] OK — ${checks.length}/${checks.length} checks passed`
+      ? `[smoke] OK — ${passed.length} passed` +
+        (skipped.length ? `, ${skipped.length} skipped (${skipped.map((c) => c.name).join(", ")})` : "")
       : `[smoke] FAILED — ${failed.length}/${checks.length}: ${failed.map((c) => c.name).join(", ")}`,
   ];
   for (const line of lines) console.log(line);

@@ -32,6 +32,7 @@ import {
   type SpawnSpec,
 } from "../shared/types.js";
 import type { LaunchOptsBuilder } from "./session-manager.js";
+import { resolveSpawnTarget } from "./spawn-target.js";
 import { parseTaskStreamLine } from "./task-stream.js";
 import { AdapterNotFoundError, ExternalHarnessError } from "./errors.js";
 import { listHarnessAdapters } from "./adapters/registry.js";
@@ -306,7 +307,14 @@ export class TaskManager {
 
     let child: TaskProcess;
     try {
-      child = this.spawnProcess(spec.command, spec.args, { cwd: spec.cwd, env });
+      // Same Windows resolution as the interactive path (SessionManager.spawn):
+      // libuv's process lookup appends only .com/.exe, never .cmd, and since
+      // CVE-2024-27980 Node refuses an explicit .cmd/.bat without `shell: true`.
+      // So a bare `claude` ENOENTs here for an npm-installed agent exactly as it
+      // did for sessions — fixing only that path would have left every
+      // macro-triggered background task broken on Windows. No-op on POSIX.
+      const target = resolveSpawnTarget(spec.command, spec.args);
+      child = this.spawnProcess(target.command, target.args, { cwd: spec.cwd, env });
     } catch (err) {
       // Never launched — nothing to track, but the generated config files
       // buildLaunchOpts just wrote still need their exit-time cleanup.
