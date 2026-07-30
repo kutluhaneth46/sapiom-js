@@ -13,7 +13,6 @@ import { loadUiPrefs } from "../lib/ui-prefs";
 import { useDismissable } from "../lib/use-dismissable";
 import { AnchoredPopover } from "./AnchoredPopover";
 import { DirectoryPicker } from "./DirectoryPicker";
-import { FolderBrowser } from "./FolderBrowser";
 import { HarnessBrandIcon } from "./HarnessBrandIcon";
 import { HarnessMenuItems } from "./HarnessMenuItems";
 import { Icon } from "./Icon";
@@ -124,28 +123,13 @@ export function NewSessionModal({
 
         <div className="modal-body">
           <section className="modal-section">
-            {isWorkspace ? (
-              /* Workspace / Open-Folder mode: browse-first picker with
-                 favorites, breadcrumbs, and an explicit "Open this folder"
-                 confirm. DirectoryPicker is left untouched for session mode. */
-              <FolderBrowser
-                value={cwd}
-                onChange={setCwd}
-                onOpen={() => void submit()}
-                recentDirs={recentDirs}
-                listDir={listDir}
-                onNewDirChange={setNewDirTyped}
-              />
-            ) : (
-              <DirectoryPicker
-                value={cwd}
-                onChange={setCwd}
-                onSubmit={() => void submit()}
-                recentDirs={recentDirs}
-                listDir={listDir}
-                onNewDirChange={setNewDirTyped}
-              />
-            )}
+            <DirectoryPicker
+              value={cwd}
+              onChange={setCwd}
+              onSubmit={() => void submit()}
+              recentDirs={recentDirs}
+              listDir={listDir}
+            />
           </section>
           {/* The one field is a DIRECTORY, not a name — say so, and say what
               the name will be, so nobody types a session title into a path. */}

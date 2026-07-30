@@ -996,9 +996,10 @@ describe("createActionsRouter", () => {
       expect(res.status).toBe(200);
       const events = parseNdjson(await res.text());
       // The ready line was already written before onWorkflowConfigChanged was
-      // called — both lines must still be present.
+      // called — both lines must still be present. building uses the
+      // pre-deploy (config) id; ready uses the result id from the build.
       expect(events).toEqual([
-        { phase: "building", definitionId: "def_new" },
+        { phase: "building", definitionId: "def_old" },
         { phase: "ready", definitionId: "def_new", buildRunId: "build_5", status: "ready" },
       ]);
     });

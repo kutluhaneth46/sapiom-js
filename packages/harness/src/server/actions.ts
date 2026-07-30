@@ -570,6 +570,11 @@ export function createActionsRouter(opts: ActionsRouterOpts): Router {
       return linked.definitionId;
     };
 
+    // Capture the pre-deploy definitionId (if any) so we can tell whether a
+    // successful deploy changed it — the cache-invalidation callback fires only
+    // when there is something new for connected clients to pick up.
+    const prevDefinitionId = configState.kind === "linked" ? configState.definitionId : undefined;
+
     try {
       // A link failure throws out of here and is mapped by the same
       // toDeployErrorEvent below — reported as itself, never as a build
@@ -591,7 +596,11 @@ export function createActionsRouter(opts: ActionsRouterOpts): Router {
         buildRunId: result.buildRunId,
         status: result.status,
       });
-      if (onWorkflowConfigChanged) {
+      // Only broadcast a config change when the definitionId actually changed —
+      // a redeploy of an already-linked workflow with the same id is a no-op
+      // for any cache that derives from sapiom.json, so don't wake every
+      // connected client unnecessarily.
+      if (onWorkflowConfigChanged && result.definitionId !== prevDefinitionId) {
         try {
           await onWorkflowConfigChanged(workflow.path);
         } catch {
