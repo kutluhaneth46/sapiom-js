@@ -30,9 +30,10 @@ import {
   type DoctorReport,
 } from "@sapiom/harness";
 import { augmentProcessPath } from "./env.js";
+import { esbuildBinaryPath } from "./esbuild-binary.js";
 import { resolveWebDir } from "./paths.js";
 import { createMainWindow } from "./windows.js";
-import { installClaudeCode } from "./agent-install.js";
+import { ensureSapiomCli, installClaudeCode } from "./agent-install.js";
 import { installRuntimeShims } from "./runtime-shims.js";
 import { BOOT_PROGRESS, BOOT_ERROR, CONSENT_SUBMIT, RETRY, type BootProgress, type BootErrorPayload } from "./ipc.js";
 
@@ -254,6 +255,11 @@ export async function boot(setupWin: BrowserWindow, mode: BootMode): Promise<Boo
   augmentProcessPath(agentBinDir(), runtimeShimDir);
   resolveTargetEnvironment();
 
+  // 1b. esbuild's native binary was pinned by index.ts's first import — far
+  //     earlier than here, because esbuild reads the setting when its module
+  //     loads (esbuild-binary.ts). Only traced here, where the boot log is.
+  debug(`esbuild binary: ${esbuildBinaryPath ?? "left to esbuild's own resolution"}`);
+
   // 2. Doctor.
   progress(setupWin, { phase: "doctor", message: "Checking your environment…", status: "active" });
   let report = await runDoctor();
@@ -270,6 +276,29 @@ export async function boot(setupWin: BrowserWindow, mode: BootMode): Promise<Boo
     report = await ensureAgentAvailable(setupWin, report);
   }
   progress(setupWin, { phase: "doctor", message: `Found: ${report.availableHarnesses.join(", ")}`, status: "done" });
+
+  // 3b. The `sapiom` CLI. The agent is told to run `sapiom agents deploy` /
+  //     `run --target local|prod` (harness macros) and `sapiom agents init`
+  //     (templates), and nothing shipped that binary — so on a machine without a
+  //     global install the agent hit `command not found` and improvised. Install
+  //     it into the same per-user prefix as the agent; PATH already includes that
+  //     dir, so it resolves on this same launch.
+  //
+  //     Non-fatal on purpose, and NOT gated behind a doctor failure: every direct
+  //     in-app action (Deploy, Local Run) works without it, so a failed install
+  //     must never block boot — it just leaves the agent-driven doors degraded,
+  //     which is exactly the state we shipped. Skipped in smoke (no network on
+  //     CI) and in dev (workspace copy) — see install-policy.ts.
+  try {
+    const cli = await ensureSapiomCli({ smoke, devMode }, (line) => debug(`sapiom-cli: ${line}`));
+    debug(
+      cli.install
+        ? `sapiom CLI install ${cli.result?.ok ? "ok" : `FAILED (exit ${cli.result?.code ?? "?"})`} — ${cli.reason}`
+        : `sapiom CLI: ${cli.reason}`,
+    );
+  } catch (err) {
+    debug(`sapiom CLI install threw (ignored): ${err instanceof Error ? err.message : String(err)}`);
+  }
 
   // 4. Machine id + first-run. "First run" means the user has never completed
   //    onboarding — i.e. no settings file has ever been persisted — NOT "has no
