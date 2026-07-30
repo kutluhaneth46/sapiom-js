@@ -166,17 +166,20 @@ test.describe("macro bar visibility in Steps tab", () => {
     await expect(macros.getByTestId("step-freeform-input")).toBeVisible();
   });
 
-  test("no macro block when there is no run (no run data → no expanded macros)", async ({ page }) => {
+  test("macros appear on step expand even without a run (per-step, not run-gated)", async ({ page }) => {
     await loadApp(page);
     await openStepsTab(page);
-    // Without a run, there is no runStep → no macros rendered.
-    // Try expanding the first step (if the graph row exists).
+    // No run yet — expanding a step STILL shows the debug macros. A not-yet-run
+    // step injects its name/structure (Explain / free-form work); run data
+    // enriches them once it exists. The macros live per step, not behind a run.
     const stepRow = page.getByTestId("canvas-step-row-intake");
-    if (await stepRow.count() > 0) {
-      await stepRow.click();
-    }
-    // The macro block must not appear without run data.
-    await expect(page.getByTestId("step-macros")).toHaveCount(0);
+    await expect(stepRow).toBeVisible();
+    await stepRow.click();
+    await expect(page.getByTestId("canvas-step-expand-intake")).toBeVisible();
+    const macros = page.getByTestId("step-macros").first();
+    await expect(macros).toBeVisible();
+    await expect(macros.getByTestId("step-macro-explain")).toBeVisible();
+    await expect(macros.getByTestId("step-freeform-input")).toBeVisible();
   });
 });
 

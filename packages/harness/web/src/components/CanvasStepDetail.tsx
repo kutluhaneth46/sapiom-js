@@ -623,8 +623,15 @@ export function CanvasStepsList({
                 >
                   Full details <Icon name="ArrowRight" size={12} />
                 </button>
-                {runStep && onInjectPrompt && (
-                  <StepDebugMacros step={runStep} onInjectPrompt={onInjectPrompt} />
+                {/* Debug macros on every step, run or not. A not-yet-run step
+                    still injects its name (+ run data once it exists) so Explain
+                    / free-form work before the first run — the macros live per
+                    step in the Steps tab, not gated behind a run. */}
+                {onInjectPrompt && (
+                  <StepDebugMacros
+                    step={runStep ?? { id: node.id, name: node.label, status: "pending" }}
+                    onInjectPrompt={onInjectPrompt}
+                  />
                 )}
               </div>
             )}
