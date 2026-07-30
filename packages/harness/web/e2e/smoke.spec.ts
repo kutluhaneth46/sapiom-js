@@ -110,7 +110,7 @@ test("session header: compact identity (name only; path in the tooltip); New ses
 
   await page.screenshot({ path: "web/e2e/screenshots/session-header.png" });
 
-  await page.getByTestId("history-trigger").click();
+  await page.getByTestId("add-workspace").click();
   await page.getByTestId("new-session-btn").click();
   await expect(page.locator(".modal-new-session")).toBeVisible();
   await page.getByRole("button", { name: "Cancel" }).click();
@@ -153,19 +153,29 @@ test("Overview heads the account menu, shows the intro panel, and any session le
   await expect(item).toBeVisible();
   await item.click();
 
-  // Selection closes the menu and swaps the main slot to the intro.
+  // Selection closes the menu and raises the intro OVER the shell.
   await expect(page.getByTestId("profile-menu")).toHaveCount(0);
   await expect(page.getByTestId("welcome-panel")).toBeVisible();
-  await expect(page.getByTestId("session-context-title")).toHaveText("Overview");
-  // No session options while the intro is up — destructive actions beside
-  // "Overview" would read as closing the view.
-  await expect(page.getByTestId("session-menu")).toHaveCount(0);
+  // The session bar keeps describing the session behind the card. It used to
+  // read "Overview" and drop its menu, because Overview replaced the slot; as an
+  // overlay it takes nothing away, so the work behind it stays addressable and
+  // re-reading what Studio is never costs you your place.
+  await expect(page.getByTestId("session-context-title")).not.toHaveText("Overview");
 
-  // Reopening the menu shows the current selection, then Escape closes it.
-  await page.getByTestId("brand-identity").click();
-  await expect(page.getByTestId("rail-overview")).toHaveClass(/is-selected/);
+  // It is a real modal: the scrim owns the pointer, so nothing behind it can be
+  // clicked through. This replaced a step that reopened the account menu while
+  // the intro was up to inspect its selected state — reachable back when
+  // Overview was a view occupying the slot, impossible for a card on top of it.
+  const blocked = await page
+    .getByTestId("brand-identity")
+    .click({ timeout: 700 })
+    .then(() => false)
+    .catch(() => true);
+  expect(blocked).toBe(true);
+
+  // Escape puts it away and hands the shell straight back.
   await page.keyboard.press("Escape");
-  await expect(page.getByTestId("profile-menu")).toHaveCount(0);
+  await expect(page.getByTestId("welcome-panel")).toHaveCount(0);
 
   // Opening the leasing agent returns to the terminal — acme-app's one live
   // session is bound to it, so opening the agent attaches to that session.
@@ -174,25 +184,50 @@ test("Overview heads the account menu, shows the intro panel, and any session le
   await expect(page.getByTestId("session-context")).toHaveAttribute("data-session-id", "sess-boot");
 });
 
+test("Overview is dismissable — scrim, close button, and Escape all put it away", async ({ page }) => {
+  // An overlay must never be a trap. Three exits, and none of them may disturb
+  // what is behind: the whole reason it is a card on top.
+  const open = async (): Promise<void> => {
+    await page.getByTestId("brand-identity").click();
+    await page.getByTestId("rail-overview").click();
+    await expect(page.getByTestId("welcome-panel")).toBeVisible();
+  };
+
+  await open();
+  await page.getByTestId("welcome-close").click();
+  await expect(page.getByTestId("welcome-panel")).toHaveCount(0);
+
+  await open();
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("welcome-panel")).toHaveCount(0);
+
+  await open();
+  // The scrim, well clear of the card.
+  await page.getByTestId("welcome-panel").click({ position: { x: 8, y: 8 } });
+  await expect(page.getByTestId("welcome-panel")).toHaveCount(0);
+  // The session it was covering is untouched.
+  await expect(page.getByTestId("session-context")).toHaveAttribute("data-session-id", "sess-boot");
+});
+
 test("creation IA: the rail + adds projects; the tab strip + adds a session to the focused agent", async ({
   page,
 }) => {
-  // The rail's + opens the AddProjectMenu first; "Open Folder" then opens
-  // the dialog in Project mode (no mode tabs — the entry point fixes intent).
+  // The rail's + is the PROJECT entry: it opens the three-door add menu. No
+  // mode tabs (the entry point fixed the intent, docs/IA.md) and no agent
+  // picker — each door asks exactly one question.
   await page.getByTestId("add-workspace").click();
-  await expect(page.getByTestId("add-project-menu")).toBeVisible();
-  await page.getByTestId("add-project-open-folder").click();
-  await expect(page.getByTestId("add-project-menu")).not.toBeVisible();
-
-  const modal = page.locator(".modal-add-workspace");
-  await expect(modal).toBeVisible();
-  await expect(modal.locator(".modal-header")).toContainText("Add workspace");
-  await expect(modal.getByTestId("add-mode-session")).toHaveCount(0);
-  await expect(modal.getByTestId("add-mode-project")).toHaveCount(0);
-  await expect(modal.getByRole("button", { name: "Add workspace" })).toBeVisible();
-  await expect(modal.getByTestId("harness-select")).toHaveCount(0);
-  await page.getByRole("button", { name: "Cancel" }).click();
-  await expect(modal).toHaveCount(0);
+  const menu = page.getByTestId("add-menu");
+  await expect(menu).toBeVisible();
+  await expect(menu.locator(".connect-card-header")).toContainText("Add");
+  await expect(menu.getByTestId("aw-doors")).toBeVisible();
+  await expect(menu.getByTestId("add-mode-session")).toHaveCount(0);
+  await expect(menu.getByTestId("add-mode-project")).toHaveCount(0);
+  await expect(menu.getByTestId("harness-select")).toHaveCount(0);
+  // "Add workspace" is now the OUTCOME of picking a folder that holds a
+  // project, not a button offered before anything is known.
+  await expect(menu.getByRole("button", { name: "Add workspace" })).toHaveCount(0);
+  await page.keyboard.press("Escape");
+  await expect(menu).toHaveCount(0);
 
   // Session creation lives in the tab strip: the trailing + opens a NEW
   // session on the focused agent (leasing), no dialog. Leasing has two tabs
@@ -434,37 +469,22 @@ test.describe("three-zone IA (rail explorer, tab strip, right pane)", () => {
   });
 });
 
-test("add project: the rail's + opens the browse-first folder dialog and registers the path", async ({ page }) => {
-  // Open via the add-project menu → "Open Folder".
+test("add project: the rail's + registers a bare folder through the 'Open a folder' door", async ({ page }) => {
   await page.getByTestId("add-workspace").click();
-  await expect(page.getByTestId("add-project-menu")).toBeVisible();
-  await page.getByTestId("add-project-open-folder").click();
-  await expect(page.getByTestId("add-project-menu")).not.toBeVisible();
+  await page.getByTestId("aw-door-have").click();
 
-  // Same dialog anatomy as new-session, its own identity: no harness picker,
-  // workspace title and CTA.
   const modal = page.locator(".modal-add-workspace");
   await expect(modal).toBeVisible();
-  await expect(modal).toContainText("Add workspace");
   await expect(modal.getByTestId("harness-select")).toHaveCount(0);
 
-  // Workspace mode now shows the browse-first FolderBrowser — no text input
-  // by default. Navigate to "/Users/demo" via the "up" breadcrumb from the
-  // initial launchDir "/Users/demo/acme-app", then pick "scratch".
-  const browser = modal.getByTestId("folder-browser-listing");
-  await expect(browser).toBeVisible({ timeout: 3000 });
+  const input = modal.getByTestId("dir-picker-input");
+  await input.fill("/Users/demo/scratch");
+  await modal.getByTestId("aw-have-continue").click();
 
-  // Navigate up to /Users/demo (parent of acme-app).
-  await modal.getByTestId("folder-browser-up").click();
-  await expect(modal.getByTestId("folder-browser-item-scratch")).toBeVisible({ timeout: 3000 });
-
-  // Click "scratch" to navigate into it.
-  await modal.getByTestId("folder-browser-item-scratch").click();
-  // Wait until the breadcrumb confirms we're at scratch (listing resolved).
-  await expect(modal.getByTestId("folder-browser-crumb-scratch")).toBeVisible({ timeout: 3000 });
-
-  // Now "Open this folder" confirms the current path.
-  await modal.getByTestId("folder-browser-open").click();
+  // scratch holds no sapiom.json, so detection says so — and registering it as
+  // a bare workspace stays available (the rail supports agent-less folders).
+  await expect(modal.getByTestId("aw-result")).toContainText("No agent project");
+  await modal.getByTestId("aw-add-anyway").click();
 
   await expect(modal).toBeHidden();
   // The connected path joins the rail as a workspace-owned workflow row.
@@ -472,7 +492,7 @@ test("add project: the rail's + opens the browse-first folder dialog and registe
 });
 
 test("new-session modal: directory picker navigates and validates", async ({ page }) => {
-  await page.getByTestId("history-trigger").click();
+  await page.getByTestId("add-workspace").click();
   await page.getByTestId("new-session-btn").click();
   await expect(page.locator(".modal-new-session")).toBeVisible();
 
@@ -514,7 +534,7 @@ test("new-session modal: a failed directory read shows an error, not an empty li
   await page.goto("/?mockError=listDir&seed=0");
   await expect(page.locator(".rail-workflows")).toBeVisible();
 
-  await page.getByTestId("history-trigger").click();
+  await page.getByTestId("add-workspace").click();
   await page.getByTestId("new-session-btn").click();
   await expect(page.locator(".modal-new-session")).toBeVisible();
 
@@ -573,12 +593,15 @@ test("the sessions menu is ONE merged past-sessions list with status tags and ri
   await expect(menu.getByText("History", { exact: true })).toHaveCount(0);
 
   // The registry's exited session renders ONCE (deduped against its own
-  // history mirror) and is tagged resumable in text, not a color-only dot.
+  // history mirror) and resolves to a real resume.
   const exited = page.getByTestId("exited-session-sess-leasing");
   await expect(exited).toBeVisible();
   await expect(page.getByTestId("history-8f2b1c6a-4d3e-4a11-9c2f-1a2b3c4d5e6f")).toHaveCount(0);
   await expect(menu.getByText("Build the leasing pipeline")).toHaveCount(1);
-  await expect(exited.locator(".past-session-tag")).toHaveText("resumable");
+  await expect(exited).toHaveAttribute("data-resumable", "true");
+  // An ordinary resume carries no state word — only the exceptions speak.
+  await expect(exited).not.toContainText("from summary");
+  await expect(exited).not.toContainText("nothing recorded");
 
   // The list is global — rfq-workflows' past session shows without
   // switching directories.
@@ -592,7 +615,7 @@ test("the sessions menu is ONE merged past-sessions list with status tags and ri
   // outranks the vendor transcript scan's messageCount (12) that the same
   // fixture also carries.
   const transcript = page.getByTestId("history-2b6d9e10-7711-4c2a-8b0a-9e4f2d1c5a33");
-  await expect(transcript.locator(".past-session-tag")).toHaveText("resumable");
+  await expect(transcript).toHaveAttribute("data-resumable", "true");
   await expect(transcript).toContainText("feat/screening-webhook");
   await expect(transcript).toContainText("3 turns");
   await expect(transcript).not.toContainText("12 turns");
@@ -617,7 +640,7 @@ test("the sessions menu is ONE merged past-sessions list with status tags and ri
   await expect(page.getByTestId("session-context")).toHaveAttribute("data-session-id", /sess-adopted/);
 });
 
-test("a phantom past session is tagged archived and never offers Resume", async ({ page }) => {
+test("a phantom past session reads 'nothing recorded' and never offers Resume", async ({ page }) => {
   // sess-phantom holds an agentSessionId (our SessionStart hook fired) but the
   // agent wrote no transcript, because the session ended before its first
   // prompt. On one real machine 16 of 49 registry rows measured this shape, and
@@ -627,15 +650,18 @@ test("a phantom past session is tagged archived and never offers Resume", async 
 
   const phantom = page.getByTestId("exited-session-sess-phantom");
   await expect(phantom).toBeVisible();
-  const tag = phantom.locator(".past-session-tag");
-  await expect(tag).toHaveText("archived");
-  await expect(tag).toHaveAttribute("data-resumable", "false");
+  await expect(phantom).toHaveAttribute("data-resumable", "false");
+  // "nothing recorded", not "archived": nothing was archived, and the word used
+  // to be shared with rows that DO have a recorded conversation to rebuild from.
+  await expect(phantom).toContainText("nothing recorded");
+  await expect(phantom).not.toContainText("from summary");
 
   // A genuinely resumable row in the same directory still reads resumable —
   // the tag reflects a per-row probe, not a blanket downgrade.
-  await expect(
-    page.getByTestId("exited-session-sess-leasing").locator(".past-session-tag"),
-  ).toHaveText("resumable");
+  await expect(page.getByTestId("exited-session-sess-leasing")).toHaveAttribute(
+    "data-resumable",
+    "true",
+  );
 
   // Opening it lands on the dead pane with Resume disabled and the real reason
   // stated, rather than a live Resume button and a bare "exit code 1".
@@ -1575,7 +1601,7 @@ test.describe("session menu copy path", () => {
 });
 
 test("directory picker: arrow keys move the highlight and Enter drills into it", async ({ page }) => {
-  await page.getByTestId("history-trigger").click();
+  await page.getByTestId("add-workspace").click();
   await page.getByTestId("new-session-btn").click();
   const input = page.getByTestId("dir-picker-input");
   await expect(page.getByTestId("dir-picker-item-leasing")).toBeVisible();

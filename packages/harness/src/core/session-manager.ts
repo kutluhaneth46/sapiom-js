@@ -22,6 +22,8 @@ import {
   type SpawnSpec,
 } from "../shared/types.js";
 import { expandHome } from "./paths.js";
+import { HOST_ESBUILD_PIN } from "./asar-path.js";
+import { resolveSpawnTarget } from "./spawn-target.js";
 import {
   AdapterNotFoundError,
   ExternalHarnessError,
@@ -187,7 +189,7 @@ export type SessionActivityListener = (harnessSessionId: string) => void;
  */
 export type LaunchOptsBuilder = (
   harnessSessionId: string,
-  req: Pick<CreateSessionRequest, "cwd" | "harness" | "profile">,
+  req: Pick<CreateSessionRequest, "cwd" | "harness" | "profile" | "rehydrateFrom">,
 ) => Omit<LaunchOpts, "harnessSessionId" | "cwd"> | Promise<Omit<LaunchOpts, "harnessSessionId" | "cwd">>;
 
 const defaultBuildLaunchOpts: LaunchOptsBuilder = () => ({});
@@ -398,6 +400,11 @@ export class SessionManager {
       lastActiveAt: this.now(),
       exitCode: null,
       boundWorkflowPath: null,
+      // What the builder actually managed to assemble, not what the caller
+      // asked for: `req.rehydrateFrom` naming a session our event log holds
+      // nothing for yields no brief, and this stays null so nothing downstream
+      // presents an empty-handed fresh session as a continuation.
+      rehydratedFrom: opts.rehydratedFrom ?? null,
       ready: false,
     };
     this.sessions.set(id, session);
@@ -876,6 +883,7 @@ export class SessionManager {
     for (const [key, value] of Object.entries(process.env)) {
       if (value !== undefined) env[key] = value;
     }
+    delete env[HOST_ESBUILD_PIN];
     for (const [key, value] of Object.entries(spec.env)) {
       if (value === null) delete env[key];
       else env[key] = value;
@@ -885,11 +893,19 @@ export class SessionManager {
     env[ENV.sessionId] = session.id;
     if (this.collectorUrl) env[ENV.collectorUrl] = this.collectorUrl;
 
+    // On Windows a bare command name (or a .cmd shim, which is what npm installs
+    // for `claude`) cannot be spawned: node-pty uses CreateProcess, which does no
+    // PATHEXT resolution and can't execute a .cmd. resolveSpawnTarget RESOLVES the
+    // shim to its real target — deliberately NOT via cmd.exe, which would expose
+    // these arguments to shell parsing (command injection; see that module).
+    // No-op on POSIX.
+    const target = resolveSpawnTarget(spec.command, spec.args);
+
     // A throw here — spawnFn itself, or loadDefaultSpawn() above (a broken
     // node-pty prebuild surfaces there, not at import time) — propagates to
     // create()/resume(), which own reconciling the session record to
     // "exited" for every pre-pty failure, not just this one.
-    const pty: IPty = spawnFn(spec.command, spec.args, {
+    const pty: IPty = spawnFn(target.command, target.args, {
       name: "xterm-256color",
       cols: DEFAULT_COLS,
       rows: DEFAULT_ROWS,

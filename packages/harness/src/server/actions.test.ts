@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createActionsRouter,
   resolveRunLocalBootstrapPath,
+  resolveRunLocalChildSpec,
   type ActionsRouterOpts,
   type RunLocalChildProcess,
 } from "./actions.js";
@@ -29,10 +30,7 @@ function makeCoreDeps(overrides: Partial<ActionsRouterOpts["coreDeps"]> = {}) {
     deploy: vi.fn(),
     run: vi.fn(),
     readConfig: vi.fn().mockReturnValue({ definitionId: "def_123" }),
-    // link: by default returns the same id already in config (no rewrite needed).
-    link: vi.fn().mockResolvedValue({ definitionId: "def_123", name: "test-agent" }),
-    // check: returns a name so resolveAgentName can avoid a basename fallback.
-    check: vi.fn().mockResolvedValue({ name: "test-agent", stepCount: 1, warnings: [], manifest: {} }),
+    link: vi.fn().mockResolvedValue({ definitionId: "def_new", name: "order-triage" }),
     writeConfig: vi.fn(),
     ...overrides,
   } as NonNullable<ActionsRouterOpts["coreDeps"]> & { __client?: unknown };
@@ -295,12 +293,12 @@ describe("createActionsRouter", () => {
       expect(coreDeps.deploy).not.toHaveBeenCalled();
     });
 
-    it("links-on-deploy when the workflow has no definitionId in sapiom.json", async () => {
-      // An unlinked workflow (no definitionId) must link via link({ create: true }),
-      // write the resolved id to sapiom.json, then deploy — no 409.
+    it("links (creating the agent) then deploys when the project is not linked yet", async () => {
+      // A fresh gallery-template clone: sapiom.json carries the fork
+      // provenance and no definitionId. This is the case that used to 409.
       const coreDeps = makeCoreDeps({
-        readConfig: vi.fn().mockReturnValue({}), // no definitionId
-        link: vi.fn().mockResolvedValue({ definitionId: "def_new", name: "test-agent" }),
+        readConfig: vi.fn().mockReturnValue({ forkId: "fork_7", templateId: "order-triage" }),
+        link: vi.fn().mockResolvedValue({ definitionId: "def_new", name: "order-triage-canonical" }),
         deploy: vi.fn().mockResolvedValue({
           definitionId: "def_new",
           buildRunId: "build_1",
@@ -309,89 +307,229 @@ describe("createActionsRouter", () => {
       });
       start({
         apiKey: "sk-test-key",
-        resolveWorkflow: () => ({ path: "/proj/agent", definitionSlug: "test-agent" }),
+        resolveWorkflow: () => ({ path: "/proj/agent", name: "order-triage" }),
         coreDeps,
       });
 
-      const res = await fetch(`${baseUrl}/api/workflows/wf-1/deploy`, {
-        method: "POST",
-      });
+      const res = await fetch(`${baseUrl}/api/workflows/wf-1/deploy`, { method: "POST" });
       expect(res.status).toBe(200);
 
-      const events = parseNdjson(await res.text());
-      expect(events).toEqual([
+      // The linking line precedes building, and the stream still ends with
+      // exactly one terminal line.
+      expect(parseNdjson(await res.text())).toEqual([
+        { phase: "linking", name: "order-triage" },
         { phase: "building", definitionId: "def_new" },
         { phase: "ready", definitionId: "def_new", buildRunId: "build_1", status: "ready" },
       ]);
 
-      // link was called with create: true and the registry slug.
+      // create: true is what makes this work on an agent that does not exist
+      // remotely yet; link() itself matches an existing one by name/slug first.
       expect(coreDeps.link).toHaveBeenCalledWith(
-        { name: "test-agent", create: true },
+        { name: "order-triage", create: true },
         expect.anything(),
       );
-      // writeConfig persisted the resolved id.
+      // The id is cached under the name the SERVER returned (not the requested
+      // name — they differ here on purpose, to prove which one wins), and
+      // writeConfig merges, so the clone's forkId/templateId survive.
       expect(coreDeps.writeConfig).toHaveBeenCalledWith("/proj/agent", {
         definitionId: "def_new",
-        name: "test-agent",
+        name: "order-triage-canonical",
       });
-      // deploy targeted the resolved id.
+      // The build then runs against the freshly linked id.
       expect(coreDeps.deploy).toHaveBeenCalledWith(
         { projectDir: "/proj/agent", definitionId: "def_new" },
         expect.anything(),
       );
     });
 
-    it("resolves stale/foreign definitionId via link and redeploys to own definition", async () => {
-      // sapiom.json carries a stale/foreign id (e.g. from a cloned template).
-      // link() resolves by name (account-scoped) and returns the user's own id.
+    it("calls onLinked exactly once with the workflow, after writeConfig, on a first-time link", async () => {
+      // The registry's list() never re-reads sapiom.json and the workspace
+      // watcher ignores a content-only edit, so the host needs telling that a
+      // project just went from unlinked to linked in order to rescan it.
+      const order: string[] = [];
       const coreDeps = makeCoreDeps({
-        readConfig: vi.fn().mockReturnValue({ definitionId: "def_foreign_267" }),
-        link: vi.fn().mockResolvedValue({ definitionId: "def_mine_42", name: "my-agent" }),
+        readConfig: vi.fn().mockReturnValue({}),
+        link: vi.fn().mockResolvedValue({ definitionId: "def_new", name: "order-triage" }),
+        writeConfig: vi.fn().mockImplementation(() => {
+          order.push("writeConfig");
+        }),
         deploy: vi.fn().mockResolvedValue({
-          definitionId: "def_mine_42",
-          buildRunId: "build_7",
+          definitionId: "def_new",
+          buildRunId: "build_1",
+          status: "ready",
+        }),
+      });
+      const onLinked = vi.fn().mockImplementation(async () => {
+        order.push("onLinked");
+      });
+      start({
+        apiKey: "sk-test-key",
+        resolveWorkflow: () => ({ path: "/proj/agent", name: "order-triage" }),
+        coreDeps,
+        onLinked,
+      });
+
+      const res = await fetch(`${baseUrl}/api/workflows/wf-1/deploy`, { method: "POST" });
+      await res.text();
+
+      expect(onLinked).toHaveBeenCalledTimes(1);
+      expect(onLinked).toHaveBeenCalledWith({ path: "/proj/agent", name: "order-triage" });
+      expect(order).toEqual(["writeConfig", "onLinked"]);
+    });
+
+    it("does not call onLinked when the project is already linked", async () => {
+      const coreDeps = makeCoreDeps({
+        deploy: vi.fn().mockResolvedValue({
+          definitionId: "def_123",
+          buildRunId: "build_9",
+          status: "ready",
+        }),
+      });
+      const onLinked = vi.fn().mockResolvedValue(undefined);
+      start({
+        apiKey: "sk-test-key",
+        resolveWorkflow: () => ({ path: "/proj/agent" }),
+        coreDeps,
+        onLinked,
+      });
+
+      const res = await fetch(`${baseUrl}/api/workflows/wf-1/deploy`, { method: "POST" });
+      await res.text();
+
+      expect(onLinked).not.toHaveBeenCalled();
+    });
+
+    it("still calls onLinked when writeConfig failed (the warning path)", async () => {
+      const coreDeps = makeCoreDeps({
+        readConfig: vi.fn().mockReturnValue({}),
+        link: vi.fn().mockResolvedValue({ definitionId: "def_new", name: "order-triage" }),
+        writeConfig: vi.fn().mockImplementation(() => {
+          throw new Error("EACCES: permission denied, open '/proj/agent/sapiom.json'");
+        }),
+        deploy: vi.fn().mockResolvedValue({
+          definitionId: "def_new",
+          buildRunId: "build_1",
+          status: "ready",
+        }),
+      });
+      const onLinked = vi.fn().mockResolvedValue(undefined);
+      start({
+        apiKey: "sk-test-key",
+        resolveWorkflow: () => ({ path: "/proj/agent", name: "order-triage" }),
+        coreDeps,
+        onLinked,
+      });
+
+      const res = await fetch(`${baseUrl}/api/workflows/wf-1/deploy`, { method: "POST" });
+      await res.text();
+
+      // A rescan is harmless whether or not the cache write succeeded, and
+      // there's nothing new to re-read when it failed either way.
+      expect(onLinked).toHaveBeenCalledTimes(1);
+      expect(onLinked).toHaveBeenCalledWith({ path: "/proj/agent", name: "order-triage" });
+    });
+
+    it("still produces a normal ready terminal and still deploys when onLinked rejects", async () => {
+      // onLinked is never expected to throw, but a rejection must not cost the
+      // user their build — it is awaited only for ordering, then swallowed.
+      const coreDeps = makeCoreDeps({
+        readConfig: vi.fn().mockReturnValue({}),
+        link: vi.fn().mockResolvedValue({ definitionId: "def_new", name: "order-triage" }),
+        deploy: vi.fn().mockResolvedValue({
+          definitionId: "def_new",
+          buildRunId: "build_1",
+          status: "ready",
+        }),
+      });
+      const onLinked = vi.fn().mockRejectedValue(new Error("rescan blew up"));
+      start({
+        apiKey: "sk-test-key",
+        resolveWorkflow: () => ({ path: "/proj/agent", name: "order-triage" }),
+        coreDeps,
+        onLinked,
+      });
+
+      const res = await fetch(`${baseUrl}/api/workflows/wf-1/deploy`, { method: "POST" });
+      expect(res.status).toBe(200);
+      const events = parseNdjson(await res.text());
+
+      expect(events).toEqual([
+        { phase: "linking", name: "order-triage" },
+        { phase: "building", definitionId: "def_new" },
+        { phase: "ready", definitionId: "def_new", buildRunId: "build_1", status: "ready" },
+      ]);
+      expect(coreDeps.deploy).toHaveBeenCalledWith(
+        { projectDir: "/proj/agent", definitionId: "def_new" },
+        expect.anything(),
+      );
+      expect(onLinked).toHaveBeenCalledTimes(1);
+    });
+
+    it("warns (but still builds) when linking succeeds but caching it to sapiom.json fails", async () => {
+      // sapiom.json is a re-resolvable cache (agent-core/src/config.ts) and link()
+      // re-resolves the same agent by name — so a failed cache write (read-only
+      // checkout, EACCES, config gone invalid between the 409 check and the
+      // write) must not cost the user their deploy. It's best-effort: warn, and
+      // carry on with the id already in hand.
+      const coreDeps = makeCoreDeps({
+        readConfig: vi.fn().mockReturnValue({}),
+        link: vi.fn().mockResolvedValue({ definitionId: "def_new", name: "order-triage" }),
+        writeConfig: vi.fn().mockImplementation(() => {
+          throw new Error("EACCES: permission denied, open '/proj/agent/sapiom.json'");
+        }),
+        deploy: vi.fn().mockResolvedValue({
+          definitionId: "def_new",
+          buildRunId: "build_1",
           status: "ready",
         }),
       });
       start({
         apiKey: "sk-test-key",
-        resolveWorkflow: () => ({ path: "/proj/agent", definitionSlug: "my-agent" }),
+        resolveWorkflow: () => ({ path: "/proj/agent", name: "order-triage" }),
         coreDeps,
       });
 
-      const res = await fetch(`${baseUrl}/api/workflows/wf-1/deploy`, {
-        method: "POST",
-      });
+      const res = await fetch(`${baseUrl}/api/workflows/wf-1/deploy`, { method: "POST" });
       expect(res.status).toBe(200);
-      const events = parseNdjson(await res.text());
-      // The resolved (own) id is the one used everywhere.
-      expect(events).toEqual([
-        { phase: "building", definitionId: "def_mine_42" },
-        { phase: "ready", definitionId: "def_mine_42", buildRunId: "build_7", status: "ready" },
-      ]);
 
-      // link was called with the registry slug.
-      expect(coreDeps.link).toHaveBeenCalledWith(
-        { name: "my-agent", create: true },
-        expect.anything(),
+      const events = parseNdjson(await res.text());
+      expect(events).toHaveLength(4);
+      expect(events[0]).toEqual({ phase: "linking", name: "order-triage" });
+      expect(events[1].phase).toBe("warning");
+      expect(events[1].message).toEqual(
+        expect.stringContaining("def_new"),
       );
-      // writeConfig rewrote the stale id with the resolved one.
-      expect(coreDeps.writeConfig).toHaveBeenCalledWith("/proj/agent", {
-        definitionId: "def_mine_42",
-        name: "my-agent",
+      // The project itself is still unlinked locally — only the remote agent
+      // exists — so the message must not read as "your project is linked".
+      expect(events[1].message).toEqual(
+        expect.stringContaining("was created on Sapiom"),
+      );
+      expect(events[1].message).toEqual(
+        expect.stringContaining("not recorded locally"),
+      );
+      expect(events[1].message).toEqual(
+        expect.stringContaining("re-deploying re-resolves it by name"),
+      );
+      expect(events[2]).toEqual({ phase: "building", definitionId: "def_new" });
+      expect(events[3]).toEqual({
+        phase: "ready",
+        definitionId: "def_new",
+        buildRunId: "build_1",
+        status: "ready",
       });
-      // deploy targeted the user's own definition, not the foreign one.
+
+      // The whole point of the override: the build still runs against the
+      // linked id even though the cache write failed.
       expect(coreDeps.deploy).toHaveBeenCalledWith(
-        { projectDir: "/proj/agent", definitionId: "def_mine_42" },
+        { projectDir: "/proj/agent", definitionId: "def_new" },
         expect.anything(),
       );
     });
 
-    it("skips writeConfig when link returns the same id already in sapiom.json", async () => {
-      // id is already correct — no redundant write.
+    it("does not link when the project is already linked", async () => {
+      // Regression guard for the common path: a linked project must never pay
+      // for a definitions round-trip, and its stream shape is unchanged.
       const coreDeps = makeCoreDeps({
-        readConfig: vi.fn().mockReturnValue({ definitionId: "def_123" }),
-        link: vi.fn().mockResolvedValue({ definitionId: "def_123", name: "test-agent" }),
         deploy: vi.fn().mockResolvedValue({
           definitionId: "def_123",
           buildRunId: "build_9",
@@ -400,34 +538,183 @@ describe("createActionsRouter", () => {
       });
       start({
         apiKey: "sk-test-key",
-        resolveWorkflow: () => ({ path: "/proj/agent", definitionSlug: "test-agent" }),
+        resolveWorkflow: () => ({ path: "/proj/agent" }),
         coreDeps,
       });
 
-      const res = await fetch(`${baseUrl}/api/workflows/wf-1/deploy`, {
-        method: "POST",
-      });
-      expect(res.status).toBe(200);
+      const res = await fetch(`${baseUrl}/api/workflows/wf-1/deploy`, { method: "POST" });
       const events = parseNdjson(await res.text());
-      expect(events.at(-1)).toMatchObject({ phase: "ready" });
 
+      expect(coreDeps.link).not.toHaveBeenCalled();
+      expect(coreDeps.writeConfig).not.toHaveBeenCalled();
+      expect(events).toEqual([
+        { phase: "building", definitionId: "def_123" },
+        { phase: "ready", definitionId: "def_123", buildRunId: "build_9", status: "ready" },
+      ]);
+    });
+
+    it("ends the stream with one terminal error when linking fails, without building", async () => {
+      const { AgentOperationError } = await import("@sapiom/agent-core");
+      const coreDeps = makeCoreDeps({
+        readConfig: vi.fn().mockReturnValue({}),
+        link: vi.fn().mockRejectedValue(
+          new AgentOperationError({
+            code: "HTTP_404",
+            message: "Could not create the agent.",
+            hint: "The tenant deploy routes may not be enabled.",
+          }),
+        ),
+      });
+      start({
+        apiKey: "sk-test-key",
+        resolveWorkflow: () => ({ path: "/proj/agent", name: "agent" }),
+        coreDeps,
+      });
+
+      const res = await fetch(`${baseUrl}/api/workflows/wf-1/deploy`, { method: "POST" });
+      expect(res.status).toBe(200);
+
+      // A link failure is reported as itself — never disguised as a build
+      // failure — and nothing is written or built.
+      expect(parseNdjson(await res.text())).toEqual([
+        { phase: "linking", name: "agent" },
+        {
+          phase: "error",
+          code: "HTTP_404",
+          message: "Could not create the agent.",
+          hint: "The tenant deploy routes may not be enabled.",
+        },
+      ]);
+      expect(coreDeps.deploy).not.toHaveBeenCalled();
       expect(coreDeps.writeConfig).not.toHaveBeenCalled();
     });
 
-    it("falls back to check() for agent name when definitionSlug is absent", async () => {
+    it("refreshes the key once and retries when linking is rejected as unauthorized", async () => {
       const coreDeps = makeCoreDeps({
         readConfig: vi.fn().mockReturnValue({}),
-        check: vi.fn().mockResolvedValue({ name: "bundled-name", stepCount: 2, warnings: [], manifest: {} }),
-        link: vi.fn().mockResolvedValue({ definitionId: "def_99", name: "bundled-name" }),
+        link: vi
+          .fn()
+          .mockRejectedValueOnce(await makeAuthRejection(401))
+          .mockResolvedValue({ definitionId: "def_new", name: "agent" }),
         deploy: vi.fn().mockResolvedValue({
-          definitionId: "def_99",
-          buildRunId: "build_3",
+          definitionId: "def_new",
+          buildRunId: "build_1",
+          status: "ready",
+        }),
+      });
+      const provider = refreshingProvider("sk-stale", "sk-fresh");
+      start({
+        apiKey: provider,
+        resolveWorkflow: () => ({ path: "/proj/agent", name: "agent" }),
+        coreDeps,
+      });
+
+      const res = await fetch(`${baseUrl}/api/workflows/wf-1/deploy`, { method: "POST" });
+      const events = parseNdjson(await res.text());
+
+      expect(provider.refreshCalls).toBe(1);
+      expect(coreDeps.link).toHaveBeenCalledTimes(2);
+      // The retry is transparent: no extra linking line, normal terminal.
+      expect(events.filter((e) => e.phase === "linking")).toHaveLength(1);
+      expect(events.at(-1)).toMatchObject({ phase: "ready", definitionId: "def_new" });
+    });
+
+    it("names the created agent from the resolveDefinitionName seam when it resolves", async () => {
+      // The seam supplies the agent's declared manifest name, which wins over
+      // both sapiom.json's cached name and the registry name.
+      const coreDeps = makeCoreDeps({
+        readConfig: vi.fn().mockReturnValue({ name: "cached-name" }),
+        deploy: vi.fn().mockResolvedValue({
+          definitionId: "def_new",
+          buildRunId: "b",
           status: "ready",
         }),
       });
       start({
         apiKey: "sk-test-key",
-        // No definitionSlug supplied — forces check() path.
+        resolveWorkflow: () => ({ path: "/proj/agent", name: "registry-name" }),
+        resolveDefinitionName: () => Promise.resolve("manifest-name"),
+        coreDeps,
+      });
+
+      await fetch(`${baseUrl}/api/workflows/wf-1/deploy`, { method: "POST" });
+
+      expect(coreDeps.link).toHaveBeenCalledWith(
+        { name: "manifest-name", create: true },
+        expect.anything(),
+      );
+    });
+
+    it("falls back to the cached name, then the registry name, then the folder", async () => {
+      // The seam is absent or fails (no node_modules yet, a bundle error) —
+      // each fallback in turn must still yield a usable name.
+      const cases: Array<{
+        config: Record<string, unknown>;
+        workflow: { path: string; name?: string };
+        seam?: () => Promise<string | null>;
+        expected: string;
+      }> = [
+        // Seam rejects → sapiom.json's cached name.
+        {
+          config: { name: "cached-name" },
+          workflow: { path: "/proj/agent", name: "registry-name" },
+          seam: () => Promise.reject(new Error("no node_modules")),
+          expected: "cached-name",
+        },
+        // No seam, no cached name → the registry name.
+        {
+          config: {},
+          workflow: { path: "/proj/agent", name: "registry-name" },
+          expected: "registry-name",
+        },
+        // Nothing at all → the project folder's basename.
+        {
+          config: {},
+          workflow: { path: "/proj/my-agent" },
+          seam: () => Promise.resolve(null),
+          expected: "my-agent",
+        },
+      ];
+
+      for (const testCase of cases) {
+        const coreDeps = makeCoreDeps({
+          readConfig: vi.fn().mockReturnValue(testCase.config),
+          deploy: vi.fn().mockResolvedValue({
+            definitionId: "def_new",
+            buildRunId: "b",
+            status: "ready",
+          }),
+        });
+        start({
+          apiKey: "sk-test-key",
+          resolveWorkflow: () => testCase.workflow,
+          ...(testCase.seam ? { resolveDefinitionName: testCase.seam } : {}),
+          coreDeps,
+        });
+
+        await fetch(`${baseUrl}/api/workflows/wf-1/deploy`, { method: "POST" });
+
+        expect(coreDeps.link).toHaveBeenCalledWith(
+          { name: testCase.expected, create: true },
+          expect.anything(),
+        );
+        // Each iteration starts its own server; close it before the next.
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+    });
+
+    it("returns 409 when sapiom.json is unreadable/unparseable", async () => {
+      const { AgentOperationError } = await import("@sapiom/agent-core");
+      const coreDeps = makeCoreDeps({
+        readConfig: vi.fn().mockImplementation(() => {
+          throw new AgentOperationError({
+            code: "BAD_CONFIG",
+            message: "sapiom.json is not valid JSON.",
+          });
+        }),
+      });
+      start({
+        apiKey: "sk-test-key",
         resolveWorkflow: () => ({ path: "/proj/agent" }),
         coreDeps,
       });
@@ -435,81 +722,14 @@ describe("createActionsRouter", () => {
       const res = await fetch(`${baseUrl}/api/workflows/wf-1/deploy`, {
         method: "POST",
       });
-      expect(res.status).toBe(200);
-      const events = parseNdjson(await res.text());
-      expect(events.at(-1)).toMatchObject({ phase: "ready" });
-
-      // check was called to read the manifest name.
-      expect(coreDeps.check).toHaveBeenCalledWith({
-        sourceDir: "/proj/agent",
-        typecheck: false,
-      });
-      // link received the bundled name.
-      expect(coreDeps.link).toHaveBeenCalledWith(
-        { name: "bundled-name", create: true },
-        expect.anything(),
-      );
-    });
-
-    it("falls back to directory basename when check() fails", async () => {
-      const coreDeps = makeCoreDeps({
-        readConfig: vi.fn().mockReturnValue({}),
-        check: vi.fn().mockRejectedValue(new Error("bundle failed")),
-        link: vi.fn().mockResolvedValue({ definitionId: "def_77", name: "my-project" }),
-        deploy: vi.fn().mockResolvedValue({
-          definitionId: "def_77",
-          buildRunId: "build_5",
-          status: "ready",
-        }),
-      });
-      start({
-        apiKey: "sk-test-key",
-        resolveWorkflow: () => ({ path: "/proj/my-project" }),
-        coreDeps,
-      });
-
-      const res = await fetch(`${baseUrl}/api/workflows/wf-1/deploy`, {
-        method: "POST",
-      });
-      expect(res.status).toBe(200);
-      const events = parseNdjson(await res.text());
-      expect(events.at(-1)).toMatchObject({ phase: "ready" });
-
-      // link received the directory basename.
-      expect(coreDeps.link).toHaveBeenCalledWith(
-        { name: "my-project", create: true },
-        expect.anything(),
-      );
-    });
-
-    it("streams a terminal error when link() fails (no name in manifest)", async () => {
-      const { AgentOperationError } = await import("@sapiom/agent-core");
-      const coreDeps = makeCoreDeps({
-        readConfig: vi.fn().mockReturnValue({}),
-        // check returns an empty name and link is never reached.
-        check: vi.fn().mockResolvedValue({ name: "", stepCount: 0, warnings: [], manifest: {} }),
-        link: vi.fn().mockRejectedValue(
-          new AgentOperationError({
-            code: "HTTP_401",
-            message: "Unauthorized.",
-          }),
-        ),
-      });
-      start({
-        apiKey: "sk-test-key",
-        resolveWorkflow: () => ({ path: "/proj/basename-fallback" }),
-        coreDeps,
-      });
-
-      const res = await fetch(`${baseUrl}/api/workflows/wf-1/deploy`, {
-        method: "POST",
-      });
-      expect(res.status).toBe(200);
-      const events = parseNdjson(await res.text());
-      // Terminal error line — the link failure is surfaced in-band, no building phase.
-      expect(events).toHaveLength(1);
-      expect(events[0]).toMatchObject({ phase: "error", code: "HTTP_401" });
+      expect(res.status).toBe(409);
+      const body = (await res.json()) as Record<string, unknown>;
+      expect(body.error).toBe("sapiom.json is not valid JSON");
       expect(coreDeps.deploy).not.toHaveBeenCalled();
+      // An unparseable config must never reach link() — the entire reason
+      // "bad-config" is a distinct state from "unlinked".
+      expect(coreDeps.link).not.toHaveBeenCalled();
+      expect(coreDeps.writeConfig).not.toHaveBeenCalled();
     });
 
     it("returns 503 (no network) when the harness has no API key", async () => {
@@ -1463,6 +1683,79 @@ describe("createActionsRouter", () => {
         "file:///app/packages/harness/src/server/actions.ts",
       );
       expect(p).toBe("/app/packages/harness/src/core/run-local-bootstrap.ts");
+    });
+  });
+
+  // ── run-local child spec (pure) ───────────────────────────────────────────
+
+  /**
+   * `POST /api/runs/local` shipped in the desktop app answering every request
+   * with `{"kind":"error","error":"spawn ENOTDIR"}` — three separate packaging
+   * defects in one four-line spawn, none of which the CLI can see:
+   *
+   *   1. `cwd` was `…/app.asar/node_modules/@sapiom/harness`. Electron patches
+   *      `fs` but nothing translates a child process's cwd, so chdir → ENOTDIR
+   *      (and ENOTDIR is not in Node's deferred-error list, so `spawn` THROWS).
+   *   2. the bootstrap SCRIPT path was inside the archive too — and the child is
+   *      plain Node, which has no asar support and cannot read it.
+   *   3. no `ELECTRON_RUN_AS_NODE=1`, so `process.execPath` (the Sapiom binary
+   *      under Electron) would have booted A SECOND COPY OF THE APP.
+   *
+   * `canvas-manifest-check.ts` already got all three right; this call site got
+   * none. These tests pin each one independently.
+   */
+  describe("resolveRunLocalChildSpec", () => {
+    const PACKAGED = "file:///Applications/Sapiom.app/Contents/Resources/app.asar/node_modules/@sapiom/harness/dist/server/actions.js";
+    const CLI = "file:///home/u/.npm/_npx/abc/node_modules/@sapiom/harness/dist/server/actions.js";
+
+    it("points the child's cwd at the unpacked twin, never into the archive", () => {
+      const spec = resolveRunLocalChildSpec(PACKAGED, { execPath: "/Applications/Sapiom.app/Contents/MacOS/Sapiom", env: {}, isElectron: true });
+      expect(spec.cwd).toBe("/Applications/Sapiom.app/Contents/Resources/app.asar.unpacked/node_modules/@sapiom/harness");
+      expect(spec.cwd).not.toContain("app.asar/");
+    });
+
+    it("points the bootstrap script at the unpacked twin — a plain-Node child cannot read the archive", () => {
+      const spec = resolveRunLocalChildSpec(PACKAGED, { execPath: "/x/Sapiom", env: {}, isElectron: true });
+      const script = spec.args.at(-1)!;
+      expect(script).toBe("/Applications/Sapiom.app/Contents/Resources/app.asar.unpacked/node_modules/@sapiom/harness/dist/core/run-local-bootstrap.js");
+      expect(spec.args.join(" ")).not.toContain("app.asar/");
+    });
+
+    it("sets ELECTRON_RUN_AS_NODE under Electron, so execPath runs the script instead of booting the app", () => {
+      const spec = resolveRunLocalChildSpec(PACKAGED, { execPath: "/x/Sapiom", env: { PATH: "/usr/bin" }, isElectron: true });
+      expect(spec.env["ELECTRON_RUN_AS_NODE"]).toBe("1");
+      expect(spec.env["PATH"]).toBe("/usr/bin"); // inherits the rest
+    });
+
+    it("leaves the CLI path untouched — no flag, no rewriting, real node", () => {
+      const spec = resolveRunLocalChildSpec(CLI, { execPath: "/usr/bin/node", env: { PATH: "/usr/bin" }, isElectron: false });
+      expect(spec.env["ELECTRON_RUN_AS_NODE"]).toBeUndefined();
+      expect(spec.cwd).toBe("/home/u/.npm/_npx/abc/node_modules/@sapiom/harness");
+      expect(spec.args).toEqual(["/home/u/.npm/_npx/abc/node_modules/@sapiom/harness/dist/core/run-local-bootstrap.js"]);
+      expect(spec.command).toBe("/usr/bin/node");
+    });
+
+    it("keeps the tsx register hook for a .ts bootstrap (dev server)", () => {
+      const spec = resolveRunLocalChildSpec("file:///repo/packages/harness/src/server/actions.ts", {
+        execPath: "/usr/bin/node",
+        env: {},
+        isElectron: false,
+      });
+      expect(spec.args).toEqual(["--import", "tsx", "/repo/packages/harness/src/core/run-local-bootstrap.ts"]);
+    });
+
+    it("does not leak the desktop host's esbuild pin into the child", () => {
+      // The pin exists ONLY so in-process (Electron main) esbuild can exec a
+      // binary outside app.asar. No child needs it — a child is plain Node and
+      // resolves real on-disk paths itself — and a workflow step body that
+      // shells out to the project's own toolchain would hit a version mismatch.
+      // So the rule is uniform: the pin never crosses a process boundary.
+      const spec = resolveRunLocalChildSpec(PACKAGED, {
+        execPath: "/x/Sapiom",
+        env: { ESBUILD_BINARY_PATH: "/app/resources/app.asar.unpacked/node_modules/@esbuild/darwin-arm64/bin/esbuild" },
+        isElectron: true,
+      });
+      expect(spec.env["ESBUILD_BINARY_PATH"]).toBeUndefined();
     });
   });
 });

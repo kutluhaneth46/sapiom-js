@@ -48,4 +48,12 @@ export { ensureAuthenticated } from "./cli/auth.js";
 export type { HarnessIdentity } from "./cli/auth.js";
 export { getOrCreateMachineId } from "./cli/machine-id.js";
 export { ensureSpawnHelperExecutable } from "./core/session-manager.js";
+// Exported so a host can spawn a pty the same way the harness does — Windows
+// cannot launch a bare command name or a .cmd shim directly (see the module).
+export { resolveSpawnTarget } from "./core/spawn-target.js";
+export type { SpawnTarget } from "./core/spawn-target.js";
+// Lets a host point the claude-code adapter at a different binary. Used by the
+// desktop app's --smoke mode to create a REAL session against a stub agent, so
+// per-OS session coverage doesn't require Claude Code installed on a CI runner.
+export { createClaudeCodeAdapter } from "./core/adapters/claude-code.js";
 export { loadSettings, saveSettings, recordRecentDir, hasStoredSettings } from "./cli/settings.js";

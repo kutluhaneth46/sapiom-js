@@ -263,9 +263,13 @@ describe("createRestRouter", () => {
     it("returns defaults before anything is persisted", async () => {
       start();
       const res = await fetch(`${baseUrl}/settings`);
+      // Exact shape, deliberately: every default here is a contract with the
+      // SPA, and `rollingSummary` in particular must default OFF — it spends
+      // tokens on a background LLM call the user never asked for.
       expect(await res.json()).toEqual({
         telemetryOptIn: false,
         recentDirs: [],
+        rollingSummary: false,
       });
     });
 
@@ -279,13 +283,27 @@ describe("createRestRouter", () => {
       expect(await res.json()).toEqual({
         telemetryOptIn: true,
         recentDirs: [],
+        rollingSummary: false,
       });
 
       const reread = await fetch(`${baseUrl}/settings`);
       expect(await reread.json()).toEqual({
         telemetryOptIn: true,
         recentDirs: [],
+        rollingSummary: false,
       });
+    });
+
+    it("persists the rolling-summary opt-in", async () => {
+      start();
+      const res = await fetch(`${baseUrl}/settings`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ rollingSummary: true }),
+      });
+      expect(await res.json()).toMatchObject({ rollingSummary: true });
+      const reread = await fetch(`${baseUrl}/settings`);
+      expect(await reread.json()).toMatchObject({ rollingSummary: true });
     });
 
     it("calls onTelemetryOptInChange only when telemetryOptIn actually changes", async () => {
@@ -1350,13 +1368,18 @@ describe("createRestRouter", () => {
       turnCount: 1,
       eventCount: 3,
       reconstructed: true,
+      archivedAt: null,
       limitations: [],
     };
 
     function stubRecords(overrides: Partial<SessionRecordReader> = {}): SessionRecordReader {
+      const find = async (id: string): Promise<SessionRecord | null> =>
+        id === "sess-1" || id === "agent-1" ? record : null;
       return {
-        read: async (id: string) => (id === "sess-1" || id === "agent-1" ? record : null),
+        read: find,
+        readFromEvents: find,
         turnCounts: async () => new Map([["agent-1", 7]]),
+        conversationIds: async () => ["sess-1"],
         ...overrides,
       };
     }

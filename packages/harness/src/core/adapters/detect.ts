@@ -11,6 +11,15 @@ import * as path from "node:path";
 const DEFAULT_PATHEXT = ".COM;.EXE;.BAT;.CMD";
 
 /**
+ * NOTE: DETECTION only — "is something by this name installed". Actually SPAWNING
+ * it on Windows is a different problem with different rules, and lives in
+ * core/spawn-target.ts (`resolveSpawnTarget`): CreateProcess cannot execute a
+ * `.cmd`, npm ships an unusable extensionless sh script beside it, and the shim's
+ * real target may be a native `.exe`. The two deliberately differ — but if you
+ * change candidate ordering here, check whether that module needs the same change.
+ * A detect-says-yes / spawn-says-no split is exactly the bug that cost a day.
+ */
+/**
  * Find an executable on PATH, returning the full path of the first match in
  * PATH order, or null when there is none. Never throws.
  *

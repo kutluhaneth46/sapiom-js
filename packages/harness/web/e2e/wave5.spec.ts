@@ -63,29 +63,25 @@ test.describe("command palette sections and highlighting", () => {
 // Add dialog: scaffold, scan, registry picker, MCP prompts
 // ---------------------------------------------------------------------------
 
-test.describe("add dialog (Project mode)", () => {
+test.describe("add workspace (three doors)", () => {
   test("a non-existent folder offers the scaffold action, which starts a session and prompts the agent", async ({
     page,
   }) => {
     // The rail's + opens AddProjectMenu; "Open Folder" enters the workspace dialog.
     await page.getByTestId("add-workspace").click();
-    await expect(page.getByTestId("add-project-menu")).toBeVisible();
-    await page.getByTestId("add-project-open-folder").click();
-    await expect(page.getByTestId("add-project-menu")).not.toBeVisible();
+    await page.getByTestId("aw-door-have").click();
     const modal = page.locator(".modal-add-workspace");
     await expect(modal).toBeVisible();
 
-    // Workspace mode uses the browse-first FolderBrowser. Use the secondary
-    // "or type a path" input to enter a non-existent folder path.
-    await modal.getByTestId("folder-browser-type-toggle").click();
-    await modal.getByTestId("folder-browser-type-input").fill("/Users/demo/brand-new-agent");
-    await modal.getByTestId("folder-browser-type-input").press("Enter");
+    await modal.getByTestId("dir-picker-input").fill("/Users/demo/brand-new-agent");
+    await modal.getByTestId("aw-have-continue").click();
 
-    const cta = modal.getByTestId("modal-scaffold-cta");
-    await expect(cta).toBeVisible();
-    await expect(modal.getByRole("button", { name: "Add workspace" })).toBeDisabled();
+    // A folder that doesn't exist can't be registered — only created.
+    await expect(modal.getByTestId("aw-result")).toContainText("doesn't exist yet");
+    await expect(modal.getByTestId("aw-add")).toHaveCount(0);
+    await expect(modal.getByTestId("aw-add-anyway")).toHaveCount(0);
 
-    await cta.click();
+    await modal.getByTestId("aw-scaffold-here").click();
     await expect(modal).toBeHidden();
 
     // The new session is live and the scaffold prompt reached its pty.
@@ -97,34 +93,35 @@ test.describe("add dialog (Project mode)", () => {
     });
   });
 
-  test("scan folder for agents registers everything under the root and toasts the count", async ({ page }) => {
-    // The rail's + opens AddProjectMenu; "Open Folder" enters the workspace dialog.
+  test("a root holding several projects offers to add them all, and toasts the count", async ({ page }) => {
     await page.getByTestId("add-workspace").click();
-    await expect(page.getByTestId("add-project-menu")).toBeVisible();
-    await page.getByTestId("add-project-open-folder").click();
-    await expect(page.getByTestId("add-project-menu")).not.toBeVisible();
+    await page.getByTestId("aw-door-have").click();
     const modal = page.locator(".modal-add-workspace");
-    await expect(modal).toBeVisible();
+    await modal.getByTestId("dir-picker-input").fill("/Users/demo");
+    await modal.getByTestId("aw-have-continue").click();
 
-    // Workspace mode uses FolderBrowser. Navigate up from the initial
-    // launchDir (/Users/demo/acme-app) to /Users/demo via the Up button.
-    await modal.getByTestId("folder-browser-up").click();
-    // Wait for the breadcrumb to confirm we are at /Users/demo.
-    await expect(modal.getByTestId("folder-browser-crumb-demo")).toBeVisible({ timeout: 3000 });
-
-    await modal.getByTestId("modal-scan-btn").click();
+    // Bulk discovery is no longer a permanent button: it is what the dialog
+    // OFFERS once the picked folder turns out to contain projects. Two of the
+    // three fixture workflows sit directly under /Users/demo (the third is
+    // nested in acme-app), so that is what detection reports here.
+    await expect(modal.getByTestId("aw-add-all")).toContainText("Add all 2");
+    await modal.getByTestId("aw-add-all").click();
     await expect(modal).toBeHidden();
-    // All three fixture workflows live under /Users/demo.
+    // The scan itself is recursive, so it finds all three.
     await expect(page.locator(".toast")).toContainText("Found 3 agent projects.");
   });
 
-  test("the MCP setup prompts are copyable and fire mcp.install", async ({ page, context }) => {
+  test("the MCP setup prompt is copyable and fires mcp.install", async ({ page, context }) => {
     await context.grantPermissions(["clipboard-read", "clipboard-write"]);
     // The rail's + opens AddProjectMenu first; "Open Folder" enters the dialog.
     await page.getByTestId("add-workspace").click();
-    await expect(page.getByTestId("add-project-menu")).toBeVisible();
-    await page.getByTestId("add-project-open-folder").click();
-    await expect(page.getByTestId("add-project-menu")).not.toBeVisible();
+    // Contextual now, not permanent: the offer exists only where it applies —
+    // a folder that exists and has no Sapiom wiring.
+    await page.getByTestId("aw-door-have").click();
+    const modal = page.locator(".modal-add-workspace");
+    await modal.getByTestId("dir-picker-input").fill("/Users/demo/scratch");
+    await modal.getByTestId("aw-have-continue").click();
+
     const block = page.getByTestId("mcp-install");
     await expect(block).toBeVisible();
 
@@ -145,7 +142,7 @@ test.describe("add dialog (Project mode)", () => {
   });
 
   test("the harness picker renders from the adapter registry", async ({ page }) => {
-    await page.getByTestId("history-trigger").click();
+    await page.getByTestId("add-workspace").click();
     await page.getByTestId("new-session-btn").click();
     const trigger = page.getByTestId("harness-select");
     await expect(trigger).toBeVisible();
@@ -181,7 +178,7 @@ test.describe("add dialog (Project mode)", () => {
 // ---------------------------------------------------------------------------
 
 test("recent-path chips middle-truncate long paths and keep the full path in the tooltip", async ({ page }) => {
-  await page.getByTestId("history-trigger").click();
+  await page.getByTestId("add-workspace").click();
   await page.getByTestId("new-session-btn").click();
 
   const chip = page.locator(".recent-dir-chip").first();
@@ -231,7 +228,7 @@ test("the directory picker's read failure carries its own Retry", async ({ page 
   await page.goto("/?mockError=listDir");
   await expect(page.locator(".rail-workflows")).toBeVisible();
 
-  await page.getByTestId("history-trigger").click();
+  await page.getByTestId("add-workspace").click();
   await page.getByTestId("new-session-btn").click();
 
   const err = page.getByTestId("dir-picker-error");

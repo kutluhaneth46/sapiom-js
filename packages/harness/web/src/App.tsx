@@ -34,7 +34,7 @@ import { SessionBar } from "./components/SessionBar";
 import { SessionStepsBar } from "./components/SessionStepsBar";
 import { SessionTabs } from "./components/SessionTabs";
 import { TelemetryNotice } from "./components/TelemetryNotice";
-import { TemplatesDialog } from "./components/TemplatesDialog";
+import { TemplatesPanel } from "./components/TemplatesPanel";
 import { Terminal } from "./components/Terminal";
 import { Toast } from "./components/Toast";
 import { TooltipLayer } from "./components/TooltipLayer";
@@ -45,6 +45,8 @@ import type { ConnectGitHubRequest } from "./lib/api";
 import type { GitHubDeviceApi } from "./components/GitHubDeviceConnect";
 import type { CanvasGraph } from "./lib/canvas-graph";
 import { classifyConnectivity, useConnectivity } from "./lib/connectivity";
+import { historyDirs } from "./lib/history-meta";
+import { resolveProjectRoot } from "./lib/project-dir";
 import { useTemplatePrompt, type StudioTemplate } from "./lib/templates";
 import { track } from "./lib/track";
 import { resolveMacroUrl } from "./lib/macro-gating";
@@ -84,6 +86,10 @@ export const App = (): JSX.Element => {
   // Overview (in the rail's account menu): shows the intro panel in the main
   // slot. Opening any session leaves it (openSession below is the one path).
   const [overviewSelected, setOverviewSelected] = useState(false);
+  // First-run Overview is shown unprompted; once dismissed it must not spring
+  // back on the next render. Boot-scoped on purpose — settings.recentDirs being
+  // empty is what makes it a first run, and that is the server's to change.
+  const [welcomeDismissed, setWelcomeDismissed] = useState(false);
   // The focused agent (or bare-scaffold folder) path — the rail's single
   // selection and the main panel's tab-strip subject. The active tab's
   // session is harness.activeSessionId.
@@ -137,6 +143,11 @@ export const App = (): JSX.Element => {
   const [sessionNames, setSessionNames] = useState<Record<string, string>>(
     () => loadUiPrefs().sessionNames ?? {},
   );
+  const dismissWelcome = (): void => {
+    setOverviewSelected(false);
+    setWelcomeDismissed(true);
+  };
+
   const renameSession = (id: string, name: string): void => {
     setSessionNames((prev) => {
       const next = { ...prev };
@@ -190,16 +201,33 @@ export const App = (): JSX.Element => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [harness.state?.sessions, focusedAgentPath]);
 
-  // Opening the palette fans out the history load (the palette half).
+  // Where NEW agent projects are created — ONE value, shared by every surface
+  // that creates one (the template door and the idea door). They used to
+  // disagree: this dialog seeded its destination from the active session's cwd
+  // while the scaffold path used whatever the user typed, so "where did my
+  // project go?" had two answers. Precedence is
+  // setting → host default → launch dir (see resolveProjectRoot).
+  const projectRoot = resolveProjectRoot({
+    settingsRoot: harness.settings?.projectRoot,
+    defaultProjectRoot: harness.state?.defaultProjectRoot,
+    launchDir: harness.state?.launchDir,
+  });
+
+  const saveProjectRoot = async (root: string): Promise<void> => {
+    await harness.updateSettings({ projectRoot: root });
+  };
+
+  // Opening the palette loads history for the same directories the rail's
+  // popover asks for — one shared builder, so whichever opens second
+  // coalesces against the first instead of re-fetching every directory.
   useEffect(() => {
     if (!paletteOpen || !harness.state) return;
-    const dirs: string[] = [];
-    const push = (dir?: string | null): void => {
-      if (dir && !dirs.includes(dir)) dirs.push(dir);
-    };
-    harness.state.sessions.forEach((session) => push(session.cwd));
-    (harness.settings?.recentDirs ?? []).forEach((dir) => push(dir));
-    if (dirs.length > 0) void harness.loadHistory(dirs.slice(0, 12));
+    const dirs = historyDirs(
+      harness.state.sessions,
+      harness.settings?.recentDirs ?? [],
+      harness.activeSessionId,
+    );
+    if (dirs.length > 0) void harness.loadHistory(dirs);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [paletteOpen]);
 
@@ -288,17 +316,21 @@ export const App = (): JSX.Element => {
   // The focused subject's tabs, and which surface the main panel shows.
   const focusTabs = liveSessionsForFocus(state.sessions, focusedAgentPath);
   const hasLiveSession = state.sessions.some((session) => session.status !== "exited");
-  const showWelcome = overviewSelected || (state.firstRun === true && !hasLiveSession);
-  const showReview = !showWelcome && reviewSummary != null;
-  const showDead = !showWelcome && !showReview && activeSession?.status === "exited";
+  // Overview floats OVER the shell, so it deliberately does not gate the states
+  // below it — the workbench, a review pane, a dead session all stay exactly as
+  // they were behind the card. Dismissed once, the first-run copy stays down for
+  // the rest of the boot; the account menu is how it comes back.
+  const showWelcome =
+    overviewSelected || (state.firstRun === true && !hasLiveSession && !welcomeDismissed);
+  const showReview = reviewSummary != null;
+  const showDead = !showReview && activeSession?.status === "exited";
   // An agent focused with no live session: honest absence, the reason opening
   // one lands on the "start a session" state rather than a board (the canvas
   // is served per session).
   const showAgentEmpty =
-    !showWelcome && !showReview && !showDead && focusedWorkflow != null && focusTabs.length === 0;
+    !showReview && !showDead && focusedWorkflow != null && focusTabs.length === 0;
   // The workbench: an active live session in the focused subject's tabs.
   const showWorkbench =
-    !showWelcome &&
     !showReview &&
     !showDead &&
     !showAgentEmpty &&
@@ -362,11 +394,29 @@ export const App = (): JSX.Element => {
 
   // The idea-to-agent path. Starts a session at the (new) folder, then
   // hands the agent the scaffold prompt.
-  const handleScaffoldSession = async (cwd: string, agentHarness: HarnessKind): Promise<void> => {
+  /**
+   * Start a session at `cwd` and hand the agent the scaffold prompt.
+   *
+   * `idea` is what the "start from an idea" door collects. It rides along
+   * verbatim — the agent needs the intent, not our paraphrase of it. Omitted
+   * (door 1's plain/new outcomes, the bare-folder affordance), the prompt is
+   * byte-identical to what it has always been, so the blank-starter path is
+   * unchanged.
+   */
+  const handleScaffoldSession = async (
+    cwd: string,
+    agentHarness: HarnessKind,
+    idea?: string,
+  ): Promise<void> => {
     const session = await createSessionAt(cwd, agentHarness);
+    const base =
+      "Scaffold a new Sapiom agent project in this directory: run `sapiom agents init .`, then use the sapiom-agent-authoring skill to";
+    const trimmedIdea = idea?.trim();
     injectPromptWithRetry(
       session.id,
-      "Scaffold a new Sapiom agent project in this directory: run `sapiom agents init .`, then use the sapiom-agent-authoring skill to define the first workflow.",
+      trimmedIdea
+        ? `${base} build this:\n\n${trimmedIdea}`
+        : `${base} define the first workflow.`,
       "Couldn't send the scaffold prompt. Ask the agent to run sapiom agents init.",
     );
   };
@@ -672,6 +722,8 @@ export const App = (): JSX.Element => {
       )}
       {!railCollapsed && (
         <WorkflowsRail
+          projectRoot={projectRoot || null}
+          onSaveProjectRoot={saveProjectRoot}
           width={widths.rail}
           minWidth={RAIL_MIN}
           workflows={state.workflows}
@@ -722,9 +774,8 @@ export const App = (): JSX.Element => {
           listHarnesses={harness.listHarnesses}
           onScaffoldSession={handleScaffoldSession}
           onScaffoldInSession={handleScaffoldInSession}
-          onUseTemplate={handleUseTemplate}
-          listTemplates={harness.listTemplates}
-          getTemplate={harness.getTemplate}
+          onBrowseTemplates={() => setTemplatesOpen(true)}
+          templatesActive={templatesOpen}
           onScanWorkflows={handleScanWorkflows}
           onOpenInEditor={openInEditor}
           onToast={harness.showToast}
@@ -735,6 +786,10 @@ export const App = (): JSX.Element => {
           organizationName={state.organizationName}
           onToggleTelemetry={async (next) => {
             await harness.updateSettings({ telemetryOptIn: next });
+          }}
+          rollingSummary={harness.settings?.rollingSummary === true}
+          onToggleRollingSummary={async (next) => {
+            await harness.updateSettings({ rollingSummary: next });
           }}
           onStartAuth={harness.startAuth}
           onDisconnect={harness.disconnect}
@@ -773,22 +828,41 @@ export const App = (): JSX.Element => {
         )}
 
         <div
-          className="app"
+          className={"app" + (templatesOpen ? " is-browsing" : "")}
           style={{
-            gridTemplateColumns: isMobile
-              ? "minmax(0, 1fr)"
-              : rightCollapsed
-                ? `minmax(${CANVAS_MIN}px, 1fr)`
-                : widths.canvas == null
-                  ? `minmax(${CANVAS_MIN}px, 1fr) minmax(${CANVAS_MIN}px, 1fr)`
-                  : `minmax(${CANVAS_MIN}px, 1fr) minmax(${CANVAS_MIN}px, ${widths.canvas}px)`,
+            gridTemplateColumns:
+              // Browsing takes the whole width: a two-column card grid inside
+              // half the shell is the letterbox this view exists to escape.
+              templatesOpen || isMobile
+                ? "minmax(0, 1fr)"
+                : rightCollapsed
+                  ? `minmax(${CANVAS_MIN}px, 1fr)`
+                  : widths.canvas == null
+                    ? `minmax(${CANVAS_MIN}px, 1fr) minmax(${CANVAS_MIN}px, 1fr)`
+                    : `minmax(${CANVAS_MIN}px, 1fr) minmax(${CANVAS_MIN}px, ${widths.canvas}px)`,
           }}
         >
+          {/* Templates is a DESTINATION, not a session sub-view: it stands in
+              for the workbench rather than sitting inside it, and brings its own
+              header with the way back. Added as a sibling, with `.is-browsing`
+              hiding the panes in CSS — the right pane must never unmount, since
+              a running Visualize enrichment lives there. */}
+          {templatesOpen && (
+            <TemplatesPanel
+              projectRoot={projectRoot || null}
+              recentDirs={harness.settings?.recentDirs ?? []}
+              listDir={harness.listDir}
+              onExit={() => setTemplatesOpen(false)}
+              onUse={handleUseTemplate}
+              listTemplates={harness.listTemplates}
+              getTemplate={harness.getTemplate}
+            />
+          )}
+
           <div className="center-pane">
             <SessionBar
-              overviewMode={showWelcome}
               openedAgentName={noSessionAgentName}
-              reviewTitle={!showWelcome && reviewSummary ? reviewSummary.title : null}
+              reviewTitle={reviewSummary ? reviewSummary.title : null}
               activeSession={showWorkbench ? activeSession : showDead ? activeSession : null}
               sessionName={
                 activeSession ? sessionDisplayName(activeSession, state.sessions, sessionNames) : null
@@ -840,19 +914,7 @@ export const App = (): JSX.Element => {
               />
             )}
             <div className="terminal-slot">
-              {showWelcome ? (
-                <WelcomePanel
-                  recentDirs={harness.settings?.recentDirs ?? []}
-                  launchDir={state.launchDir ?? null}
-                  listDir={harness.listDir}
-                  onCreateSession={handleCreateSession}
-                  listHarnesses={harness.listHarnesses}
-                  onUseTemplate={handleUseTemplate}
-                  listTemplates={harness.listTemplates}
-                  getTemplate={harness.getTemplate}
-                  firstRun={state.firstRun === true}
-                />
-              ) : showReview && reviewSummary ? (
+              {showReview && reviewSummary ? (
                 <PastSessionPane
                   summary={reviewSummary}
                   loadRecord={harness.sessionRecord}
@@ -869,6 +931,13 @@ export const App = (): JSX.Element => {
                   resumeMode={deadResumeMode}
                   loadRecord={harness.sessionRecord}
                   onResume={() => void harness.resumeSession(activeSession.id)}
+                  onContinue={() =>
+                    void harness.rehydrateSession({
+                      cwd: activeSession.cwd,
+                      harness: activeSession.harness,
+                      from: activeSession.id,
+                    })
+                  }
                   onClose={() => void harness.closeSession(activeSession.id)}
                 />
               ) : showAgentEmpty && focusedWorkflow ? (
@@ -1086,13 +1155,27 @@ export const App = (): JSX.Element => {
         />
       )}
 
-      {templatesOpen && (
-        <TemplatesDialog
-          launchDir={activeSession?.cwd ?? state.launchDir ?? null}
-          onClose={() => setTemplatesOpen(false)}
-          onUse={handleUseTemplate}
-          listTemplates={harness.listTemplates}
-          getTemplate={harness.getTemplate}
+      {showWelcome && (
+        <WelcomePanel
+          recentDirs={harness.settings?.recentDirs ?? []}
+          sessions={state.sessions}
+          workflows={state.workflows}
+          projectRoot={projectRoot || null}
+          onConnect={async (cwd) => {
+            await harness.connectWorkflow(cwd);
+          }}
+          onScan={handleScanWorkflows}
+          onScaffold={handleScaffoldSession}
+          onSaveProjectRoot={saveProjectRoot}
+          listDir={harness.listDir}
+          onCreateSession={handleCreateSession}
+          listHarnesses={harness.listHarnesses}
+          onBrowseTemplates={() => {
+            dismissWelcome();
+            setTemplatesOpen(true);
+          }}
+          onDismiss={dismissWelcome}
+          firstRun={state.firstRun === true}
         />
       )}
 

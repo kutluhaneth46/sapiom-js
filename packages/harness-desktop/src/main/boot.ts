@@ -22,6 +22,7 @@ import {
   recordRecentDir,
   hasStoredSettings,
   startServer,
+  createClaudeCodeAdapter,
   CLAUDE_INSTALL_COMMAND,
   CODEX_INSTALL_COMMAND,
   type HarnessServer,
@@ -29,9 +30,10 @@ import {
   type DoctorReport,
 } from "@sapiom/harness";
 import { augmentProcessPath } from "./env.js";
+import { esbuildBinaryPath } from "./esbuild-binary.js";
 import { resolveWebDir } from "./paths.js";
 import { createMainWindow } from "./windows.js";
-import { installClaudeCode } from "./agent-install.js";
+import { ensureSapiomCli, installClaudeCode } from "./agent-install.js";
 import { installRuntimeShims } from "./runtime-shims.js";
 import { BOOT_PROGRESS, BOOT_ERROR, CONSENT_SUBMIT, RETRY, type BootProgress, type BootErrorPayload } from "./ipc.js";
 
@@ -253,6 +255,11 @@ export async function boot(setupWin: BrowserWindow, mode: BootMode): Promise<Boo
   augmentProcessPath(agentBinDir(), runtimeShimDir);
   resolveTargetEnvironment();
 
+  // 1b. esbuild's native binary was pinned by index.ts's first import — far
+  //     earlier than here, because esbuild reads the setting when its module
+  //     loads (esbuild-binary.ts). Only traced here, where the boot log is.
+  debug(`esbuild binary: ${esbuildBinaryPath ?? "left to esbuild's own resolution"}`);
+
   // 2. Doctor.
   progress(setupWin, { phase: "doctor", message: "Checking your environment…", status: "active" });
   let report = await runDoctor();
@@ -269,6 +276,29 @@ export async function boot(setupWin: BrowserWindow, mode: BootMode): Promise<Boo
     report = await ensureAgentAvailable(setupWin, report);
   }
   progress(setupWin, { phase: "doctor", message: `Found: ${report.availableHarnesses.join(", ")}`, status: "done" });
+
+  // 3b. The `sapiom` CLI. The agent is told to run `sapiom agents deploy` /
+  //     `run --target local|prod` (harness macros) and `sapiom agents init`
+  //     (templates), and nothing shipped that binary — so on a machine without a
+  //     global install the agent hit `command not found` and improvised. Install
+  //     it into the same per-user prefix as the agent; PATH already includes that
+  //     dir, so it resolves on this same launch.
+  //
+  //     Non-fatal on purpose, and NOT gated behind a doctor failure: every direct
+  //     in-app action (Deploy, Local Run) works without it, so a failed install
+  //     must never block boot — it just leaves the agent-driven doors degraded,
+  //     which is exactly the state we shipped. Skipped in smoke (no network on
+  //     CI) and in dev (workspace copy) — see install-policy.ts.
+  try {
+    const cli = await ensureSapiomCli({ smoke, devMode }, (line) => debug(`sapiom-cli: ${line}`));
+    debug(
+      cli.install
+        ? `sapiom CLI install ${cli.result?.ok ? "ok" : `FAILED (exit ${cli.result?.code ?? "?"})`} — ${cli.reason}`
+        : `sapiom CLI: ${cli.reason}`,
+    );
+  } catch (err) {
+    debug(`sapiom CLI install threw (ignored): ${err instanceof Error ? err.message : String(err)}`);
+  }
 
   // 4. Machine id + first-run. "First run" means the user has never completed
   //    onboarding — i.e. no settings file has ever been persisted — NOT "has no
@@ -320,6 +350,16 @@ export async function boot(setupWin: BrowserWindow, mode: BootMode): Promise<Boo
   });
   const bootToken = randomBytes(32).toString("hex");
   const port = await findFreePort();
+
+  // Test-only seam (smoke mode): point the claude-code adapter at a stub script
+  // so `--smoke` can create a REAL session — spawning a real pty through the
+  // real server — on a machine with no coding agent installed. This is what gives
+  // us per-OS coverage of session creation, the step that broke on Windows while
+  // every green test tier ran on Linux or in mock mode. Ignored outside --smoke.
+  const stubAgent = smoke ? process.env.SAPIOM_SMOKE_STUB_AGENT : undefined;
+  const stubbedHarnesses = stubAgent ? (["claude-code"] as const) : null;
+  if (stubAgent) debug(`smoke: stubbing the claude-code agent with ${stubAgent}`);
+
   const server = await startServer({
     port,
     host: "127.0.0.1",
@@ -330,10 +370,23 @@ export async function boot(setupWin: BrowserWindow, mode: BootMode): Promise<Boo
     machineId,
     webDir: resolveWebDir(),
     launchDir,
+    // NEW projects go one level down, in `projects/`, not directly into
+    // launchDir. On this host launchDir is `~/.sapiom/harness` — the harness's
+    // own state store (sessions.json, settings.json, workflows.json,
+    // machine-id, generated/) — so creating user projects as its direct
+    // children would interleave code with state and make "clear my state" and
+    // "delete my agents" the same gesture. The seeded sample already uses a
+    // containing subfolder (`sample-project/`), and the rail discovers projects
+    // by scanning recursively for the marker, so nesting costs nothing.
+    //
+    // launchDir itself must stay put: it is the scan root, and moving it would
+    // orphan the seeded sample from the rail.
+    projectRoot: path.join(launchDir, "projects"),
     autoCreateSession: !firstRun,
-    defaultHarnessKind: pickDefaultHarness(report),
-    availableHarnesses: report.availableHarnesses,
+    defaultHarnessKind: stubbedHarnesses ? "claude-code" : pickDefaultHarness(report),
+    availableHarnesses: stubbedHarnesses ? [...stubbedHarnesses] : report.availableHarnesses,
     firstRun,
+    ...(stubAgent ? { adapters: { "claude-code": createClaudeCodeAdapter({ binary: stubAgent }) } } : {}),
   });
 
   // 9. Load the SPA in the main window; close setup once it renders.

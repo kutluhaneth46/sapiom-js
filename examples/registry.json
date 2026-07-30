@@ -8,6 +8,7 @@
       "description": "A durable sequential sign-off chain — pause-per-gate approvals with reminders, timeout escalation, and compensation on rejection.",
       "tags": ["approval", "saga", "pause-resume", "durable"],
       "category": "reliability-governance",
+      "discipline": "Governance",
       "cadence": "on-demand",
       "complexity": "simple",
       "sourcePath": "examples/approval-chain",
@@ -70,6 +71,7 @@
       "description": "Enrich a lead list, write a personalized first line for each prospect, verify deliverability, then drip follow-ups that stop the moment someone replies.",
       "tags": ["outreach", "sales", "drip", "personalization"],
       "category": "revenue-marketing",
+      "discipline": "Revenue",
       "cadence": "on-demand",
       "complexity": "involved",
       "sourcePath": "examples/cold-outreach-engine",
@@ -146,6 +148,7 @@
       "description": "Turn one blog post or transcript into a tweet thread, LinkedIn post, newsletter, quote graphics, and a short clip — then email the whole pack.",
       "tags": ["content", "marketing", "media", "scheduled", "pipeline"],
       "category": "revenue-marketing",
+      "discipline": "Marketing",
       "cadence": "scheduled",
       "complexity": "advanced",
       "sourcePath": "examples/content-repurposing-pipeline",
@@ -206,6 +209,7 @@
       "description": "On a schedule, a coding agent bumps a repo's dependencies in a sandbox, runs the tests, and pushes only when the build is green.",
       "tags": ["dependencies", "coding-agent", "scheduled", "ci"],
       "category": "product-engineering",
+      "discipline": "Release engineering",
       "cadence": "scheduled",
       "complexity": "advanced",
       "sourcePath": "examples/dependency-upgrade",
@@ -273,6 +277,7 @@
       "description": "Process a huge dataset in resumable chunks, checkpointing progress so the job survives restarts and picks up where it left off.",
       "tags": ["durable", "backfill", "batch", "cron"],
       "category": "data-knowledge",
+      "discipline": "Data",
       "cadence": "scheduled",
       "complexity": "simple",
       "sourcePath": "examples/durable-backfill",
@@ -294,10 +299,10 @@
         },
         {
           "name": "process",
-          "description": "Processes the current chunk in a sandbox, saves a result file and rewrites the checkpoint, then pauses for the next heartbeat — or finishes once the last chunk is done.",
-          "kind": "capability",
+          "description": "Process the current chunk, save its result and rewrite the checkpoint, then wait for the next heartbeat — or, running offline with nothing to fire one, loop straight to the next chunk. Finishes once the last chunk is done.",
+          "kind": "pause",
           "capability": "sandboxes.exec",
-          "next": ["finalize"]
+          "next": ["finalize", "process"]
         },
         {
           "name": "finalize",
@@ -313,6 +318,7 @@
       "description": "Ingest errors by webhook or a scheduled pull, cluster and summarize them with an LLM, dedupe against a database, and email a daily digest.",
       "tags": ["errors", "triage", "digest", "dedupe", "scheduled", "logs"],
       "category": "reliability-governance",
+      "discipline": "Reliability",
       "cadence": "scheduled",
       "complexity": "moderate",
       "sourcePath": "examples/error-triage-digest",
@@ -358,6 +364,7 @@
       "description": "Score an output against your own rubric with an LLM judge, then branch to publish or revise on whether it clears a threshold.",
       "tags": ["evals", "quality-gate", "llm-judge", "composition"],
       "category": "product-engineering",
+      "discipline": "AI operations",
       "cadence": "on-demand",
       "complexity": "moderate",
       "sourcePath": "examples/eval-gate",
@@ -396,6 +403,7 @@
       "description": "The smallest working Sapiom agent — one step that returns a greeting, so you can confirm build, deploy, and run before adding a real capability.",
       "tags": ["starter", "minimal"],
       "category": "starter",
+      "discipline": "Starter",
       "cadence": "on-demand",
       "complexity": "minimal",
       "sourcePath": "examples/hello-agent",
@@ -415,6 +423,7 @@
       "description": "An agent does the prep, then waits for a person to approve before it spends money or does anything it can't undo.",
       "tags": ["approval", "human-in-the-loop", "hitl", "fallback"],
       "category": "reliability-governance",
+      "discipline": "Governance",
       "cadence": "on-demand",
       "complexity": "advanced",
       "sourcePath": "examples/human-in-the-loop",
@@ -436,11 +445,11 @@
         },
         {
           "name": "notifyApprover",
-          "description": "Email the approver the ranked recommendation, then pause and wait for their decision — costing nothing while idle (resumes at 'onDecision').",
+          "description": "Email the approver the ranked recommendation, then pause and wait for their decision — costing nothing while idle. With no approver set, stop at the gate with the shortlist instead of waiting forever.",
           "kind": "pause",
           "checkpoint": true,
           "capability": "email.send",
-          "next": ["onDecision"]
+          "next": ["onDecision", "pending"]
         },
         {
           "name": "onDecision",
@@ -475,6 +484,12 @@
           "terminal": true
         },
         {
+          "name": "pending",
+          "description": "No approver was set, so the run stops holding the ranked shortlist and the signal that continues it. Nothing was offered, and nothing was approved.",
+          "kind": "compute",
+          "terminal": true
+        },
+        {
           "name": "escalate",
           "description": "The ranked list ran out, or nobody could be contacted — hand off to a person.",
           "kind": "capability",
@@ -489,6 +504,7 @@
       "description": "Take a meeting transcript, pull out the contact, the CRM fields to update, and the action items, write them to a database, and email a summary.",
       "tags": ["crm", "sales", "transcript", "pause-resume"],
       "category": "revenue-marketing",
+      "discipline": "Revenue",
       "cadence": "on-demand",
       "complexity": "moderate",
       "sourcePath": "examples/meeting-notes-crm",
@@ -534,6 +550,7 @@
       "description": "Search the web for a company's recent news, then publish a dated, illustrated roundup page to a small website for that company.",
       "tags": ["news", "summarize", "images", "publish"],
       "category": "revenue-marketing",
+      "discipline": "Marketing",
       "cadence": "on-demand",
       "complexity": "involved",
       "sourcePath": "examples/news-roundup",
@@ -583,6 +600,7 @@
       "description": "On a weekly schedule, it researches a niche, writes and illustrates the issue, and emails it to your subscriber list.",
       "tags": ["newsletter", "scheduled", "llm", "email"],
       "category": "revenue-marketing",
+      "discipline": "Marketing",
       "cadence": "scheduled",
       "complexity": "involved",
       "sourcePath": "examples/newsletter-autopilot",
@@ -630,15 +648,11 @@
       "description": "Deploy a live endpoint that turns a plain-English question into a read-only SQL query and returns the answer.",
       "tags": ["database", "sql", "endpoint", "llm", "natural-language"],
       "category": "data-knowledge",
+      "discipline": "Data",
       "cadence": "on-event",
       "complexity": "involved",
       "sourcePath": "examples/nl-db-query-endpoint",
-      "capabilities": [
-        "database.get",
-        "models.run",
-        "sandboxes.deployPreview",
-        "vault.get"
-      ],
+      "capabilities": ["database.get", "models.run", "sandboxes.deployPreview"],
       "steps": [
         {
           "name": "validate",
@@ -651,7 +665,7 @@
           "description": "Reads the target Postgres connection string from a Sapiom database handle to inject into the endpoint.",
           "kind": "capability",
           "capability": "database.get",
-          "next": ["plan"]
+          "next": ["plan", "rejected"]
         },
         {
           "name": "plan",
@@ -668,10 +682,16 @@
         },
         {
           "name": "deploy",
-          "description": "Writes the endpoint server into a sandbox and exposes it at a stable URL, injecting DATABASE_URL and a vault-read API key.",
+          "description": "Write the endpoint server into a sandbox and expose it at a stable URL, injecting DATABASE_URL and the endpoint's own API key. With no key, nothing is deployed.",
           "kind": "capability",
           "capability": "sandboxes.deployPreview",
-          "next": ["deployed", "deploy_failed"]
+          "next": ["deployed", "deploy_failed", "endpoint_skipped"]
+        },
+        {
+          "name": "endpoint_skipped",
+          "description": "The endpoint needs an API key of its own to translate each request; without one nothing is deployed, and the run returns the translated, guarded SQL instead of a URL that cannot answer.",
+          "kind": "compute",
+          "terminal": true
         },
         {
           "name": "deployed",
@@ -699,6 +719,7 @@
       "description": "Read a table of leads and, per row, generate a personalized image or short clip, store it, and email each person a link — on a schedule.",
       "tags": ["marketing", "generative", "media", "scheduled"],
       "category": "revenue-marketing",
+      "discipline": "Marketing",
       "cadence": "scheduled",
       "complexity": "involved",
       "sourcePath": "examples/personalized-media-at-scale",
@@ -752,19 +773,15 @@
       "description": "When a pull request opens, a coding agent reviews the code and flags missing tests, then posts the review to your email or Slack.",
       "tags": ["coding-agent", "review", "pause-resume", "webhook"],
       "category": "product-engineering",
+      "discipline": "Engineering",
       "cadence": "on-webhook",
       "complexity": "advanced",
       "sourcePath": "examples/pr-review-bot",
-      "capabilities": [
-        "models.coding",
-        "models.run",
-        "email.send",
-        "vault.get"
-      ],
+      "capabilities": ["models.coding", "models.run", "email.send"],
       "steps": [
         {
           "name": "watch",
-          "description": "Registers a PR webhook and how to resume this run, then pauses and waits for a pull request — costing nothing while idle.",
+          "description": "Register with the webhook source and pause until a PR opens — costing nothing while idle. With no source configured, review the built-in sample PR instead of waiting forever.",
           "kind": "pause",
           "next": ["review"]
         },
@@ -791,9 +808,8 @@
         },
         {
           "name": "reportSlack",
-          "description": "Reads your Slack bot token from the Vault and posts the review to the configured channel.",
-          "kind": "capability",
-          "capability": "vault.get",
+          "description": "Post the review to the configured channel with your Slack bot token. Without one, the review is returned in the run's output and nothing is posted.",
+          "kind": "compute",
           "next": ["posted", "failed"]
         },
         {
@@ -816,21 +832,28 @@
       "description": "A cron heartbeat that checks a sandbox preview and, when it has gone down, redeploys it for you — no human needed.",
       "tags": ["sandbox", "self-healing", "cron", "keep-alive"],
       "category": "reliability-governance",
+      "discipline": "Reliability",
       "cadence": "scheduled",
       "complexity": "simple",
       "sourcePath": "examples/preview-keep-alive",
       "capabilities": [
         "sandboxes.deployPreview",
         "sandboxes.attach",
-        "database.get",
-        "vault.get"
+        "database.get"
       ],
       "steps": [
         {
           "name": "check",
-          "description": "Fetches the preview's health path. Sends it on to heal only when the app is actually down.",
+          "description": "Fetch the preview's health path and send it on to heal only when the app is actually down. With no target given, provision one first.",
           "kind": "compute",
-          "next": ["healthy", "heal"]
+          "next": ["healthy", "heal", "provision"]
+        },
+        {
+          "name": "provision",
+          "description": "With no target given, create a small sandbox with a trivial health server in it, so the heal step has a real app to relaunch.",
+          "kind": "capability",
+          "capability": "sandboxes.create",
+          "next": ["heal", "heal_failed"]
         },
         {
           "name": "healthy",
@@ -840,7 +863,7 @@
         },
         {
           "name": "heal",
-          "description": "Re-attaches the sandbox and redeploys the code already uploaded there, restarting it at the same URL. First assembles the startup env, adding a DATABASE_URL from a Postgres handle and any vault secrets read at run time.",
+          "description": "Re-attach the sandbox and redeploy the code already uploaded there, restarting it at the same URL. First assembles the startup env, adding a DATABASE_URL from a Postgres handle and any declared secrets the platform injected.",
           "kind": "capability",
           "capability": "sandboxes.deployPreview",
           "next": ["healed", "heal_failed"]
@@ -865,6 +888,7 @@
       "description": "Draft a client proposal from a request, render it to a PDF, then wait for a person to approve it before it emails the client.",
       "tags": ["sales", "pdf", "approval", "human-in-the-loop", "quote"],
       "category": "revenue-marketing",
+      "discipline": "Revenue",
       "cadence": "on-demand",
       "complexity": "involved",
       "sourcePath": "examples/proposal-generator",
@@ -880,7 +904,7 @@
           "description": "An LLM turns the request into a structured proposal — title, summary, scope, and priced line items — then the totals are computed in code, not trusted from the model.",
           "kind": "llm",
           "capability": "models.run",
-          "next": ["render"]
+          "next": ["render", "rejected"]
         },
         {
           "name": "render",
@@ -891,11 +915,11 @@
         },
         {
           "name": "review",
-          "description": "Email the approver a summary and the PDF link, then pause and wait for their decision — costing nothing while idle (resumes at 'onDecision').",
+          "description": "Email the approver a summary and the PDF link, then pause and wait for their decision — costing nothing while idle. With no approver set, stop at the gate with the drafted proposal instead of waiting forever.",
           "kind": "pause",
           "checkpoint": true,
           "capability": "email.send",
-          "next": ["onDecision"]
+          "next": ["onDecision", "pending"]
         },
         {
           "name": "onDecision",
@@ -908,6 +932,12 @@
           "description": "The one outward step — email the approved proposal to the client. A dry run skips the send.",
           "kind": "capability",
           "capability": "email.send",
+          "terminal": true
+        },
+        {
+          "name": "pending",
+          "description": "No approver was set, so the run stops holding the drafted proposal and the signal that continues it. Nothing was sent, and nothing was approved.",
+          "kind": "compute",
           "terminal": true
         },
         {
@@ -924,6 +954,7 @@
       "description": "Research a topic across the web, then build and deploy a shareable live report site — not just a document.",
       "tags": ["research", "coding-agent", "sandbox", "publish"],
       "category": "data-knowledge",
+      "discipline": "Research",
       "cadence": "on-demand",
       "complexity": "advanced",
       "sourcePath": "examples/research-to-microsite",
@@ -952,7 +983,7 @@
         },
         {
           "name": "synthesize",
-          "description": "Hand the sources to an LLM to write a structured, cited report. A dry run stops here and returns the report.",
+          "description": "Hand the sources to an LLM to write a structured, cited report. A dry run — or a report too empty to build a site from — stops here and returns the report.",
           "kind": "llm",
           "capability": "models.run",
           "next": ["build", "drafted"]
@@ -960,7 +991,7 @@
         {
           "name": "build",
           "description": "Launch a coding agent to build a self-contained static site from the report, then pause until it finishes — costing nothing while it works.",
-          "kind": "llm",
+          "kind": "pause",
           "capability": "models.coding",
           "next": ["publish"]
         },
@@ -1004,6 +1035,7 @@
       "description": "Turn one scene description into a short, multi-shot video with a consistent style.",
       "tags": ["generative", "video", "pipeline", "media"],
       "category": "revenue-marketing",
+      "discipline": "Marketing",
       "cadence": "on-demand",
       "complexity": "advanced",
       "sourcePath": "examples/scene-to-video",
@@ -1061,6 +1093,7 @@
       "description": "On a schedule, it audits your resources against a policy, waits for a person to sign off, then archives the signed attestation.",
       "tags": ["compliance", "scheduled", "human-in-the-loop", "attestation"],
       "category": "finance-legal-people",
+      "discipline": "Legal",
       "cadence": "scheduled",
       "complexity": "involved",
       "sourcePath": "examples/scheduled-compliance-audit",
@@ -1087,10 +1120,10 @@
         },
         {
           "name": "review",
-          "description": "Pause and wait for a human sign-off signal, costing nothing while idle (resumes at 'onSignoff').",
+          "description": "Hold the drafted attestation and pause for a human sign-off — costing nothing while idle. With no signer set, stop at the gate with the draft instead of waiting forever.",
           "kind": "pause",
           "checkpoint": true,
-          "next": ["onSignoff"]
+          "next": ["onSignoff", "pending"]
         },
         {
           "name": "onSignoff",
@@ -1103,6 +1136,12 @@
           "description": "Write the signed attestation to durable file storage and return its file id and download link; a dry run skips the upload.",
           "kind": "capability",
           "capability": "fileStorage.upload",
+          "terminal": true
+        },
+        {
+          "name": "pending",
+          "description": "No signer was set, so the run stops holding a DRAFT attestation. Nothing was signed, filed, or archived.",
+          "kind": "compute",
           "terminal": true
         },
         {
@@ -1119,6 +1158,7 @@
       "description": "On a schedule, query a database, write the narrative and render charts, then email the insight report.",
       "tags": ["scheduled", "database", "analytics", "report"],
       "category": "data-knowledge",
+      "discipline": "Data",
       "cadence": "scheduled",
       "complexity": "involved",
       "sourcePath": "examples/scheduled-db-insight-report",
@@ -1129,8 +1169,7 @@
         "sandboxes.create",
         "fileStorage.upload",
         "fileStorage.getDownloadUrl",
-        "email.send",
-        "vault.get"
+        "email.send"
       ],
       "steps": [
         {
@@ -1169,6 +1208,7 @@
       "description": "On a schedule, it researches a topic and emails you a short, sourced brief.",
       "tags": ["research", "search", "scheduled", "llm"],
       "category": "data-knowledge",
+      "discipline": "Research",
       "cadence": "scheduled",
       "complexity": "moderate",
       "sourcePath": "examples/scheduled-research-brief",
@@ -1206,13 +1246,14 @@
     {
       "id": "slack-notifier",
       "name": "Slack Notifier",
-      "description": "Post a message to Slack with a token you store in the Vault — the starter for wiring up any external API.",
+      "description": "Post a message to Slack with your own bot token — the starter for wiring up any external API.",
       "tags": ["integration", "starter", "slack"],
       "category": "starter",
+      "discipline": "Starter",
       "cadence": "on-demand",
       "complexity": "minimal",
       "sourcePath": "examples/slack-notifier",
-      "capabilities": ["vault"],
+      "capabilities": [],
       "steps": [
         {
           "name": "validate",
@@ -1222,10 +1263,9 @@
         },
         {
           "name": "post",
-          "description": "Read your Slack token from the Vault and post the message to Slack.",
-          "kind": "capability",
-          "capability": "vault",
-          "next": ["posted", "failed"]
+          "description": "Post the message to Slack with your bot token. Without one, the message is returned in the run's output and nothing is posted.",
+          "kind": "compute",
+          "next": ["posted", "failed", "rejected"]
         },
         {
           "name": "posted",
@@ -1253,15 +1293,11 @@
       "description": "Watches a fleet of workflows, spots which member is off cadence, and launches it — with a model that may only pick from a fixed list of safe moves.",
       "tags": ["orchestration", "agents-managing-agents", "meta-workflow"],
       "category": "reliability-governance",
+      "discipline": "Reliability",
       "cadence": "scheduled",
       "complexity": "involved",
       "sourcePath": "examples/the-brain",
-      "capabilities": [
-        "models.run",
-        "database.get",
-        "database.create",
-        "vault.get"
-      ],
+      "capabilities": ["models.run", "database.get", "database.create"],
       "steps": [
         {
           "name": "scan",
@@ -1297,6 +1333,7 @@
       "description": "Start a slow external job, pause until a webhook calls back, then summarize the result and decide whether to accept it.",
       "tags": ["durable", "pause-resume", "webhook", "async"],
       "category": "product-engineering",
+      "discipline": "Engineering",
       "cadence": "on-demand",
       "complexity": "simple",
       "sourcePath": "examples/wait-for-webhook",
@@ -1304,7 +1341,7 @@
       "steps": [
         {
           "name": "kickoff",
-          "description": "Starts the external job, registers how to resume this run, then pauses and waits for the callback — costing nothing while idle.",
+          "description": "Register the resume contract with the external job and pause until it calls back — costing nothing while idle. With no register URL, no job was started, so it decides on an empty payload rather than waiting forever.",
           "kind": "pause",
           "next": ["decide"]
         },
@@ -1335,6 +1372,7 @@
       "description": "Search the web for a topic and get back a short, sourced digest.",
       "tags": ["research", "search"],
       "category": "data-knowledge",
+      "discipline": "Research",
       "cadence": "on-demand",
       "complexity": "simple",
       "sourcePath": "examples/web-research-digest",

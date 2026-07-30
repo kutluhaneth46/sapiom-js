@@ -12,14 +12,86 @@ set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 rel="${SMOKE_RELEASE_DIR:-$here/../release}"
 
-# Never touch the developer's (or the runner's) real state: ~/.sapiom is shared
-# with the npx CLI. HOME covers POSIX, USERPROFILE+APPDATA cover Windows
-# (os.homedir and Electron's userData read those).
 smoke_home="$(mktemp -d)"
-mkdir -p "$smoke_home/project"
-export HOME="$smoke_home" USERPROFILE="$smoke_home" APPDATA="$smoke_home/AppData"
-export SAPIOM_LAUNCH_DIR="$smoke_home/project"
-export SAPIOM_SMOKE_OUT="$smoke_home/smoke.txt"
+mkdir -p "$smoke_home/project" "$smoke_home/AppData"
+
+# The app is a NATIVE process, so every path handed to it must be native too.
+# git-bash's mktemp returns a POSIX path (/tmp/tmp.XXXX) with no drive letter, and
+# Windows cannot use it: exporting that as APPDATA made Electron fail while
+# creating its userData directory — before logging existed — which is the "exit 3
+# with no output on any channel" we spent several CI rounds chasing. It was this
+# script breaking the app, not the app. `cygpath -w` converts; a no-op elsewhere.
+native() {
+  case "$(uname -s)" in
+    MINGW* | MSYS* | CYGWIN*) cygpath -w "$1" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+app_home="$(native "$smoke_home")"
+
+# Relocate the home dir so a local run cannot touch the developer's ~/.sapiom,
+# which is shared with the npx CLI. HOME covers POSIX; USERPROFILE and APPDATA
+# cover Windows (os.homedir and Electron's userData read those).
+#
+# NOT on CI, and that is the point: a runner is an ephemeral VM destroyed minutes
+# later, so there is nothing to protect — while relocating %USERPROFILE% there
+# BREAKS the app. Chromium derives its profile, cache and crash-handler paths from
+# it, and a bare temp dir has no AppData\Local subtree, so it aborts before
+# Electron initialises logging: an exit code and total silence on every channel.
+# An env bisect pinned it to this exact assignment after several wrong theories
+# (asar, then the ESM entry, then APPDATA's path format).
+if [ -z "${CI:-}" ]; then
+  # A Windows developer needs the real profile shape, not just the directory.
+  mkdir -p "$smoke_home/AppData/Roaming" "$smoke_home/AppData/Local"
+  export HOME="$app_home" USERPROFILE="$app_home" APPDATA="$(native "$smoke_home/AppData/Roaming")"
+  # HOME is NOT enough on Linux: Electron derives `userData` from XDG_CONFIG_HOME
+  # when it is set, so relocating only HOME left every local smoke run writing to
+  # the developer's real ~/.config/@sapiom/… — installing packages and app state
+  # into the very profile these lines exist to protect. Found while verifying the
+  # sapiom-CLI install: the app reported success and the files were nowhere near
+  # the temp HOME.
+  mkdir -p "$smoke_home/.config"
+  export XDG_CONFIG_HOME="$(native "$smoke_home/.config")"
+else
+  echo "[smoke] CI detected — leaving HOME/USERPROFILE/APPDATA alone (ephemeral runner)"
+fi
+export SAPIOM_LAUNCH_DIR="$(native "$smoke_home/project")"
+# Two forms of the report path: the app writes to the native one, this script
+# reads the POSIX one.
+report_file="$smoke_home/smoke.txt"
+export SAPIOM_SMOKE_OUT="$(native "$report_file")"
+
+# A stand-in for the coding agent, so the smoke run can create a REAL session
+# (POST /api/sessions → pty spawn) on a machine with no agent installed. It is
+# deliberately a SCRIPT, not an .exe: npm installs `claude.cmd` on Windows, and
+# spawning that is what failed there — CreateProcess does no PATHEXT lookup and
+# cannot execute a .cmd. A stub that was an .exe would pass while the real thing
+# broke. It just idles briefly so the session is genuinely running.
+if [ "$(uname -s)" != "Linux" ] && [ "$(uname -s)" != "Darwin" ]; then
+  # Shaped like an npm shim on purpose — a `.cmd` that runs `node <script>` — because
+  # that is exactly what `claude.cmd` is, and it's the shape resolveSpawnTarget has
+  # to see through. A stub that were a plain .cmd (or an .exe) would exercise a path
+  # real agents never take, and is now correctly refused rather than shelled out.
+  stub="$smoke_home/stub-agent.cmd"
+  # Dumps its own environment first — see SAPIOM_SMOKE_AGENT_ENV below.
+  printf 'const f = process.env.SAPIOM_SMOKE_AGENT_ENV;\nif (f) require("fs").writeFileSync(f, Object.entries(process.env).map(([k, v]) => k + "=" + v).join("\\n") + "\\n");\nsetTimeout(() => process.exit(0), 3000);\n' > "$smoke_home/stub-agent.js"
+  printf '@echo off\r\n"%%dp0%%\\node.exe" "%%dp0%%\\stub-agent.js" %%*\r\n' > "$stub"
+else
+  stub="$smoke_home/stub-agent.sh"
+  printf '#!/bin/sh\n[ -n "$SAPIOM_SMOKE_AGENT_ENV" ] && env > "$SAPIOM_SMOKE_AGENT_ENV"\nsleep 3\nexit 0\n' > "$stub"
+  chmod +x "$stub"
+fi
+# Where the stub agent writes its environment, so a check can assert on what the
+# AGENT actually inherited rather than on what the main process meant to pass.
+# This caught a real regression: the desktop host pins ESBUILD_BINARY_PATH so its
+# own bundler can exec a binary outside app.asar, and the whole parent env is
+# copied into the pty — so every agent, and every tool it ran in the user's repo,
+# inherited a pin to OUR esbuild build ("Host version X does not match binary
+# version Y" on a project that builds fine outside the app).
+export SAPIOM_SMOKE_AGENT_ENV="$(native "$smoke_home/agent-env.txt")"
+# Native, because resolveSpawnTarget resolves this inside the app: a POSIX
+# path has no drive letter, so the Windows lookup would never find it.
+export SAPIOM_SMOKE_STUB_AGENT="$(native "$stub")"
 # CI is not a user.
 export SAPIOM_TELEMETRY_DISABLED=1
 # Windows: makes Electron log rather than swallow.
@@ -62,9 +134,9 @@ case "$(uname -s)" in
     ;;
 esac
 
-if [ -f "$SAPIOM_SMOKE_OUT" ]; then
+if [ -f "$report_file" ]; then
   echo "--- smoke report ---"
-  cat "$SAPIOM_SMOKE_OUT"
+  cat "$report_file"
 elif [ "$status" -ne 0 ]; then
   # No file AND a bad exit: the app died before it could report — which is the
   # one case where the exit code is all we have (see the Windows exit-3 bug).

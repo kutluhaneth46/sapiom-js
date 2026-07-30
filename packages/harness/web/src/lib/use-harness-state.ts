@@ -5,6 +5,7 @@ import type {
   BusMessage,
   RunView,
   CreateSessionRequest,
+  HarnessKind,
   HarnessSession,
   HarnessSettings,
   RunMacroRequest,
@@ -42,6 +43,11 @@ const api = createApi();
  * reads as continuously busy rather than flickering between pings.
  */
 const BUSY_WINDOW_MS = 3_000;
+
+/** Optimistic cap on the recent-dirs list this client sends. Cosmetic only —
+ *  the server sanitizes and caps the real list (MAX_RECENT_DIRS in
+ *  cli/settings.ts) and its response replaces this guess. */
+const RECENT_DIRS_UI_CAP = 8;
 
 /** Where a run executed — the server announces it on execution.started.
  *  "local" runs are stubbed (capabilities run against fixtures); "prod" runs
@@ -98,6 +104,17 @@ export interface HarnessStateHook {
    *  recorded for it). Stable identity — safe as an effect dependency. */
   sessionRecord: (id: string) => Promise<SessionRecord | null>;
   resumeSession: (harnessSessionId: string) => Promise<HarnessSession>;
+  /**
+   * Portable continue: a fresh session in `cwd`, seeded with our own
+   * reconstruction of the session `from` identifies (either id form). For a
+   * conversation the agent no longer holds — the only thing still possible for
+   * it, and now a real continuation rather than a blank start.
+   */
+  rehydrateSession: (req: {
+    cwd: string;
+    harness: HarnessKind;
+    from: string;
+  }) => Promise<HarnessSession>;
   resumeFromHistory: (summary: SessionSummary) => Promise<HarnessSession>;
   /** Dismisses an exited session (DELETE): drops it from the list and, if it was active, falls back to another running session or clears the pane. */
   closeSession: (id: string) => Promise<void>;
@@ -231,6 +248,15 @@ export interface HarnessStateHook {
 export function useHarnessState(): HarnessStateHook {
   const [state, setState] = useState<AppState | null>(null);
   const [settings, setSettings] = useState<HarnessSettings | null>(null);
+  /**
+   * Mirror of `settings` for the one reader that cannot wait for a re-render:
+   * createSession needs the CURRENT recent dirs synchronously, because they are
+   * also the body of the PATCH it sends. Assigned during render, which is safe
+   * precisely because it is a mirror — idempotent, so StrictMode's double render
+   * changes nothing, and never read during render itself.
+   */
+  const settingsRef = useRef<HarnessSettings | null>(null);
+  settingsRef.current = settings;
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   // Boot-error facts (HTTP status / network-throw flag), shaped for the
@@ -244,6 +270,16 @@ export function useHarnessState(): HarnessStateHook {
   const [history, setHistory] = useState<SessionSummary[]>([]);
   const [toast, setToast] = useState<string | null>(null);
   const [historyLoading, setHistoryLoading] = useState(false);
+  // History fan-out bookkeeping — see loadHistory. Refs, not state: neither
+  // affects the render, and both are read/written within a single call.
+  const inFlightHistory = useRef<Map<string, Promise<SessionSummary[]>>>(new Map());
+  const historyLoads = useRef(0);
+  // Deploys in flight, keyed by workflow path. A second click while one is
+  // running must not start another: for an UNLINKED project each deploy calls
+  // link({ create: true }), which is a read-then-write with no uniqueness
+  // guard, so two concurrent deploys create two remote agents. Same shape as
+  // inFlightHistory above.
+  const inFlightDeploys = useRef<Map<string, Promise<void>>>(new Map());
   const [lastMessage, setLastMessage] = useState<BusMessage | null>(null);
   const [busySessionIds, setBusySessionIds] = useState<Set<string>>(new Set());
   const [tasks, setTasks] = useState<BackgroundTask[]>([]);
@@ -657,22 +693,48 @@ export function useHarnessState(): HarnessStateHook {
    * one).
    */
   const loadHistory = useCallback(async (cwds: string[]) => {
+    // Fan out per directory; one failing dir never hides the others'
+    // history — and, since only fulfilled cwds count as refreshed, never
+    // evicts what we already had for it either.
+    //
+    // Coalesced per directory, because three surfaces load history
+    // independently and their requests overlap: the palette and the rail
+    // popover both ask for `historyDirs(...)`, and the dead pane asks for one
+    // directory that is almost always already in that list. A caller that
+    // arrives while a directory is in flight awaits that request instead of
+    // issuing a second one. The entry is dropped the moment it settles — this
+    // deduplicates concurrent callers, it is NOT a cache, so a later open
+    // still re-reads the directory.
+    const unique = Array.from(new Set(cwds));
+    const requests = unique.map((cwd) => {
+      const pending = inFlightHistory.current.get(cwd);
+      if (pending) return pending;
+      const request = api.sessionHistory(cwd).finally(() => {
+        inFlightHistory.current.delete(cwd);
+      });
+      inFlightHistory.current.set(cwd, request);
+      return request;
+    });
+
+    // Counted, not a boolean: with concurrent loads, a flag that every caller
+    // sets and the FIRST to settle clears reports "loaded" while the rest are
+    // still in flight — which renders the popover's empty state over a list
+    // that is about to arrive.
+    historyLoads.current += 1;
     setHistoryLoading(true);
     try {
-      // Fan out per directory; one failing dir never hides the others'
-      // history — and, since only fulfilled cwds count as refreshed, never
-      // evicts what we already had for it either.
-      const results = await Promise.allSettled(cwds.map((cwd) => api.sessionHistory(cwd)));
+      const results = await Promise.allSettled(requests);
       const refreshed: SessionSummary[] = [];
       const refreshedCwds = new Set<string>();
       results.forEach((result, index) => {
         if (result.status !== "fulfilled") return;
-        refreshedCwds.add(cwds[index]!);
+        refreshedCwds.add(unique[index]!);
         refreshed.push(...result.value);
       });
       setHistory((prev) => mergeHistory(prev, refreshed, refreshedCwds));
     } finally {
-      setHistoryLoading(false);
+      historyLoads.current -= 1;
+      if (historyLoads.current === 0) setHistoryLoading(false);
     }
   }, []);
 
@@ -690,17 +752,31 @@ export function useHarnessState(): HarnessStateHook {
     );
     selectSession(session.id);
 
-    let optimisticRecentDirs: string[] = [];
-    setSettings((prev) => {
-      optimisticRecentDirs = [req.cwd, ...(prev?.recentDirs ?? []).filter((dir) => dir !== req.cwd)].slice(0, 8);
-      return prev ? { ...prev, recentDirs: optimisticRecentDirs } : prev;
-    });
+    // Built from the ref BEFORE touching state, because this value is also the
+    // PATCH body below and must exist synchronously.
+    //
+    // It used to be assigned INSIDE the setSettings updater on the line below.
+    // That worked only by accident: React invokes a useState updater eagerly —
+    // synchronously, inside the dispatch — when that hook has no pending update,
+    // as a bail-out optimization. It is NOT a guarantee. With an update already
+    // queued on this hook (a session create landing near the boot settings
+    // fetch, say) the updater runs later instead, and the PATCH ships the
+    // initializer: `[]`. The server MERGES a settings patch, so that is a real
+    // erasure of the persisted list, not a no-op.
+    //
+    // Verified: reintroducing the old form still passes the e2e below, because
+    // the eager path covers the common case. The bug is the dependence on it.
+    const nextRecentDirs = [
+      req.cwd,
+      ...(settingsRef.current?.recentDirs ?? []).filter((dir) => dir !== req.cwd),
+    ].slice(0, RECENT_DIRS_UI_CAP);
+    setSettings((prev) => (prev ? { ...prev, recentDirs: nextRecentDirs } : prev));
     // The server is the source of truth for what actually qualifies as a
     // recent dir (must resolve to a real, existing directory) — replace the
     // optimistic guess with its sanitized response so invalid input (e.g.
     // stray free text typed into the directory field) never lingers in the UI.
     try {
-      const updated = await api.updateSettings({ recentDirs: optimisticRecentDirs });
+      const updated = await api.updateSettings({ recentDirs: nextRecentDirs });
       setSettings((prev) => (prev ? { ...prev, recentDirs: updated.recentDirs } : prev));
     } catch {
       // Non-fatal — session creation itself already succeeded.
@@ -737,15 +813,43 @@ export function useHarnessState(): HarnessStateHook {
   );
 
   /**
-   * Resumes a history entry, in the order that preserves the most context:
+   * Portable continue. A conversation the agent no longer holds can't be
+   * reattached by anyone, so this starts a fresh session and hands it our own
+   * reconstruction of the old one — the same path for every harness, including
+   * ones with no resume flag at all.
    *
-   *  1. A row the registry already tracks → resume that record.
-   *  2. A transcript-only row the agent still holds (`resumeMode:
-   *     "agent-resume"`, verified server-side) → adopt it into the registry
-   *     and resume for real. This is the case that used to silently start a
-   *     fresh session and throw the conversation away.
-   *  3. Anything else (`rehydrate`) → a fresh session in the same directory,
-   *     which is all that's possible until H3 lands portable continue.
+   * `rehydratedFrom` on the response is the server's account of what actually
+   * happened, not an echo of the request: when our event log held nothing for
+   * that id, it comes back null and this says so. Silence there would be the
+   * exact dishonesty this epic removes — a blank session presented as a
+   * continuation.
+   */
+  const rehydrateSession = useCallback(
+    async ({ cwd, harness, from }: { cwd: string; harness: HarnessKind; from: string }) => {
+      const session = await createSession({ cwd, harness, rehydrateFrom: from });
+      if (!session.rehydratedFrom) {
+        setToast("Nothing was recorded for that session, so this one starts fresh.");
+      }
+      return session;
+    },
+    [createSession],
+  );
+
+  /**
+   * Resumes a history entry by branching on the server-verified `resumeMode`
+   * — never on what we happen to hold. Before H1 this guessed (a row with an
+   * `agentSessionId` was treated as resumable), which made one in three rows a
+   * button guaranteed to fail; the mode is now resolved against the agent's
+   * own store by `GET /sessions/history`, and this just obeys it.
+   *
+   *  1. `agent-resume` + a registry record → resume that record; the agent
+   *     genuinely reattaches to the conversation.
+   *  2. `agent-resume`, transcript-only → adopt it into the registry first,
+   *     then resume for real.
+   *  3. `rehydrate` → the agent does NOT hold this conversation, so nothing
+   *     can reattach to it. Start a fresh session seeded with our own
+   *     reconstruction of it (`rehydrateFrom`), which is what makes continue
+   *     work for a harness with no resume flag at all.
    *
    * A failed adopt does NOT fall through to a fresh session: it surfaces the
    * server's reason as a toast, because quietly starting something different
@@ -756,36 +860,43 @@ export function useHarnessState(): HarnessStateHook {
       const harnessSessionId =
         summary.harnessSessionId ??
         state?.sessions.find((session) => session.agentSessionId === summary.agentSessionId)?.id;
-      if (harnessSessionId) return resumeSession(harnessSessionId);
-      if (summary.resumeMode === "agent-resume") {
-        try {
-          const adopted = await api.adoptSession({
-            agentSessionId: summary.agentSessionId,
-            harness: summary.harness,
-            cwd: summary.cwd,
-            title: summary.title,
-            lastActiveAt: summary.lastActiveAt,
-          });
-          // Upsert: the adopted record is new to the registry in the normal
-          // case, but the server resumes an existing one when the row was
-          // already tracked, and then this response is the fresher copy.
-          setState((prev) => {
-            if (!prev) return prev;
-            const sessions = prev.sessions.some((s) => s.id === adopted.id)
-              ? prev.sessions.map((s) => (s.id === adopted.id ? adopted : s))
-              : [...prev.sessions, adopted];
-            return { ...prev, sessions };
-          });
-          selectSession(adopted.id);
-          return adopted;
-        } catch (err) {
-          setToast(err instanceof ApiError && err.reason ? err.reason : (err as Error).message);
-          throw err;
-        }
+      if (summary.resumeMode === "rehydrate") {
+        // Prefer our own id: it resolves the whole conversation (every harness
+        // session that shares this agent session), where the agent session id
+        // alone only finds it if our events recorded one.
+        return rehydrateSession({
+          cwd: summary.cwd,
+          harness: summary.harness,
+          from: harnessSessionId ?? summary.agentSessionId,
+        });
       }
-      return createSession({ cwd: summary.cwd, harness: summary.harness });
+      if (harnessSessionId) return resumeSession(harnessSessionId);
+      try {
+        const adopted = await api.adoptSession({
+          agentSessionId: summary.agentSessionId,
+          harness: summary.harness,
+          cwd: summary.cwd,
+          title: summary.title,
+          lastActiveAt: summary.lastActiveAt,
+        });
+        // Upsert: the adopted record is new to the registry in the normal
+        // case, but the server resumes an existing one when the row was
+        // already tracked, and then this response is the fresher copy.
+        setState((prev) => {
+          if (!prev) return prev;
+          const sessions = prev.sessions.some((s) => s.id === adopted.id)
+            ? prev.sessions.map((s) => (s.id === adopted.id ? adopted : s))
+            : [...prev.sessions, adopted];
+          return { ...prev, sessions };
+        });
+        selectSession(adopted.id);
+        return adopted;
+      } catch (err) {
+        setToast(err instanceof ApiError && err.reason ? err.reason : (err as Error).message);
+        throw err;
+      }
     },
-    [state, resumeSession, createSession, selectSession],
+    [state, resumeSession, rehydrateSession, selectSession],
   );
 
   const closeSession = useCallback(
@@ -862,60 +973,87 @@ export function useHarnessState(): HarnessStateHook {
   // the registry so a linked/rebuilt workflow's Deployed chip flips. Swallows
   // failures into the toast (like runMacro) — its caller fires it unawaited.
   const deploy = useCallback(
-    async (workflowPath: string): Promise<void> => {
-      setToast("Deploying — building on Sapiom…");
-      try {
-        const terminal = await api.deploy(workflowPath, (event) => {
-          if (event.phase === "building") setToast("Deploying — building on Sapiom…");
-        });
-        if (terminal.phase === "ready") {
-          setToast("Deployed to Sapiom.");
-          // Persist the deploy result so the deployment popover can surface the
-          // build id and relative timestamp without a network call.
-          saveLastDeploy(workflowPath, {
-            buildRunId: terminal.buildRunId,
-            deployedAt: Date.now(),
+    (workflowPath: string): Promise<void> => {
+      // A second click while one is running returns the SAME in-flight
+      // promise instead of starting another — see inFlightDeploys above.
+      const existing = inFlightDeploys.current.get(workflowPath);
+      if (existing) return existing;
+
+      const run = (async (): Promise<void> => {
+        setToast("Deploying…");
+        // Which non-terminal phase was last seen, so a terminal `error` can
+        // say whether linking or building failed — both are the same wire
+        // shape, told apart only by what preceded them.
+        let lastNonTerminalPhase: "linking" | "building" | null = null;
+        // The warning line (if any), remembered the same way — NOT a ref, NOT
+        // shared state, just a per-call local — so it survives the `building`
+        // toast that follows it in the same chunk (the server writes `warning`
+        // then `building` back to back; without this the warning is
+        // overwritten before it's ever seen) and gets folded into the success
+        // toast instead.
+        let pendingWarning: string | null = null;
+        try {
+          const terminal = await api.deploy(workflowPath, (event) => {
+            // A never-linked project (a fresh template clone) gets its agent
+            // created first — say so, rather than claiming we're building.
+            if (event.phase === "linking") {
+              lastNonTerminalPhase = "linking";
+              setToast(`Deploying — creating the agent "${event.name}" on Sapiom…`);
+            } else if (event.phase === "warning") {
+              // Non-terminal and advisory: the agent was created but its id
+              // couldn't be written back to sapiom.json. The message is
+              // already a complete, user-facing sentence composed
+              // server-side — pass it through verbatim. A later `building`
+              // legitimately replaces this toast, so it's also remembered
+              // above to resurface on success.
+              pendingWarning = event.message;
+              setToast(event.message);
+            } else if (event.phase === "building") {
+              lastNonTerminalPhase = "building";
+              setToast("Deploying — building on Sapiom…");
+            }
           });
-          // Clear any prior deploy error for this workflow — it succeeded.
-          setLastDeployErrorByPath((prev) => {
-            if (!prev.has(workflowPath)) return prev;
-            const next = new Map(prev);
-            next.delete(workflowPath);
-            return next;
-          });
-          // A successful deploy links/rebuilds the agent — re-read the registry
-          // so definitionId (the Draft→Deployed truth) and the deploy-gated
-          // actions update without waiting on a bus refresh.
-          await refreshWorkflows();
-        } else if (terminal.phase === "error") {
-          const rawMsg = terminal.hint
-            ? `Deploy failed: ${terminal.message} (${terminal.hint})`
-            : `Deploy failed: ${terminal.message}`;
-          // Replace a raw "definition not found" error with an actionable prompt
-          // so users who cloned a gallery template know what to do.
-          const msg = isDefinitionNotFoundError(terminal.message)
-            ? definitionNotFoundMessage()
-            : rawMsg;
+          if (terminal.phase === "ready") {
+            setToast(pendingWarning ? `Deployed to Sapiom. ${pendingWarning}` : "Deployed to Sapiom.");
+            // Clear any prior deploy error for this workflow — it succeeded.
+            setLastDeployErrorByPath((prev) => {
+              if (!prev.has(workflowPath)) return prev;
+              const next = new Map(prev);
+              next.delete(workflowPath);
+              return next;
+            });
+            // A successful deploy links/rebuilds the agent — re-read the registry
+            // so definitionId (the Draft→Deployed truth) and the deploy-gated
+            // actions update without waiting on a bus refresh.
+            await refreshWorkflows();
+          } else if (terminal.phase === "error") {
+            // Same error shape for a link failure and a build failure —
+            // distinguish them by whichever non-terminal phase preceded it.
+            const prefix = lastNonTerminalPhase === "linking" ? "Couldn't create the agent" : "Deploy failed";
+            const msg = terminal.hint
+              ? `${prefix}: ${terminal.message} (${terminal.hint})`
+              : `${prefix}: ${terminal.message}`;
+            setToast(msg);
+            // Persist the failure so the action bar can distinguish "last deploy
+            // failed" from "never deployed" after the toast is dismissed.
+            setLastDeployErrorByPath((prev) => new Map(prev).set(workflowPath, msg));
+          }
+        } catch (err) {
+          const msg = err instanceof ApiError && err.reason ? err.reason : (err as Error).message;
           setToast(msg);
-          // Persist the failure so the action bar can distinguish "last deploy
-          // failed" from "never deployed" after the toast is dismissed.
+          // An exception from the deploy stream (e.g. network error) also counts
+          // as a deploy failure — persist so the action bar reflects it.
           setLastDeployErrorByPath((prev) => new Map(prev).set(workflowPath, msg));
+        } finally {
+          // Signal that a deploy action settled (success or failure) so the
+          // SessionStepsBar can clear its pending ring for this button.
+          bumpDirectActionSettleSeq();
+          inFlightDeploys.current.delete(workflowPath);
         }
-      } catch (err) {
-        const raw = err instanceof ApiError && err.reason ? err.reason : (err as Error).message;
-        // Replace a raw "definition not found" error with an actionable prompt.
-        const msg = isDefinitionNotFoundError(raw)
-          ? definitionNotFoundMessage()
-          : raw;
-        setToast(msg);
-        // An exception from the deploy stream (e.g. network error) also counts
-        // as a deploy failure — persist so the action bar reflects it.
-        setLastDeployErrorByPath((prev) => new Map(prev).set(workflowPath, msg));
-      } finally {
-        // Signal that a deploy action settled (success or failure) so the
-        // SessionStepsBar can clear its pending ring for this button.
-        bumpDirectActionSettleSeq();
-      }
+      })();
+
+      inFlightDeploys.current.set(workflowPath, run);
+      return run;
     },
     [refreshWorkflows, bumpDirectActionSettleSeq],
   );
@@ -1009,6 +1147,7 @@ export function useHarnessState(): HarnessStateHook {
     getTemplate,
     sessionRecord,
     resumeSession,
+    rehydrateSession,
     resumeFromHistory,
     closeSession,
     connectWorkflow,

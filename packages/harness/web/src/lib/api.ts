@@ -79,10 +79,15 @@ export type RunLocalLine =
 
 /**
  * One line of the `POST /api/workflows/:id/deploy` NDJSON stream (mirrors
- * `DeployStreamEvent` in src/server/actions.ts): a `building` line up front,
- * then exactly one terminal `ready` | `error` line closing the stream.
+ * `DeployStreamEvent` in src/server/actions.ts): an optional `linking` line
+ * when the server has to resolve-or-create the remote agent first, an
+ * optional `warning` line (non-terminal, advisory — the agent was created but
+ * its id couldn't be written back to sapiom.json), a `building` line, then
+ * exactly one terminal `ready` | `error` line closing the stream.
  */
 export type DeployStreamEvent =
+  | { phase: "linking"; name: string }
+  | { phase: "warning"; message: string }
   | { phase: "building"; definitionId: string }
   | { phase: "ready"; definitionId: string; buildRunId: string; status: string }
   | { phase: "error"; code: string; message: string; hint?: string };
@@ -859,6 +864,10 @@ class MockApi implements HarnessApi {
       workflows: this.workflows,
       macros: MOCK_MACROS,
       launchDir: MOCK_LAUNCH_DIR,
+      // Mirrors the Electron host (`<launchDir>/projects`) rather than the CLI
+      // host (bare launchDir), so mock mode exercises the more interesting of
+      // the two: a project root that differs from the launch dir.
+      defaultProjectRoot: `${MOCK_LAUNCH_DIR}/projects`,
       consentSource: mockConsentSource,
       ...(mockEnvReason ? { consentEnvReason: mockEnvReason } : {}),
       ...(this.fresh ? { firstRun: true } : {}),
@@ -877,6 +886,11 @@ class MockApi implements HarnessApi {
       status: "starting",
       createdAt: new Date().toISOString(),
       lastActiveAt: new Date().toISOString(),
+      // Mirrors the real server: portable continue only claims to have carried
+      // context when a record for that id exists. The fixtures have records for
+      // MOCK_SESSION_RECORDS' keys and nothing else.
+      rehydratedFrom:
+        req.rehydrateFrom && MOCK_SESSION_RECORDS[req.rehydrateFrom] ? req.rehydrateFrom : null,
       ready: false,
     };
     this.sessions = [...this.sessions, session];
@@ -1104,7 +1118,20 @@ class MockApi implements HarnessApi {
     return {
       path: normalized,
       parent,
-      dirs: names.map((name) => ({ name, path: normalized === "/" ? `/${name}` : `${normalized}/${name}` })),
+      dirs: names.map((name) => {
+        const dirPath = normalized === "/" ? `/${name}` : `${normalized}/${name}`;
+        return {
+          name,
+          path: dirPath,
+          // Derived from MOCK_WORKFLOWS (what exists on the mock DISK), not from
+          // `this.workflows` (what the rail currently knows about). They are not
+          // the same thing: a project can sit on disk unregistered — that is
+          // precisely the case "I have a project" exists to handle — and keying
+          // off registry state would leave every folder unbadged under
+          // `?mockState=fresh`, making that flow untestable.
+          hasAgentProject: MOCK_WORKFLOWS.some((workflow) => workflow.path === dirPath),
+        };
+      }),
     };
   }
 
@@ -1257,6 +1284,14 @@ class MockApi implements HarnessApi {
     onEvent?: StreamLineHandler<DeployStreamEvent>,
   ): Promise<DeployStreamEvent> {
     this.recordDirectAction("deploy", { workflowPath });
+    // Mirror the real server: an unlinked workflow is linked (agent created)
+    // before the build, so mock mode exercises the same two-phase stream.
+    const target = this.workflows.find((w) => w.path === workflowPath);
+    if (target && target.definitionId == null) {
+      const linking: DeployStreamEvent = { phase: "linking", name: target.name };
+      onEvent?.(linking);
+      await delay(200);
+    }
     const building: DeployStreamEvent = { phase: "building", definitionId: "mock-def" };
     onEvent?.(building);
     await delay(400);

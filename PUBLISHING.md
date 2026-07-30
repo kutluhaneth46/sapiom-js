@@ -8,9 +8,40 @@ npm via **OIDC Trusted Publishing** — no long-lived `NPM_TOKEN`, no interactiv
 The one exception is the **first-ever publish of a brand-new package**, which
 CI cannot do (see [Bootstrapping a new package](#bootstrapping-a-new-package)).
 
-> The `@sapiom/langchain` and `@sapiom/langchain-classic` packages are
-> quarantined out of the workspace (see `pnpm-workspace.yaml`) and are not
-> published by this flow.
+> **`@sapiom/langchain` and `@sapiom/langchain-classic` are no longer
+> maintained and are not published.** Both are `"private": true`, so
+> `changeset publish` skips them (it only considers non-private packages) and
+> `npm`/`pnpm` refuse them outright. They stay in the workspace and are still
+> built and tested by `-r` — this stops them SHIPPING, nothing else. npm keeps
+> serving the last release, 0.5.0.
+>
+> This note previously claimed they were "quarantined out of the workspace (see
+> `pnpm-workspace.yaml`)". That was true from 2026-06-16 until 2026-07-08, when
+> the exclusions were removed. For the three weeks after, the two packages were
+> live in the release flow with no Trusted Publisher configured — so every
+> `Publish` run failed on them with `ENEEDAUTH` while this note said they were
+> not published by this flow at all, which is a large part of why a red job went
+> unexamined. If they are ever revived, the fix is to drop `"private"` AND
+> configure a Trusted Publisher for each on npmjs.com; both already exist there,
+> so no manual bootstrap publish is needed.
+
+## Desktop installers are a separate flow
+
+`@sapiom/harness-desktop` is `private` and never goes to npm. It ships as signed
+installers attached to a GitHub Release by
+`.github/workflows/desktop-release.yml`, on its own tag namespace so it can never
+trigger the npm publish above:
+
+| Tag | Release | Update channel |
+| --- | --- | --- |
+| `harness-desktop-v1.2.3` | final | `latest` — every user |
+| `harness-desktop-v1.2.3-beta.1` | pre-release | `beta` — testers only |
+
+Bump `packages/harness-desktop/package.json` **first**: the tag must match it
+exactly or the build fails, by design — that field names the artifacts and drives
+auto-update. Installed apps then update themselves in place, so a release only
+has to reach people once. Details and pitfalls:
+`packages/harness-desktop/CLAUDE.md`.
 
 ## The normal flow (automated)
 

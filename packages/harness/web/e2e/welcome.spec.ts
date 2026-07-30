@@ -6,9 +6,14 @@
  * auto boot session then). The default fixtures (a lived-in install) double as
  * the returning-user case.
  *
- * The panel has two states and they are NOT interchangeable: the hero pitch is
- * first-run only, and a returning user gets their recent workspaces instead. The
- * bug this guards is the hero rendering for someone who already has workspaces.
+ * The panel is ONE anatomy for both audiences now: hero band, what Studio is,
+ * the two ways in (a folder, the catalog), documentation, then where you have
+ * already been. Only the greeting differs — "Welcome to" is a thing you say
+ * once — and the recents block simply has nothing to render on a fresh install.
+ *
+ * It used to fork into two whole layouts, a pitch and an Overview list, which
+ * left the returning surface with no explanation of the product and the
+ * first-run surface with no way into anything.
  */
 import { expect, test } from "@playwright/test";
 
@@ -26,7 +31,7 @@ async function openTemplates(page: import("@playwright/test").Page): Promise<voi
   await expect(page.locator(".rail-workflows")).toBeVisible();
   await openOverview(page);
   await page.getByTestId("welcome-browse-templates").click();
-  await expect(page.getByTestId("templates-dialog")).toBeVisible();
+  await expect(page.getByTestId("templates-panel")).toBeVisible();
 }
 
 test.describe("first run", () => {
@@ -35,42 +40,61 @@ test.describe("first run", () => {
     await expect(page.locator(".rail-workflows")).toBeVisible();
   });
 
-  test("renders the hero pitch instead of the bare terminal empty state", async ({ page }) => {
+  test("greets, says what Studio is, and offers the two ways in", async ({ page }) => {
     const panel = page.getByTestId("welcome-panel");
     await expect(panel).toBeVisible();
-    await expect(page.locator(".terminal-empty")).toHaveCount(0);
+    // The card floats OVER the shell rather than replacing a pane, so the
+    // terminal's own empty state stays behind it. That used to be asserted
+    // absent, back when Overview was a view that took the slot.
+    await expect(page.locator(".terminal-empty")).toBeVisible();
 
-    await expect(panel).toContainText("Sapiom Studio for full-stack agentic products.");
-    // The two primary actions plus the compact macros/⌘K hint.
+    // "Welcome to" is the one thing that marks a first run.
+    await expect(panel).toContainText("Welcome to Sapiom Agent Studio");
+    await expect(panel).toContainText("Local runs are free and offline");
+
+    // Each way in is a row that says what picking it does, not a bare button.
+    const folder = page.getByTestId("welcome-open-card");
+    await expect(folder).toContainText("Open a folder");
+    await expect(folder).toContainText("Nothing is uploaded");
     await expect(page.getByTestId("welcome-start-project")).toBeVisible();
+
+    const templates = page.getByTestId("welcome-templates-card");
+    await expect(templates).toContainText("Start from a template");
     await expect(page.getByTestId("welcome-browse-templates")).toBeVisible();
-    const hints = page.getByTestId("welcome-hints");
-    await expect(hints).toContainText("Visualize");
-    await expect(hints).toContainText("Run local");
-    await expect(hints).toContainText("Deploy");
-    await expect(hints).toContainText("⌘K");
+
+    // Nowhere to go back to on a fresh install, so nothing claims otherwise.
+    await expect(page.getByTestId("welcome-recents")).toHaveCount(0);
 
     await page.screenshot({ path: "web/e2e/screenshots/welcome-panel.png", fullPage: true });
   });
 
-  test("'New workspace' opens the existing new-session flow and creating a session dismisses the panel", async ({
+  test("'Open folder' opens the folder door, and adding one dismisses the panel", async ({
     page,
   }) => {
+    // This CTA used to open the SESSION modal — the most prominent button on
+    // the first-run screen said "workspace" and delivered "new session". It now
+    // reaches the same add flow the rail's + does, and lands directly on the
+    // folder question rather than re-asking which of three intents this was.
     await page.getByTestId("welcome-start-project").click();
-    await expect(page.getByText("New session")).toBeVisible();
+    await expect(page.locator(".modal-add-workspace")).toBeVisible();
+    await expect(page.locator(".modal-new-session")).toHaveCount(0);
+    await expect(page.getByTestId("aw-doors")).toHaveCount(0);
 
-    // Same directory picker as the tab strip's "+" — pick a real fixture dir.
-    await page.getByTestId("dir-picker-input").fill("/Users/demo/acme-app");
-    await page.getByRole("button", { name: "Start session" }).click();
+    // Already at door 1: pick a fixture folder that holds an agent project.
+    await page.getByTestId("dir-picker-input").fill("/Users/demo/rfq-workflows");
+    await page.getByTestId("aw-have-continue").click();
+    await expect(page.getByTestId("aw-result")).toContainText("This is an agent project");
+    await page.getByTestId("aw-add").click();
 
-    await expect(page.getByTestId("welcome-panel")).toHaveCount(0);
-    await expect(page.getByTestId("session-context-title")).toContainText("acme-app");
+    // The workspace joins the rail; the first-run pitch is done.
+    await expect(page.locator(".modal-add-workspace")).toHaveCount(0);
+    await expect(page.getByTestId("workflow-rfq-workflows")).toBeVisible();
   });
 
-  test("the footer links out to the documentation instead of a dismiss", async ({ page }) => {
+  test("documentation is a way out to the docs, never a dismiss", async ({ page }) => {
     const docs = page.getByTestId("welcome-docs");
     await expect(docs).toBeVisible();
-    await expect(docs).toHaveAttribute("href", "https://docs.sapiom.ai");
+    await expect(docs).toHaveAttribute("href", "https://docs.sapiom.ai/agents/quick-start");
     await expect(docs).toHaveAttribute("target", "_blank");
   });
 });
@@ -83,20 +107,96 @@ test.describe("returning user", () => {
     await expect(page.getByTestId("welcome-panel")).toHaveCount(0);
   });
 
-  test("Overview shows recent workspaces, NOT the first-run pitch", async ({ page }) => {
-    // The regression: `showWelcome` used to be `overviewSelected || firstRun`,
-    // so opening Overview with 10 workspaces pitched the product at you.
+  test("Overview drops the first-run greeting but keeps the same anatomy", async ({ page }) => {
     await page.goto("/");
     await expect(page.locator(".rail-workflows")).toBeVisible();
 
     await openOverview(page);
 
     const panel = page.getByTestId("welcome-panel");
-    await expect(panel).not.toContainText("Sapiom Studio for full-stack agentic products.");
+    // Greeted once, on the first run — not every time you open Overview.
+    await expect(panel).toContainText("Sapiom Agent Studio");
+    await expect(panel).not.toContainText("Welcome to");
+    // Everything else is the same surface, plus the thing a returning user came
+    // for: where they have already been.
     await expect(page.getByTestId("welcome-recents")).toBeVisible();
-    // The action band is shared by both states.
     await expect(page.getByTestId("welcome-start-project")).toBeVisible();
     await expect(page.getByTestId("welcome-browse-templates")).toBeVisible();
+  });
+
+  test("carries no screenshot of itself, and never puts content out of reach", async ({ page }) => {
+    // The card briefly opened with a cropped capture of the app above the copy —
+    // ~120px on a surface whose job is to be read at a glance, reading as a
+    // fragment of a UI rather than a picture of the product.
+    await page.goto("/");
+    await expect(page.locator(".rail-workflows")).toBeVisible();
+    await openOverview(page);
+    await expect(page.getByTestId("welcome-hero")).toHaveCount(0);
+    await expect(page.locator(".welcome-panel img")).toHaveCount(0);
+
+    // Height is the regression that recurs here, and the first attempt at
+    // guarding it measured the card against its container — which passed on
+    // these fonts and failed on CI's, where the same copy wraps ~34px taller.
+    // So the invariant is REACHABILITY, which no font metric can break: at any
+    // window height the card stays inside the scrim, the two actions are on
+    // screen, and the last workspace row can be scrolled to. Getting that wrong
+    // is silent — a card that honours a max-height by clipping its own bottom
+    // looks fine and hides rows below the fold.
+    for (const height of [1000, 640, 460]) {
+      await page.setViewportSize({ width: 1280, height });
+
+      const card = await page.locator(".welcome-card").boundingBox();
+      const scrim = await page.getByTestId("welcome-panel").boundingBox();
+      expect(card!.height, `card must fit the scrim at ${height}px`).toBeLessThanOrEqual(
+        scrim!.height,
+      );
+
+      // The fixed part stays put: these are the reason the card exists.
+      await expect(page.getByTestId("welcome-start-project")).toBeInViewport();
+      await expect(page.getByTestId("welcome-browse-templates")).toBeInViewport();
+
+      // And the part that yields is scrollable rather than clipped.
+      const lastRow = page.locator(".welcome-recent").last();
+      await lastRow.scrollIntoViewIfNeeded();
+      await expect(lastRow, `last row must be reachable at ${height}px`).toBeInViewport();
+    }
+
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await page.screenshot({ path: "web/e2e/screenshots/welcome-overview.png", fullPage: true });
+  });
+
+  test("lists workspaces from session history, not just launch dirs", async ({ page }) => {
+    // The defect: the list read settings.recentDirs, which recordRecentDir only
+    // ever fills with the LAUNCH dir — one entry forever, under a heading
+    // promising workspaces, while the rail knew dozens. /Users/demo/scratch is
+    // the proof: a session cwd in the fixtures that is absent from recentDirs,
+    // so it could not appear before this change.
+    await page.goto("/");
+    await expect(page.locator(".rail-workflows")).toBeVisible();
+    await openOverview(page);
+
+    await expect(page.getByTestId("welcome-recent-scratch")).toBeVisible();
+    // Newest activity first: acme-app (a live session) above rfq-workflows (a day old).
+    const rows = page.getByTestId("welcome-recents").locator("li");
+    await expect(rows.first()).toContainText("acme-app");
+    await expect(rows).toHaveCount(4);
+  });
+
+  test("rows carry their agent count, and claim nothing for a bare folder", async ({ page }) => {
+    await page.goto("/");
+    await expect(page.locator(".rail-workflows")).toBeVisible();
+    await openOverview(page);
+
+    // acme-app holds one agent project (leasing) in the fixtures.
+    await expect(page.getByTestId("welcome-recent-acme-app")).toContainText("1 agent");
+    // scratch is bare — a first-class workspace with nothing in it yet, so no
+    // count is claimed for it.
+    await expect(page.getByTestId("welcome-recent-scratch")).not.toContainText("agent");
+    // All three fixture agents sit inside the visible rows, so nothing is
+    // omitted and the note must stay away. Its positive case (a registry bigger
+    // than the list) is unit-tested — unlistedAgentCount in
+    // lib/recent-workspaces.test.ts — since the mock fixtures never produce it.
+    await expect(page.getByTestId("welcome-recents-note")).toHaveCount(0);
   });
 
   test("clicking a recent workspace opens a session in it", async ({ page }) => {
@@ -110,6 +210,40 @@ test.describe("returning user", () => {
 
     await expect(page.getByTestId("welcome-panel")).toHaveCount(0);
     await expect(page.getByTestId("session-context-title")).toContainText("acme-app");
+  });
+
+  test("creating a session promotes its folder in recentDirs instead of wiping the list", async ({
+    page,
+  }) => {
+    // Pins the contract createSession has to keep: opening a folder PROMOTES it
+    // and keeps the rest. Both the mock and the real server merge a settings
+    // patch, so a client that sends an empty array erases the persisted list.
+    //
+    // Honest scope: this test does NOT fail against the pre-fix code, which
+    // built the patch body inside a setSettings updater. React's eager-updater
+    // optimization runs that synchronously whenever the hook has no pending
+    // update, which is the common case — so the old form passes here too. The
+    // fix removed the dependence on that internal behaviour; this test guards
+    // the behaviour itself, and would catch a future patch that sends a stale or
+    // empty list outright.
+    await page.goto("/");
+    await expect(page.locator(".rail-workflows")).toBeVisible();
+
+    await openOverview(page);
+    await page.getByTestId("welcome-recent-rfq-workflows").click();
+    await expect(page.getByTestId("welcome-panel")).toHaveCount(0);
+
+    // The directory picker's chips are the surface that still reads recentDirs
+    // directly, so they show what actually survived.
+    await page.getByTestId("add-workspace").click();
+    await page.getByTestId("aw-door-have").click();
+    const chips = page.locator(".recent-dir-chip");
+    await expect(chips).toHaveCount(3); // all three fixtures kept, none dropped
+    // The folder just opened moves to the front rather than replacing the list.
+    // Asserted on the label, not `title`: TooltipLayer moves a title into
+    // data-tip-stash to render its own tooltip, so a title assertion races that
+    // rewrite and reads null once it has run.
+    await expect(chips.first()).toContainText("rfq-workflows");
   });
 
   test("rows disable while one is opening, so a second click cannot double-fire", async ({ page }) => {
@@ -134,57 +268,55 @@ test.describe("returning user", () => {
   });
 });
 
-test.describe("templates dialog", () => {
-  test("lists the live catalog grouped by category, with a complexity band or an em dash", async ({ page }) => {
+test.describe("templates browser, reached from Overview", () => {
+  test("shows the live catalog with facets, not a pinned pair", async ({ page }) => {
     await openTemplates(page);
-    const dialog = page.getByTestId("templates-dialog");
+    const panel = page.getByTestId("templates-panel");
+    await expect(page.getByTestId("templates-grid").first()).toBeVisible();
 
-    // More than the two entries the old hardcoded pin carried, and grouped by
-    // the registry's outcome axes rather than one flat "Gallery" heading.
-    await expect(page.getByTestId("template-row-web-research-digest")).toBeVisible();
-    await expect(page.getByTestId("template-row-cold-outreach-engine")).toBeVisible();
-    await expect(dialog).toContainText("Revenue and marketing");
-    await expect(dialog).toContainText("Data and knowledge");
-    // Bundled starters remain, as their own offline group.
-    await expect(dialog).toContainText("Bundled starters");
-    await expect(page.getByTestId("template-row-coding-pause")).toBeVisible();
+    // More than the two entries the old hardcoded pin carried.
+    await expect(page.getByTestId("template-card-web-research-digest")).toBeVisible();
+    await expect(page.getByTestId("template-card-cold-outreach-engine")).toBeVisible();
 
-    // The band rides on the card beside the step count. Two ends of the scale,
-    // so a regression that blanked the slot could not pass by matching one word.
-    await expect(page.getByTestId("template-row-dependency-upgrade")).toContainText("Advanced 5/5");
-    await expect(page.getByTestId("template-row-approval-chain")).toContainText("Simple 2/5");
+    // The registry's outcome axis is a filter column now rather than a set of
+    // headings the list was chopped into.
+    await expect(panel).toContainText("Category");
+    await expect(page.getByTestId("templates-category-revenue-marketing")).toContainText(
+      "Revenue and marketing",
+    );
+    await expect(page.getByTestId("templates-category-data-knowledge")).toBeVisible();
 
-    // A card whose payload carried no band degrades to an em dash — the guard
-    // that keeps a published Studio pointed at an older backend from throwing.
-    const noBand = page.getByTestId("template-row-web-research-digest");
-    await expect(noBand).toContainText("—");
+    // Bundled starters remain, as their own offline block.
+    await expect(panel).toContainText("Bundled starters");
+    await expect(page.getByTestId("template-card-coding-pause")).toBeVisible();
 
-    // And nothing in this dialog reads as money any more (SAP-2085 removed the
-    // cost estimate; a card still printing one would mean we re-derived it).
-    expect(await page.getByTestId("templates-dialog").textContent()).not.toMatch(/\$\d/);
+    // Nothing on this surface reads as money. SAP-2085 replaced the per-run cost
+    // estimate with a complexity band, so a price here would mean someone
+    // re-derived one. The band itself is asserted in templates.spec.ts: it lives
+    // on the card's spec sheet and in the detail note, not on the card face,
+    // because it is a reference figure rather than what you choose by.
+    expect(await panel.textContent()).not.toMatch(/\$\d/);
   });
 
-  test("search filters across name, tag, and capability", async ({ page }) => {
+  test("narrowing by category keeps the counts honest", async ({ page }) => {
     await openTemplates(page);
+    await expect(page.getByTestId("templates-grid").first()).toBeVisible();
 
-    await page.getByTestId("template-search").fill("outreach");
-
-    await expect(page.getByTestId("template-row-cold-outreach-engine")).toBeVisible();
-    await expect(page.getByTestId("template-row-web-research-digest")).toHaveCount(0);
-
-    await page.getByTestId("template-search").fill("zzz-no-such-template");
-    await expect(page.getByTestId("templates-no-results")).toBeVisible();
+    await page.getByTestId("templates-category-data-knowledge").click();
+    await expect(page.getByTestId("template-card-web-research-digest")).toBeVisible();
+    await expect(page.getByTestId("template-card-cold-outreach-engine")).toHaveCount(0);
   });
 
-  test("selecting a template loads its manifest into the detail pane", async ({ page }) => {
+  test("opening a template loads its real manifest", async ({ page }) => {
     await openTemplates(page);
+    await expect(page.getByTestId("templates-grid").first()).toBeVisible();
 
-    await page.getByTestId("template-row-dependency-upgrade").click();
+    await page.getByTestId("template-card-open-dependency-upgrade").click();
 
     const detail = page.getByTestId("template-detail");
     await expect(detail).toContainText("Dependency Upgrade");
     await expect(page.getByTestId("template-graph")).toBeVisible();
-    // The destination follows the selection while it's untouched.
-    await expect(page.getByTestId("template-dest-input")).toHaveValue(/dependency-upgrade$/);
+    // The bar carries the commit for whatever is open.
+    await expect(page.getByTestId("template-use-btn")).toBeVisible();
   });
 });

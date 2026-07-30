@@ -32,7 +32,6 @@ import { fileURLToPath } from "node:url";
 import { Router } from "express";
 import {
   AgentOperationError,
-  check as coreCheck,
   createClient,
   deploy as coreDeploy,
   link as coreLink,
@@ -40,11 +39,13 @@ import {
   readConfig as coreReadConfig,
   writeConfig as coreWriteConfig,
   type DeployResult,
+  type LinkResult,
   type RunResult,
   type SapiomConfig,
 } from "@sapiom/agent-core";
 
 import { resolveCoreBaseUrl } from "../core/definition-slug-resolver.js";
+import { HOST_ESBUILD_PIN, unpackedPath } from "../core/asar-path.js";
 import type { RunLocalRequest } from "../core/run-local-bootstrap.js";
 import {
   type ApiKeyProvider,
@@ -61,19 +62,25 @@ export interface ActionWorkflow {
   /** Absolute path to the agent project directory (deploy's `projectDir`). */
   path: string;
   /**
-   * The deployed agent's slug (`defineAgent({ name })`) cached from the
-   * registry — the preferred source for the link name on deploy. Mirrors
-   * {@link WorkflowInfo.definitionSlug}.
+   * Registry display name (`package.json`'s `name`, else the folder basename).
+   * Optional so a host that only knows the path still works; used as a
+   * mid-priority fallback when naming an agent this route has to create.
    */
-  definitionSlug?: string | null;
+  name?: string;
 }
 
 /**
- * One line of the deploy NDJSON stream. `building` is emitted once the build is
- * triggered; exactly one terminal line (`ready` | `error`) closes the stream.
- * `capability`-agnostic and credential-free by construction.
+ * One line of the deploy NDJSON stream. `linking` is emitted only when the
+ * project had no `definitionId` and the route is resolving-or-creating its
+ * remote agent; `warning` is non-terminal and advisory — it never replaces a
+ * terminal line and may appear alongside either outcome (e.g. linking
+ * succeeded but caching the id in `sapiom.json` failed); `building` is emitted
+ * once the build is triggered; exactly one terminal line (`ready` | `error`)
+ * closes the stream. `capability`-agnostic and credential-free by construction.
  */
 export type DeployStreamEvent =
+  | { phase: "linking"; name: string }
+  | { phase: "warning"; message: string }
   | { phase: "building"; definitionId: string }
   | { phase: "ready"; definitionId: string; buildRunId: string; status: string }
   | { phase: "error"; code: string; message: string; hint?: string };
@@ -88,8 +95,9 @@ export interface ActionsCoreDeps {
   deploy: typeof coreDeploy;
   run: typeof coreRun;
   readConfig: typeof coreReadConfig;
+  /** Resolve-or-create the server-side agent for an unlinked project. */
   link: typeof coreLink;
-  check: typeof coreCheck;
+  /** Cache the linked id back into `sapiom.json` (merges; never clobbers). */
   writeConfig: typeof coreWriteConfig;
 }
 
@@ -99,7 +107,6 @@ const DEFAULT_CORE_DEPS: ActionsCoreDeps = {
   run: coreRun,
   readConfig: coreReadConfig,
   link: coreLink,
-  check: coreCheck,
   writeConfig: coreWriteConfig,
 };
 
@@ -139,20 +146,80 @@ export function resolveRunLocalBootstrapPath(moduleUrl: string): string {
   return join(dirname(here), "..", "core", `run-local-bootstrap${ext}`);
 }
 
+/** Everything needed to launch the run-local child, resolved but not yet spawned
+ *  — so the packaging-sensitive path math is unit-testable. */
+export interface RunLocalChildSpec {
+  command: string;
+  args: string[];
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+}
+
 /**
- * The default spawn: `node <bootstrap>` with `cwd` set to this package's root
- * so the bootstrap's `import "@sapiom/agent-core"` resolves against the
- * harness's real dependency (same technique as canvas-manifest-check). A `.ts`
- * bootstrap (dev only) is loaded through the `tsx` register hook; the built
- * `.js` runs on bare node. stdin is piped so the route can write the request.
+ * Resolve how to launch the run-local bootstrap child: `node <bootstrap>` with
+ * `cwd` at this package's root, so the bootstrap's `import "@sapiom/agent-core"`
+ * resolves against the harness's real dependency. A `.ts` bootstrap (dev only)
+ * goes through the `tsx` register hook; the built `.js` runs on bare node.
+ *
+ * Three things here exist ONLY for the packaged desktop app, and their absence
+ * is why every local run failed there with `spawn ENOTDIR` while the CLI was
+ * fine. `canvas-manifest-check.ts` already does all three; this call site did
+ * none of them:
+ *
+ *  1. **cwd must be the unpacked twin.** `import.meta.url` reports a path inside
+ *     `app.asar`; nothing translates a child's cwd, so `chdir` fails. ENOTDIR is
+ *     not in Node's deferred-error list, so `spawn` throws SYNCHRONOUSLY and the
+ *     route answers `{"kind":"error","error":"spawn ENOTDIR"}`.
+ *  2. **the script path must be the unpacked twin too.** The child is plain Node
+ *     with no asar support whatsoever — it cannot read a file inside the archive,
+ *     however well Electron's own `fs` copes.
+ *  3. **`ELECTRON_RUN_AS_NODE=1` under Electron.** `process.execPath` is the
+ *     Sapiom binary there; without the flag it boots a SECOND COPY OF THE APP
+ *     instead of running the script. Only set when actually inside Electron, so
+ *     the CLI (real node) is untouched.
+ *
+ * `ESBUILD_BINARY_PATH` is dropped: the desktop host pins it so its in-process
+ * bundler can exec a binary outside app.asar, but no child needs it (a child
+ * resolves real on-disk paths itself) and a workflow step body that shells out
+ * to the project's own toolchain would hit an esbuild version mismatch.
  */
-function defaultRunLocalSpawn(): RunLocalChildProcess {
-  const bootstrap = resolveRunLocalBootstrapPath(import.meta.url);
-  const nodeArgs = bootstrap.endsWith(".ts")
+export function resolveRunLocalChildSpec(
+  moduleUrl: string,
+  runtime: { execPath: string; env: NodeJS.ProcessEnv; isElectron: boolean },
+): RunLocalChildSpec {
+  const bootstrap = unpackedPath(resolveRunLocalBootstrapPath(moduleUrl));
+  const args = bootstrap.endsWith(".ts")
     ? ["--import", "tsx", bootstrap]
     : [bootstrap];
-  return spawnChildProcess(process.execPath, nodeArgs, {
-    cwd: join(dirname(fileURLToPath(import.meta.url)), "..", ".."),
+  // Via the constant, not the literal name. `HOST_ESBUILD_PIN`'s whole purpose is
+  // to be the ONE place that key is written, and its doc names this spec as one of
+  // the three strippers — but a rest-destructure needs a literal, so renaming the
+  // constant would have silently left this child inheriting the pin and hitting
+  // `Host version "X" does not match binary version "Y"`.
+  const inherited = Object.fromEntries(
+    Object.entries(runtime.env).filter(([key]) => key !== HOST_ESBUILD_PIN),
+  );
+  return {
+    command: runtime.execPath,
+    args,
+    cwd: unpackedPath(join(dirname(fileURLToPath(moduleUrl)), "..", "..")),
+    env: {
+      ...inherited,
+      ...(runtime.isElectron ? { ELECTRON_RUN_AS_NODE: "1" } : {}),
+    },
+  };
+}
+
+/** The default spawn. stdin is piped so the route can write the request. */
+function defaultRunLocalSpawn(): RunLocalChildProcess {
+  const spec = resolveRunLocalChildSpec(import.meta.url, {
+    execPath: process.execPath,
+    env: process.env,
+    isElectron: Boolean(process.versions.electron),
+  });
+  return spawnChildProcess(spec.command, spec.args, {
+    cwd: spec.cwd,
+    env: spec.env,
     stdio: ["pipe", "pipe", "pipe"],
   });
 }
@@ -218,6 +285,30 @@ export interface ActionsRouterOpts {
    * registry — the router does not read the registry directly.
    */
   resolveWorkflow: (id: string) => ActionWorkflow | null;
+  /**
+   * The agent's DECLARED name (`defineAgent({ name })`) for a project the route
+   * has to link on the fly, or null when it cannot be determined. Optional: the
+   * route falls back to `sapiom.json`'s cached name, then
+   * {@link ActionWorkflow.name}, then the project folder's basename.
+   *
+   * A seam rather than a direct call so this router keeps knowing nothing about
+   * the canvas extraction cache (see core/definition-name.ts, which
+   * `server/index.ts` wires in here). Never expected to throw — a rejection is
+   * treated as "could not determine".
+   */
+  resolveDefinitionName?: (workflow: ActionWorkflow) => Promise<string | null>;
+  /**
+   * Called after the route has linked a previously-unlinked project and cached
+   * its new `definitionId`, so the host can refresh whatever it derives from
+   * `sapiom.json`. The registry's `list()` never re-reads the file and the
+   * workspace watcher ignores a content-only edit, so without this a
+   * first-time deploy leaves the SPA showing "Draft" with Prod Run gated.
+   *
+   * A seam rather than a direct call so this router keeps knowing nothing about
+   * the workflow registry (`server/index.ts` wires it). Never expected to
+   * throw — a rejection must not cost the user their build.
+   */
+  onLinked?: (workflow: ActionWorkflow) => Promise<void>;
   /** Injectable core operations. Test seam; defaults to the real exports. */
   coreDeps?: Partial<ActionsCoreDeps>;
   /**
@@ -240,22 +331,34 @@ export interface ActionsRouterOpts {
 }
 
 /**
- * Read the cached `definitionId` from a project's `sapiom.json`, or null when
- * absent/unreadable. Used to detect whether the link-resolved id differs from
- * what is already on disk so `writeConfig` can be skipped when it is a no-op.
- * Never throws.
+ * What a project's `sapiom.json` says about its server-side identity. Three
+ * states, not two: an unlinked project is fixable by linking on the spot (the
+ * deploy route does exactly that), while an unparseable file is not — and
+ * telling them apart matters, because `writeConfig` re-reads the file and
+ * throws BAD_CONFIG on invalid JSON. Auto-linking on a broken config would
+ * create a remote agent and then fail to record it, orphaning it.
+ *
+ * `name` on the unlinked state is the cached agent name a previous `link`
+ * wrote, if any — the deploy route uses it to name the agent it creates.
  */
-function readDefinitionId(
+type ProjectConfigState =
+  | { kind: "linked"; definitionId: string }
+  | { kind: "unlinked"; name?: string }
+  | { kind: "bad-config" };
+
+function readProjectConfigState(
   readConfig: typeof coreReadConfig,
   projectDir: string,
-): string | null {
+): ProjectConfigState {
   let config: SapiomConfig | null;
   try {
     config = readConfig(projectDir);
   } catch {
-    return null;
+    return { kind: "bad-config" };
   }
-  return config?.definitionId ?? null;
+  const definitionId = config?.definitionId;
+  if (definitionId) return { kind: "linked", definitionId };
+  return config?.name ? { kind: "unlinked", name: config.name } : { kind: "unlinked" };
 }
 
 /**
@@ -328,42 +431,6 @@ async function withKeyRefreshRetry<T>(
 }
 
 /**
- * Determine the agent name to use when resolving (or creating) the server-side
- * definition on deploy. Precedence mirrors the MCP `link` tool's `linkName`:
- *   1. `definitionSlug` from the workflow registry (cached `defineAgent({name})`).
- *   2. `check({ sourceDir })` — bundles index.ts locally, reads the name field.
- *   3. Directory basename — last-resort when bundling fails (no tsc installed,
- *      index.ts missing, etc.).
- *
- * Never throws: the basename fallback is always available. Returns null only
- * when the project path itself is unreliable (empty string).
- */
-async function resolveAgentName(
-  workflow: ActionWorkflow,
-  checkFn: typeof coreCheck,
-): Promise<string | null> {
-  // 1. Registry slug (fastest, already resolved).
-  if (typeof workflow.definitionSlug === "string" && workflow.definitionSlug.trim() !== "") {
-    return workflow.definitionSlug.trim();
-  }
-
-  // 2. Bundle and read the manifest name.
-  try {
-    const result = await checkFn({ sourceDir: workflow.path, typecheck: false });
-    if (result.name && result.name.trim() !== "") {
-      return result.name.trim();
-    }
-  } catch {
-    // Bundling failed (missing entry, no node_modules, etc.) — fall through.
-  }
-
-  // 3. Directory basename.
-  const dir = workflow.path.trim();
-  if (!dir) return null;
-  return basename(dir) || null;
-}
-
-/**
  * Create the actions router. Mounts:
  *   - `POST /api/workflows/:id/deploy` — NDJSON build-status stream.
  *   - `POST /api/runs` — `{ executionId }` for a started prod execution.
@@ -393,23 +460,20 @@ export function createActionsRouter(opts: ActionsRouterOpts): Router {
   /**
    * POST /api/workflows/:id/deploy
    *
-   * Resolves (or creates) the caller's own server-side agent definition by
-   * name, then deploys it: mints push credentials, pushes the synthesized
-   * tree, triggers a build, and polls to a terminal status — all inside
-   * @sapiom/agent-core's {@link deploy}. Streams NDJSON: a `building` line
-   * once the link step succeeds and the build is triggered, then exactly one
-   * terminal `ready`/`error` line.
-   *
-   * The link step resolves by name (account-scoped), so a stale/foreign
-   * `definitionId` in sapiom.json (e.g. from a cloned template) is ignored:
-   * Deploy always targets the caller's own definition. The resolved
-   * `definitionId` is written back to sapiom.json when it differs, so a
-   * subsequent Prod Run picks up the correct id without another link.
+   * Deploys the linked agent for the given workflow id: mints push credentials,
+   * pushes the synthesized tree, triggers a build, and polls to a terminal
+   * status — all inside @sapiom/agent-core's {@link deploy}. Streams NDJSON: a
+   * `building` line up front, then exactly one terminal `ready`/`error` line.
+   * A project with no `definitionId` yet is linked on the fly first (a
+   * `linking` line precedes `building`) rather than rejected; if the resolved
+   * agent's id could not be cached in `sapiom.json`, a non-terminal `warning`
+   * line follows before `building` continues.
    *
    * 200  NDJSON stream (even a build failure is a 200 with a terminal `error`
    *      line — the request itself succeeded; the build outcome is in-band).
    * 400  id missing/empty
    * 404  workflow id not registered
+   * 409  sapiom.json is unparseable
    * 503  harness is not signed in to Sapiom
    */
   router.post("/api/workflows/:id/deploy", async (req, res) => {
@@ -429,6 +493,12 @@ export function createActionsRouter(opts: ActionsRouterOpts): Router {
       return;
     }
 
+    const configState = readProjectConfigState(deps.readConfig, workflow.path);
+    if (configState.kind === "bad-config") {
+      res.status(409).json({ error: "sapiom.json is not valid JSON" });
+      return;
+    }
+
     // From here the outcome is streamed in-band as NDJSON — status is 200 and
     // headers are committed before the (potentially long) link+build runs.
     res.status(200);
@@ -438,58 +508,77 @@ export function createActionsRouter(opts: ActionsRouterOpts): Router {
       res.write(JSON.stringify(event) + "\n");
     };
 
-    try {
-      // ── Step 1: resolve the agent name ─────────────────────────────────
-      // Prefer the registry slug (fastest, no bundling), then a local bundle
-      // check, then the directory basename. Mirrors the MCP link tool's
-      // linkName derivation — keeps link consistent with what check/deploy
-      // would produce.
-      const agentName = await resolveAgentName(workflow, deps.check);
-      if (!agentName) {
-        write({
-          phase: "error",
-          code: "NAME_REQUIRED",
-          message: "Could not determine the agent name.",
-          hint: "Ensure index.ts is present and exports defineAgent({ name: '…' }).",
-        });
-        res.end();
-        return;
-      }
+    /**
+     * The definition id to build against: the linked one, or a freshly
+     * resolved-or-created one for a project that has never been linked (a
+     * gallery-template clone lands exactly this way — `clone` writes the fork
+     * provenance and leaves `definitionId` for deploy to fill in).
+     *
+     * `link({ create: true })` matches an existing remote agent by name/slug
+     * BEFORE creating one, so this is resync-or-create: re-deploying never
+     * duplicates an agent, and a template already deployed from another machine
+     * re-attaches to the same definition.
+     */
+    const ensureDefinitionId = async (): Promise<string> => {
+      if (configState.kind === "linked") return configState.definitionId;
 
-      // ── Step 2: resolve-or-create the caller's own definition ──────────
-      // link() resolves by name (account-scoped), ignoring any stale/foreign
-      // definitionId already in sapiom.json. create: true mints a new
-      // definition when none exists by that name in the caller's account.
-      const linkResult = await withKeyRefreshRetry(
+      const fromSeam = opts.resolveDefinitionName
+        ? await opts.resolveDefinitionName(workflow).catch(() => null)
+        : null;
+      const name =
+        fromSeam?.trim() ||
+        configState.name?.trim() ||
+        workflow.name?.trim() ||
+        basename(workflow.path);
+
+      write({ phase: "linking", name });
+      // Same refresh-on-rejected-key recovery the build gets; the retry is
+      // transparent to the stream (no second linking line).
+      const linked: LinkResult = await withKeyRefreshRetry(
         provider,
         clientFor,
-        (client) => deps.link({ name: agentName, create: true }, client),
+        (client) => deps.link({ name, create: true }, client),
       );
-      const definitionId = linkResult.definitionId;
-
-      // ── Step 3: persist the resolved id when it differs ────────────────
-      // Keep sapiom.json current so a subsequent Prod Run reads the right id
-      // without another link. Merge-writes only the fields link owns.
-      const existingId = readDefinitionId(deps.readConfig, workflow.path);
-      const idChanged = existingId !== definitionId;
-      if (idChanged) {
-        try {
-          deps.writeConfig(workflow.path, {
-            definitionId,
-            name: linkResult.name,
-          });
-        } catch {
-          // Non-fatal: the deploy still uses the resolved id; a write failure
-          // just means the next deploy will re-link (which is cheap).
-        }
+      // Cache under the name the SERVER settled on, matching what
+      // `sapiom agents link` writes. writeConfig merges, so the clone's
+      // forkId/templateId/repoFullName survive.
+      //
+      // Best-effort: sapiom.json is a re-resolvable cache (agent-core's
+      // config.ts) and `link` re-resolves the same agent by name, so a failed
+      // write here (read-only checkout, EACCES, a config that turned invalid
+      // between the 409 check above and this write) must not cost the user
+      // their deploy — warn and carry on with the id already in hand.
+      try {
+        deps.writeConfig(workflow.path, {
+          definitionId: linked.definitionId,
+          name: linked.name,
+        });
+      } catch (cacheErr) {
+        write({
+          phase: "warning",
+          message:
+            `The agent "${linked.name}" was created on Sapiom (${linked.definitionId}) but not recorded locally: ${cacheErr instanceof Error ? cacheErr.message : String(cacheErr)}. The build continues; re-deploying re-resolves it by name.`,
+        });
       }
+      // Best-effort, same as the cache write above, and run whether or not it
+      // succeeded: a rescan is harmless either way, and there is nothing new to
+      // re-read when the write failed. Without this, the registry's list()
+      // never re-reads sapiom.json and the workspace watcher ignores a
+      // content-only edit, so the SPA would keep showing "Draft" after the
+      // very first successful deploy of a project.
+      if (opts.onLinked) await opts.onLinked(workflow).catch(() => undefined);
+      return linked.definitionId;
+    };
 
-      // ── Step 4: build and deploy ────────────────────────────────────────
+    try {
+      // A link failure throws out of here and is mapped by the same
+      // toDeployErrorEvent below — reported as itself, never as a build
+      // failure, and `deploy` is never reached.
+      const definitionId = await ensureDefinitionId();
       write({ phase: "building", definitionId });
-
-      // Auth against the live key, refreshing + retrying once on a rejected
-      // key (same recovery the runs router gets). The building/terminal
-      // streaming shape is unchanged — the retry is transparent to the stream.
+      // Auth against the live key, refreshing + retrying once on a rejected key
+      // (same recovery the runs router gets). The building/terminal streaming
+      // shape is unchanged — the retry is transparent to the NDJSON stream.
       const result: DeployResult = await withKeyRefreshRetry(
         provider,
         clientFor,
@@ -502,18 +591,7 @@ export function createActionsRouter(opts: ActionsRouterOpts): Router {
         buildRunId: result.buildRunId,
         status: result.status,
       });
-      // ── Step 5: propagate the new definitionId to connected clients ────
-      // After a successful deploy the sapiom.json on disk has a fresh (or
-      // confirmed) definitionId. Notify the server so it can re-read the
-      // registry entry and broadcast `workflows.changed` — which causes every
-      // connected client's refreshWorkflows() to return the updated id,
-      // keeping the chip, canvas badge, and Prod Run all in sync without a
-      // manual reload. Only fired when the id actually changed (a redeploy of
-      // an already-linked workflow is a no-op for the cache). The call is
-      // fire-and-forget from the handler's perspective: a failure here is
-      // non-fatal (the deploy succeeded; only the broadcast is missed, and
-      // the client-side refreshWorkflows() still runs as a fallback).
-      if (idChanged && onWorkflowConfigChanged) {
+      if (onWorkflowConfigChanged) {
         try {
           await onWorkflowConfigChanged(workflow.path);
         } catch {
