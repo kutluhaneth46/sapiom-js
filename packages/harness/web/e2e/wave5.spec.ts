@@ -73,7 +73,10 @@ test.describe("add workspace (three doors)", () => {
     const modal = page.locator(".modal-add-workspace");
     await expect(modal).toBeVisible();
 
-    await modal.getByTestId("dir-picker-input").fill("/Users/demo/brand-new-agent");
+    // FolderBrowser: use "or type a path" to navigate to a non-existent folder.
+    await modal.getByTestId("folder-browser-type-toggle").click();
+    await modal.getByTestId("folder-browser-type-input").fill("/Users/demo/brand-new-agent");
+    await modal.getByTestId("folder-browser-type-input").press("Enter");
     await modal.getByTestId("aw-have-continue").click();
 
     // A folder that doesn't exist can't be registered — only created.
@@ -97,7 +100,9 @@ test.describe("add workspace (three doors)", () => {
     await page.getByTestId("add-workspace").click();
     await page.getByTestId("aw-door-have").click();
     const modal = page.locator(".modal-add-workspace");
-    await modal.getByTestId("dir-picker-input").fill("/Users/demo");
+    await modal.getByTestId("folder-browser-type-toggle").click();
+    await modal.getByTestId("folder-browser-type-input").fill("/Users/demo");
+    await modal.getByTestId("folder-browser-type-input").press("Enter");
     await modal.getByTestId("aw-have-continue").click();
 
     // Bulk discovery is no longer a permanent button: it is what the dialog
@@ -119,7 +124,9 @@ test.describe("add workspace (three doors)", () => {
     // a folder that exists and has no Sapiom wiring.
     await page.getByTestId("aw-door-have").click();
     const modal = page.locator(".modal-add-workspace");
-    await modal.getByTestId("dir-picker-input").fill("/Users/demo/scratch");
+    await modal.getByTestId("folder-browser-type-toggle").click();
+    await modal.getByTestId("folder-browser-type-input").fill("/Users/demo/scratch");
+    await modal.getByTestId("folder-browser-type-input").press("Enter");
     await modal.getByTestId("aw-have-continue").click();
 
     const block = page.getByTestId("mcp-install");
@@ -177,12 +184,16 @@ test.describe("add workspace (three doors)", () => {
 // Recent-path chips
 // ---------------------------------------------------------------------------
 
-test("recent-path chips middle-truncate long paths and keep the full path in the tooltip", async ({ page }) => {
+test("recent-path buttons show the folder name and keep the full path in the tooltip", async ({ page }) => {
   await page.getByTestId("add-workspace").click();
   await page.getByTestId("new-session-btn").click();
 
-  const chip = page.locator(".recent-dir-chip").first();
-  await expect(chip).toHaveText("/Users/…/acme-app");
+  // FolderBrowser shows recent dirs as folder-name chips in the Recents section.
+  const recents = page.getByTestId("folder-browser-recents");
+  await expect(recents).toBeVisible();
+  // The first recent dir in the fixtures is acme-app.
+  const chip = recents.locator(".folder-browser-recent-btn").first();
+  await expect(chip).toContainText("acme-app");
   await expect(chip).toHaveAttribute("title", "/Users/demo/acme-app");
 });
 
@@ -224,19 +235,19 @@ test("overview mode shows the fresh-install canvas state, not the previous sessi
 // Directory picker error retry
 // ---------------------------------------------------------------------------
 
-test("the directory picker's read failure carries its own Retry", async ({ page }) => {
+test("the folder browser's read failure carries its own Retry", async ({ page }) => {
   await page.goto("/?mockError=listDir");
   await expect(page.locator(".rail-workflows")).toBeVisible();
 
   await page.getByTestId("add-workspace").click();
   await page.getByTestId("new-session-btn").click();
 
-  const err = page.getByTestId("dir-picker-error");
+  const err = page.getByTestId("folder-browser-error");
   await expect(err).toBeVisible();
-  const retry = page.getByTestId("dir-picker-retry");
+  const retry = page.getByTestId("folder-browser-retry");
   await expect(retry).toBeVisible();
 
   // The fault persists, so retrying lands back on the same honest error.
   await retry.click();
-  await expect(page.getByTestId("dir-picker-error")).toBeVisible();
+  await expect(page.getByTestId("folder-browser-error")).toBeVisible();
 });
