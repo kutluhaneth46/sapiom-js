@@ -2,4 +2,4 @@
 "@sapiom/harness": patch
 ---
 
-Removed the legacy deploy / prod-run / run-local terminal macros. The Studio performs these actions through its direct API routes now, so the old macros were an unused duplicate path that would have started the coding agent (and its cost) unnecessarily.
+The macros API (`POST /api/macros/:id/run`) no longer executes the `deploy`, `prod_run`, or `run_local` ids — those run through the Studio's direct API. This closes the terminal-inject bypass without affecting the Local Run / Prod Run / Deploy buttons, which continue to render and route through the direct action path as before.

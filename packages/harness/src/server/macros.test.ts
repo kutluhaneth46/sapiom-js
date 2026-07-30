@@ -20,7 +20,7 @@ const workflow: WorkflowInfo = {
 };
 
 /** A custom inject macro used in tests that need an inject-kind macro to exercise the
- *  PTY path — since deploy/prod_run/run_local are no longer in DEFAULT_MACROS. */
+ *  PTY path — since deploy/prod_run/run_local are blocked at the route level. */
 const CUSTOM_INJECT_MACRO: MacroDef = {
   id: "test-inject",
   label: "Test inject",
@@ -76,10 +76,13 @@ describe("macros router", () => {
   });
 
   // ---------------------------------------------------------------------------
-  // Removed PTY-inject macros — must all return 404, never inject
+  // Direct-action macros — present in DEFAULT_MACROS as button identities but
+  // blocked at the route level (409) to close the PTY-inject bypass. The
+  // Studio's direct API routes handle these; curl cannot use this route to
+  // start a pty-injected agent run.
   // ---------------------------------------------------------------------------
 
-  it("404s POST /api/macros/deploy/run — deploy is no longer in DEFAULT_MACROS", async () => {
+  it("409s POST /api/macros/deploy/run — deploy is routed through the direct API, not the PTY", async () => {
     const deps = makeDeps();
     await start(deps);
     const res = await fetch(`${baseUrl}/api/macros/deploy/run`, {
@@ -87,14 +90,14 @@ describe("macros router", () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ harnessSessionId: "sess-1", workflowPath: workflow.path }),
     });
-    expect(res.status).toBe(404);
+    expect(res.status).toBe(409);
     const body = (await res.json()) as { error: string };
     expect(body.error).toContain("deploy");
     // Critically: no PTY injection occurred.
     expect(deps.injectInput).not.toHaveBeenCalled();
   });
 
-  it("404s POST /api/macros/prod_run/run — prod_run is no longer in DEFAULT_MACROS", async () => {
+  it("409s POST /api/macros/prod_run/run — prod_run is routed through the direct API, not the PTY", async () => {
     const deps = makeDeps();
     await start(deps);
     const res = await fetch(`${baseUrl}/api/macros/prod_run/run`, {
@@ -102,13 +105,13 @@ describe("macros router", () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ harnessSessionId: "sess-1", workflowPath: workflow.path }),
     });
-    expect(res.status).toBe(404);
+    expect(res.status).toBe(409);
     const body = (await res.json()) as { error: string };
     expect(body.error).toContain("prod_run");
     expect(deps.injectInput).not.toHaveBeenCalled();
   });
 
-  it("404s POST /api/macros/run_local/run — run_local is no longer in DEFAULT_MACROS", async () => {
+  it("409s POST /api/macros/run_local/run — run_local is routed through the direct API, not the PTY", async () => {
     const deps = makeDeps();
     await start(deps);
     const res = await fetch(`${baseUrl}/api/macros/run_local/run`, {
@@ -116,7 +119,7 @@ describe("macros router", () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ harnessSessionId: "sess-1", workflowPath: workflow.path }),
     });
-    expect(res.status).toBe(404);
+    expect(res.status).toBe(409);
     const body = (await res.json()) as { error: string };
     expect(body.error).toContain("run_local");
     expect(deps.injectInput).not.toHaveBeenCalled();
