@@ -1125,6 +1125,10 @@ export const App = (): JSX.Element => {
                     return next;
                   });
                 }}
+                lastDeployError={rightPaneWorkflow ? harness.lastDeployErrorFor(rightPaneWorkflow.path) : null}
+                onDeploy={() => {
+                  if (rightPaneWorkflow) void harness.deploy(rightPaneWorkflow.path);
+                }}
               />
             </div>
 

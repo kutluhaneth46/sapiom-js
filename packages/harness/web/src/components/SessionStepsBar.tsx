@@ -1,9 +1,8 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import type { JSX } from "react";
 import type { MacroDef, WorkflowInfo } from "@shared/types";
 
 import { Icon } from "./Icon";
-import { DeploymentPopover } from "./DeploymentPopover";
 import { macroDisabledReason } from "../lib/macro-gating";
 import { track } from "../lib/track";
 
@@ -44,18 +43,18 @@ interface SessionStepsBarProps {
 }
 
 /**
- * The agent's action bar on the shared subheader row. NOT a stepper: per
+ * The agent's operate bar on the shared subheader row. NOT a stepper: per
  * Sapiom's own model (docs.sapiom.ai /agents) these are repeatable ACTIONS,
  * not one-way stages — you run local as often as you test, deploy as often
- * as you ship. The only durable state is "deployed" (definitionId), shown as
- * the left-anchored status chip. Actions sit right-anchored, Deploy at the
- * right edge as the primary:
+ * as you ship. Actions sit right-anchored, Deploy at the right edge as the
+ * primary:
  *   Local Run = run_local  (test run, capabilities stubbed)
  *   Prod Run  = prod_run   (real cloud execution; needs a deploy)
  *   Deploy    = deploy     (push + cloud build)
  *
- * The "Go to dashboard" affordance (open_prod equivalent) lives in the canvas
- * header's WorkflowActionsHeader when a definitionId is set.
+ * The deployed/draft status chip and DeploymentPopover live in the canvas
+ * header (WorkflowActionsHeader, board surface). The "Go to dashboard" link
+ * lives in the right-pane tab bar (App.tsx).
  */
 export function SessionStepsBar({
   workflow,
@@ -71,11 +70,6 @@ export function SessionStepsBar({
 }: SessionStepsBarProps): JSX.Element {
   const macroFor = (id: string): MacroDef | undefined => macros.find((m) => m.id === id);
   const deployed = workflow.definitionId != null;
-
-  // Deployment popover state
-  const [popoverOpen, setPopoverOpen] = useState(false);
-  const chipRef = useRef<HTMLButtonElement>(null);
-  const closePopover = useCallback(() => setPopoverOpen(false), []);
 
   // Launched-but-not-durable feedback: a clicked action shows a dotted
   // "in flight" ring until a durable signal lands. The ring clears on ANY
@@ -137,43 +131,6 @@ export function SessionStepsBar({
 
   return (
     <div className="session-steps" data-testid="session-steps" aria-label="Agent actions">
-      {/* The one durable truth, left-anchored: has this agent been deployed?
-          Now a button so the user can click for deployment details. */}
-      <button
-        ref={chipRef}
-        type="button"
-        className="status-tag status-tag-action session-lifecycle-chip"
-        data-testid="session-lifecycle-chip"
-        data-deployed={deployed}
-        data-deploy-error={lastDeployError != null && !deployed ? "" : undefined}
-        data-tooltip={
-          deployed
-            ? `Deployed to Sapiom (definition ${workflow.definitionId}). Click for details.`
-            : lastDeployError != null
-              ? "Last deploy failed. Click for details."
-              : "Draft: not yet deployed. Click for details."
-        }
-        aria-haspopup="dialog"
-        aria-expanded={popoverOpen}
-        onClick={() => setPopoverOpen((prev) => !prev)}
-      >
-        <Icon name={deployed ? "Cloud" : "CloudOff"} size={13} />
-        {/* display: contents at rest, hidden by the bar's container query
-            below 380px — the icon + tooltip keep carrying the state. */}
-        <span className="session-lifecycle-label">
-          {deployed ? "Deployed" : lastDeployError != null ? "Deploy failed" : "Draft"}
-        </span>
-      </button>
-
-      <DeploymentPopover
-        open={popoverOpen}
-        anchorRef={chipRef}
-        onDismiss={closePopover}
-        workflow={workflow}
-        lastDeployError={lastDeployError}
-        onDeploy={onDeploy}
-      />
-
       {/* One-click preview loop, v0: the server detected a dev
           server this session's agent started - one click opens the app. */}
       {preview && (

@@ -1332,12 +1332,19 @@ test.describe("agent action bar (status chip + right-anchored actions)", () => {
     await expect(chip).toContainText("Deployed");
     await expect(chip).toHaveAttribute("data-deployed", "true");
 
-    // Actions sit right-anchored with Deploy at the right edge.
+    // The deployed/draft status chip now lives in the canvas header (right pane),
+    // separate from the operate buttons (Local Run / Prod Run / Deploy) which
+    // remain in the middle bar. Verify each is in its expected container.
+    const canvasHeader = page.getByTestId("workflow-actions-header");
+    await expect(canvasHeader).toBeVisible();
+    await expect(canvasHeader.getByTestId("session-lifecycle-chip")).toBeVisible();
+    // Operate buttons are in the middle bar's session-steps container.
+    await expect(page.getByTestId("session-step-run")).toBeVisible();
+    await expect(page.getByTestId("session-step-deploy")).toBeVisible();
+    // Deploy still sits to the right of Run in the middle bar.
     const runBox = await page.getByTestId("session-step-run").boundingBox();
     const deployBox = await page.getByTestId("session-step-deploy").boundingBox();
-    const chipBox = await chip.boundingBox();
     expect((deployBox?.x ?? 0)).toBeGreaterThan(runBox?.x ?? 0);
-    expect((runBox?.x ?? 0)).toBeGreaterThan(chipBox?.x ?? 0);
 
     // Run fires the DIRECT prod-run route (no pty inject / user LLM credits):
     // it records lastDirectAction, never lastMacroRun, and carries leasing's

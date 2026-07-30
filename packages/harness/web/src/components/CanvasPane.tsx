@@ -70,6 +70,14 @@ interface CanvasPaneProps {
    * Called with `null` when the document is invalidated (session swap, reload).
    */
   onGraphChange?: (graph: import("../lib/canvas-graph").CanvasGraph | null) => void;
+  /**
+   * Error from the last failed deploy for the bound workflow. Forwarded into
+   * WorkflowActionsHeader so the board-surface chip/popover reflects the
+   * current deploy state.
+   */
+  lastDeployError: string | null;
+  /** Fires a deploy action — delegated from the deployment popover. */
+  onDeploy: () => void;
 }
 
 export function CanvasPane({
@@ -94,6 +102,8 @@ export function CanvasPane({
   workflows,
   onOpenWorkflow,
   onGraphChange,
+  lastDeployError,
+  onDeploy,
 }: CanvasPaneProps): JSX.Element {
   const [hasGeneratedContent, setHasGeneratedContent] = useState(false);
   const [reloadKey, setReloadKey] = useState(0);
@@ -705,6 +715,8 @@ export function CanvasPane({
           runTarget={runTarget}
           runs={runs}
           onSelectRun={onSelectRun}
+          lastDeployError={lastDeployError}
+          onDeploy={onDeploy}
         />
       )}
 
@@ -805,7 +817,7 @@ export function CanvasPane({
         /* No diagram yet, but a run was observed: the live per-step data
            renders instead of "No steps yet". */
         <div className="canvas-steps-surface" data-testid="canvas-steps-surface">
-          <RunStepsList run={run} target={runTarget} onInjectPrompt={onInjectPrompt} />
+          <RunStepsList run={run} target={runTarget} onInjectPrompt={onInjectPrompt} onOpenDetail={setDetailStepId} />
         </div>
       ) : !showsContent && sessionExited ? (
         /* nothing was generated and the session is dead — a render here would
@@ -1083,7 +1095,7 @@ export function CanvasPane({
               ) : run ? (
                 /* No structural graph, but a real run was observed:
                    its per-step truth renders instead of a dead end. */
-                <RunStepsList run={run} target={runTarget} onInjectPrompt={onInjectPrompt} />
+                <RunStepsList run={run} target={runTarget} onInjectPrompt={onInjectPrompt} onOpenDetail={setDetailStepId} />
               ) : (
                 /* Same title as the pre-render empty state; the hint names
                    this cause (a rendered canvas that posted no graph). */

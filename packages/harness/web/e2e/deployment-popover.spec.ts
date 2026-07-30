@@ -194,3 +194,87 @@ test.describe("Deploy-failed chip — popover shows error + Retry", () => {
     await expect(retryBtn).toContainText("Retry deploy");
   });
 });
+
+// ---------------------------------------------------------------------------
+// 5. Chip location — now in the canvas header (right pane), not the middle bar
+// ---------------------------------------------------------------------------
+
+test.describe("Chip location — canvas header (right pane, board surface)", () => {
+  test("the session-lifecycle-chip renders inside the workflow-actions-header (canvas pane), not inside session-steps", async ({
+    page,
+  }) => {
+    // The chip must live in the canvas header, not the middle bar.
+    const canvasHeader = page.getByTestId("workflow-actions-header");
+    await expect(canvasHeader).toBeVisible();
+    await expect(canvasHeader.getByTestId("session-lifecycle-chip")).toBeVisible();
+
+    // The middle bar (session-steps) must NOT contain the chip.
+    const bar = page.getByTestId("session-steps");
+    await expect(bar).toBeVisible();
+    await expect(bar.getByTestId("session-lifecycle-chip")).toHaveCount(0);
+  });
+
+  test("the chip is visible on the Canvas tab and hidden on the Steps tab (board-only affordance)", async ({
+    page,
+  }) => {
+    // On the Canvas tab (default): chip is in the board header.
+    await expect(page.getByTestId("right-tab-canvas")).toHaveClass(/is-active/);
+    await expect(page.getByTestId("session-lifecycle-chip")).toBeVisible();
+
+    // Switching to the Steps tab: the board header is replaced by the steps
+    // header, so the chip is no longer in the board subheader. The operate
+    // buttons in the middle bar remain present and deploy-gating still works.
+    await page.getByTestId("right-tab-steps").click();
+    await expect(page.getByTestId("right-tab-steps")).toHaveClass(/is-active/);
+    // The chip is absent from the steps header (steps header shows name + count).
+    await expect(page.getByTestId("session-lifecycle-chip")).toHaveCount(0);
+    // But the operate buttons stay — deploy-gating is still active.
+    await expect(page.getByTestId("session-step-deploy")).toBeVisible();
+    await expect(page.getByTestId("session-step-run")).toBeVisible();
+
+    // Switching back to Canvas: chip returns.
+    await page.getByTestId("right-tab-canvas").click();
+    await expect(page.getByTestId("session-lifecycle-chip")).toBeVisible();
+  });
+
+  test("operate buttons still render and Prod Run remains deploy-gated after the chip move", async ({
+    page,
+  }) => {
+    // The leasing workflow is deployed — Prod Run must be enabled.
+    await expect(page.getByTestId("session-step-run")).toBeEnabled();
+    await expect(page.getByTestId("session-step-deploy")).toBeEnabled();
+    await expect(page.getByTestId("session-step-local")).toBeEnabled();
+
+    // Switching to rfq (draft) and starting a session confirms the gate.
+    await page.getByTestId("workflow-rfq").locator(".workflow-item-trigger").click();
+    await page.getByTestId("open-agent-start-session").click();
+    await expect(page.getByTestId("session-workflow-chip")).toContainText("rfq");
+
+    await expect(page.getByTestId("session-step-run")).toBeDisabled();
+    await expect(page.getByTestId("session-step-run")).toHaveAttribute("aria-label", /Not deployed yet/);
+    // The chip in the canvas header reads "Draft" for this undeployed workflow.
+    await expect(page.getByTestId("session-lifecycle-chip")).toContainText("Draft");
+  });
+
+  test("deploy-state propagates to the canvas-header chip after a successful deploy", async ({
+    page,
+  }) => {
+    // Navigate to rfq (undeployed) and start a session.
+    await page.getByTestId("workflow-rfq").locator(".workflow-item-trigger").click();
+    await page.getByTestId("open-agent-start-session").click();
+    await expect(page.getByTestId("session-workflow-chip")).toContainText("rfq");
+
+    // Chip reads "Draft" before deploy.
+    const chip = page.getByTestId("session-lifecycle-chip");
+    await expect(chip).toContainText("Draft");
+
+    // Deploy — the canvas-header chip must update to "Deployed" after the
+    // workflow's definitionId is set (the same deploy propagation path that
+    // SessionStepsBar previously used still updates WorkflowActionsHeader
+    // via the workflow.definitionId prop).
+    await page.getByTestId("session-step-deploy").click();
+    await expect(page.getByTestId("toast")).toContainText("Deployed to Sapiom.", { timeout: 5_000 });
+    await expect(chip).toContainText("Deployed", { timeout: 3_000 });
+    await expect(chip).toHaveAttribute("data-deployed", "true");
+  });
+});

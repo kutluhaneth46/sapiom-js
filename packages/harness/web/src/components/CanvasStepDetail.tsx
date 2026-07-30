@@ -435,15 +435,22 @@ export function StepDebugMacros({
  *
  * When `onInjectPrompt` is provided (a live session), each step's
  * expanded area includes the debug macros block ({@link StepDebugMacros}).
+ *
+ * When `onOpenDetail` is provided, each expanded step shows a
+ * "Full details →" button that drills into the step's full detail pane,
+ * matching the affordance available in {@link CanvasStepsList}.
  */
 export function RunStepsList({
   run,
   target,
   onInjectPrompt,
+  onOpenDetail,
 }: {
   run: RunView;
   target: RunTarget | null;
   onInjectPrompt?: (text: string) => void;
+  /** Opens the full detail pane for a run step (by step id). */
+  onOpenDetail?: (id: string) => void;
 }): JSX.Element {
   return (
     <div className="canvas-steps-list" data-testid="canvas-run-fallback">
@@ -457,7 +464,7 @@ export function RunStepsList({
         const meta = [
           step.latencyMs !== undefined ? formatTimeout(step.latencyMs) : null,
         ].filter((v): v is string => v !== null);
-        const hasExpand = Boolean(step.error || step.logSlice || onInjectPrompt);
+        const hasExpand = Boolean(step.error || step.logSlice || onInjectPrompt || onOpenDetail);
         return (
           <div key={step.id} className="canvas-step-item">
             <div className="canvas-step-row is-static" data-testid={`canvas-run-step-${step.name}`}>
@@ -479,6 +486,15 @@ export function RunStepsList({
                     <summary>Logs</summary>
                     <pre>{step.logSlice}</pre>
                   </details>
+                )}
+                {onOpenDetail && (
+                  <button
+                    className="canvas-step-open"
+                    data-testid={`canvas-run-step-open-${step.name}`}
+                    onClick={() => onOpenDetail(step.id)}
+                  >
+                    Full details <Icon name="ArrowRight" size={12} />
+                  </button>
                 )}
                 {onInjectPrompt && (
                   <StepDebugMacros step={step} onInjectPrompt={onInjectPrompt} />
