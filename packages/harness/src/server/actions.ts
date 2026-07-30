@@ -34,6 +34,7 @@ import {
   AgentOperationError,
   createClient,
   deploy as coreDeploy,
+  getDefinition as coreGetDefinition,
   link as coreLink,
   run as coreRun,
   readConfig as coreReadConfig,
@@ -99,6 +100,13 @@ export interface ActionsCoreDeps {
   link: typeof coreLink;
   /** Cache the linked id back into `sapiom.json` (merges; never clobbers). */
   writeConfig: typeof coreWriteConfig;
+  /**
+   * Verify that a definition id is accessible under the current API key.
+   * Returns the definition summary on success; throws `AgentOperationError`
+   * (code `HTTP_404` | `HTTP_403` | `HTTP_401` | `NETWORK` | …) on failure.
+   * Used by `ensureDefinitionId` to detect foreign ids before falling back.
+   */
+  getDefinition: typeof coreGetDefinition;
 }
 
 const DEFAULT_CORE_DEPS: ActionsCoreDeps = {
@@ -108,6 +116,7 @@ const DEFAULT_CORE_DEPS: ActionsCoreDeps = {
   readConfig: coreReadConfig,
   link: coreLink,
   writeConfig: coreWriteConfig,
+  getDefinition: coreGetDefinition,
 };
 
 /**
@@ -400,6 +409,26 @@ function isAuthRejectionError(err: unknown): boolean {
 }
 
 /**
+ * Whether a thrown value is a definitive "the definition is not accessible
+ * under this account" — 404 (not found) or 403/401 (forbidden/unauthorized).
+ * These warrant falling back to link-by-name; transient errors (5xx, NETWORK,
+ * connection reset) do not — a blip must never silently duplicate an agent.
+ *
+ * Note: HTTP_401/403 from a definition-verify call mean "this id is not yours"
+ * (distinguished from an expired API key because the key was already validated
+ * to reach this point). We therefore treat them as definitive ownership failures
+ * rather than auth rejections worthy of a refresh retry.
+ */
+function isDefinitiveOwnershipFailure(err: unknown): boolean {
+  return (
+    err instanceof AgentOperationError &&
+    (err.code === "HTTP_404" ||
+      err.code === "HTTP_403" ||
+      err.code === "HTTP_401")
+  );
+}
+
+/**
  * Run a core operation with the current API key and, when it fails with an auth
  * rejection, refresh the shared credential store once and retry with the newer
  * key — the deploy/prod-run analogue of run-state.ts's refresh-on-401 recovery.
@@ -509,25 +538,56 @@ export function createActionsRouter(opts: ActionsRouterOpts): Router {
     };
 
     /**
-     * The definition id to build against: the linked one, or a freshly
-     * resolved-or-created one for a project that has never been linked (a
-     * gallery-template clone lands exactly this way — `clone` writes the fork
-     * provenance and leaves `definitionId` for deploy to fill in).
+     * The definition id to build against: the linked one (verified as
+     * accessible under the current key), or a freshly resolved-or-created one
+     * when the project has never been linked or when the committed id belongs
+     * to a different account (e.g. a GitHub-cloned repo someone else had
+     * deployed).
      *
-     * `link({ create: true })` matches an existing remote agent by name/slug
-     * BEFORE creating one, so this is resync-or-create: re-deploying never
-     * duplicates an agent, and a template already deployed from another machine
-     * re-attaches to the same definition.
+     * For a linked project: first verify ownership via a GET on the definition.
+     * If it resolves, return it (redeploy the same definition — precise,
+     * rename-safe). If it returns 404/403/401 (definitive not-found/forbidden),
+     * fall back to `link({ create: true })` — the exact resolve-or-create-by-
+     * name path the unlinked branch uses; the same `linking` stream line is
+     * emitted. Transient/5xx/NETWORK errors are NOT caught here — a blip must
+     * never silently duplicate an agent.
+     *
+     * For an unlinked project: `link({ create: true })` matches an existing
+     * remote agent by name/slug BEFORE creating one, so this is resync-or-
+     * create: re-deploying never duplicates an agent, and a template already
+     * deployed from another machine re-attaches to the same definition.
      */
     const ensureDefinitionId = async (): Promise<string> => {
-      if (configState.kind === "linked") return configState.definitionId;
+      if (configState.kind === "linked") {
+        const { definitionId } = configState;
+        // Verify the id is reachable under the current key. A definitive
+        // not-found/forbidden (HTTP 404/403/401) means the id belongs to
+        // another account; fall through to link-by-name. Any other error
+        // (5xx, NETWORK) propagates — a transient blip must not trigger the
+        // fork and risk duplicating an agent.
+        try {
+          await withKeyRefreshRetry(provider, clientFor, (client) =>
+            deps.getDefinition(definitionId, client),
+          );
+          return definitionId;
+        } catch (err) {
+          if (!isDefinitiveOwnershipFailure(err)) throw err;
+          // Fall through to link-by-name (same path as the unlinked branch).
+        }
+      }
 
       const fromSeam = opts.resolveDefinitionName
         ? await opts.resolveDefinitionName(workflow).catch(() => null)
         : null;
+      // `configState.name` exists only on the "unlinked" variant. A "linked"
+      // project reaching here means the id failed ownership verification and we
+      // are falling back to link-by-name — treat the cached name as absent for
+      // naming purposes (it was the server-side name from the foreign account).
+      const cachedName =
+        configState.kind === "unlinked" ? configState.name : undefined;
       const name =
         fromSeam?.trim() ||
-        configState.name?.trim() ||
+        cachedName?.trim() ||
         workflow.name?.trim() ||
         basename(workflow.path);
 

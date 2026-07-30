@@ -32,6 +32,8 @@ function makeCoreDeps(overrides: Partial<ActionsRouterOpts["coreDeps"]> = {}) {
     readConfig: vi.fn().mockReturnValue({ definitionId: "def_123" }),
     link: vi.fn().mockResolvedValue({ definitionId: "def_new", name: "order-triage" }),
     writeConfig: vi.fn(),
+    // By default, getDefinition resolves (the id belongs to this account).
+    getDefinition: vi.fn().mockResolvedValue({ id: "def_123", name: "my-agent" }),
     ...overrides,
   } as NonNullable<ActionsRouterOpts["coreDeps"]> & { __client?: unknown };
 }
@@ -551,6 +553,168 @@ describe("createActionsRouter", () => {
         { phase: "building", definitionId: "def_123" },
         { phase: "ready", definitionId: "def_123", buildRunId: "build_9", status: "ready" },
       ]);
+    });
+
+    // ── ownership-aware fallback (linked + foreign id) ──────────────────────
+
+    it("linked + id resolves → redeploys the same definition, link() NOT called", async () => {
+      // The happy path for a linked project: the definition id is accessible
+      // under this account, so Deploy reuses it. No link(), no linking line.
+      const coreDeps = makeCoreDeps({
+        getDefinition: vi.fn().mockResolvedValue({ id: "def_123", name: "my-agent" }),
+        deploy: vi.fn().mockResolvedValue({
+          definitionId: "def_123",
+          buildRunId: "build_9",
+          status: "ready",
+        }),
+      });
+      start({
+        apiKey: "sk-test-key",
+        resolveWorkflow: () => ({ path: "/proj/agent" }),
+        coreDeps,
+      });
+
+      const res = await fetch(`${baseUrl}/api/workflows/wf-1/deploy`, { method: "POST" });
+      const events = parseNdjson(await res.text());
+
+      // getDefinition verified ownership — link() must NOT have been called.
+      expect(coreDeps.getDefinition).toHaveBeenCalledOnce();
+      expect(coreDeps.getDefinition).toHaveBeenCalledWith("def_123", expect.anything());
+      expect(coreDeps.link).not.toHaveBeenCalled();
+      expect(coreDeps.writeConfig).not.toHaveBeenCalled();
+      // Stream shape unchanged — no extra linking line.
+      expect(events).toEqual([
+        { phase: "building", definitionId: "def_123" },
+        { phase: "ready", definitionId: "def_123", buildRunId: "build_9", status: "ready" },
+      ]);
+    });
+
+    it("linked + id 404 → falls back to link({name, create:true}), emits linking", async () => {
+      // The foreign-id scenario: sapiom.json has a definitionId from someone
+      // else's account. getDefinition returns 404, so Deploy falls back to
+      // link-by-name — re-attaches or creates under your account.
+      const { AgentOperationError } = await import("@sapiom/agent-core");
+      const coreDeps = makeCoreDeps({
+        getDefinition: vi.fn().mockRejectedValue(
+          new AgentOperationError({ code: "HTTP_404", message: "Definition not found." }),
+        ),
+        link: vi.fn().mockResolvedValue({ definitionId: "def_mine", name: "order-triage" }),
+        deploy: vi.fn().mockResolvedValue({
+          definitionId: "def_mine",
+          buildRunId: "build_2",
+          status: "ready",
+        }),
+      });
+      start({
+        apiKey: "sk-test-key",
+        resolveWorkflow: () => ({ path: "/proj/agent", name: "order-triage" }),
+        coreDeps,
+      });
+
+      const res = await fetch(`${baseUrl}/api/workflows/wf-1/deploy`, { method: "POST" });
+      const events = parseNdjson(await res.text());
+
+      // A linking line must precede building (same as the unlinked path).
+      expect(events[0]).toEqual({ phase: "linking", name: "order-triage" });
+      expect(events[1]).toEqual({ phase: "building", definitionId: "def_mine" });
+      expect(events[2]).toMatchObject({ phase: "ready", definitionId: "def_mine" });
+
+      // link() was called with create:true — resync-or-create under this account.
+      expect(coreDeps.link).toHaveBeenCalledWith(
+        { name: "order-triage", create: true },
+        expect.anything(),
+      );
+      // The new id was written back to sapiom.json.
+      expect(coreDeps.writeConfig).toHaveBeenCalledWith("/proj/agent", {
+        definitionId: "def_mine",
+        name: "order-triage",
+      });
+    });
+
+    it("linked + id 403/forbidden → falls back to link(), same as 404", async () => {
+      // 403 (forbidden) is also a definitive ownership failure — the id exists
+      // but is not accessible to this account. Same fallback as 404.
+      const { AgentOperationError } = await import("@sapiom/agent-core");
+      const coreDeps = makeCoreDeps({
+        getDefinition: vi.fn().mockRejectedValue(
+          new AgentOperationError({ code: "HTTP_403", message: "Forbidden." }),
+        ),
+        link: vi.fn().mockResolvedValue({ definitionId: "def_mine", name: "order-triage" }),
+        deploy: vi.fn().mockResolvedValue({
+          definitionId: "def_mine",
+          buildRunId: "build_3",
+          status: "ready",
+        }),
+      });
+      start({
+        apiKey: "sk-test-key",
+        resolveWorkflow: () => ({ path: "/proj/agent", name: "order-triage" }),
+        coreDeps,
+      });
+
+      const res = await fetch(`${baseUrl}/api/workflows/wf-1/deploy`, { method: "POST" });
+      const events = parseNdjson(await res.text());
+
+      expect(events[0]).toEqual({ phase: "linking", name: "order-triage" });
+      expect(coreDeps.link).toHaveBeenCalledWith(
+        { name: "order-triage", create: true },
+        expect.anything(),
+      );
+    });
+
+    it("linked + id transient/5xx → does NOT fork; error propagates, no duplicate agent", async () => {
+      // A network blip or 5xx on the verify must not trigger the fallback —
+      // that would risk silently duplicating an agent under this account.
+      // The error propagates and is reported as a terminal error line.
+      const { AgentOperationError } = await import("@sapiom/agent-core");
+      const coreDeps = makeCoreDeps({
+        getDefinition: vi.fn().mockRejectedValue(
+          new AgentOperationError({ code: "HTTP_500", message: "Internal server error." }),
+        ),
+        deploy: vi.fn().mockResolvedValue({
+          definitionId: "def_123",
+          buildRunId: "build_4",
+          status: "ready",
+        }),
+      });
+      start({
+        apiKey: "sk-test-key",
+        resolveWorkflow: () => ({ path: "/proj/agent" }),
+        coreDeps,
+      });
+
+      const res = await fetch(`${baseUrl}/api/workflows/wf-1/deploy`, { method: "POST" });
+      const events = parseNdjson(await res.text());
+
+      // The transient error must surface as a terminal error line.
+      expect(events).toHaveLength(1);
+      expect(events[0]).toMatchObject({ phase: "error", code: "HTTP_500" });
+      // link() must NOT have been called — no fork, no duplicate.
+      expect(coreDeps.link).not.toHaveBeenCalled();
+      expect(coreDeps.deploy).not.toHaveBeenCalled();
+    });
+
+    it("linked + NETWORK error on verify → does NOT fork; error propagates", async () => {
+      // Same as 5xx: a NETWORK error (connection reset, DNS failure) on the
+      // verify must not trigger the fallback.
+      const { AgentOperationError } = await import("@sapiom/agent-core");
+      const coreDeps = makeCoreDeps({
+        getDefinition: vi.fn().mockRejectedValue(
+          new AgentOperationError({ code: "NETWORK", message: "Could not reach host." }),
+        ),
+      });
+      start({
+        apiKey: "sk-test-key",
+        resolveWorkflow: () => ({ path: "/proj/agent" }),
+        coreDeps,
+      });
+
+      const res = await fetch(`${baseUrl}/api/workflows/wf-1/deploy`, { method: "POST" });
+      const events = parseNdjson(await res.text());
+
+      expect(events).toHaveLength(1);
+      expect(events[0]).toMatchObject({ phase: "error", code: "NETWORK" });
+      expect(coreDeps.link).not.toHaveBeenCalled();
     });
 
     it("ends the stream with one terminal error when linking fails, without building", async () => {
