@@ -16,6 +16,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { JSX } from "react";
 import type { ConnectGitHubRequest } from "../lib/api";
+import { relativeTimeLabel } from "../lib/relative-time";
 import { Icon } from "./Icon";
 
 // ---------------------------------------------------------------------------
@@ -519,13 +520,13 @@ function RepoList({
 
   return (
     <div className="github-repo-list-wrap" data-testid="github-repo-list">
-      {/* Connected status + disconnect link */}
+      {/* Account header: login + subtle disconnect */}
       <div className="github-device-connected-bar">
-        <Icon name="Check" size={13} />
-        <span className="connect-github-label">{login}</span>
+        <Icon name="Check" size={12} />
+        <span className="github-repo-account-login">{login}</span>
         <button
           type="button"
-          className="btn-ghost github-device-disconnect-inline"
+          className="github-device-disconnect-inline"
           data-testid="github-device-disconnect"
           onClick={onDisconnect}
         >
@@ -557,34 +558,63 @@ function RepoList({
       {/* List */}
       <div className="github-repo-list" data-testid="github-repo-list-items">
         {filtered.length === 0 ? (
-          <p className="connect-github-field-hint">No repositories found.</p>
+          <p className="github-repo-empty">No repositories match.</p>
         ) : (
           filtered.map((repo) => {
-            const repoName = repo.fullName.split("/").pop() ?? repo.fullName;
+            const slashIdx = repo.fullName.indexOf("/");
+            const owner = slashIdx >= 0 ? repo.fullName.slice(0, slashIdx + 1) : "";
+            const repoName = slashIdx >= 0 ? repo.fullName.slice(slashIdx + 1) : repo.fullName;
             const isCloning = cloning === repo.fullName;
+            const updatedLabel =
+              repo.updatedAt
+                ? relativeTimeLabel(new Date(repo.updatedAt).getTime())
+                : null;
             return (
               <button
                 key={repo.fullName}
                 type="button"
-                className={"btn-ghost github-repo-item" + (isCloning ? " is-cloning" : "")}
+                className={"github-repo-item" + (isCloning ? " is-cloning" : "")}
                 data-testid={`github-repo-item-${repoName}`}
                 disabled={cloning !== null}
                 onClick={() => onClone(repo)}
                 title={`Clone into ${parent}/${repoName}`}
               >
-                <span className="github-repo-item-name">
-                  {repo.private && <Icon name="Settings" size={12} />}
-                  <span>{repo.fullName}</span>
+                {/* Leading icon */}
+                <span className="github-repo-item-icon">
+                  {repo.private
+                    ? <Icon name="Lock" size={12} />
+                    : <Icon name="BookMarked" size={12} />}
                 </span>
-                {isCloning && (
-                  <span className="github-repo-cloning-hint">
-                    <Icon name="Loader" size={12} />
-                    Cloning…
+
+                {/* Main content */}
+                <span className="github-repo-item-body">
+                  {/* Line 1: owner/name */}
+                  <span className="github-repo-item-name">
+                    <span className="github-repo-item-owner">{owner}</span>
+                    <span className="github-repo-item-reponame">{repoName}</span>
                   </span>
-                )}
-                {repo.description && (
-                  <span className="github-repo-item-desc">{repo.description}</span>
-                )}
+                  {/* Line 2: description — only rendered when present */}
+                  {repo.description && (
+                    <span className="github-repo-item-desc">{repo.description}</span>
+                  )}
+                </span>
+
+                {/* Trailing: updated time at rest, clone affordance / cloning state on hover */}
+                <span className="github-repo-item-trail">
+                  {isCloning ? (
+                    <span className="github-repo-cloning-hint">
+                      <Icon name="Loader" size={11} />
+                      <span>Cloning…</span>
+                    </span>
+                  ) : (
+                    <>
+                      {updatedLabel && (
+                        <span className="github-repo-item-updated">{updatedLabel}</span>
+                      )}
+                      <span className="github-repo-clone-label">Clone</span>
+                    </>
+                  )}
+                </span>
               </button>
             );
           })

@@ -898,22 +898,55 @@ input {
   color: var(--text);
 }
 
+/* Account header bar: check mark + login + disconnect link */
 .github-device-connected-bar {
   display: flex;
   align-items: center;
-  gap: var(--sp2);
+  gap: var(--sp1);
   font-size: var(--type-label);
-  color: var(--text);
+  color: var(--text-faint);
   padding-bottom: var(--sp1);
 }
 
-.github-device-disconnect,
-.github-device-disconnect-inline {
+.github-repo-account-login {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-size: var(--type-label);
-  margin-left: auto;
-  padding: 2px var(--sp2);
+  color: var(--text-dim);
+  font-weight: 510;
 }
 
+/* Disconnect: text-only action, no border — a secondary affordance */
+.github-device-disconnect,
+.github-device-disconnect-inline {
+  flex-shrink: 0;
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: var(--type-meta);
+  color: var(--text-faint);
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  transition: color var(--transition-fast);
+}
+
+.github-device-disconnect:hover,
+.github-device-disconnect-inline:hover {
+  color: var(--text);
+}
+
+.github-device-disconnect:focus-visible,
+.github-device-disconnect-inline:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+/* Repo list container */
 .github-repo-list-wrap {
   display: flex;
   flex-direction: column;
@@ -923,53 +956,169 @@ input {
 .github-repo-list {
   display: flex;
   flex-direction: column;
-  gap: 2px;
-  max-height: min(200px, 40vh);
+  gap: 1px;
+  max-height: min(240px, 45vh);
   overflow-y: auto;
 }
 
+/* Each repo: a clean horizontal row, left-aligned, no pill border */
 .github-repo-item {
   display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 2px;
+  flex-direction: row;
+  align-items: center;
+  gap: var(--sp2);
   width: 100%;
   text-align: left;
-  padding: var(--sp1) var(--sp2);
-  border-radius: var(--radius-sm, 3px);
+  padding: 7px var(--sp2);
+  border: 0;
+  background: transparent;
+  border-radius: var(--radius);
   font-size: var(--type-label);
+  color: var(--text-dim);
+  transition:
+    background-color var(--transition-fast),
+    color var(--transition-fast);
+  cursor: pointer;
+  min-width: 0;
 }
 
-.github-repo-item-name {
+.github-repo-item:hover:not(:disabled) {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.github-repo-item:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: -2px;
+}
+
+.github-repo-item:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+/* Active cloning row: slightly dimmed, others are also dimmed via :disabled */
+.github-repo-item.is-cloning {
+  opacity: 1;
+  color: var(--text);
+  background: var(--surface-hover);
+}
+
+/* Leading icon slot: lock (private) or book (public) */
+.github-repo-item-icon {
+  flex: 0 0 auto;
   display: flex;
   align-items: center;
-  gap: var(--sp1);
-  font-weight: 510;
+  color: var(--text-faint);
 }
 
+/* Body: stacks name line + optional desc line */
+.github-repo-item-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+/* Name line: owner (muted) + reponame (emphasized) */
+.github-repo-item-name {
+  display: flex;
+  align-items: baseline;
+  gap: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: var(--type-label);
+  line-height: 1.4;
+}
+
+.github-repo-item-owner {
+  color: var(--text-faint);
+  font-weight: 400;
+  flex-shrink: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.github-repo-item-reponame {
+  font-weight: 560;
+  color: inherit;
+  flex-shrink: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Description: single line, ellipsis — never overlaps next row */
 .github-repo-item-desc {
-  font-size: var(--type-meta, 11px);
+  font-size: var(--type-meta);
   color: var(--text-faint);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  max-width: 100%;
+  line-height: 1.35;
 }
 
+/* Trailing slot: updated time at rest, clone label on hover */
+.github-repo-item-trail {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: var(--sp1);
+  min-width: 0;
+}
+
+/* Updated timestamp: quiet, secondary */
+.github-repo-item-updated {
+  font-size: var(--type-meta);
+  color: var(--text-faint);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  transition: opacity var(--transition-fast);
+}
+
+/* "Clone" affordance: hidden at rest, revealed on row hover */
+.github-repo-clone-label {
+  font-size: var(--type-meta);
+  color: var(--text-faint);
+  white-space: nowrap;
+  opacity: 0;
+  transition: opacity var(--transition-fast);
+}
+
+.github-repo-item:hover:not(:disabled) .github-repo-clone-label {
+  opacity: 1;
+  color: var(--text-dim);
+}
+
+/* On hover, hide the updated timestamp so only "Clone" shows */
+.github-repo-item:hover:not(:disabled) .github-repo-item-updated {
+  opacity: 0;
+}
+
+/* Cloning state: spinner + "Cloning…" inline */
 .github-repo-cloning-hint {
   display: flex;
   align-items: center;
   gap: var(--sp1);
-  font-size: var(--type-meta, 11px);
+  font-size: var(--type-meta);
   color: var(--text-faint);
+  white-space: nowrap;
+}
+
+/* Empty state for filtered-out results */
+.github-repo-empty {
+  padding: var(--sp2) var(--sp2);
+  font-size: var(--type-label);
+  color: var(--text-faint);
+  text-align: center;
 }
 
 .github-device-unconfigured {
   padding: var(--sp1) 0;
-}
-
-.github-repo-item.is-cloning {
-  opacity: 0.7;
 }
 
 .rail-list {
