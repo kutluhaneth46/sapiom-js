@@ -52,8 +52,7 @@ export interface FolderBrowserProps {
    * that doesn't exist yet (the server walked up to the nearest ancestor).
    * Pass `true` when the typed path is new (parent exists, leaf doesn't),
    * `false` when the typed path resolved to itself or the input was cleared.
-   * This mirrors DirectoryPicker's `onNewDirChange` so the parent can gate
-   * scaffold / scan / "Add project" actions the same way.
+   * The parent can use this to gate scaffold / scan / "Add project" actions.
    */
   onNewDirChange?: (isNew: boolean) => void;
 }
@@ -63,7 +62,8 @@ export interface FolderBrowserProps {
 // ---------------------------------------------------------------------------
 
 /**
- * Browse-first folder picker for the "Open Folder" (workspace-connect) flow.
+ * Browse-first folder picker used in the "Open Folder", new-session, and
+ * template-use flows.
  *
  * Layout, top to bottom:
  *   1. Favorites row (Home / Desktop / Documents / Downloads) + Recents chips
@@ -71,9 +71,6 @@ export interface FolderBrowserProps {
  *   3. Folder list — click a subfolder to drill in
  *   4. "Open this folder" primary button
  *   5. Secondary "or type a path" collapsible input
- *
- * This is a SEPARATE component from DirectoryPicker so the other call sites
- * (new-session modal session mode, command-palette) are not affected.
  */
 export function FolderBrowser({
   value,
@@ -91,7 +88,7 @@ export function FolderBrowser({
   const [error, setError] = useState<string | null>(null);
   const [retryNonce, setRetryNonce] = useState(0);
   // Tracks whether the currently selected path is a new (non-existent)
-  // directory typed by the user — mirrors DirectoryPicker's newDirTyped signal.
+  // directory typed by the user via the "or type a path" secondary input.
   const [newDirTyped, setNewDirTyped] = useState(false);
 
   // Favorites: after first mount we probe each favorite and keep only the
@@ -138,7 +135,7 @@ export function FolderBrowser({
     setLoading(true);
     setError(null);
 
-    /** Compute the parent of a path (mirrors DirectoryPicker's parentOf). */
+    /** Compute the parent of a path. */
     const parentOf = (p: string): string | null => {
       const trimmed = p.replace(/\/+$/, "");
       const cut = trimmed.slice(0, trimmed.lastIndexOf("/"));
@@ -154,19 +151,40 @@ export function FolderBrowser({
           setParent(res.parent);
           setDirs(res.dirs);
 
-          // Detect whether the user typed a path that doesn't exist yet: the
-          // server walks up to the nearest real ancestor, so res.path will
-          // differ from the originally requested path when the leaf is new.
-          const isNew = requestedTypedPath != null && res.path !== requestedTypedPath;
+          // Detect whether the path that was requested doesn't exist yet: the
+          // server walks up to the nearest real ancestor, so res.path differs
+          // from the originally requested path when the leaf is new.
+          //
+          // Two entry-points produce a non-existent path:
+          //   1. The user types one via "or type a path" — requestedTypedPath
+          //      holds the raw input.
+          //   2. The initial value passed by the parent is an absolute path that
+          //      doesn't exist yet (e.g. a suggested template destination).
+          //      In this case requestedTypedPath is null, but browsePath is an
+          //      absolute path whose tail didn't exist. We detect this by checking
+          //      that browsePath starts with "/" (absolute), res.path is a proper
+          //      ancestor of browsePath, and the response walked up (not just
+          //      expanded a tilde alias).
+          const walkedUp = res.path !== browsePath;
+          const isAbsoluteWalkUp =
+            requestedTypedPath == null &&
+            walkedUp &&
+            browsePath.startsWith("/") &&
+            browsePath.startsWith(res.path + "/");
+          const isNew =
+            requestedTypedPath != null
+              ? walkedUp && res.path !== requestedTypedPath
+              : isAbsoluteWalkUp;
           if (isNew) {
-            // The typed path is new — keep the original typed value as the
+            // The path is new — keep the original requested value as the
             // controlled value so the parent's submit / scaffold use it, while
             // the browser shows the resolved ancestor's listing.
             setNewDirTyped(true);
-            onChange(requestedTypedPath);
+            // Use the typed path if available, otherwise the original browsePath.
+            onChange(requestedTypedPath ?? browsePath);
           } else {
-            // Resolved to an existing directory (browse navigation or typed
-            // path that already exists) — sync normally.
+            // Resolved to an existing directory (browse navigation, tilde
+            // expansion, or typed path that already exists) — sync normally.
             setNewDirTyped(false);
             onChange(res.path);
           }
@@ -174,16 +192,15 @@ export function FolderBrowser({
         })
         .catch(async () => {
           // B1: The real server returns 404 for non-existent paths (unlike the
-          // mock which walks up itself).  Mirror DirectoryPicker's ancestor
-          // fallback: retry the parent so a typed new-folder path still shows
-          // the scaffold CTA instead of an error.
-          if (requestedTypedPath == null) {
-            // Not a typed navigation — show the error as-is.
+          // mock which walks up itself).  Ancestor fallback: retry the parent
+          // for typed paths and absolute initial values so a new-folder path
+          // still shows the scaffold CTA instead of an error.
+          const canRetry = requestedTypedPath != null || browsePath.startsWith("/");
+          if (!canRetry) {
+            // Tilde-relative path that the real server can't read — show error.
             if (!cancelled) {
               setError("Couldn't read that directory.");
-              // B2: clear any stale new-dir flag so the parent doesn't keep
-              // the "Add project" button disabled.
-              onNewDirChange?.(false);
+              onNewDirChange?.(false); // B2
             }
             return;
           }
@@ -198,12 +215,13 @@ export function FolderBrowser({
           try {
             const res = await listDir(up);
             if (cancelled) return;
-            // Parent exists — the typed path is a new directory.
+            // Parent exists — the requested path is a new directory.
             setBrowsePath(res.path);
             setParent(res.parent);
             setDirs(res.dirs);
             setNewDirTyped(true);
-            onChange(requestedTypedPath);
+            // Preserve the original path (typed or initial absolute value).
+            onChange(requestedTypedPath ?? browsePath);
             onNewDirChange?.(true);
           } catch {
             if (!cancelled) {
