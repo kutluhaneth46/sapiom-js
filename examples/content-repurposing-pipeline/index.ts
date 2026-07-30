@@ -128,6 +128,8 @@ const DEFAULT_NUM_QUOTES = 2;
 const MAX_QUOTES = 4;
 /** Username for the inbox we send from (created once, then reused). */
 const SENDER_USERNAME = "content-repurposing";
+const TRANSIENT_IMAGE_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
+const MAX_ERROR_MESSAGE_LENGTH = 4_096;
 
 /** Title paired with `SAMPLE_SOURCE`. */
 const SAMPLE_TITLE = "Why small teams ship faster";
@@ -153,6 +155,108 @@ function clampQuotes(n: number | undefined): number {
 function must<T>(v: T | undefined, name: string): T {
   if (v === undefined) throw new Error(`missing shared state: ${name}`);
   return v;
+}
+
+function numericStatus(value: unknown): number | undefined {
+  const status =
+    typeof value === "number"
+      ? value
+      : typeof value === "string" && value.trim()
+        ? Number(value)
+        : Number.NaN;
+  return Number.isInteger(status) ? status : undefined;
+}
+
+function isAsciiWordChar(char: string | undefined): boolean {
+  if (!char) return false;
+  const code = char.charCodeAt(0);
+  return (
+    (code >= 48 && code <= 57) ||
+    (code >= 65 && code <= 90) ||
+    code === 95 ||
+    (code >= 97 && code <= 122)
+  );
+}
+
+function skipWhitespace(value: string, start: number): number {
+  let cursor = start;
+  while (
+    cursor < value.length &&
+    (value[cursor] === " " ||
+      value[cursor] === "\t" ||
+      value[cursor] === "\n" ||
+      value[cursor] === "\r" ||
+      value[cursor] === "\f")
+  ) {
+    cursor += 1;
+  }
+  return cursor;
+}
+
+/** Parse common HTTP/status-code phrases without a backtracking regular expression. */
+function hasTransientStatus(message: string): boolean {
+  const value = message.slice(0, MAX_ERROR_MESSAGE_LENGTH).toLowerCase();
+
+  for (const marker of ["http", "status"]) {
+    let searchFrom = 0;
+    while (searchFrom < value.length) {
+      const markerIndex = value.indexOf(marker, searchFrom);
+      if (markerIndex === -1) break;
+      searchFrom = markerIndex + marker.length;
+
+      if (
+        isAsciiWordChar(value[markerIndex - 1]) ||
+        isAsciiWordChar(value[searchFrom])
+      ) {
+        continue;
+      }
+
+      let cursor = skipWhitespace(value, searchFrom);
+      if (
+        marker === "status" &&
+        value.startsWith("code", cursor) &&
+        !isAsciiWordChar(value[cursor + 4])
+      ) {
+        cursor = skipWhitespace(value, cursor + 4);
+      }
+      if (value[cursor] === ":" || value[cursor] === "=") {
+        cursor = skipWhitespace(value, cursor + 1);
+      }
+
+      const codeText = value.slice(cursor, cursor + 3);
+      const code = Number(codeText);
+      if (
+        codeText.length === 3 &&
+        Number.isInteger(code) &&
+        !isAsciiWordChar(value[cursor + 3]) &&
+        TRANSIENT_IMAGE_STATUSES.has(code)
+      ) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+/** Prefer structured HTTP status and use message parsing only as a narrow fallback. */
+export function isTransientImageError(error: unknown): boolean {
+  if (error && typeof error === "object") {
+    const direct = numericStatus((error as { status?: unknown }).status);
+    const nested = numericStatus(
+      (error as { response?: { status?: unknown } }).response?.status,
+    );
+    const status = direct ?? nested;
+    if (status !== undefined) return TRANSIENT_IMAGE_STATUSES.has(status);
+  }
+
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    hasTransientStatus(message) ||
+    /application error|network|socket|timed?\s*out|temporar/i.test(
+      message.slice(0, MAX_ERROR_MESSAGE_LENGTH),
+    )
+  );
 }
 
 /**
@@ -380,13 +484,34 @@ const graphics = defineStep({
     // persists each output so we get a durable `fileId` + a ready-to-use URL to
     // hand the clip step as its start frame and to link from the pack.
     const generated = await Promise.all(
-      pack.quoteGraphics.map((q) =>
-        ctx.sapiom.contentGeneration.images.create({
-          prompt: q.imagePrompt,
-          numImages: 1,
-          storage: { visibility: "private" },
-        }),
-      ),
+      pack.quoteGraphics.map(async (q, index) => {
+        const maxAttempts = 3;
+        for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+          try {
+            return await ctx.sapiom.contentGeneration.images.create({
+              prompt: q.imagePrompt,
+              numImages: 1,
+              storage: { visibility: "private" },
+            });
+          } catch (error) {
+            const message =
+              error instanceof Error ? error.message : String(error);
+            const transient = isTransientImageError(error);
+            if (!transient || attempt === maxAttempts) throw error;
+
+            const delayMs = 500 * 2 ** (attempt - 1);
+            ctx.logger.warn("transient image generation failure; retrying", {
+              quote: index + 1,
+              attempt,
+              maxAttempts,
+              delayMs,
+              error: message.slice(0, 500),
+            });
+            await new Promise((resolve) => setTimeout(resolve, delayMs));
+          }
+        }
+        throw new Error("unreachable image retry state");
+      }),
     );
     const results: Graphic[] = generated.map((result, i) => {
       const img = result.images?.[0];
