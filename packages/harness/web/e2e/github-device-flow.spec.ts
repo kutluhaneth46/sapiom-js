@@ -23,11 +23,21 @@ test.beforeEach(async ({ page }) => {
   await expect(page.locator(".rail-workflows")).toBeVisible();
 });
 
+/** Navigate + → Connect to GitHub door → AddProjectMenu → GitHub button. */
+async function openGitHubDeviceFlow(page: import("@playwright/test").Page): Promise<void> {
+  await page.getByTestId("add-workspace").click();
+  await expect(page.getByTestId("add-menu")).toBeVisible();
+  await page.getByTestId("aw-door-github").click();
+  await expect(page.getByTestId("add-project-menu")).toBeVisible();
+  await page.getByTestId("add-project-connect-github").click();
+}
+
 test.describe("GitHub Device Flow", () => {
   test('clicking "Connect to GitHub" shows the Device Flow panel', async ({
     page,
   }) => {
     await page.getByTestId("add-workspace").click();
+    await page.getByTestId("aw-door-github").click();
     await expect(page.getByTestId("add-project-menu")).toBeVisible();
 
     await page.getByTestId("add-project-connect-github").click();
@@ -39,8 +49,7 @@ test.describe("GitHub Device Flow", () => {
   });
 
   test("device start shows user code, clipboard hint, and Open GitHub fallback button", async ({ page }) => {
-    await page.getByTestId("add-workspace").click();
-    await page.getByTestId("add-project-connect-github").click();
+    await openGitHubDeviceFlow(page);
     await expect(page.getByTestId("github-device-start")).toBeVisible({ timeout: 5000 });
 
     await page.getByTestId("github-device-start").click();
@@ -59,8 +68,7 @@ test.describe("GitHub Device Flow", () => {
   test("polling auto-starts after deviceStart → authorized → shows login + Browse repos (no Open click needed)", async ({
     page,
   }) => {
-    await page.getByTestId("add-workspace").click();
-    await page.getByTestId("add-project-connect-github").click();
+    await openGitHubDeviceFlow(page);
     await expect(page.getByTestId("github-device-start")).toBeVisible({ timeout: 5000 });
 
     await page.getByTestId("github-device-start").click();
@@ -77,8 +85,7 @@ test.describe("GitHub Device Flow", () => {
   test("Browse repos shows the repo list → pick one → mock clone → repo in rail", async ({
     page,
   }) => {
-    await page.getByTestId("add-workspace").click();
-    await page.getByTestId("add-project-connect-github").click();
+    await openGitHubDeviceFlow(page);
     await expect(page.getByTestId("github-device-start")).toBeVisible({ timeout: 5000 });
 
     await page.getByTestId("github-device-start").click();
@@ -102,8 +109,7 @@ test.describe("GitHub Device Flow", () => {
   });
 
   test("repo list search filters correctly", async ({ page }) => {
-    await page.getByTestId("add-workspace").click();
-    await page.getByTestId("add-project-connect-github").click();
+    await openGitHubDeviceFlow(page);
     await expect(page.getByTestId("github-device-start")).toBeVisible({ timeout: 5000 });
     await page.getByTestId("github-device-start").click();
     await expect(page.getByTestId("github-device-code")).toBeVisible({ timeout: 5000 });
@@ -125,8 +131,7 @@ test.describe("GitHub Device Flow", () => {
   });
 
   test("Disconnect button in repo list reverts to idle", async ({ page }) => {
-    await page.getByTestId("add-workspace").click();
-    await page.getByTestId("add-project-connect-github").click();
+    await openGitHubDeviceFlow(page);
     await expect(page.getByTestId("github-device-start")).toBeVisible({ timeout: 5000 });
     await page.getByTestId("github-device-start").click();
     await expect(page.getByTestId("github-device-code")).toBeVisible({ timeout: 5000 });
@@ -147,8 +152,7 @@ test.describe("GitHub Device Flow", () => {
     await page.goto("/?seed=0&mockError=githubPollDenied");
     await expect(page.locator(".rail-workflows")).toBeVisible();
 
-    await page.getByTestId("add-workspace").click();
-    await page.getByTestId("add-project-connect-github").click();
+    await openGitHubDeviceFlow(page);
     await expect(page.getByTestId("github-device-start")).toBeVisible({ timeout: 5000 });
     await page.getByTestId("github-device-start").click();
     await expect(page.getByTestId("github-device-code")).toBeVisible({ timeout: 5000 });
@@ -163,8 +167,7 @@ test.describe("GitHub Device Flow", () => {
     await page.goto("/?seed=0&mockError=githubPollExpired");
     await expect(page.locator(".rail-workflows")).toBeVisible();
 
-    await page.getByTestId("add-workspace").click();
-    await page.getByTestId("add-project-connect-github").click();
+    await openGitHubDeviceFlow(page);
     await expect(page.getByTestId("github-device-start")).toBeVisible({ timeout: 5000 });
     await page.getByTestId("github-device-start").click();
     await expect(page.getByTestId("github-device-code")).toBeVisible({ timeout: 5000 });
@@ -181,8 +184,7 @@ test.describe("GitHub Device Flow", () => {
     await page.goto("/?seed=0&mockError=githubNotConfigured");
     await expect(page.locator(".rail-workflows")).toBeVisible();
 
-    await page.getByTestId("add-workspace").click();
-    await page.getByTestId("add-project-connect-github").click();
+    await openGitHubDeviceFlow(page);
 
     // Should show the unconfigured state.
     await expect(page.getByTestId("github-device-unconfigured")).toBeVisible({ timeout: 5000 });
@@ -190,8 +192,7 @@ test.describe("GitHub Device Flow", () => {
   });
 
   test("back button returns to the menu", async ({ page }) => {
-    await page.getByTestId("add-workspace").click();
-    await page.getByTestId("add-project-connect-github").click();
+    await openGitHubDeviceFlow(page);
     await expect(page.getByTestId("github-device-connect")).toBeVisible({ timeout: 5000 });
 
     await page.getByRole("button", { name: "Back to menu" }).click();

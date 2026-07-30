@@ -1,11 +1,12 @@
 /**
- * E2E tests for the Workspace "+" add-project menu:
- *  - The "+" opens the menu with exactly "Open Folder" and "Connect to GitHub".
- *  - "Open Folder" closes the menu and opens the existing NewSessionModal
- *    (workspace mode).
- *  - "Connect to GitHub" opens the Device Flow panel (primary path in mock mode).
- *    The URL-paste form (ConnectGitHubForm) remains as a fallback view accessed
- *    via the Device Flow's "unconfigured" state — not as the direct click target.
+ * E2E tests for the "Connect to GitHub" door in the Workspace "+" Add menu.
+ *
+ *  - The "+" opens the integrated Add menu (three workspace doors + New session
+ *    + Connect to GitHub).
+ *  - The "Connect to GitHub" door opens the AddProjectMenu sub-popover with
+ *    Device Flow (primary) or URL-paste (fallback).
+ *  - "Open Folder" inside AddProjectMenu closes it and opens the Add workspace
+ *    dialog at the "have" door.
  *
  * Runs against `vite dev` with VITE_MOCK=1 — no server, no real git clone.
  */
@@ -16,15 +17,24 @@ test.beforeEach(async ({ page }) => {
   await expect(page.locator(".rail-workflows")).toBeVisible();
 });
 
+/** Helper: navigate from + → aw-door-github → add-project-menu is visible. */
+async function openGitHubSubMenu(page: import("@playwright/test").Page): Promise<void> {
+  await page.getByTestId("add-workspace").click();
+  await expect(page.getByTestId("add-menu")).toBeVisible();
+  await page.getByTestId("aw-door-github").click();
+  await expect(page.getByTestId("add-project-menu")).toBeVisible();
+}
+
 test.describe("add-project menu", () => {
   test('clicking "+" opens a menu with exactly two items: Open Folder and Connect to GitHub', async ({
     page,
   }) => {
-    await page.getByTestId("add-workspace").click();
+    // The + now opens the integrated Add menu — navigate to the GitHub sub-menu.
+    await openGitHubSubMenu(page);
     const menu = page.getByTestId("add-project-menu");
     await expect(menu).toBeVisible();
 
-    // The menu must have exactly these two items and nothing else.
+    // The GitHub sub-menu has exactly "Open Folder" and "Connect to GitHub".
     const openFolderBtn = page.getByTestId("add-project-open-folder");
     const connectGitHubBtn = page.getByTestId("add-project-connect-github");
     await expect(openFolderBtn).toBeVisible();
@@ -38,8 +48,7 @@ test.describe("add-project menu", () => {
   test('"Open Folder" closes the menu and opens the folder connect modal', async ({
     page,
   }) => {
-    await page.getByTestId("add-workspace").click();
-    await expect(page.getByTestId("add-project-menu")).toBeVisible();
+    await openGitHubSubMenu(page);
 
     await page.getByTestId("add-project-open-folder").click();
 
@@ -47,14 +56,14 @@ test.describe("add-project menu", () => {
     await expect(page.getByTestId("add-project-menu")).not.toBeVisible();
 
     // The "Add workspace" modal (workspace mode, role=dialog) is open.
-    const modal = page.getByRole("dialog", { name: "Add workspace" });
+    const modal = page.locator(".modal-add-workspace");
     await expect(modal).toBeVisible();
   });
 
   test('"Connect to GitHub" shows the Device Flow panel inside the menu', async ({
     page,
   }) => {
-    await page.getByTestId("add-workspace").click();
+    await openGitHubSubMenu(page);
     await page.getByTestId("add-project-connect-github").click();
 
     // The Device Flow panel is the primary view — not the URL-paste form.
@@ -66,7 +75,7 @@ test.describe("add-project menu", () => {
   test("Connect to GitHub: Device Flow → authorized → browse → clone adds repo to rail", async ({
     page,
   }) => {
-    await page.getByTestId("add-workspace").click();
+    await openGitHubSubMenu(page);
     await page.getByTestId("add-project-connect-github").click();
     await expect(page.getByTestId("github-device-start")).toBeVisible({ timeout: 5000 });
 
@@ -97,7 +106,7 @@ test.describe("add-project menu", () => {
     await page.goto("/?seed=0&mockError=githubNotConfigured");
     await expect(page.locator(".rail-workflows")).toBeVisible();
 
-    await page.getByTestId("add-workspace").click();
+    await openGitHubSubMenu(page);
     await page.getByTestId("add-project-connect-github").click();
 
     // The Device Flow panel shows the unconfigured hint.
@@ -105,7 +114,7 @@ test.describe("add-project menu", () => {
   });
 
   test("Back button in the Device Flow panel returns to the menu items", async ({ page }) => {
-    await page.getByTestId("add-workspace").click();
+    await openGitHubSubMenu(page);
     await page.getByTestId("add-project-connect-github").click();
     await expect(page.getByTestId("github-device-connect")).toBeVisible({ timeout: 5000 });
 
@@ -118,7 +127,7 @@ test.describe("add-project menu", () => {
   });
 
   test("Escape or outside click dismisses the menu", async ({ page }) => {
-    await page.getByTestId("add-workspace").click();
+    await openGitHubSubMenu(page);
     await expect(page.getByTestId("add-project-menu")).toBeVisible();
 
     await page.keyboard.press("Escape");
