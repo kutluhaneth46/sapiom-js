@@ -327,7 +327,9 @@ const render = defineStep({
     const client = ctx.shared.get("client") ?? {};
 
     const fileName = `${quoteNumber}.pdf`;
-    const boxName = `proposal-${quoteNumber.toLowerCase()}`;
+    // A retried render must never collide with the failed attempt's sandbox.
+    // `ctx.attempts` is stable within one attempt and increments on step retry.
+    const boxName = `proposal-${quoteNumber.toLowerCase()}-a${ctx.attempts}`;
     const proposalJson = JSON.stringify({
       quoteNumber,
       currency,
@@ -336,30 +338,43 @@ const render = defineStep({
       draft: draftDoc,
       totals,
     });
+    const renderDir = `render-a${ctx.attempts}`;
 
     // Lay out the PDF in a throwaway sandbox, then read the bytes back as base64.
     // A sandbox is torn down in `finally` so a render failure never leaks compute.
     let pdfBase64 = "";
     const box = await ctx.sapiom.sandboxes.create({ name: boxName });
     try {
-      await box.writeFile("proposal.json", proposalJson);
-      await box.writeFile("render.mjs", RENDER_SCRIPT);
-      // Install the (pure-JS) PDF library and render. `--no-save` keeps it out of
-      // a package.json we don't ship; errors surface via a non-zero exit below.
+      // Keep file writes and process execution in one explicit directory under
+      // the sandbox workspace. This avoids both the old cwd mismatch and putting
+      // the generated proposal on a shell command line.
+      await box.exec(`mkdir -p ${renderDir}`);
+      await box.writeFile(`${renderDir}/proposal.json`, proposalJson);
+      await box.writeFile(`${renderDir}/render.mjs`, RENDER_SCRIPT);
       const built = await box.exec(
-        `npm install --no-save --no-audit --no-fund --loglevel=error ${PDF_PACKAGE} && node render.mjs`,
-        { timeout: 180_000 },
+        [
+          `npm install --no-save --no-audit --no-fund --loglevel=error ${PDF_PACKAGE}`,
+          "node render.mjs",
+        ].join(" && "),
+        { cwd: renderDir, timeout: 180_000 },
       );
       if (built.exitCode !== 0) {
         ctx.logger.error("pdf render failed", {
           exitCode: built.exitCode,
-          stderr: built.stderr.slice(-500),
+          stderr: built.stderr.slice(-4_000),
+          stdout: built.stdout.slice(-2_000),
+          sandbox: boxName,
         });
-        throw new Error(`PDF render failed (exit ${built.exitCode})`);
+        throw new Error(
+          `PDF render failed in ${boxName} (exit ${built.exitCode}): ${built.stderr.slice(-1_000)}`,
+        );
       }
       // Read the PDF as base64 so binary bytes survive the text-only exec channel.
       const read = await box.exec(
         `base64 -w0 ${fileName} || base64 ${fileName}`,
+        {
+          cwd: renderDir,
+        },
       );
       pdfBase64 = read.stdout.replace(/\s+/g, "");
     } finally {

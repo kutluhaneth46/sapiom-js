@@ -16,7 +16,7 @@ import { VIDEO_RESULT_SIGNAL, type VideoResultPayload } from "@sapiom/tools";
  * separates a Sapiom agent from a plain script:
  *
  *   decompose ─▶ keyframes ─▶ animate ⇄ collect ─▶ stitch ─▶ finalize
- *   (models.run) (images.create) (video.launch)   (drain)  (video.launch) (terminal)
+ *   (models.run) (images.create) (video.launch)   (drain)  (video.create) (terminal)
  *
  *   1. decompose — an LLM (`ctx.sapiom.models.run`) turns the scene into a global
  *      style/identity "bible" plus an ordered shot list.
@@ -27,10 +27,10 @@ import { VIDEO_RESULT_SIGNAL, type VideoResultPayload } from "@sapiom/tools";
  *      `collect` when that clip is ready.
  *   4. collect — record the finished clip, then loop back to `animate` for the
  *      next shot, or advance to `stitch` once every clip is in.
- *   5. stitch — concat the N clips into one video (a FAL ffmpeg-merge job), again
- *      async: pause on it and resume at `finalize`.
- *   6. finalize — terminal; return the stitched video's durable `videoFileId` +
- *      `downloadUrl`.
+ *   5. stitch — concat the N clips with FAL's synchronous merge endpoint; the
+ *      SDK's bounded poll fallback handles an unexpected queue.
+ *   6. finalize — terminal; return the stitched video's `videoFileId` when
+ *      persistence succeeded, plus the available `downloadUrl`.
  *
  * Why sequential animate rather than launching all clips at once: a paused step
  * waits on a single `(signal, correlationId)` pair. Launching every clip up front
@@ -48,7 +48,7 @@ interface Shot {
   image_prompt: string;
   /** Motion prompt for the clip: subject → action → camera → duration → lighting → style. */
   motion_prompt: string;
-  /** Clip length in seconds (kept short, ≤10s). */
+  /** Clip length in seconds (Kling 2.1 Pro accepts only 5 or 10). */
   duration: number;
   /** Transition into the next shot (e.g. "cut", "dissolve"). */
   transition: string;
@@ -68,7 +68,7 @@ interface Keyframe {
 }
 
 /** A finished clip, as recorded by `collect` from a resumed video job. */
-interface Clip {
+export interface Clip {
   fileId?: string;
   downloadUrl?: string;
 }
@@ -120,6 +120,15 @@ const DEFAULT_NUM_SHOTS = 3;
 const MAX_SHOTS = 6;
 /** Per-clip cap (seconds) — image-to-video models animate short clips best. */
 const MAX_CLIP_SECONDS = 10;
+const SHORT_CLIP_SECONDS = 5;
+
+/** Normalize an authored/model-proposed duration to the nearest Kling enum. */
+export function normalizeClipDuration(duration: number | undefined): number {
+  if (typeof duration !== "number" || !Number.isFinite(duration)) {
+    return MAX_CLIP_SECONDS;
+  }
+  return duration < 7.5 ? SHORT_CLIP_SECONDS : MAX_CLIP_SECONDS;
+}
 
 function clampShots(n: number | undefined): number {
   if (typeof n !== "number" || !Number.isFinite(n)) return DEFAULT_NUM_SHOTS;
@@ -129,6 +138,31 @@ function clampShots(n: number | undefined): number {
 function must<T>(v: T | undefined, name: string): T {
   if (v === undefined) throw new Error(`missing shared state: ${name}`);
   return v;
+}
+
+/** Resolve every clip without losing the identity associated with its URL. */
+export async function resolveClipInputs(
+  clips: readonly Clip[],
+  getDownloadUrl: (fileId: string) => Promise<{ downloadUrl: string }>,
+): Promise<Array<{ clip: Clip; url: string }>> {
+  if (clips.length === 0) {
+    throw new Error("cannot stitch scene: no clips were collected");
+  }
+  return await Promise.all(
+    clips.map(async (clip, index) => {
+      const url = clip.downloadUrl
+        ? clip.downloadUrl
+        : clip.fileId
+          ? (await getDownloadUrl(clip.fileId)).downloadUrl
+          : "";
+      if (!url) {
+        throw new Error(
+          `cannot stitch scene: clip ${index + 1} has no usable download URL`,
+        );
+      }
+      return { clip, url };
+    }),
+  );
 }
 
 /**
@@ -167,10 +201,7 @@ function parsePlan(
     const shots: Shot[] = rawShots.slice(0, MAX_SHOTS).map((s, i): Shot => {
       const shot = (s ?? {}) as Partial<Shot>;
       const dflt = fallback.shots[Math.min(i, fallback.shots.length - 1)];
-      const duration =
-        typeof shot.duration === "number" && Number.isFinite(shot.duration)
-          ? Math.max(1, Math.min(MAX_CLIP_SECONDS, shot.duration))
-          : dflt.duration;
+      const duration = normalizeClipDuration(shot.duration);
       return {
         image_prompt:
           typeof shot.image_prompt === "string" && shot.image_prompt.trim()
@@ -221,7 +252,7 @@ const decompose = defineStep({
       "color, lighting, and lens) and an ordered list of shots. Repeat the bible VERBATIM at " +
       "the start of every shot's image_prompt so keyframes stay consistent. Order each " +
       "motion_prompt as subject -> action -> camera -> duration -> lighting -> style. " +
-      `Return between 1 and ${numShots} shots, each clip <= ${MAX_CLIP_SECONDS}s. ` +
+      `Return between 1 and ${numShots} shots; duration must be exactly ${SHORT_CLIP_SECONDS} or ${MAX_CLIP_SECONDS} seconds. ` +
       "Reply with ONLY minified JSON: " +
       '{"bible":string,"shots":[{"image_prompt":string,"motion_prompt":string,"duration":number,"transition":string}]}.';
     const prompt = `Scene: ${scene}\nNumber of shots: ${numShots}\nAspect ratio: ${aspectRatio}`;
@@ -316,16 +347,16 @@ const animate = defineStep({
     const model = ctx.shared.get("model") ?? DEFAULT_VIDEO_MODEL;
 
     ctx.logger.info("animating shot", { index: index + 1, of: shots.length });
-    // Launch the image-to-video job and pause the step on its result signal. A
-    // fixed seed + the shared aspect ratio keep the clips visually consistent.
+    // Launch the image-to-video job and pause on its result signal when queued.
+    // The shared aspect ratio keeps clips visually consistent. Kling 2.1 Pro
+    // accepts duration only as "5" or "10" and does not accept a seed parameter.
     const handle = await ctx.sapiom.contentGeneration.video.launch({
       model,
       prompt: shot.motion_prompt,
       params: {
         image_url: imageUrl,
-        duration: shot.duration,
+        duration: String(normalizeClipDuration(shot.duration)),
         aspect_ratio: must(ctx.shared.get("aspectRatio"), "aspectRatio"),
-        seed: 42,
       },
       storage: { visibility: "private" },
     });
@@ -342,6 +373,12 @@ const collect = defineStep({
     const index = must(ctx.shared.get("animateIndex"), "animateIndex");
 
     const out = result.outputs?.[0];
+    if (!out?.fileId && !out?.downloadUrl) {
+      const storageError = out?.storageError ? `: ${out.storageError}` : "";
+      throw new Error(
+        `video generation completed without a usable output for shot ${index + 1}${storageError}`,
+      );
+    }
     const clip: Clip = {
       ...(out?.fileId !== undefined && { fileId: out.fileId }),
       ...(out?.downloadUrl !== undefined && { downloadUrl: out.downloadUrl }),
@@ -362,30 +399,73 @@ const collect = defineStep({
 
 const stitch = defineStep({
   name: "stitch",
-  next: [],
-  // Stitching is another async video job (FAL ffmpeg merge): pause on its result
-  // and resume at `finalize` with the stitched video.
-  pause: { signal: VIDEO_RESULT_SIGNAL, resumeStep: "finalize" },
+  next: ["finalize"],
+  // FAL ffmpeg merge is contractually synchronous today. `create()` returns
+  // immediately for that shape; its explicit 12-minute bound only covers an
+  // unexpected queue and stays below the runner's 15-minute step deadline.
   async run(_input: unknown, ctx: AgentExecutionContext<Shared>) {
     const scene = must(ctx.shared.get("scene"), "scene");
     const clips = must(ctx.shared.get("clips"), "clips");
     // Ready-to-use URLs for the merge input. For a longer-lived reference re-mint
     // from each clip's `fileId` via `ctx.sapiom.fileStorage.getDownloadUrl(fileId)`.
-    const videoUrls = clips
-      .map((c) => c.downloadUrl)
-      .filter((u): u is string => Boolean(u));
-    ctx.logger.info("stitching clips", { clips: videoUrls.length });
+    const resolved = await resolveClipInputs(
+      clips,
+      async (fileId) => await ctx.sapiom.fileStorage.getDownloadUrl(fileId),
+    );
+    const videoUrls = resolved.map(({ url }) => url);
+    ctx.logger.info("stitching clips", { clips: resolved.length });
 
-    // `prompt` is required by the capability guard; the merge endpoint ignores it,
-    // so we pass the scene for traceability. `video_urls` is the FAL merge input,
-    // forwarded verbatim via `params`.
-    const handle = await ctx.sapiom.contentGeneration.video.launch({
+    // FAL's merge endpoint requires at least two URLs. A one-shot scene is
+    // already a finished video, so bypass the merge rather than making an
+    // invalid request.
+    if (clips.length === 1) {
+      const only = resolved[0];
+      ctx.logger.info("single clip scene — bypassing merge");
+      return goto("finalize", {
+        outputs: [
+          {
+            ...(only.clip.fileId !== undefined && {
+              fileId: only.clip.fileId,
+            }),
+            downloadUrl: only.url,
+          },
+        ],
+      });
+    }
+
+    const merged = await ctx.sapiom.contentGeneration.video.create({
       model: MERGE_MODEL,
       prompt: scene,
       params: { video_urls: videoUrls },
       storage: { visibility: "private" },
+      timeoutMs: 12 * 60_000,
     });
-    return await pauseUntilSignal(handle, { resumeStep: "finalize" });
+    if (
+      !merged.video?.fileId &&
+      !merged.video?.downloadUrl &&
+      !merged.video?.url
+    ) {
+      throw new Error(
+        `video merge completed without a usable output${merged.video?.storageError ? `: ${merged.video.storageError}` : ""}`,
+      );
+    }
+    const downloadUrl = merged.video.downloadUrl ?? merged.video.url;
+    return goto("finalize", {
+      outputs: [
+        {
+          ...(merged.video.fileId !== undefined && {
+            fileId: merged.video.fileId,
+          }),
+          ...(downloadUrl !== undefined && { downloadUrl }),
+          ...(merged.video.downloadUrlExpiresAt !== undefined && {
+            downloadUrlExpiresAt: merged.video.downloadUrlExpiresAt,
+          }),
+          ...(merged.video.storageError !== undefined && {
+            storageError: merged.video.storageError,
+          }),
+        },
+      ],
+    });
   },
 });
 
@@ -398,7 +478,8 @@ const finalize = defineStep({
     const out = result.outputs?.[0];
     ctx.logger.info("pipeline complete", {
       shots: shots.length,
-      hasVideo: Boolean(out?.fileId),
+      hasVideo: Boolean(out?.fileId || out?.downloadUrl),
+      durable: Boolean(out?.fileId),
     });
     return terminate({
       videoFileId: out?.fileId ?? null,

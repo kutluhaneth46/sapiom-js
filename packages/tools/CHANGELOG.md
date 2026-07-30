@@ -1,5 +1,27 @@
 # @sapiom/tools
 
+## 0.24.0
+
+### Minor Changes
+
+- a1e0e4f: Add `database.list()` to the `database` capability — a thin, read-only listing over `GET /v1/databases` that returns every database you own, each with connection credentials. It never creates, mutates, or removes anything. Use it to discover a handle you (or another of your workflows) already provisioned before deciding whether to reuse it. Available on the client (`sapiom.database.list()`) and as an ambient function (`import { database } from "@sapiom/tools"`).
+
+## 0.23.0
+
+### Minor Changes
+
+- 55cde7f: Add the `browserAutomation` capability with sessions, screenshots, and identity management:
+
+  - `browserAutomation.sessions.create()` — open a browser session; returns a `BrowserSession` with a CDP WebSocket (`cdpUrl`) for Playwright/Puppeteer.
+  - `browserAutomation.sessions.createWithIdentity({ identityId })` — open a session pre-authenticated with a stored identity.
+  - `browserAutomation.sessions.close(sessionId)` — close a session and settle its billing; returns a `SessionSettlement` with `capturedAmountUsd` and `creditsUsed`.
+  - `browserAutomation.screenshot(input)` — one-shot screenshot (`url` required, billed at `$0.01`) or session-mode screenshot (`sessionId` provided, no per-call charge). The returned `url` is an absolute hosted image URL.
+  - `browserAutomation.withSession(fn, opts?)` — the recommended pattern: opens a session, invokes `fn(activeSession)`, and always closes in a `finally` block so sessions never leak at the $1.00 ceiling. The `activeSession` carries all `BrowserSession` fields plus a session-bound `screenshot` convenience.
+  - `browserAutomation.identities.create(input)` — store credentials for automatic login during sessions (free).
+  - `BrowserAutomationHttpError` (`{ status, body }`) — thrown on non-2xx responses; re-exported from the barrel.
+  - `"./browser-automation"` subpath export added to `package.json`.
+  - `createStubClient()` wires a deterministic `browserAutomation` stub for every operation, including `withSession` invoking `fn` with a stub `ActiveSession`.
+
 ## 0.22.1
 
 ### Patch Changes

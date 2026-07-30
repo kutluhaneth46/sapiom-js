@@ -103,6 +103,8 @@ interface Member {
    * live `/definitions` list, falling back to DEF_IDS (see launchChild).
    */
   slug: string;
+  /** Optional environment-specific child definition id. */
+  definitionId?: string;
   /**
    * Expected cadence in hours. <= 24 is treated as "daily" (surfaces
    * `no_child_ran_today` when it hasn't run today); > 24 is "periodic"
@@ -249,6 +251,7 @@ function resolveFleet(input: EntryInput | undefined): Member[] {
       id: String(m.id),
       label: m.label ?? m.id,
       slug: String(m.slug),
+      definitionId: m.definitionId?.trim() || undefined,
       cadenceHours: Number.isFinite(m.cadenceHours) ? m.cadenceHours : 24,
       dueHourUtc: m.dueHourUtc,
       staleHours: m.staleHours,
@@ -551,13 +554,22 @@ const WF_BASE = `${(process.env.SAPIOM_API_BASE_URL ?? "https://api.sapiom.ai").
 const DEF_IDS: Record<string, string> = {
   // "hello-agent": "123",
 };
-let defIdCache: Record<string, string> | null = null;
+const defIdCache = new Map<string, Record<string, string>>();
 
-async function resolveDefId(slug: string, key: string): Promise<string> {
-  if (!defIdCache) {
+async function resolveDefId(
+  slug: string,
+  key: string,
+  tenantId: string,
+  logger: Ctx["logger"],
+): Promise<string> {
+  let tenantDefinitions = defIdCache.get(tenantId);
+  if (!tenantDefinitions) {
     try {
       const res = await fetch(`${WF_BASE}/definitions`, {
-        headers: { "x-api-key": key },
+        headers: {
+          "x-api-key": key,
+          "sapiom-scope": `tenant:${tenantId}`,
+        },
       });
       if (res.ok) {
         const list = (await res.json()) as {
@@ -565,17 +577,31 @@ async function resolveDefId(slug: string, key: string): Promise<string> {
           name?: string;
           slug?: string;
         }[];
-        defIdCache = Object.fromEntries(
+        tenantDefinitions = Object.fromEntries(
           list
             .filter((d) => d.slug ?? d.name)
             .map((d) => [String(d.slug ?? d.name), String(d.id)]),
         );
+        defIdCache.set(tenantId, tenantDefinitions);
+      } else {
+        const detail = await res.text().catch(() => res.statusText);
+        logger.warn("child definition lookup failed", {
+          slug,
+          tenantId,
+          status: res.status,
+          detail: detail.slice(0, 300),
+        });
       }
-    } catch {
+    } catch (error) {
+      logger.warn("child definition lookup errored", {
+        slug,
+        tenantId,
+        error: error instanceof Error ? error.message : String(error),
+      });
       // fall back to the static map below
     }
   }
-  return defIdCache?.[slug] ?? DEF_IDS[slug] ?? "";
+  return tenantDefinitions?.[slug] ?? DEF_IDS[slug] ?? "";
 }
 
 /** Human-readable reasons a play produced no launch. */
@@ -584,6 +610,8 @@ const LAUNCH_SKIP_REASONS: Record<string, string> = {
     "no API key was available in the run, so no child workflow was started",
   "child-not-deployed":
     "the child workflow is not deployed in this tenant yet, so there was nothing to launch",
+  "no-tenant-id":
+    "the execution had no tenant id, so the child definition could not be resolved safely",
   "no-execution-id":
     "the engine accepted the launch but returned no execution id",
 };
@@ -596,9 +624,13 @@ const LAUNCH_SKIP_REASONS: Record<string, string> = {
  * expected first-run state, not a crash. The caller records the skip and its
  * reason in the event log so the briefing says what did not happen.
  */
-async function launchChild(
+export async function launchChild(
   slug: string,
+  explicitDefinitionId: string | undefined,
   input: unknown,
+  tenantId: string | null,
+  traceExternalId: string,
+  logger: Ctx["logger"],
   idempotencyKey?: string,
 ): Promise<{ executionId: string | null; dryRun: boolean; skipped?: string }> {
   const key = process.env.SAPIOM_API_KEY ?? "";
@@ -608,7 +640,16 @@ async function launchChild(
       dryRun: true,
       skipped: "no-api-key",
     };
-  const definitionId = await resolveDefId(slug, key);
+  let definitionId = explicitDefinitionId;
+  if (!definitionId) {
+    if (!tenantId)
+      return {
+        executionId: null,
+        dryRun: false,
+        skipped: "no-tenant-id",
+      };
+    definitionId = await resolveDefId(slug, key, tenantId, logger);
+  }
   if (!definitionId)
     return {
       executionId: null,
@@ -617,7 +658,12 @@ async function launchChild(
     };
   const res = await fetch(`${WF_BASE}/executions`, {
     method: "POST",
-    headers: { "x-api-key": key, "content-type": "application/json" },
+    headers: {
+      "x-api-key": key,
+      "content-type": "application/json",
+      ...(tenantId ? { "sapiom-scope": `tenant:${tenantId}` } : {}),
+      "x-sapiom-trace-external-id": traceExternalId,
+    },
     body: JSON.stringify({ definitionId, input, idempotencyKey }),
   });
   const text = await res.text();
@@ -895,7 +941,15 @@ const actuate = defineStep({
           continue;
         }
 
-        const child = await launchChild(member.slug, member.input ?? {}, idem);
+        const child = await launchChild(
+          member.slug,
+          member.definitionId,
+          member.input ?? {},
+          ctx.tenantId,
+          ctx.executionId,
+          ctx.logger,
+          idem,
+        );
         if (child.skipped) {
           // Nothing was launched. Record the skip and its reason so the briefing
           // says so, and release the cooldown — a launch that never happened must
