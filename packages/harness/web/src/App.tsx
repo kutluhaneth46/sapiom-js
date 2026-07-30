@@ -877,41 +877,46 @@ export const App = (): JSX.Element => {
               onExpandRight={rightCollapsed ? () => setRightCollapsed(false) : null}
             />
 
-            {/* Session tab strip: one tab per live session belonging to the
-                focused agent. Session switching lives here, not in the rail. */}
-            {showTabs && (
-              <SessionTabs
-                sessions={focusTabs}
-                activeSessionId={harness.activeSessionId}
-                busySessionIds={harness.busySessionIds}
-                labelOf={(session) => sessionDisplayName(session, state.sessions, sessionNames)}
-                agentName={focusedWorkflow?.name ?? activeSession?.title ?? "this agent"}
-                onSelect={selectTab}
-                onClose={handleCloseTab}
-                onNew={() => {
-                  if (focusedWorkflow) handleStartSessionForAgent(focusedWorkflow);
-                  else if (focusedAgentPath) void handleCreateSession(focusedAgentPath, "claude-code");
-                }}
-              />
-            )}
-
-            {/* Agent action bar: shown for the active session's bound workflow
-                in the workbench. Hidden while reviewing/dead/empty. */}
-            {showWorkbench && activeSession && boundWorkflow && (
-              <SessionStepsBar
-                workflow={boundWorkflow}
-                activeSessionId={harness.activeSessionId}
-                sessionReady={activeSession.ready === true && activeSession.status !== "exited"}
-                macros={state.macros}
-                onRunMacro={(macro) => handleRunMacroForWorkflow(boundWorkflow, macro)}
-                preview={harness.previewBySession.get(activeSession.id) ?? null}
-                lastDeployError={harness.lastDeployErrorFor(boundWorkflow.path)}
-                authenticated={state.authenticated}
-                directActionSettleSeq={harness.directActionSettleSeq}
-                onDeploy={() => {
-                  void harness.deploy(boundWorkflow.path);
-                }}
-              />
+            {/* Combined session chrome bar: horizontally-scrollable tab strip
+                (tabs + "+") pinned in a scroll region on the left, with the
+                agent action bar (lifecycle chip + run/deploy buttons) fixed to
+                the right — all in ONE border-bottom row so no vertical space
+                is wasted between the tabs and the actions. The actions section
+                is only rendered when there is an active bound workflow. */}
+            {(showTabs || (showWorkbench && activeSession && boundWorkflow)) && (
+              <div className="session-chrome-bar">
+                {showTabs && (
+                  <SessionTabs
+                    sessions={focusTabs}
+                    activeSessionId={harness.activeSessionId}
+                    busySessionIds={harness.busySessionIds}
+                    labelOf={(session) => sessionDisplayName(session, state.sessions, sessionNames)}
+                    agentName={focusedWorkflow?.name ?? activeSession?.title ?? "this agent"}
+                    onSelect={selectTab}
+                    onClose={handleCloseTab}
+                    onNew={() => {
+                      if (focusedWorkflow) handleStartSessionForAgent(focusedWorkflow);
+                      else if (focusedAgentPath) void handleCreateSession(focusedAgentPath, "claude-code");
+                    }}
+                  />
+                )}
+                {showWorkbench && activeSession && boundWorkflow && (
+                  <SessionStepsBar
+                    workflow={boundWorkflow}
+                    activeSessionId={harness.activeSessionId}
+                    sessionReady={activeSession.ready === true && activeSession.status !== "exited"}
+                    macros={state.macros}
+                    onRunMacro={(macro) => handleRunMacroForWorkflow(boundWorkflow, macro)}
+                    preview={harness.previewBySession.get(activeSession.id) ?? null}
+                    lastDeployError={harness.lastDeployErrorFor(boundWorkflow.path)}
+                    authenticated={state.authenticated}
+                    directActionSettleSeq={harness.directActionSettleSeq}
+                    onDeploy={() => {
+                      void harness.deploy(boundWorkflow.path);
+                    }}
+                  />
+                )}
+              </div>
             )}
             <div className="terminal-slot">
               {showReview && reviewSummary ? (
@@ -1041,21 +1046,21 @@ export const App = (): JSX.Element => {
                 Code
               </button>
               <div className="right-pane-corner">
-                {/* Deployed pill → dashboard. The board has no subheader now, so
-                    its deploy status lives here in the tab bar (Tidjane's design:
-                    nothing sits between the tabs and the canvas). */}
+                {/* Dashboard link: opens the deployed workflow in the dashboard.
+                    Rendered as a plain icon button (no deployed-status badge) —
+                    the single deployed-state indicator lives in the middle
+                    panel's lifecycle chip + DeploymentPopover. */}
                 {rightTab === "canvas" && rightPaneWorkflow?.definitionId != null && (
                   <a
-                    className="status-tag status-tag-action workflow-deployed-tag right-pane-deployed"
+                    className="theme-toggle right-pane-dashboard-link"
                     data-testid="workflow-dashboard-link"
                     href={`https://app.sapiom.ai/workflows/${rightPaneWorkflow.definitionId}`}
                     target="_blank"
                     rel="noreferrer"
-                    aria-label="Deployed — open in the Sapiom dashboard"
+                    aria-label="Go to dashboard"
                     data-tooltip="Open this workflow in the Sapiom dashboard"
                   >
-                    <Icon name="Cloud" size={12} />
-                    deployed
+                    <Icon name="ExternalLink" size={14} />
                   </a>
                 )}
                 {/* Canvas expand sits right beside the collapse-panel toggle. */}
