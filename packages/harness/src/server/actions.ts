@@ -26,7 +26,7 @@
 
 import { spawn as spawnChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { Router } from "express";
@@ -34,9 +34,12 @@ import {
   AgentOperationError,
   createClient,
   deploy as coreDeploy,
+  link as coreLink,
   run as coreRun,
   readConfig as coreReadConfig,
+  writeConfig as coreWriteConfig,
   type DeployResult,
+  type LinkResult,
   type RunResult,
   type SapiomConfig,
 } from "@sapiom/agent-core";
@@ -58,14 +61,26 @@ import {
 export interface ActionWorkflow {
   /** Absolute path to the agent project directory (deploy's `projectDir`). */
   path: string;
+  /**
+   * Registry display name (`package.json`'s `name`, else the folder basename).
+   * Optional so a host that only knows the path still works; used as a
+   * mid-priority fallback when naming an agent this route has to create.
+   */
+  name?: string;
 }
 
 /**
- * One line of the deploy NDJSON stream. `building` is emitted once the build is
- * triggered; exactly one terminal line (`ready` | `error`) closes the stream.
- * `capability`-agnostic and credential-free by construction.
+ * One line of the deploy NDJSON stream. `linking` is emitted only when the
+ * project had no `definitionId` and the route is resolving-or-creating its
+ * remote agent; `warning` is non-terminal and advisory — it never replaces a
+ * terminal line and may appear alongside either outcome (e.g. linking
+ * succeeded but caching the id in `sapiom.json` failed); `building` is emitted
+ * once the build is triggered; exactly one terminal line (`ready` | `error`)
+ * closes the stream. `capability`-agnostic and credential-free by construction.
  */
 export type DeployStreamEvent =
+  | { phase: "linking"; name: string }
+  | { phase: "warning"; message: string }
   | { phase: "building"; definitionId: string }
   | { phase: "ready"; definitionId: string; buildRunId: string; status: string }
   | { phase: "error"; code: string; message: string; hint?: string };
@@ -80,6 +95,10 @@ export interface ActionsCoreDeps {
   deploy: typeof coreDeploy;
   run: typeof coreRun;
   readConfig: typeof coreReadConfig;
+  /** Resolve-or-create the server-side agent for an unlinked project. */
+  link: typeof coreLink;
+  /** Cache the linked id back into `sapiom.json` (merges; never clobbers). */
+  writeConfig: typeof coreWriteConfig;
 }
 
 const DEFAULT_CORE_DEPS: ActionsCoreDeps = {
@@ -87,6 +106,8 @@ const DEFAULT_CORE_DEPS: ActionsCoreDeps = {
   deploy: coreDeploy,
   run: coreRun,
   readConfig: coreReadConfig,
+  link: coreLink,
+  writeConfig: coreWriteConfig,
 };
 
 /**
@@ -246,6 +267,30 @@ export interface ActionsRouterOpts {
    * registry — the router does not read the registry directly.
    */
   resolveWorkflow: (id: string) => ActionWorkflow | null;
+  /**
+   * The agent's DECLARED name (`defineAgent({ name })`) for a project the route
+   * has to link on the fly, or null when it cannot be determined. Optional: the
+   * route falls back to `sapiom.json`'s cached name, then
+   * {@link ActionWorkflow.name}, then the project folder's basename.
+   *
+   * A seam rather than a direct call so this router keeps knowing nothing about
+   * the canvas extraction cache (see core/definition-name.ts, which
+   * `server/index.ts` wires in here). Never expected to throw — a rejection is
+   * treated as "could not determine".
+   */
+  resolveDefinitionName?: (workflow: ActionWorkflow) => Promise<string | null>;
+  /**
+   * Called after the route has linked a previously-unlinked project and cached
+   * its new `definitionId`, so the host can refresh whatever it derives from
+   * `sapiom.json`. The registry's `list()` never re-reads the file and the
+   * workspace watcher ignores a content-only edit, so without this a
+   * first-time deploy leaves the SPA showing "Draft" with Prod Run gated.
+   *
+   * A seam rather than a direct call so this router keeps knowing nothing about
+   * the workflow registry (`server/index.ts` wires it). Never expected to
+   * throw — a rejection must not cost the user their build.
+   */
+  onLinked?: (workflow: ActionWorkflow) => Promise<void>;
   /** Injectable core operations. Test seam; defaults to the real exports. */
   coreDeps?: Partial<ActionsCoreDeps>;
   /**
@@ -258,24 +303,34 @@ export interface ActionsRouterOpts {
 }
 
 /**
- * Extract the linked `definitionId` from a project's `sapiom.json`. The config
- * file — not the registry — is the source of truth for a project's server-side
- * definition id, so both deploy and (a future) resolve path read it here. Never
- * throws: an unlinked/unreadable project returns null and the route maps that to
- * a 409.
+ * What a project's `sapiom.json` says about its server-side identity. Three
+ * states, not two: an unlinked project is fixable by linking on the spot (the
+ * deploy route does exactly that), while an unparseable file is not — and
+ * telling them apart matters, because `writeConfig` re-reads the file and
+ * throws BAD_CONFIG on invalid JSON. Auto-linking on a broken config would
+ * create a remote agent and then fail to record it, orphaning it.
+ *
+ * `name` on the unlinked state is the cached agent name a previous `link`
+ * wrote, if any — the deploy route uses it to name the agent it creates.
  */
-function readDefinitionId(
+type ProjectConfigState =
+  | { kind: "linked"; definitionId: string }
+  | { kind: "unlinked"; name?: string }
+  | { kind: "bad-config" };
+
+function readProjectConfigState(
   readConfig: typeof coreReadConfig,
   projectDir: string,
-): string | null {
+): ProjectConfigState {
   let config: SapiomConfig | null;
   try {
     config = readConfig(projectDir);
   } catch {
-    // BAD_CONFIG (unparseable sapiom.json) — treat as "not linked" for the route.
-    return null;
+    return { kind: "bad-config" };
   }
-  return config?.definitionId ?? null;
+  const definitionId = config?.definitionId;
+  if (definitionId) return { kind: "linked", definitionId };
+  return config?.name ? { kind: "unlinked", name: config.name } : { kind: "unlinked" };
 }
 
 /**
@@ -380,12 +435,16 @@ export function createActionsRouter(opts: ActionsRouterOpts): Router {
    * pushes the synthesized tree, triggers a build, and polls to a terminal
    * status — all inside @sapiom/agent-core's {@link deploy}. Streams NDJSON: a
    * `building` line up front, then exactly one terminal `ready`/`error` line.
+   * A project with no `definitionId` yet is linked on the fly first (a
+   * `linking` line precedes `building`) rather than rejected; if the resolved
+   * agent's id could not be cached in `sapiom.json`, a non-terminal `warning`
+   * line follows before `building` continues.
    *
    * 200  NDJSON stream (even a build failure is a 200 with a terminal `error`
    *      line — the request itself succeeded; the build outcome is in-band).
    * 400  id missing/empty
    * 404  workflow id not registered
-   * 409  workflow is not linked to a Sapiom agent (no definitionId)
+   * 409  sapiom.json is unparseable
    * 503  harness is not signed in to Sapiom
    */
   router.post("/api/workflows/:id/deploy", async (req, res) => {
@@ -405,11 +464,9 @@ export function createActionsRouter(opts: ActionsRouterOpts): Router {
       return;
     }
 
-    const definitionId = readDefinitionId(deps.readConfig, workflow.path);
-    if (!definitionId) {
-      res
-        .status(409)
-        .json({ error: "workflow is not linked to a Sapiom agent" });
+    const configState = readProjectConfigState(deps.readConfig, workflow.path);
+    if (configState.kind === "bad-config") {
+      res.status(409).json({ error: "sapiom.json is not valid JSON" });
       return;
     }
 
@@ -422,9 +479,74 @@ export function createActionsRouter(opts: ActionsRouterOpts): Router {
       res.write(JSON.stringify(event) + "\n");
     };
 
-    write({ phase: "building", definitionId });
+    /**
+     * The definition id to build against: the linked one, or a freshly
+     * resolved-or-created one for a project that has never been linked (a
+     * gallery-template clone lands exactly this way — `clone` writes the fork
+     * provenance and leaves `definitionId` for deploy to fill in).
+     *
+     * `link({ create: true })` matches an existing remote agent by name/slug
+     * BEFORE creating one, so this is resync-or-create: re-deploying never
+     * duplicates an agent, and a template already deployed from another machine
+     * re-attaches to the same definition.
+     */
+    const ensureDefinitionId = async (): Promise<string> => {
+      if (configState.kind === "linked") return configState.definitionId;
+
+      const fromSeam = opts.resolveDefinitionName
+        ? await opts.resolveDefinitionName(workflow).catch(() => null)
+        : null;
+      const name =
+        fromSeam?.trim() ||
+        configState.name?.trim() ||
+        workflow.name?.trim() ||
+        basename(workflow.path);
+
+      write({ phase: "linking", name });
+      // Same refresh-on-rejected-key recovery the build gets; the retry is
+      // transparent to the stream (no second linking line).
+      const linked: LinkResult = await withKeyRefreshRetry(
+        provider,
+        clientFor,
+        (client) => deps.link({ name, create: true }, client),
+      );
+      // Cache under the name the SERVER settled on, matching what
+      // `sapiom agents link` writes. writeConfig merges, so the clone's
+      // forkId/templateId/repoFullName survive.
+      //
+      // Best-effort: sapiom.json is a re-resolvable cache (agent-core's
+      // config.ts) and `link` re-resolves the same agent by name, so a failed
+      // write here (read-only checkout, EACCES, a config that turned invalid
+      // between the 409 check above and this write) must not cost the user
+      // their deploy — warn and carry on with the id already in hand.
+      try {
+        deps.writeConfig(workflow.path, {
+          definitionId: linked.definitionId,
+          name: linked.name,
+        });
+      } catch (cacheErr) {
+        write({
+          phase: "warning",
+          message:
+            `The agent "${linked.name}" was created on Sapiom (${linked.definitionId}) but not recorded locally: ${cacheErr instanceof Error ? cacheErr.message : String(cacheErr)}. The build continues; re-deploying re-resolves it by name.`,
+        });
+      }
+      // Best-effort, same as the cache write above, and run whether or not it
+      // succeeded: a rescan is harmless either way, and there is nothing new to
+      // re-read when the write failed. Without this, the registry's list()
+      // never re-reads sapiom.json and the workspace watcher ignores a
+      // content-only edit, so the SPA would keep showing "Draft" after the
+      // very first successful deploy of a project.
+      if (opts.onLinked) await opts.onLinked(workflow).catch(() => undefined);
+      return linked.definitionId;
+    };
 
     try {
+      // A link failure throws out of here and is mapped by the same
+      // toDeployErrorEvent below — reported as itself, never as a build
+      // failure, and `deploy` is never reached.
+      const definitionId = await ensureDefinitionId();
+      write({ phase: "building", definitionId });
       // Auth against the live key, refreshing + retrying once on a rejected key
       // (same recovery the runs router gets). The building/terminal streaming
       // shape is unchanged — the retry is transparent to the NDJSON stream.

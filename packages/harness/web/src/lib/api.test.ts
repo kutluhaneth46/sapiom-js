@@ -47,6 +47,27 @@ describe("terminalDeployEvent", () => {
   it("synthesizes an error for an empty stream", () => {
     expect(terminalDeployEvent([])).toMatchObject({ phase: "error", code: "NO_OUTPUT" });
   });
+
+  it("treats a linking line as non-terminal", async () => {
+    // The server emits `linking` before `building` when it has to create the
+    // agent; only ready/error may end the stream.
+    const events: DeployStreamEvent[] = [
+      { phase: "linking", name: "order-triage" },
+      { phase: "building", definitionId: "42" },
+    ];
+    expect(terminalDeployEvent(events)).toMatchObject({ phase: "error", code: "NO_OUTPUT" });
+  });
+
+  it("treats a warning line as non-terminal", async () => {
+    // `warning` is advisory (the agent was created but its id couldn't be
+    // written to sapiom.json) — it never closes the stream on its own.
+    const events: DeployStreamEvent[] = [
+      { phase: "linking", name: "order-triage" },
+      { phase: "warning", message: "Couldn't save the agent id to sapiom.json." },
+      { phase: "building", definitionId: "42" },
+    ];
+    expect(terminalDeployEvent(events)).toMatchObject({ phase: "error", code: "NO_OUTPUT" });
+  });
 });
 
 describe("parseNdjsonLine (deploy stream)", () => {

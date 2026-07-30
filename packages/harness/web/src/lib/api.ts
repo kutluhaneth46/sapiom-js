@@ -79,10 +79,15 @@ export type RunLocalLine =
 
 /**
  * One line of the `POST /api/workflows/:id/deploy` NDJSON stream (mirrors
- * `DeployStreamEvent` in src/server/actions.ts): a `building` line up front,
- * then exactly one terminal `ready` | `error` line closing the stream.
+ * `DeployStreamEvent` in src/server/actions.ts): an optional `linking` line
+ * when the server has to resolve-or-create the remote agent first, an
+ * optional `warning` line (non-terminal, advisory — the agent was created but
+ * its id couldn't be written back to sapiom.json), a `building` line, then
+ * exactly one terminal `ready` | `error` line closing the stream.
  */
 export type DeployStreamEvent =
+  | { phase: "linking"; name: string }
+  | { phase: "warning"; message: string }
   | { phase: "building"; definitionId: string }
   | { phase: "ready"; definitionId: string; buildRunId: string; status: string }
   | { phase: "error"; code: string; message: string; hint?: string };
@@ -1162,6 +1167,14 @@ class MockApi implements HarnessApi {
     onEvent?: StreamLineHandler<DeployStreamEvent>,
   ): Promise<DeployStreamEvent> {
     this.recordDirectAction("deploy", { workflowPath });
+    // Mirror the real server: an unlinked workflow is linked (agent created)
+    // before the build, so mock mode exercises the same two-phase stream.
+    const target = this.workflows.find((w) => w.path === workflowPath);
+    if (target && target.definitionId == null) {
+      const linking: DeployStreamEvent = { phase: "linking", name: target.name };
+      onEvent?.(linking);
+      await delay(200);
+    }
     const building: DeployStreamEvent = { phase: "building", definitionId: "mock-def" };
     onEvent?.(building);
     await delay(400);
