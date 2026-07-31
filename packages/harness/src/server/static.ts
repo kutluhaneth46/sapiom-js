@@ -9,6 +9,12 @@
  * relying on the `?token=` query param — which is lost on navigation/reload
  * and caused every /api POST to 401 after the first page load (SAP-1898).
  *
+ * Display-mode injection: the served `<html>` carries the persisted
+ * `data-display-mode` (see readDisplayModeSync). The page's pre-paint script
+ * prefers that attribute over localStorage, which is what makes the desktop
+ * app open in the user's theme: it loads the SPA from a fresh ephemeral port
+ * every launch, so its localStorage is a new, empty origin store each time.
+ *
  * Implementation note: `express.static` serves index.html directly on `/`
  * requests, bypassing any downstream handlers. To guarantee injection we:
  *   1. Use `express.static` with `index: false` so it never auto-serves
@@ -21,6 +27,8 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import express, { Router, type Request, type Response } from "express";
+
+import type { DisplayMode } from "../shared/types.js";
 
 const PLACEHOLDER_HTML = `<!doctype html>
 <html>
@@ -63,7 +71,23 @@ function injectTokenScript(html: string, bootToken: string): string {
   return script + html;
 }
 
-export function createStaticRouter(webDir: string, bootToken: string): Router {
+/**
+ * Stamps the persisted display mode onto the document element, before any
+ * script runs at all. Left untouched when the mode is unknown (no settings
+ * file yet) so the page falls back to its own resolution.
+ */
+function injectDisplayMode(html: string, mode: DisplayMode | undefined): string {
+  if (!mode) return html;
+  return html.replace(/<html\b/, `<html data-display-mode="${mode}"`);
+}
+
+export function createStaticRouter(
+  webDir: string,
+  bootToken: string,
+  /** Re-read per HTML response, not captured: a mode changed in this session
+   *  must be what a reload paints with. */
+  readDisplayMode: () => DisplayMode | undefined = () => undefined,
+): Router {
   const router = Router();
   const indexPath = join(webDir, "index.html");
 
@@ -72,7 +96,7 @@ export function createStaticRouter(webDir: string, bootToken: string): Router {
     // (it's a Vite build output), so a single read is fine and avoids
     // repeated disk I/O for every page navigation request.
     const rawHtml = readFileSync(indexPath, "utf-8");
-    const injectedHtml = injectTokenScript(rawHtml, bootToken);
+    const tokenizedHtml = injectTokenScript(rawHtml, bootToken);
 
     // Serve hashed assets (JS, CSS, images) via express.static.
     // `index: false` prevents express.static from auto-serving index.html
@@ -81,7 +105,10 @@ export function createStaticRouter(webDir: string, bootToken: string): Router {
     router.use(express.static(webDir, { index: false }));
 
     router.get("*", (_req: Request, res: Response) => {
-      res.status(200).set("Content-Type", "text/html").send(injectedHtml);
+      res
+        .status(200)
+        .set("Content-Type", "text/html")
+        .send(injectDisplayMode(tokenizedHtml, readDisplayMode()));
     });
   } else {
     router.get("*", (_req: Request, res: Response) => {
