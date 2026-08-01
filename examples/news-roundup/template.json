@@ -58,5 +58,12 @@
         "companyName": "Polsia"
       }
     }
-  ]
+  ],
+  "zeroSetup": {
+    "terminalState": "completed",
+    "expect": [
+      { "path": "status", "assert": "nonEmptyString" }
+    ],
+    "narrative": "Searches the web for the company's recent news and publishes an illustrated roundup page; with no recent news it honestly reports no-news."
+  }
 }
