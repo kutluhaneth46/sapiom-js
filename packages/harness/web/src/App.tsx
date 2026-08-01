@@ -50,6 +50,7 @@ import { registerViewContext, track as trackProduct } from "./lib/analytics/even
 import type { HarnessView } from "./lib/analytics/journeys";
 import { resolveMacroUrl } from "./lib/macro-gating";
 import { directActionKind } from "./lib/macro-actions";
+import { describeWorkflowPrompt } from "./lib/describe-prompt";
 import { sessionDisplayName } from "./lib/session-name";
 import { loadUiPrefs, saveUiPrefs } from "./lib/ui-prefs";
 import { CANVAS_MIN, RAIL_MIN, isMobileShell, useMobileShell, usePaneWidths } from "./lib/use-pane-widths";
@@ -291,6 +292,27 @@ export const App = (): JSX.Element => {
   useEffect(() => {
     if (deadCwdNeedingHistory) void loadHistory([deadCwdNeedingHistory]);
   }, [deadCwdNeedingHistory, loadHistory]);
+
+  // Describe-with-AI outcome feedback. The run is a hidden background task that
+  // never takes over the board — but it must never finish SILENTLY either.
+  // Toast when a describe task leaves "running" (the exact "spins then stops
+  // with no result and no message" report). On success the canvas also
+  // re-renders on its own from the edited source.
+  const describeTaskStatus = useRef(new Map<string, string>());
+  useEffect(() => {
+    for (const task of harness.tasks) {
+      if (task.macroId !== "describe") continue;
+      const prev = describeTaskStatus.current.get(task.id);
+      if (prev === "running" && task.status !== "running") {
+        harness.showToast(
+          task.status === "failed"
+            ? "Couldn't generate descriptions — check the agent terminal for details."
+            : "Describe run finished — the canvas updates if the agent changed the source.",
+        );
+      }
+      describeTaskStatus.current.set(task.id, task.status);
+    }
+  }, [harness.tasks, harness.showToast]);
 
   if (harness.loading) {
     return <div className="app-status">Loading Sapiom Studio…</div>;
@@ -652,6 +674,23 @@ export const App = (): JSX.Element => {
       void harness.runMacro(macro.id, {
         harnessSessionId: sessionId,
         workflowPath: workflow?.path,
+      });
+    })();
+  };
+
+  // "Describe with AI": run the describe macro HEADLESS (execution:"background")
+  // so the agent edits the workflow source out of sight — never the interactive
+  // terminal. The prompt is passed as the macro's `subject`; the source watcher
+  // re-renders the canvas when the agent saves. The button's loading state is
+  // driven by the resulting background task (see CanvasPane `describeRunning`).
+  const handleDescribeWithAI = (workflow: WorkflowInfo): void => {
+    void (async () => {
+      const sessionId = (await handleBindWorkflow(workflow.path)) ?? harness.activeSessionId;
+      if (!sessionId) return;
+      void harness.runMacro("describe", {
+        harnessSessionId: sessionId,
+        workflowPath: workflow.path,
+        subject: describeWorkflowPrompt(workflow),
       });
     })();
   };
@@ -1037,6 +1076,7 @@ export const App = (): JSX.Element => {
                 onInjectPrompt={(text) => {
                   if (harness.activeSessionId) void harness.injectInput(harness.activeSessionId, text);
                 }}
+                onDescribeWorkflow={handleDescribeWithAI}
               />
             </div>
 

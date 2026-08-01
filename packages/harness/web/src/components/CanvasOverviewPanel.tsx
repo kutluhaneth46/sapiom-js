@@ -35,6 +35,13 @@ interface CanvasOverviewPanelProps {
   onDeselect: () => void;
   /** Collapses the overview to its ⓘ reopen affordance (overview mode only). */
   onCollapse: () => void;
+  /** "Describe with AI": runs a hidden background agent that authors the
+   *  `description` fields in the workflow source (the canvas re-renders from
+   *  them on save). Undefined when no session can take it — button hidden. */
+  onDescribeWithAI?: () => void;
+  /** True while a describe background run is in flight — drives the button's
+   *  loading state. */
+  describing?: boolean;
 }
 
 /**
@@ -58,6 +65,8 @@ export function CanvasOverviewPanel({
   onOpenSteps,
   onDeselect,
   onCollapse,
+  onDescribeWithAI,
+  describing = false,
 }: CanvasOverviewPanelProps): JSX.Element {
   const panelRef = useRef<HTMLDivElement>(null);
   const headRef = useRef<HTMLDivElement>(null);
@@ -68,6 +77,22 @@ export function CanvasOverviewPanel({
   const manualRef = useRef<number | null>(loadUiPrefs().canvasInspectorHeight ?? null);
   const [height, setHeight] = useState<number | null>(null);
   const [resizing, setResizing] = useState(false);
+
+  // "Describe with AI" loading. Optimistic on click so the user waits on
+  // nothing, then handed off to the real background run: `describing` is the
+  // live task state (from CanvasPane), `pending` covers the gap before the task
+  // appears (and is all mock mode has). A safety timeout drops an optimistic
+  // click that never became a task, so the button can't spin forever.
+  const [pending, setPending] = useState(false);
+  const describeLoading = pending || describing;
+  useEffect(() => {
+    if (describing) setPending(false);
+  }, [describing]);
+  useEffect(() => {
+    if (!pending) return;
+    const timer = window.setTimeout(() => setPending(false), 8000);
+    return () => window.clearTimeout(timer);
+  }, [pending]);
 
   /** Half the canvas pane — the hard cap for hug and drag alike. */
   const capHeight = (): number => {
@@ -265,6 +290,49 @@ export function CanvasOverviewPanel({
               <>
                 {overview.description && (
                   <p className="canvas-overview-desc">{overview.description}</p>
+                )}
+                {/* AI authors the deterministic `description` fields in the
+                    source; the canvas re-renders from them on save. Hidden when
+                    no session can take the inject (onDescribeWithAI undefined). */}
+                {onDescribeWithAI && (
+                  <button
+                    type="button"
+                    className={"canvas-describe-ai" + (describeLoading ? " is-loading" : "")}
+                    data-testid="canvas-describe-ai"
+                    disabled={describeLoading}
+                    aria-busy={describeLoading}
+                    onClick={() => {
+                      // The Rewrite variant edits source that already has
+                      // hand-written descriptions — confirm before the agent can
+                      // replace them. The empty (Describe) variant has nothing to
+                      // destroy, so it fires straight away.
+                      if (
+                        overview.description &&
+                        !window.confirm(
+                          "Rewrite this workflow's descriptions? The agent will edit the source and may replace text you wrote by hand.",
+                        )
+                      ) {
+                        return;
+                      }
+                      // Optimistic: the button shows loading the instant you
+                      // click, before the background run reports in.
+                      setPending(true);
+                      onDescribeWithAI();
+                    }}
+                    data-tooltip="Runs a hidden agent that writes descriptions into the workflow source — the canvas updates when it saves"
+                  >
+                    {describeLoading ? (
+                      <>
+                        <span className="canvas-describe-spinner" aria-hidden="true" />
+                        Describing…
+                      </>
+                    ) : (
+                      <>
+                        <Icon name="Sparkles" size={13} />
+                        {overview.description ? "Rewrite descriptions with AI" : "Describe with AI"}
+                      </>
+                    )}
+                  </button>
                 )}
                 {overview.notes.length > 0 && (
                   <ul className="canvas-overview-notes">

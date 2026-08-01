@@ -48,6 +48,10 @@ interface CanvasPaneProps {
   /** Sends a prompt to the active session's agent (used by the render-error
    *  state's one-click fix). */
   onInjectPrompt: (text: string) => void;
+  /** Runs the "Describe with AI" background macro for a workflow — a headless
+   *  agent authors the source `description` fields (never the interactive
+   *  terminal). The button's loading state is driven by the resulting task. */
+  onDescribeWorkflow: (workflow: WorkflowInfo) => void;
   /** Which projection of the rendered document is showing: the board, or
    *  the Steps tab (list + per-step detail) built from its posted graph. */
   surface: "board" | "steps";
@@ -83,6 +87,7 @@ export function CanvasPane({
   tasks,
   onRunMacro,
   onInjectPrompt,
+  onDescribeWorkflow,
   surface,
   onOpenSteps,
   run,
@@ -658,9 +663,17 @@ export function CanvasPane({
       task.harnessSessionId === sessionId &&
       (task.workflowPath == null || task.workflowPath === boundWorkflowPath),
   );
-  const runningTask = sessionTasks.find((task) => task.status === "running") ?? null;
+  // A "describe" run is a HIDDEN background pass — its only surface is the
+  // overview button's loading state (below), never the board activity/overlay
+  // or the failure takeover. Every other background task keeps its board
+  // treatment, so it's filtered out of runningTask / latestFinished here.
+  const describeRunning = sessionTasks.some(
+    (task) => task.status === "running" && task.macroId === "describe",
+  );
+  const runningTask =
+    sessionTasks.find((task) => task.status === "running" && task.macroId !== "describe") ?? null;
   const latestFinished = sessionTasks
-    .filter((task) => task.status !== "running")
+    .filter((task) => task.status !== "running" && task.macroId !== "describe")
     .sort((a, b) => (b.endedAt ?? "").localeCompare(a.endedAt ?? ""))[0];
   const failedTask =
     !runningTask && latestFinished?.status === "failed" && !dismissedTaskIds.has(latestFinished.id)
@@ -1102,6 +1115,12 @@ export function CanvasPane({
               }}
               onDeselect={() => setSelectedNodeId(null)}
               onCollapse={() => setOverviewOpen(false)}
+              onDescribeWithAI={
+                boundWorkflow && sessionId && !sessionExited
+                  ? () => onDescribeWorkflow(boundWorkflow)
+                  : undefined
+              }
+              describing={describeRunning}
             />
           )}
           {/* Standalone chat panel — independent of the info panel above; shows
