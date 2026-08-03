@@ -431,9 +431,8 @@ export const App = (): JSX.Element => {
    *
    * `idea` is what the "start from an idea" door collects. It rides along
    * verbatim — the agent needs the intent, not our paraphrase of it. Omitted
-   * (door 1's plain/new outcomes, the bare-folder affordance), the prompt is
-   * byte-identical to what it has always been, so the blank-starter path is
-   * unchanged.
+   * (door 1's plain/new outcomes, the bare-folder affordance), the prompt keeps
+   * the same default-starter path without inventing an idea for the user.
    */
   const handleScaffoldSession = async (
     cwd: string,

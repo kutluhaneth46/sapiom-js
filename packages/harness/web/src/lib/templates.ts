@@ -207,8 +207,8 @@ export function matchesQuery(template: StudioTemplate, query: string): boolean {
 /**
  * The prompt handed to the session's agent after "Use template" starts a session
  * in the destination folder. Both branches name the REAL operation: the clone
- * MCP tool for gallery templates (with its auth failure path), the bundled
- * template init command for starters. Both end with the same next move (a free
+ * MCP tool for gallery templates (with its auth failure path), the local
+ * scaffold MCP tool for starters. Both end with the same next move (a free
  * local test run), so use → edit → run is one continuous path rather than a
  * journey that stops at the clone.
  */
