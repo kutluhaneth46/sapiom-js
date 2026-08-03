@@ -31,7 +31,8 @@ import {
   defaultTransport,
   resolveCoreBaseUrl,
 } from "../_client/index.js";
-import { SearchHttpError } from "./errors.js";
+import { resolveServiceUrl } from "../_client/service-url.js";
+import { ensureOk, SearchHttpError } from "./errors.js";
 
 export { SearchHttpError };
 
@@ -622,4 +623,80 @@ export async function domainSearch(
     },
   );
   return mapDomainSearch(input.domain, raw);
+}
+
+// ----- map -----
+
+/**
+ * `map` is gateway-direct, unlike the routed verbs above: site mapping is not a
+ * routed capability (`/v2/map` carries no capability id at the gateway), so the
+ * call goes straight to the Firecrawl provider host with the credential on the
+ * default gateway header. Flat-priced at $0.009 per call.
+ */
+const MAP_BASE_URL = resolveServiceUrl(
+  "firecrawl",
+  process.env.SAPIOM_FIRECRAWL_URL,
+);
+
+export interface MapInput {
+  /** URL of the site to map (an HTML page — not an image/binary URL). */
+  url: string;
+}
+
+/** One discovered URL. `title`/`description` are best-effort and often null. */
+export interface MapLink {
+  url: string;
+  title?: string | null;
+  description?: string | null;
+}
+
+export interface MapResult {
+  /** Every URL discovered from the starting page (sitemap + crawled links). */
+  links: MapLink[];
+  /** Upstream success flag (absent on some responses; links presence is the signal). */
+  success?: boolean;
+}
+
+interface RawMapResponse {
+  success?: boolean;
+  links?: Array<{ url?: string; title?: string | null; description?: string | null }>;
+}
+
+/**
+ * Discover every URL on a website without extracting content — fast sitemap
+ * discovery from a starting page ($0.009 flat). Returns structured links
+ * (unlike the MCP tool of the same capability, which renders markdown text).
+ *
+ * Failed requests throw {@link SearchHttpError}.
+ */
+export async function map(
+  input: MapInput,
+  transport: Transport = defaultTransport(),
+  baseUrl: string = MAP_BASE_URL,
+): Promise<MapResult> {
+  if (!input?.url) {
+    throw new SearchHttpError("map requires a url", 400, undefined);
+  }
+  const res = await ensureOk(
+    await transport.fetch(`${baseUrl}/v2/map`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ url: input.url }),
+    }),
+    `Failed to map ${input.url}`,
+  );
+  const raw = (await res.json()) as RawMapResponse;
+  const links = Array.isArray(raw.links)
+    ? raw.links
+        .filter((l): l is { url: string } & typeof l => typeof l?.url === "string")
+        .map((l) => ({
+          url: l.url,
+          ...(l.title !== undefined && { title: l.title }),
+          ...(l.description !== undefined && { description: l.description }),
+        }))
+    : [];
+  return {
+    links,
+    ...(raw.success !== undefined && { success: raw.success }),
+  };
 }

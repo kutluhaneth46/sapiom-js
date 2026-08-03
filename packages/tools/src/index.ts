@@ -114,6 +114,24 @@ export { toImageResumePayload } from "./content-generation/index.js";
 
 export * as search from "./search/index.js";
 export { SearchHttpError } from "./search/index.js";
+export type { MapInput, MapLink, MapResult } from "./search/index.js";
+
+// searchindex — provisioned Upstash Search indexes (auto-embedding); control
+// plane + a bound per-index handle for the data-plane operations.
+export * as searchindex from "./search-index/index.js";
+export { SearchIndexHttpError } from "./search-index/index.js";
+export type {
+  SearchIndex,
+  SearchIndexInfo,
+  SearchIndexStatus,
+  CreateSearchIndexInput,
+  UpdateSearchIndexInput,
+  SearchDocument,
+  SearchHit,
+  SearchQueryInput,
+  SearchIndexRangeInput,
+  SearchIndexRangeResult,
+} from "./search-index/index.js";
 
 export * as database from "./database/index.js";
 export { DatabaseHttpError } from "./database/index.js";

@@ -113,6 +113,14 @@ import type {
   ActiveSession,
 } from "../browser-automation/index.js";
 import type { ScopedKey } from "../keys/index.js";
+import type {
+  SearchDocument,
+  SearchHit,
+  SearchIndex,
+  SearchIndexInfo,
+  SearchIndexRangeResult,
+} from "../search-index/index.js";
+import type { MapResult } from "../search/index.js";
 
 /** Per-capability overrides, keyed by capability path (see module docs). */
 export type StubOverrides = Record<
@@ -691,6 +699,88 @@ export function createStubClient(opts: StubClientOptions = {}): Sapiom {
   const memoryNamespaces = new Map<string, Map<string, StubMemoryRecord>>();
   let memorySeq = 0;
 
+  // Per-client search-index state: created indexes plus their documents, keyed
+  // `${indexId}/${indexName}`. Stateful so run_local exercises the real flow —
+  // upsert → query/range/fetchDocuments/deleteDocuments reflect prior writes.
+  const searchIndexRegistry = new Map<string, SearchIndexInfo>();
+  const searchIndexDocs = new Map<string, Map<string, SearchDocument>>();
+  let searchIndexSeq = 0;
+
+  const stubSearchIndexInfo = (id: string, name: string): SearchIndexInfo => ({
+    id,
+    name,
+    status: "active",
+    url: `https://${id}.search.data.stub.invalid`,
+    region: "us-central1",
+    expiresAt: null,
+    createdAt: "2099-01-01T00:00:00Z",
+  });
+
+  const bindStubSearchIndex = (info: SearchIndexInfo): SearchIndex => {
+    const docsFor = (indexName?: string): Map<string, SearchDocument> => {
+      const key = `${info.id}/${indexName ?? "default"}`;
+      let docs = searchIndexDocs.get(key);
+      if (!docs) {
+        docs = new Map();
+        searchIndexDocs.set(key, docs);
+      }
+      return docs;
+    };
+    return {
+      ...info,
+      upsert: (documents, opts) =>
+        Promise.resolve(
+          r("searchindex.upsert", [documents, opts], () => {
+            const docs = docsFor(opts?.indexName);
+            for (const doc of documents) docs.set(doc.id, doc);
+            return undefined;
+          }) as void,
+        ),
+      query: (input, opts) =>
+        Promise.resolve(
+          r("searchindex.query", [input, opts], () => {
+            // Deterministic relevance: a hit is any document whose content
+            // JSON contains the query (case-insensitive), score 1.
+            const needle = input.query.toLowerCase();
+            const hits: SearchHit[] = [...docsFor(opts?.indexName).values()]
+              .filter((doc) =>
+                JSON.stringify(doc.content).toLowerCase().includes(needle),
+              )
+              .map((doc) => ({ ...doc, score: 1 }));
+            return hits.slice(0, input.limit ?? 10);
+          }) as SearchHit[],
+        ),
+      range: (input, opts) =>
+        Promise.resolve(
+          r("searchindex.range", [input, opts], () => {
+            const all = [...docsFor(opts?.indexName).values()];
+            const offset = input?.cursor ? Number(input.cursor) || 0 : 0;
+            const limit = input?.limit ?? 100;
+            const next = offset + limit;
+            return {
+              nextCursor: next < all.length ? String(next) : null,
+              documents: all.slice(offset, next),
+            };
+          }) as SearchIndexRangeResult,
+        ),
+      fetchDocuments: (ids, opts) =>
+        Promise.resolve(
+          r("searchindex.fetchDocuments", [ids, opts], () => {
+            const docs = docsFor(opts?.indexName);
+            return ids.map((id) => docs.get(id) ?? null);
+          }) as Array<SearchDocument | null>,
+        ),
+      deleteDocuments: (ids, opts) =>
+        Promise.resolve(
+          r("searchindex.deleteDocuments", [ids, opts], () => {
+            const docs = docsFor(opts?.indexName);
+            for (const id of ids) docs.delete(id);
+            return undefined;
+          }) as void,
+        ),
+    };
+  };
+
   // Resolve a coding run result, then re-wrap its `sandbox` as a handle so the
   // blocking `run()` path keeps a method-capable Sandbox even when the result was
   // overridden with plain JSON. `keys` lets `launch()` accept `models.coding.launch`
@@ -1186,6 +1276,13 @@ export function createStubClient(opts: StubClientOptions = {}): Sapiom {
             ],
           })) as WebSearchResponse,
         ),
+      map: (input) =>
+        Promise.resolve(
+          r("search.map", [input], () => ({
+            success: true,
+            links: [{ url: input.url, title: "Stub Page", description: null }],
+          })) as MapResult,
+        ),
       emailSearch: {
         findEmail: (input) =>
           Promise.resolve(
@@ -1236,6 +1333,59 @@ export function createStubClient(opts: StubClientOptions = {}): Sapiom {
             })) as DomainSearchResult,
           ),
       },
+    },
+    searchindex: {
+      create: (input) =>
+        Promise.resolve(
+          r("searchindex.create", [input], () => {
+            const id = `stub-searchindex-${++searchIndexSeq}`;
+            const info = stubSearchIndexInfo(id, input.name);
+            searchIndexRegistry.set(id, info);
+            return bindStubSearchIndex(info);
+          }) as SearchIndex,
+        ),
+      get: (id) =>
+        Promise.resolve(
+          r("searchindex.get", [id], () =>
+            bindStubSearchIndex(
+              searchIndexRegistry.get(id) ??
+                stubSearchIndexInfo(id, `stub-${id}`),
+            ),
+          ) as SearchIndex,
+        ),
+      list: () =>
+        Promise.resolve(
+          r("searchindex.list", [], () =>
+            [...searchIndexRegistry.values()].map(bindStubSearchIndex),
+          ) as SearchIndex[],
+        ),
+      update: (id, input) =>
+        Promise.resolve(
+          r("searchindex.update", [id, input], () => {
+            const existing =
+              searchIndexRegistry.get(id) ??
+              stubSearchIndexInfo(id, `stub-${id}`);
+            const updated: SearchIndexInfo = {
+              ...existing,
+              ...(input.name !== undefined && { name: input.name }),
+              ...(input.expiresAt !== undefined && {
+                expiresAt: input.expiresAt,
+              }),
+            };
+            searchIndexRegistry.set(id, updated);
+            return bindStubSearchIndex(updated);
+          }) as SearchIndex,
+        ),
+      delete: (id) =>
+        Promise.resolve(
+          r("searchindex.delete", [id], () => {
+            searchIndexRegistry.delete(id);
+            for (const key of [...searchIndexDocs.keys()]) {
+              if (key.startsWith(`${id}/`)) searchIndexDocs.delete(key);
+            }
+            return undefined;
+          }) as void,
+        ),
     },
     database: {
       create: (input) =>

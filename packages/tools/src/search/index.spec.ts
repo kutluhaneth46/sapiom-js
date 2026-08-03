@@ -6,6 +6,7 @@ import {
   findEmail,
   verifyEmail,
   domainSearch,
+  map,
   SearchHttpError,
 } from "./index.js";
 
@@ -1000,5 +1001,68 @@ describe("createClient().search.emailSearch", () => {
     );
     expect(headerOf(calls[0]!, "x-api-key")).toBe("client-key");
     expect(headerOf(calls[1]!, "x-api-key")).toBe("client-key");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// search.map() — gateway-direct (NOT routed): straight to the Firecrawl host
+// on the default x-sapiom-api-key header, $0.009 flat.
+// ---------------------------------------------------------------------------
+
+describe("search.map()", () => {
+  it("POSTs {base}/v2/map on the default gateway header and maps links", async () => {
+    const { transport, calls } = makeTransport([
+      () =>
+        jsonResponse({
+          success: true,
+          links: [
+            { url: "https://docs.example.com/", title: "Home", description: null },
+            { url: "https://docs.example.com/verify/" },
+            { notAUrl: true },
+          ],
+        }),
+    ]);
+
+    const result = await map({ url: "https://docs.example.com" }, transport, BASE);
+
+    expect(calls[0]!.url).toBe(`${BASE}/v2/map`);
+    expect(calls[0]!.init.method).toBe("POST");
+    // Gateway-direct — the credential rides the DEFAULT x-sapiom-api-key header
+    // (the routed verbs above use x-api-key via capabilityCall instead).
+    expect(headerOf(calls[0]!, "x-sapiom-api-key")).toBe("test-key");
+    expect(bodyOf(calls[0]!)).toEqual({ url: "https://docs.example.com" });
+
+    expect(result.success).toBe(true);
+    expect(result.links).toEqual([
+      { url: "https://docs.example.com/", title: "Home", description: null },
+      { url: "https://docs.example.com/verify/" },
+    ]);
+  });
+
+  it("returns empty links when the upstream omits them", async () => {
+    const { transport } = makeTransport([() => jsonResponse({ success: true })]);
+    const result = await map({ url: "https://x.test" }, transport, BASE);
+    expect(result.links).toEqual([]);
+  });
+
+  it("throws before fetching on a missing url", async () => {
+    const { transport, calls } = makeTransport([]);
+    await expect(map({ url: "" }, transport, BASE)).rejects.toBeInstanceOf(
+      SearchHttpError,
+    );
+    expect(calls).toHaveLength(0);
+  });
+
+  it("throws SearchHttpError with status + body on a non-2xx", async () => {
+    const { transport } = makeTransport([
+      () =>
+        new Response(JSON.stringify({ error: "invalid url" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json" },
+        }),
+    ]);
+    await expect(
+      map({ url: "https://x.test" }, transport, BASE),
+    ).rejects.toMatchObject({ status: 400, body: { error: "invalid url" } });
   });
 });
