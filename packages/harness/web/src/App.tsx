@@ -43,7 +43,7 @@ import { ApiError, boundWorkflowPathOf } from "./lib/api";
 import { classifyConnectivity, useConnectivity } from "./lib/connectivity";
 import { historyDirs } from "./lib/history-meta";
 import { resolveProjectRoot } from "./lib/project-dir";
-import { useTemplatePrompt, type StudioTemplate } from "./lib/templates";
+import { starterScaffoldInstruction, useTemplatePrompt, type StudioTemplate } from "./lib/templates";
 import { track } from "./lib/track";
 import { initAnalytics } from "./lib/analytics/posthog";
 import { registerViewContext, track as trackProduct } from "./lib/analytics/events";
@@ -442,14 +442,15 @@ export const App = (): JSX.Element => {
   ): Promise<void> => {
     const session = await createSessionAt(cwd, agentHarness);
     const base =
-      "Scaffold a new Sapiom agent project in this directory: run `sapiom agents init .`, then use the sapiom-agent-authoring skill to";
+      `Scaffold a new Sapiom agent project in this directory: ${starterScaffoldInstruction(cwd, "default")}, ` +
+      "then run npm install, read AGENTS.md, and use the sapiom-agent-authoring skill to";
     const trimmedIdea = idea?.trim();
     injectPromptWithRetry(
       session.id,
       trimmedIdea
         ? `${base} build this:\n\n${trimmedIdea}`
         : `${base} define the first agent.`,
-      "Couldn't send the scaffold prompt. Ask the coding agent to run sapiom agents init.",
+      "Couldn't send the scaffold prompt. Ask the coding agent to call sapiom_dev_agents_scaffold.",
     );
   };
 
@@ -474,10 +475,11 @@ export const App = (): JSX.Element => {
   // Bare-scaffold folder affordance: a live session sits in a folder
   // with no agent yet. Ask that session to scaffold its first agent in place.
   const handleScaffoldInSession = (sessionId: string): void => {
+    const cwd = state.sessions.find((session) => session.id === sessionId)?.cwd ?? ".";
     injectPromptWithRetry(
       sessionId,
-      "Scaffold a new Sapiom agent project in this directory: run `sapiom agents init .`, then use the sapiom-agent-authoring skill to define the first agent.",
-      "Couldn't send the scaffold prompt. Ask the coding agent to run sapiom agents init.",
+      `Scaffold a new Sapiom agent project in this directory: ${starterScaffoldInstruction(cwd, "default")}, then run npm install, read AGENTS.md, and use the sapiom-agent-authoring skill to define the first agent.`,
+      "Couldn't send the scaffold prompt. Ask the coding agent to call sapiom_dev_agents_scaffold.",
     );
   };
 
@@ -490,7 +492,7 @@ export const App = (): JSX.Element => {
       useTemplatePrompt(template, cwd),
       template.kind === "gallery"
         ? "Couldn't send the clone prompt. Ask the coding agent to run sapiom_dev_agents_clone."
-        : "Couldn't send the starter prompt. Ask the coding agent to run sapiom agents init.",
+        : "Couldn't send the starter prompt. Ask the coding agent to call sapiom_dev_agents_scaffold.",
     );
   };
 

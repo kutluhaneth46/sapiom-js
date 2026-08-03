@@ -92,11 +92,14 @@ test.describe("add workspace (three doors)", () => {
     await page.waitForFunction(() => {
       const test = (window as unknown as { __HARNESS_TEST__?: { lastInjectInput?: { req: { text: string } } } })
         .__HARNESS_TEST__;
-      return test?.lastInjectInput?.req.text.includes("sapiom agents init") ?? false;
+      return test?.lastInjectInput?.req.text.includes("sapiom_dev_agents_scaffold") ?? false;
     });
     const scaffoldPrompt = await page.evaluate(() =>
       (window as unknown as { __HARNESS_TEST__?: { lastInjectInput?: { req: { text: string } } } })
         .__HARNESS_TEST__?.lastInjectInput?.req.text,
+    );
+    expect(scaffoldPrompt).toContain(
+      '{"dir":"/Users/demo/brand-new-agent","template":"default"}',
     );
     expect(scaffoldPrompt).toContain("define the first agent");
     expect(scaffoldPrompt?.toLowerCase()).not.toContain("workflow");

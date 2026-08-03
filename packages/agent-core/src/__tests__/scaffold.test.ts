@@ -7,6 +7,7 @@
 import { execFileSync } from "node:child_process";
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
@@ -66,6 +67,7 @@ describe("scaffold", () => {
       expect(result.projectName).toBe("my-orch");
       expect(result.template).toBe("default");
       expect(existsSync(path.join(targetDir, "index.ts"))).toBe(true);
+      expect(readFileSync(path.join(targetDir, "sapiom.json"), "utf8")).toBe("{}\n");
 
       // Replacements applied: __PROJECT_NAME__ → my-orch in package.json
       const pkg = JSON.parse(
@@ -124,6 +126,52 @@ describe("scaffold", () => {
           versions: { agent: "1.0.0", tools: "1.0.0", zod: "3.0.0" },
         }),
       ).rejects.toMatchObject({ code: "DIR_NOT_EMPTY" });
+    } finally {
+      rmSync(targetDir, { recursive: true, force: true });
+    }
+  });
+
+  it("scaffolds around Studio-owned .sapiom state without committing it", async () => {
+    const targetDir = makeTmp();
+    const studioDir = path.join(targetDir, ".sapiom");
+    mkdirSync(studioDir);
+    writeFileSync(path.join(studioDir, "harness-context.json"), '{"sentinel":"__PROJECT_NAME__"}\n');
+    try {
+      const result = await scaffold({
+        targetDir,
+        projectName: "studio-agent",
+        versions: { agent: "1.0.0", tools: "1.0.0", zod: "3.0.0" },
+      });
+
+      expect(result.gitInitialized).toBe(true);
+      expect(readFileSync(path.join(studioDir, "harness-context.json"), "utf8")).toBe(
+        '{"sentinel":"__PROJECT_NAME__"}\n',
+      );
+
+      const tracked = execFileSync("git", ["ls-files"], {
+        cwd: targetDir,
+        encoding: "utf8",
+      }).trim().split("\n");
+      expect(tracked).toContain("sapiom.json");
+      expect(tracked).toContain(".sapiom-dev/stubs.json");
+      expect(tracked.some((file) => file.startsWith(".sapiom/"))).toBe(false);
+    } finally {
+      rmSync(targetDir, { recursive: true, force: true });
+    }
+  });
+
+  it("still rejects user content beside Studio-owned .sapiom state", async () => {
+    const targetDir = makeTmp();
+    mkdirSync(path.join(targetDir, ".sapiom"));
+    writeFileSync(path.join(targetDir, "existing.txt"), "keep me");
+    try {
+      await expect(
+        scaffold({
+          targetDir,
+          versions: { agent: "1.0.0", tools: "1.0.0", zod: "3.0.0" },
+        }),
+      ).rejects.toMatchObject({ code: "DIR_NOT_EMPTY" });
+      expect(readFileSync(path.join(targetDir, "existing.txt"), "utf8")).toBe("keep me");
     } finally {
       rmSync(targetDir, { recursive: true, force: true });
     }
