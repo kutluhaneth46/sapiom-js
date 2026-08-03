@@ -345,28 +345,46 @@ describe("SearchIndex.query()", () => {
 });
 
 describe("SearchIndex.range()", () => {
-  it("POSTs {url}/range/default with cursor/limit and maps the page", async () => {
+  it("POSTs {url}/range/default with cursor/limit/include flags and maps the live `vectors` page shape", async () => {
+    // Live-verified upstream shape (2026-08-03): { result: { nextCursor, vectors } }.
     const { idx, calls } = await makeHandle([
       () =>
         jsonResponse({
-          nextCursor: "42",
-          documents: [
-            { id: "a", content: { t: 1 }, metadata: { contentHash: "h1" } },
-            { id: "b", content: { t: 2 } },
-          ],
+          result: {
+            nextCursor: "42",
+            vectors: [
+              { id: "a", metadata: { contentHash: "h1" } },
+              { id: "b", content: { t: 2 } },
+            ],
+          },
         }),
     ]);
-    const page = await idx.range({ cursor: "0", limit: 100 });
+    const page = await idx.range({ cursor: "0", limit: 100, includeMetadata: true });
     expect(calls[0]!.url).toBe(`${DATA_URL}/range/default`);
-    expect(bodyOf(calls[0]!)).toEqual({ cursor: "0", limit: 100 });
+    expect(bodyOf(calls[0]!)).toEqual({ cursor: "0", limit: 100, includeMetadata: true });
     expect(page.nextCursor).toBe("42");
     expect(page.documents.map((d) => d.id)).toEqual(["a", "b"]);
     expect(page.documents[0]!.metadata).toEqual({ contentHash: "h1" });
+    // Items without payloads (flags off upstream) still map with empty content.
+    expect(page.documents[0]!.content).toEqual({});
+  });
+
+  it("falls back to a `documents` page key and maps it identically", async () => {
+    const { idx } = await makeHandle([
+      () =>
+        jsonResponse({
+          nextCursor: "7",
+          documents: [{ id: "a", content: { t: 1 } }],
+        }),
+    ]);
+    const page = await idx.range();
+    expect(page.nextCursor).toBe("7");
+    expect(page.documents.map((d) => d.id)).toEqual(["a"]);
   });
 
   it("sends an empty body on the first page and normalizes an empty nextCursor to null", async () => {
     const { idx, calls } = await makeHandle([
-      () => jsonResponse({ nextCursor: "", documents: [] }),
+      () => jsonResponse({ result: { nextCursor: "", vectors: [] } }),
     ]);
     const page = await idx.range();
     expect(bodyOf(calls[0]!)).toEqual({});
@@ -375,14 +393,15 @@ describe("SearchIndex.range()", () => {
 });
 
 describe("SearchIndex.fetchDocuments() / deleteDocuments()", () => {
-  it("POSTs {url}/fetch/default with ids and preserves nulls for misses", async () => {
+  it("POSTs {url}/fetch/default with ids + include flags and preserves nulls for misses", async () => {
     const { idx, calls } = await makeHandle([
-      () => jsonResponse([{ id: "a", content: { t: 1 } }, null]),
+      () => jsonResponse({ result: [{ id: "a", metadata: { contentHash: "h1" } }, null] }),
     ]);
-    const docs = await idx.fetchDocuments(["a", "missing"]);
+    const docs = await idx.fetchDocuments(["a", "missing"], { includeMetadata: true });
     expect(calls[0]!.url).toBe(`${DATA_URL}/fetch/default`);
-    expect(bodyOf(calls[0]!)).toEqual({ ids: ["a", "missing"] });
+    expect(bodyOf(calls[0]!)).toEqual({ ids: ["a", "missing"], includeMetadata: true });
     expect(docs[0]!.id).toBe("a");
+    expect(docs[0]!.metadata).toEqual({ contentHash: "h1" });
     expect(docs[1]).toBeNull();
   });
 

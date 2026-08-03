@@ -29,10 +29,16 @@ await idx.upsert([
 const hits = await idx.query({ query: "how do I authenticate?", limit: 3 });
 // hits: [{ id, content, metadata, score }] — best first
 
-// Reconciliation: enumerate everything, page by page.
+// Reconciliation: enumerate everything, page by page. Range items carry only
+// `id` unless you ask for payloads — `includeMetadata: true` is the
+// hash-diff reconciler's flag (verified against the live data plane).
 let cursor: string | null = null;
 do {
-  const page = await idx.range({ cursor: cursor ?? undefined, limit: 100 });
+  const page = await idx.range({
+    cursor: cursor ?? undefined,
+    limit: 100,
+    includeMetadata: true,
+  });
   // page.documents[].metadata.contentHash → diff against fresh hashes
   cursor = page.nextCursor;
 } while (cursor);

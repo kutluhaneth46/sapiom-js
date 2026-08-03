@@ -129,6 +129,7 @@ export type {
   SearchDocument,
   SearchHit,
   SearchQueryInput,
+  SearchIndexIncludeOptions,
   SearchIndexRangeInput,
   SearchIndexRangeResult,
 } from "./search-index/index.js";

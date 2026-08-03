@@ -726,6 +726,19 @@ export function createStubClient(opts: StubClientOptions = {}): Sapiom {
       }
       return docs;
     };
+    // Mirror the live data plane: enumeration reads return id-only items
+    // unless the include flags are set (a reconciler that forgets
+    // `includeMetadata: true` should fail the same way under run_local).
+    const stripUnrequested = (
+      doc: SearchDocument,
+      flags?: { includeMetadata?: boolean; includeData?: boolean },
+    ): SearchDocument => ({
+      id: doc.id,
+      content: flags?.includeData ? doc.content : {},
+      ...(flags?.includeMetadata && doc.metadata !== undefined
+        ? { metadata: doc.metadata }
+        : {}),
+    });
     return {
       ...info,
       upsert: (documents, opts) =>
@@ -759,7 +772,9 @@ export function createStubClient(opts: StubClientOptions = {}): Sapiom {
             const next = offset + limit;
             return {
               nextCursor: next < all.length ? String(next) : null,
-              documents: all.slice(offset, next),
+              documents: all
+                .slice(offset, next)
+                .map((doc) => stripUnrequested(doc, input)),
             };
           }) as SearchIndexRangeResult,
         ),
@@ -767,7 +782,10 @@ export function createStubClient(opts: StubClientOptions = {}): Sapiom {
         Promise.resolve(
           r("searchindex.fetchDocuments", [ids, opts], () => {
             const docs = docsFor(opts?.indexName);
-            return ids.map((id) => docs.get(id) ?? null);
+            return ids.map((id) => {
+              const doc = docs.get(id);
+              return doc ? stripUnrequested(doc, opts) : null;
+            });
           }) as Array<SearchDocument | null>,
         ),
       deleteDocuments: (ids, opts) =>

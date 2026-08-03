@@ -125,7 +125,15 @@ export interface SearchQueryInput {
   filter?: string;
 }
 
-export interface SearchIndexRangeInput {
+/** Payload-inclusion flags for enumeration reads (both default false upstream). */
+export interface SearchIndexIncludeOptions {
+  /** Include each document's `metadata` (e.g. contentHash) — the reconciliation flag. */
+  includeMetadata?: boolean;
+  /** Include each document's `content` payload. */
+  includeData?: boolean;
+}
+
+export interface SearchIndexRangeInput extends SearchIndexIncludeOptions {
   /** Opaque pagination cursor from a previous page (start with none or `"0"`). */
   cursor?: string;
   /** Page size. */
@@ -156,15 +164,22 @@ export interface SearchIndex extends SearchIndexInfo {
   upsert(documents: SearchDocument[], opts?: DataPlaneOptions): Promise<void>;
   /** Search the index. Returns ranked hits (best first). */
   query(input: SearchQueryInput, opts?: DataPlaneOptions): Promise<SearchHit[]>;
-  /** Enumerate documents page by page — the reconciliation primitive. */
+  /**
+   * Enumerate documents page by page — the reconciliation primitive. Items
+   * carry only `id` unless you set the include flags (verified live:
+   * `{ includeMetadata: true }` is what a hash-diff reconciler wants).
+   */
   range(
     input?: SearchIndexRangeInput,
     opts?: DataPlaneOptions,
   ): Promise<SearchIndexRangeResult>;
-  /** Fetch specific documents by id (`null` for ids that don't exist). */
+  /**
+   * Fetch specific documents by id (`null` for ids that don't exist). Items
+   * carry only `id` unless you set the include flags.
+   */
   fetchDocuments(
     ids: string[],
-    opts?: DataPlaneOptions,
+    opts?: DataPlaneOptions & SearchIndexIncludeOptions,
   ): Promise<Array<SearchDocument | null>>;
   /** Delete specific documents by id. */
   deleteDocuments(ids: string[], opts?: DataPlaneOptions): Promise<void>;
@@ -330,6 +345,9 @@ function bindIndex(info: SearchIndexInfo, transport: Transport): SearchIndex {
       const body: Record<string, unknown> = {};
       if (input?.cursor != null) body.cursor = input.cursor;
       if (input?.limit != null) body.limit = input.limit;
+      if (input?.includeMetadata != null)
+        body.includeMetadata = input.includeMetadata;
+      if (input?.includeData != null) body.includeData = input.includeData;
 
       const raw = await dataPlaneJson(
         transport,
@@ -341,14 +359,20 @@ function bindIndex(info: SearchIndexInfo, transport: Transport): SearchIndex {
         },
         `Failed to range search index '${info.id}'`,
       );
+      // Verified live 2026-08-03: the upstream page shape is
+      // `{ nextCursor, vectors: [...] }` (Search rides the vector API's range;
+      // `documents` kept as a defensive fallback should upstream rename).
       const page = unwrapResult(raw) as
-        | { nextCursor?: unknown; documents?: unknown }
+        | { nextCursor?: unknown; vectors?: unknown; documents?: unknown }
         | undefined;
-      const documents = Array.isArray(page?.documents)
-        ? page.documents
-            .map(toDocument)
-            .filter((doc): doc is SearchDocument => doc !== null)
-        : [];
+      const items = Array.isArray(page?.vectors)
+        ? page.vectors
+        : Array.isArray(page?.documents)
+          ? page.documents
+          : [];
+      const documents = items
+        .map(toDocument)
+        .filter((doc): doc is SearchDocument => doc !== null);
       const nextCursor =
         typeof page?.nextCursor === "string" && page.nextCursor !== ""
           ? page.nextCursor
@@ -365,13 +389,17 @@ function bindIndex(info: SearchIndexInfo, transport: Transport): SearchIndex {
         );
       }
       const indexName = resolveIndexName(opts);
+      const body: Record<string, unknown> = { ids };
+      if (opts?.includeMetadata != null)
+        body.includeMetadata = opts.includeMetadata;
+      if (opts?.includeData != null) body.includeData = opts.includeData;
       const raw = await dataPlaneJson(
         transport,
         `${info.url}/fetch/${indexName}`,
         {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ ids }),
+          body: JSON.stringify(body),
         },
         `Failed to fetch documents from search index '${info.id}'`,
       );
