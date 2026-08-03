@@ -79,8 +79,13 @@ test.describe("theme — system preference", () => {
 });
 
 test("brand header shows the Sapiom wordmark and the demo-workspace identity", async ({ page }) => {
+  await expect(page).toHaveTitle("Agent Studio");
   await expect(page.locator(".brand-name")).toHaveText("Sapiom");
-  await expect(page.locator(".brand-product")).toHaveText("Studio");
+  await expect(page.locator(".brand-product")).toHaveText("Agent Studio");
+  await expect(page.getByTestId("palette-trigger")).toHaveAttribute(
+    "aria-label",
+    "Jump to session, agent, or path",
+  );
   // Mock mode is the static demo build: it must never claim a connected
   // Sapiom account — the identity chip reads "Demo workspace" instead.
   const identity = page.getByTestId("brand-identity");
@@ -95,6 +100,18 @@ test("auto-selects the running boot session on initial load", async ({ page }) =
   const header = page.getByTestId("session-context");
   await expect(header).toHaveAttribute("data-session-id", "sess-boot");
   await expect(header.locator(".session-dot")).toHaveAttribute("data-status", "running");
+
+  await page.evaluate(() => {
+    (window as unknown as { __HARNESS_TEST__: { publish: (message: unknown) => void } }).__HARNESS_TEST__.publish({
+      type: "session.activity",
+      harnessSessionId: "sess-boot",
+      at: new Date().toISOString(),
+    });
+  });
+  await expect(header.getByTestId("session-status-tag")).toHaveAttribute(
+    "data-tooltip",
+    "The coding agent produced output in the last few seconds",
+  );
 });
 
 test("session header: compact identity (name only; path in the tooltip); New session opens from the rail's history menu", async ({
@@ -494,7 +511,15 @@ test("add project: the rail's + registers a bare folder through the 'Open a fold
 test("new-session modal: directory picker navigates and validates", async ({ page }) => {
   await page.getByTestId("add-workspace").click();
   await page.getByTestId("new-session-btn").click();
-  await expect(page.locator(".modal-new-session")).toBeVisible();
+  const modal = page.locator(".modal-new-session");
+  await expect(modal).toBeVisible();
+  await expect(modal.locator(".modal-field-hint")).toHaveText(
+    "Pick the workspace folder the coding agent runs in; the session is named after the folder.",
+  );
+  await expect(modal.getByTestId("harness-select")).toHaveAttribute(
+    "aria-label",
+    "Coding agent for this session",
+  );
 
   const startButton = page.getByRole("button", { name: "Start session" });
   const input = page.getByTestId("dir-picker-input");
@@ -896,7 +921,7 @@ test.describe("workflow actions", () => {
     // tab bar for deployed workflows. leasing is deployed (definitionId set) on load.
     const dashLink = page.getByTestId("workflow-dashboard-link");
     await expect(dashLink).toBeVisible();
-    await expect(dashLink).toHaveAttribute("href", /app\.sapiom\.ai\/workflows\//);
+    await expect(dashLink).toHaveAttribute("href", /app\.sapiom\.ai\/agents\//);
     await expect(dashLink).toHaveAttribute("target", "_blank");
   });
 
@@ -1394,6 +1419,24 @@ test.describe("account profile row", () => {
     const menu = page.getByTestId("profile-menu");
     await expect(menu).toBeVisible();
     await expect(page.getByTestId("profile-open-dashboard")).toBeVisible();
+    await page.evaluate(() => {
+      const harnessWindow = window as unknown as {
+        __SAP_2332_OPENED_URL__?: string;
+        open: typeof window.open;
+      };
+      harnessWindow.open = ((url?: string | URL) => {
+        harnessWindow.__SAP_2332_OPENED_URL__ = String(url ?? "");
+        return null;
+      }) as typeof window.open;
+    });
+    await page.getByTestId("profile-open-dashboard").click();
+    await expect.poll(() => page.evaluate(() => (
+      window as unknown as { __SAP_2332_OPENED_URL__?: string }
+    ).__SAP_2332_OPENED_URL__)).toBe("https://app.sapiom.ai/agents");
+
+    // Reopen after the dashboard action closes the menu.
+    await profile.click();
+    await expect(menu).toBeVisible();
     // Demo build: the switch item reads as connect and stays actionable.
     await expect(page.getByTestId("profile-switch-account")).toHaveText(/Connect Sapiom account/);
     await expect(page.getByTestId("profile-switch-account")).toBeEnabled();
@@ -1768,6 +1811,10 @@ test("a detected dev server surfaces a Preview chip on the action bar", async ({
   await expect(chip).toBeVisible();
   await expect(chip).toContainText("Preview :5173");
   await expect(chip).toHaveAttribute("href", "http://localhost:5173/");
+  await expect(chip).toHaveAttribute(
+    "data-tooltip",
+    "The coding agent is serving an app on port 5173. Opens http://localhost:5173/",
+  );
 });
 
 test("an observed run renders per-step status and latency in the steps tab", async ({ page }) => {
