@@ -228,7 +228,7 @@ test.describe("templates journey (from the welcome panel)", () => {
       '{"dir":"/Users/demo/acme-app/projects/coding-pause","template":"coding-pause"}',
     );
     expect(prompt).toContain("sapiom_dev_agents_run_local");
-    expect(prompt).toContain("adapt the agent");
+    expect(prompt).toContain("Keep the shipped starter unchanged");
     expect(prompt.toLowerCase()).not.toContain("workflow");
   });
 
