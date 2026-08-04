@@ -37,7 +37,12 @@ describe("server instructions", () => {
     expect(AUTHORING_INSTRUCTIONS).not.toContain("defineOrchestration");
     expect(AUTHORING_INSTRUCTIONS).not.toContain("@sapiom/orchestration");
     // Pointer to the full docs + the scaffold-shipped guidance (AGENTS.md + skill)
-    expect(AUTHORING_INSTRUCTIONS).toContain("https://docs.sapiom.ai/agents");
+    expect(AUTHORING_INSTRUCTIONS).toContain(
+      "https://docs.sapiom.ai/agents/authoring",
+    );
+    expect(AUTHORING_INSTRUCTIONS).toContain(
+      "https://docs.sapiom.ai/guides/connect-claude-code-with-mcp",
+    );
     expect(AUTHORING_INSTRUCTIONS).toContain("AGENTS.md");
     expect(AUTHORING_INSTRUCTIONS).toContain("sapiom-agent-authoring");
     // The two-MCP frame: agents learn the hosted MCP exists for direct tool calls

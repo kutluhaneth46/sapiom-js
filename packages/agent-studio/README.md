@@ -1,7 +1,7 @@
 # Agent Studio
 
 Agent Studio is a local workspace for building, testing, deploying, and running
-Sapiom agents with your own coding agent.
+Sapiom agents with Claude Code.
 
 ```bash
 npx @sapiom/agent-studio@latest [dir]
@@ -20,4 +20,6 @@ continues to work:
 npx @sapiom/harness@latest [dir]
 ```
 
-Agent Studio requires Node.js 20 or newer and Claude Code or Codex on `PATH`.
+Agent Studio requires Node.js 20 or newer and Claude Code on `PATH`. The
+supported direct launch command and current setup requirements are documented at
+[Install Agent Studio](https://docs.sapiom.ai/agent-studio/install).
