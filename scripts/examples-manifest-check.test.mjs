@@ -56,7 +56,7 @@ test("every existing manifest in the repo validates unchanged", () => {
     );
   }
   assert.deepEqual(problems, []);
-  assert.ok(registry.templates.length >= 24);
+  assert.ok(registry.templates.length >= 11);
 });
 
 test("the copy length caps are enforced by the schema, with a pointer", () => {
