@@ -12,13 +12,16 @@ you have two Sapiom MCP servers pre-wired, and the conventions below are
 active for the whole session. Follow them.
 
 **The two MCPs, and when to use each:**
-- **sapiom-direct** (remote, HTTP) — the paid capability surface an agent calls at
-  *runtime* from inside a deployed agent's step code (ctx.sapiom.*):
-  repositories, sandboxes, models, and so on. You don't call this directly
-  while authoring.
-- **sapiom-dev** (local, stdio) — the unmetered authoring surface for this
-  session. Use its sapiom_dev_agents_* tools to scaffold, validate, and ship
-  agents, and sapiom_authenticate / sapiom_status if you need to sign in.
+- **sapiom-direct** (remote, HTTP) — the hosted direct-capability surface for
+  ad hoc calls from this coding client. Agent source instead calls typed
+  ctx.sapiom.* methods; a deployed run routes those calls through Sapiom cloud,
+  not through this client MCP configuration. Don't substitute sapiom-direct
+  for the authoring tools below.
+- **sapiom** (local, stdio; wire identity **sapiom-dev**) — the authoring
+  surface for this session. Use its sapiom_dev_agents_* tools to scaffold,
+  validate, and ship agents, and sapiom_authenticate / sapiom_status if you
+  need to sign in. Local Run creates no Sapiom capability request or spend,
+  but authored JavaScript and its ordinary side effects still run.
 
 **When something about Sapiom is wrong, send it upstream.** If the user hits a
 bug, calls something confusing or broken, or wishes it worked differently,

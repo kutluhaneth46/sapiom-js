@@ -1,8 +1,13 @@
-import { readFileSync, readdirSync, statSync } from "node:fs";
-import { dirname, extname, join, relative, resolve } from "node:path";
+import { readFileSync, readdirSync } from "node:fs";
+import { dirname, extname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const REPOSITORY_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const DOCS_ORIGIN = "https://docs.sapiom.ai";
+const SUPPORTED_LOCAL_CLAUDE_COMMAND =
+  "claude mcp add sapiom -- npx -y @sapiom/mcp";
+const SUPPORTED_HOSTED_CLAUDE_COMMAND =
+  'claude mcp add --scope user --transport http sapiom-direct https://api.sapiom.ai/v1/mcp --header "x-api-key: $SAPIOM_API_KEY"';
 /**
  * Public pages in the approved Docs.sapiom.ai information architecture.
  * Product source may link only to these canonical routes; redirects are for
@@ -75,11 +80,17 @@ const TEXT_EXTENSIONS = new Set([
 
 const IGNORED_DIRECTORIES = new Set([
   ".git",
+  ".next",
+  ".turbo",
   "build",
   "coverage",
   "dist",
   "node_modules",
   "release",
+]);
+const IGNORED_REPOSITORY_PATHS = new Set([
+  "scripts/docs-links-check.mjs",
+  "scripts/docs-links-check.test.mjs",
 ]);
 
 const REQUIRED_EMITTED_LINKS = [
@@ -92,28 +103,52 @@ const REQUIRED_EMITTED_LINKS = [
   "https://docs.sapiom.ai/reference/agent-studio",
 ];
 
-function walk(path) {
-  if (statSync(path).isFile()) return [path];
-  return readdirSync(path, { withFileTypes: true }).flatMap((entry) => {
+function normalizeRelativePath(root, path) {
+  return relative(root, path).split(sep).join("/");
+}
+
+function walk(root, directory = root) {
+  return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+    if (entry.isSymbolicLink()) return [];
+    const path = join(directory, entry.name);
+    const relativePath = normalizeRelativePath(root, path);
+    if (IGNORED_REPOSITORY_PATHS.has(relativePath)) return [];
     if (entry.isDirectory() && IGNORED_DIRECTORIES.has(entry.name)) return [];
-    return walk(join(path, entry.name));
+    if (entry.isDirectory()) return walk(root, path);
+    return entry.isFile() ? [path] : [];
   });
 }
 
-export function extractDocsLinks(content) {
+function extractDocsLinkMatches(content) {
   return [
-    ...content.matchAll(/https:\/\/docs\.sapiom\.ai(?:\/[^\s<>"'`)\]]*)?/g),
-  ].map((match) => match[0].replace(/[.,;:]+$/, ""));
+    ...content.matchAll(
+      /(?<![\w.-])(?:https?:\/\/)?docs\.sapiom\.[a-z]+(?:\/[^\s<>"'`)\]]*)?/gi,
+    ),
+  ].map((match) => ({
+    index: match.index ?? 0,
+    rawLink: match[0].replace(/[.,;:]+$/, ""),
+  }));
+}
+
+export function extractDocsLinks(content) {
+  return extractDocsLinkMatches(content).map(({ rawLink }) => rawLink);
 }
 
 export function validateDocsLinkContent(filePath, content) {
   const errors = [];
-  for (const rawLink of extractDocsLinks(content)) {
-    const url = new URL(rawLink);
+  for (const { index, rawLink } of extractDocsLinkMatches(content)) {
+    const url = new URL(
+      rawLink.includes("://") ? rawLink : `https://${rawLink}`,
+    );
+    const line = content.slice(0, index).split("\n").length;
+    if (url.origin !== DOCS_ORIGIN) {
+      errors.push(
+        `${filePath}:${line} emits malformed docs origin ${url.origin}`,
+      );
+      continue;
+    }
     const pathname = url.pathname.replace(/\/$/, "") || "/";
     if (CANONICAL_DOC_ROUTES.has(pathname)) continue;
-    const offset = content.indexOf(rawLink);
-    const line = content.slice(0, offset).split("\n").length;
     errors.push(
       `${filePath}:${line} emits noncanonical docs route ${pathname}`,
     );
@@ -121,30 +156,69 @@ export function validateDocsLinkContent(filePath, content) {
   return errors;
 }
 
+export function validateSupportedMcpSetupContent(filePath, content) {
+  const errors = [];
+  for (const match of content.matchAll(/claude mcp add[^\n]*/gi)) {
+    const command = match[0];
+    const line = content.slice(0, match.index ?? 0).split("\n").length;
+    if (command.includes("@sapiom/mcp") && /\bsapiom-dev\b/.test(command)) {
+      errors.push(
+        `${filePath}:${line} registers local @sapiom/mcp with the unsupported sapiom-dev client alias`,
+      );
+    }
+    if (
+      (/--transport\s+http/i.test(command) ||
+        /https?:\/\/api\.sapiom\./i.test(command)) &&
+      /\bsapiom\b/.test(command) &&
+      !/\bsapiom-direct\b/.test(command)
+    ) {
+      errors.push(
+        `${filePath}:${line} registers the hosted MCP with the local sapiom client alias`,
+      );
+    }
+  }
+
+  if (
+    /\.(?:json|md)$/i.test(filePath) &&
+    /["']sapiom-dev["']\s*:/.test(content)
+  ) {
+    errors.push(
+      `${filePath} uses sapiom-dev as a client configuration key instead of the server's wire identity`,
+    );
+  }
+  return errors;
+}
+
 export function validateRepository(root = REPOSITORY_ROOT) {
-  const candidates = [
-    join(root, "README.md"),
-    join(root, "packages"),
-    join(root, "plugins"),
-  ]
-    .flatMap((path) => walk(path))
+  const candidates = walk(root)
     .filter((path) => TEXT_EXTENSIONS.has(extname(path)))
     .filter((path) => !path.endsWith("CHANGELOG.md"));
 
   const files = candidates.map((path) => ({
     path,
-    relativePath: relative(root, path),
+    relativePath: normalizeRelativePath(root, path),
     content: readFileSync(path, "utf8"),
   }));
-  const errors = files.flatMap(({ relativePath, content }) =>
-    validateDocsLinkContent(relativePath, content),
-  );
+  const errors = files.flatMap(({ relativePath, content }) => [
+    ...validateDocsLinkContent(relativePath, content),
+    ...validateSupportedMcpSetupContent(relativePath, content),
+  ]);
   if (errors.length) throw new Error(errors.join("\n"));
 
   const corpus = files.map(({ content }) => content).join("\n");
   for (const link of REQUIRED_EMITTED_LINKS) {
     if (!corpus.includes(link)) {
       throw new Error(`Required canonical product link is missing: ${link}`);
+    }
+  }
+  for (const command of [
+    SUPPORTED_LOCAL_CLAUDE_COMMAND,
+    SUPPORTED_HOSTED_CLAUDE_COMMAND,
+  ]) {
+    if (!corpus.includes(command)) {
+      throw new Error(
+        `Required supported setup command is missing: ${command}`,
+      );
     }
   }
 

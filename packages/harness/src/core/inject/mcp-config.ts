@@ -4,11 +4,11 @@ import { HARNESS_PATHS } from "../../shared/types.js";
 import { expandHome } from "../../cli/paths.js";
 
 export interface McpConfigOptions {
-  /** SAPIOM_ENVIRONMENT to pass through to the sapiom-dev child process. */
+  /** SAPIOM_ENVIRONMENT to pass through to the local authoring child process. */
   environment?: string;
   /**
    * Cached Sapiom API key (from CLI auth), if signed in. Sent as
-   * `x-api-key` on the remote `sapiom` MCP — empirically verified against
+   * `x-api-key` on the remote `sapiom-direct` MCP — empirically verified against
    * api.sapiom.ai/v1/mcp (both `x-api-key` and `Authorization: Bearer` are
    * accepted for `sk_`-prefixed keys; `x-api-key` matches its CORS
    * allow-list order and needs no prefix formatting). Omitted entirely when
@@ -20,7 +20,7 @@ export interface McpConfigOptions {
    *  HARNESS_PATHS.generated. Override in tests to avoid the real home dir. */
   generatedRoot?: string;
   /**
-   * This harness's own version, advertised to the sapiom-dev child as
+   * This harness's own version, advertised to the local authoring child as
    * `SAPIOM_HARNESS_VERSION`. The MCP is `npx`'d from the registry and so has
    * no way to know which Studio launched it; `sapiom_send_feedback` stamps this
    * into every feedback record, which is what makes "which build is this user
@@ -32,7 +32,8 @@ export interface McpConfigOptions {
 
 /**
  * Writes the `--mcp-config` file for a harness session: the remote HTTP
- * capability MCP (`sapiom`) and the local stdio authoring MCP (`sapiom-dev`).
+ * capability MCP (`sapiom-direct`) and the local stdio authoring MCP
+ * (`sapiom`; wire identity `sapiom-dev`).
  * Written under `HARNESS_PATHS.generated/<harnessSessionId>/` so concurrent
  * sessions never share (or race on) a config file. Returns the file's
  * absolute path for the adapter to pass as `--mcp-config <path>`.
@@ -56,12 +57,12 @@ export async function generateMcpConfig(
 
   const config = {
     mcpServers: {
-      sapiom: {
+      "sapiom-direct": {
         type: "http",
         url: "https://api.sapiom.ai/v1/mcp",
         ...(options.apiKey ? { headers: { "x-api-key": options.apiKey } } : {}),
       },
-      "sapiom-dev": {
+      sapiom: {
         command: "npx",
         // Pin the dist-tag (`@latest`) rather than the bare name so npx always
         // resolves the PUBLISHED package from the registry. A bare
@@ -78,7 +79,7 @@ export async function generateMcpConfig(
   };
 
   const filePath = path.join(dir, "mcp-config.json");
-  // May now carry a live API key (the `sapiom` entry's headers) — restrict
+  // May now carry a live API key (the `sapiom-direct` entry's headers) — restrict
   // to the owner, matching how ~/.sapiom/credentials.json is written.
   await fs.writeFile(filePath, JSON.stringify(config, null, 2) + "\n", { mode: 0o600 });
   return filePath;

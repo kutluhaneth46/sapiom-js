@@ -1,53 +1,36 @@
 # @sapiom/mcp
 
-The **local developer** MCP server for Sapiom. It runs on your machine over
-stdio under the server name `sapiom-dev` — the unmetered `sapiom_dev_*` surface
-for building and operating on Sapiom. Today it gives a coding agent the tools to
-scaffold, test, deploy, and inspect Sapiom orchestrations; the namespace leaves
-room for other non-capability developer tooling later.
+The **local authoring** MCP server for Sapiom. It runs on your machine over
+stdio and reports the wire identity `sapiom-dev`. Register it in your client
+under the supported alias `sapiom`. Its `sapiom_dev_*` tools let a coding
+agent scaffold, test, deploy, and inspect Sapiom agents.
 
-> **Not the capability surface.** This is *not* the remote "Sapiom" MCP (the
+> **Not the capability surface.** This is _not_ the remote "Sapiom" MCP (the
 > hosted connector with `sapiom_sandbox_*`, scrape, search, … capability tools).
-> `sapiom-dev` is the local developer surface; it makes no paid capability calls
-> and exposes no capability tools. See
+> The local server exposes no direct capability tools. Local Run creates no
+> Sapiom capability request or spend, but authored JavaScript and its ordinary
+> side effects still run. Cloud actions authenticate separately and a production
+> run can make metered capability calls. See
 > [the two Sapiom MCP servers](../../docs/mcp-servers.md) for which to use when.
 
 ## Install
 
-No global install — run it on demand with `npx`:
-
-```jsonc
-{
-  "mcpServers": {
-    "sapiom-dev": {
-      "command": "npx",
-      "args": ["-y", "@sapiom/mcp"]
-    }
-  }
-}
-```
-
-In Claude Code:
+No global install is required. In Claude Code:
 
 ```sh
-claude mcp add sapiom-dev -- npx -y @sapiom/mcp
+claude mcp add sapiom -- npx -y @sapiom/mcp
 ```
+
+The registration alias is `sapiom`; the package's MCP handshake still reports
+the server identity `sapiom-dev`.
 
 ## Configuration
 
-The server targets the `production` environment by default. Override it with the
-`SAPIOM_ENVIRONMENT` environment variable:
+The server targets the `production` environment by default. Register a
+staging-specific local server with:
 
-```jsonc
-{
-  "mcpServers": {
-    "sapiom-dev": {
-      "command": "npx",
-      "args": ["-y", "@sapiom/mcp"],
-      "env": { "SAPIOM_ENVIRONMENT": "staging" }
-    }
-  }
-}
+```sh
+claude mcp add sapiom -e SAPIOM_ENVIRONMENT=staging -- npx -y @sapiom/mcp
 ```
 
 - `production` (alias `prod`) → `app.sapiom.ai` / `api.sapiom.ai` — the default.
@@ -59,49 +42,53 @@ expected shape if it encounters an unknown environment name).
 
 ## Authentication
 
-The first networked call (`link`, `deploy`, `run`, `inspect`, `signal`) needs a
-Sapiom API key. Run **`sapiom_authenticate`** and the server opens a browser
-login flow, then caches the resulting key per environment in
+Cloud operations such as `clone`, `link`, `deploy`, production `run`,
+`inspect`, schedules, and signals need a Sapiom API key. Run
+**`sapiom_authenticate`** and the server opens a browser login flow, then
+caches the resulting key per environment in
 `~/.sapiom/credentials.json`. After that, tools work without re-authenticating.
 `sapiom_status` reports who you're authenticated as; `sapiom_logout` clears the
 cached credentials.
 
 The local authoring tools (`scaffold`, `check`, `run_local`) need no
-authentication — they run entirely offline.
+Sapiom authentication. `run_local` replaces `ctx.sapiom.*` calls with
+local stubs, but it still executes the agent's ordinary JavaScript and any
+file, process, or network side effects that code performs.
 
 ## Tools
 
-| Tool | Network | What it does |
-| --- | --- | --- |
-| `sapiom_authenticate` | browser | Log in and cache an API key for the current environment |
-| `sapiom_status` | — | Report authentication status |
-| `sapiom_logout` | — | Clear cached credentials |
-| `sapiom_send_feedback` | ✓ | Relay the user's product feedback to the Sapiom team |
-| `sapiom_dev_agents_scaffold` | — | Create a new orchestration project |
-| `sapiom_dev_agents_check` | — | Bundle + validate the step graph offline |
-| `sapiom_dev_agents_run_local` | — | Run the workflow locally, resolving capability calls from stubs (no cost) |
-| `sapiom_dev_agents_link` | ✓ | Resolve/create the hosted orchestration and cache its id |
-| `sapiom_dev_agents_clone` | ✓ | Fork a gallery template (or re-clone a fork) into a local project |
-| `sapiom_dev_agents_deploy` | ✓ | Push the current commit, build, and wait for it |
-| `sapiom_dev_agents_run` | ✓ | Start a real cloud execution |
-| `sapiom_dev_agents_inspect` | ✓ | Inspect an execution or build (optionally waiting for it) |
-| `sapiom_dev_agents_signal` | ✓ | Resume a paused execution by delivering a signal |
-| `sapiom_dev_agents_schedule` | ✓ | Create a recurring (cron) or one-off schedule for a deployed agent |
-| `sapiom_dev_agents_schedule_inspect` | ✓ | Inspect one schedule (with fire history) or list an agent's schedules |
-| `sapiom_dev_agents_schedule_cancel` | ✓ | Cancel a schedule (stops all future fires) |
-| `sapiom_dev_agents_cron_preview` | ✓ | Validate a cron expression and preview its next occurrences |
+| Tool                                 | Network | What it does                                                                            |
+| ------------------------------------ | ------- | --------------------------------------------------------------------------------------- |
+| `sapiom_authenticate`                | browser | Log in and cache an API key for the current environment                                 |
+| `sapiom_status`                      | —       | Report authentication status                                                            |
+| `sapiom_logout`                      | —       | Clear cached credentials                                                                |
+| `sapiom_send_feedback`               | ✓       | Relay the user's product feedback to the Sapiom team                                    |
+| `sapiom_dev_agents_scaffold`         | —       | Create a new agent project                                                              |
+| `sapiom_dev_agents_check`            | —       | Bundle + validate the step graph offline                                                |
+| `sapiom_dev_agents_run_local`        | —       | Run the agent locally with stubbed Sapiom capabilities; ordinary side effects still run |
+| `sapiom_dev_agents_link`             | ✓       | Resolve or create the hosted agent and cache its definition id                          |
+| `sapiom_dev_agents_clone`            | ✓       | Fork a gallery template (or re-clone a fork) into a local project                       |
+| `sapiom_dev_agents_deploy`           | ✓       | Push the current commit, build, and wait for it                                         |
+| `sapiom_dev_agents_run`              | ✓       | Start a real cloud execution                                                            |
+| `sapiom_dev_agents_inspect`          | ✓       | Inspect an execution or build (optionally waiting for it)                               |
+| `sapiom_dev_agents_signal`           | ✓       | Resume a paused execution by delivering a signal                                        |
+| `sapiom_dev_agents_schedule`         | ✓       | Create a recurring (cron) or one-off schedule for a deployed agent                      |
+| `sapiom_dev_agents_schedule_inspect` | ✓       | Inspect one schedule (with fire history) or list an agent's schedules                   |
+| `sapiom_dev_agents_schedule_cancel`  | ✓       | Cancel a schedule (stops all future fires)                                              |
+| `sapiom_dev_agents_cron_preview`     | ✓       | Validate a cron expression and preview its next occurrences                             |
 
 A typical loop: `scaffold` → write step code → `run_local` until green → `link`
 → `deploy` → `run` → `inspect`.
 
 ## How capabilities fit in
 
-Workflows authored here call Sapiom capabilities — sandboxes, repositories,
+Agents authored here call Sapiom capabilities — sandboxes, repositories,
 coding agents, search, storage, content generation — through
 [`@sapiom/tools`](../tools) (`ctx.sapiom.*`). `run_local` resolves those calls
-from stubs; a real `run`/`deploy` executes them in the cloud (metered). This MCP
-never grows a per-capability tool of its own — capabilities live in
-`@sapiom/tools` and the remote `sapiom` MCP. See
+from stubs; a production run executes them in Sapiom cloud and can incur
+capability spend. This MCP never grows a per-capability tool of its own —
+capabilities live in `@sapiom/tools` and the hosted MCP registered as
+`sapiom-direct`. See
 [the positioning doc](../../docs/mcp-servers.md) for the full policy.
 
 ## Sending feedback

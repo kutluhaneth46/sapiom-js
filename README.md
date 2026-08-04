@@ -22,7 +22,7 @@ This is a monorepo of focused packages. Install only what you need.
 | [@sapiom/agent](./packages/agent) | [![npm](https://img.shields.io/npm/v/@sapiom/agent)](https://www.npmjs.com/package/@sapiom/agent) | The authoring contract: `defineAgent`, `defineStep`, directives (`goto`/`terminate`), and types |
 | [@sapiom/tools](./packages/tools) | [![npm](https://img.shields.io/npm/v/@sapiom/tools)](https://www.npmjs.com/package/@sapiom/tools) | Typed client for Sapiom capabilities — the same tools your agents call, callable from your code |
 | [@sapiom/cli](./packages/cli)     | [![npm](https://img.shields.io/npm/v/@sapiom/cli)](https://www.npmjs.com/package/@sapiom/cli)     | Command line: scaffold, validate, deploy, and schedule agents                                   |
-| [@sapiom/mcp](./packages/mcp)     | [![npm](https://img.shields.io/npm/v/@sapiom/mcp)](https://www.npmjs.com/package/@sapiom/mcp)     | Local developer MCP server (`sapiom-dev`) — build & operate agents from your coding agent       |
+| [@sapiom/mcp](./packages/mcp)     | [![npm](https://img.shields.io/npm/v/@sapiom/mcp)](https://www.npmjs.com/package/@sapiom/mcp)     | Local authoring MCP (`sapiom` client alias; `sapiom-dev` wire identity)                        |
 
 ### Runtime internals
 
@@ -112,12 +112,14 @@ Add the local developer MCP so your coding agent can scaffold, test, deploy, and
 inspect Sapiom agents. In Claude Code:
 
 ```sh
-claude mcp add sapiom-dev -- npx -y @sapiom/mcp
+claude mcp add sapiom -- npx -y @sapiom/mcp
 ```
 
-> `@sapiom/mcp` is the **local developer** surface (`sapiom_dev_*`). It is
-> distinct from the remote Sapiom capability MCP that services paid tool calls —
-> see [docs/mcp-servers.md](./docs/mcp-servers.md) for which to use when.
+> `@sapiom/mcp` reports the wire identity `sapiom-dev`, but `sapiom` above
+> is the supported client-local registration alias. It exposes the local
+> authoring surface (`sapiom_dev_*`), distinct from the hosted capability MCP
+> registered as `sapiom-direct`. See
+> [docs/mcp-servers.md](./docs/mcp-servers.md) for the boundary.
 
 ## 📚 Documentation
 
@@ -137,7 +139,7 @@ claude mcp add sapiom-dev -- npx -y @sapiom/mcp
     └── @sapiom/agent-core      Scaffold / validate / operate (pure functions)
             ↑
             ├── @sapiom/cli     Command line
-            └── @sapiom/mcp     Local developer MCP (sapiom-dev)
+            └── @sapiom/mcp     Local authoring MCP (client alias: sapiom)
 
 @sapiom/tools            Typed capability client (sandboxes, repos, models, …)
 ```
