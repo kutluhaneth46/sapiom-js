@@ -6,8 +6,32 @@ The full authoring guide ships inside this project at `.claude/skills/sapiom-age
 
 ## Authoring
 
-- An orchestration is `defineAgent({ entry, steps })`; each step is `defineStep({ name, next, run })`. Keep exactly one `defineAgent(...)` export.
+- An agent is `defineAgent({ entry, steps })`; each step is `defineStep({ name, next, run })`. Keep exactly one `defineAgent(...)` export.
 - **Capabilities come from the types.** What's available on `ctx.sapiom` is defined by `@sapiom/tools` — read the types / use autocomplete rather than guessing. A wrong capability or method name fails typecheck.
+
+## The entry input contract
+
+The **entry step's `inputSchema` is this agent's public API** — the dashboard Run form, the trigger snippet, and engine-side validation are all generated from it. Declare it (with `zod` from `zod/v4`) even when the agent looks input-free, and give every field a `.default()` so a zero-input run (the empty Run form) still validates. An entry step with no `inputSchema` tells the platform the agent takes no input — the Run form renders empty and `check` warns.
+
+```ts
+import { defineStep, terminate } from "@sapiom/agent";
+import { z } from "zod/v4";
+
+const start = defineStep({
+  name: "start",
+  next: [],
+  terminal: true,
+  inputSchema: z.object({
+    repo: z.string().default("sapiom/sapiom"),
+    window: z.enum(["day", "week", "month"]).default("week"),
+  }),
+  async run(input, ctx) {           // input: { repo: string; window: "day" | "week" | "month" }
+    return terminate({ scanned: input.repo });
+  },
+});
+```
+
+`inputSchema` on a non-entry step validates that step's inbound payload — but only the entry step's schema is read as the agent's public contract.
 
 ## Validating
 
@@ -15,7 +39,7 @@ When you've made a coherent change and want to validate it — the same point yo
 
 - **`npm run typecheck`** — types, and confirms every `ctx.sapiom.*` capability/method you used exists.
 - **check** — typecheck + bundle + manifest + step-graph validation. The full local pre-flight before deploy.
-- **run_local** — runs your **real** step code locally against **stub capabilities**: every `ctx.sapiom.*` call (namespace calls *and* handle methods like `repo.pushFromSandbox`) returns a built-in default, so a workflow runs end-to-end with zero setup. Returns a per-step trace.
+- **run_local** — runs your **real** step code locally against **stub capabilities**: every `ctx.sapiom.*` call (namespace calls *and* handle methods like `repo.pushFromSandbox`) returns a built-in default, so an agent run completes end-to-end with zero setup. Returns a per-step trace.
 - **deploy** — ship it.
 
 > Write each step the way it should run in production. `run_local` adapts to your code (stub capabilities), not the other way around — never weaken or drop real logic to shape a local run.
@@ -34,7 +58,7 @@ When you've made a coherent change and want to validate it — the same point yo
 
 ## Dispatched runs: pause & resume
 
-A long-running capability (today the coding agent) is launched fire-and-forget and the workflow suspends until it finishes:
+A long-running capability (today the coding agent) is launched fire-and-forget and the agent run suspends until it finishes:
 
 ```ts
 const run = await ctx.sapiom.models.coding.launch({ task, gitRepository: repo }); // returns a handle, not a result

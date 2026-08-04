@@ -143,8 +143,10 @@ describe("createRestRouter", () => {
         version: "9.9.9-test",
         authenticated: false,
         userId: null,
+        tenantId: null,
         organizationName: null,
         telemetryOptIn: false,
+        productAnalyticsOptIn: true,
         sessions: [],
         workflows: [],
         macros: [],
@@ -231,7 +233,7 @@ describe("createRestRouter", () => {
 
       start({
         sessionManager: fakeSessionManager([session]),
-        identity: { userId: "user-1", organizationName: "Acme" },
+        identity: { userId: "user-1", tenantId: "user-1", organizationName: "Acme" },
         listWorkflows: async () => [workflow],
         listMacros: () => [macro],
       });
@@ -765,6 +767,9 @@ describe("createRestRouter", () => {
       );
 
       expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({
+        error: "Unknown agent path '/not/registered' — scan or connect it before binding a session to it",
+      });
       expect(sessionManager.setBoundWorkflowPath).not.toHaveBeenCalled();
       expect(writeWorkspaceContext).not.toHaveBeenCalled();
     });
@@ -1489,4 +1494,3 @@ describe("createRestRouter", () => {
     });
   });
 });
-

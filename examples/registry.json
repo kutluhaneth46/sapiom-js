@@ -63,12 +63,20 @@
           "capability": "email.send",
           "terminal": true
         }
-      ]
+      ],
+      "setup": {
+        "runsWithNoSetup": true,
+        "connectionCount": 0,
+        "settingCount": 2,
+        "provisions": ["postgres"],
+        "degradedWithoutSetup": "Runs the saga with no approvers supplied, so nothing is committed and it escalates."
+      }
     },
     {
       "id": "cold-outreach-engine",
       "name": "Personalized Cold Outreach",
       "description": "Enrich a lead list, write a personalized first line for each prospect, verify deliverability, then drip follow-ups that stop the moment someone replies.",
+      "rank": 5,
       "tags": ["outreach", "sales", "drip", "personalization"],
       "category": "revenue-marketing",
       "discipline": "Revenue",
@@ -140,7 +148,14 @@
           "kind": "compute",
           "terminal": true
         }
-      ]
+      ],
+      "setup": {
+        "runsWithNoSetup": true,
+        "connectionCount": 0,
+        "settingCount": 1,
+        "provisions": ["postgres"],
+        "degradedWithoutSetup": "Runs the outreach engine with no leads, so there is nobody to write to and nothing is sent."
+      }
     },
     {
       "id": "content-repurposing-pipeline",
@@ -201,7 +216,13 @@
           "capability": "email.send",
           "terminal": true
         }
-      ]
+      ],
+      "setup": {
+        "runsWithNoSetup": true,
+        "connectionCount": 0,
+        "settingCount": 1,
+        "degradedWithoutSetup": "Repurposes the built-in sample post into copy plus real rendered quote graphics; skips the pricey teaser clip and emails nothing because no recipient is set."
+      }
     },
     {
       "id": "dependency-upgrade",
@@ -269,48 +290,13 @@
           "kind": "compute",
           "terminal": true
         }
-      ]
-    },
-    {
-      "id": "durable-backfill",
-      "name": "Large Dataset Backfill",
-      "description": "Process a huge dataset in resumable chunks, checkpointing progress so the job survives restarts and picks up where it left off.",
-      "tags": ["durable", "backfill", "batch", "cron"],
-      "category": "data-knowledge",
-      "discipline": "Data",
-      "cadence": "scheduled",
-      "complexity": "simple",
-      "sourcePath": "examples/durable-backfill",
-      "capabilities": [
-        "database.get",
-        "sandboxes.create",
-        "sandboxes.exec",
-        "fileStorage.upload",
-        "fileStorage.getDownloadUrl",
-        "fileStorage.list",
-        "fileStorage.delete"
       ],
-      "steps": [
-        {
-          "name": "plan",
-          "description": "Works out the job — dataset size, chunk size, and a stable job id — then resumes from a saved checkpoint if one exists for that id.",
-          "kind": "compute",
-          "next": ["process"]
-        },
-        {
-          "name": "process",
-          "description": "Process the current chunk, save its result and rewrite the checkpoint, then wait for the next heartbeat — or, running offline with nothing to fire one, loop straight to the next chunk. Finishes once the last chunk is done.",
-          "kind": "pause",
-          "capability": "sandboxes.exec",
-          "next": ["finalize", "process"]
-        },
-        {
-          "name": "finalize",
-          "description": "Writes a manifest of the run and returns a summary.",
-          "kind": "compute",
-          "terminal": true
-        }
-      ]
+      "setup": {
+        "runsWithNoSetup": true,
+        "connectionCount": 0,
+        "settingCount": 1,
+        "degradedWithoutSetup": "Runs a coding agent to triage upgrades and writes a report; pushes nothing (no repo)."
+      }
     },
     {
       "id": "error-triage-digest",
@@ -356,7 +342,14 @@
           "capability": "email.send",
           "terminal": true
         }
-      ]
+      ],
+      "setup": {
+        "runsWithNoSetup": true,
+        "connectionCount": 0,
+        "settingCount": 2,
+        "provisions": ["postgres"],
+        "degradedWithoutSetup": "Triages sample errors into a digest; emails nothing because no recipient is set."
+      }
     },
     {
       "id": "eval-gate",
@@ -395,7 +388,75 @@
           "kind": "compute",
           "terminal": true
         }
-      ]
+      ],
+      "setup": {
+        "runsWithNoSetup": true,
+        "connectionCount": 0,
+        "settingCount": 0,
+        "degradedWithoutSetup": "Grades the built-in sample against a rubric and returns a decision with rationale."
+      }
+    },
+    {
+      "id": "fan-out-and-combine",
+      "name": "Fan Out and Combine",
+      "description": "Split a goal into parts, run each part as its own child agent run in parallel, then merge the results into one answer.",
+      "tags": ["orchestration", "fan-out", "map-reduce", "agents"],
+      "category": "reliability-governance",
+      "discipline": "Reliability",
+      "cadence": "on-demand",
+      "complexity": "involved",
+      "sourcePath": "examples/fan-out-and-combine",
+      "capabilities": ["agents.run", "models.run"],
+      "steps": [
+        {
+          "name": "plan",
+          "description": "Resolve the goal, the parts to fan out, and the child agent to run for each — this agent itself by default. A leaf handles one part; a dry run returns the plan.",
+          "kind": "compute",
+          "next": ["solve", "fanOut", "planned"]
+        },
+        {
+          "name": "solve",
+          "description": "Leaf role: analyse one part toward the goal with a model, then finish. A leaf never fans out, which bounds the recursion to one level.",
+          "kind": "llm",
+          "capability": "models.run",
+          "next": [],
+          "terminal": true
+        },
+        {
+          "name": "fanOut",
+          "description": "Launch one child run per part in parallel and wait for all of them; a child that fails becomes a row, not a crash.",
+          "kind": "capability",
+          "capability": "agents.run",
+          "next": ["reduce"]
+        },
+        {
+          "name": "reduce",
+          "description": "Merge the children's analyses into one answer. If nothing came back with content, say so rather than invent it.",
+          "kind": "llm",
+          "capability": "models.run",
+          "next": ["done"]
+        },
+        {
+          "name": "done",
+          "description": "Return the combined answer and each child's status.",
+          "kind": "compute",
+          "next": [],
+          "terminal": true
+        },
+        {
+          "name": "planned",
+          "description": "Off-ramp for a dry run: return the fan-out plan with nothing dispatched.",
+          "kind": "compute",
+          "next": [],
+          "terminal": true
+        }
+      ],
+      "setup": {
+        "runsWithNoSetup": true,
+        "connectionCount": 0,
+        "settingCount": 0,
+        "degradedWithoutSetup": "Fans a sample goal into three parallel child runs of itself and returns one combined answer."
+      }
     },
     {
       "id": "hello-agent",
@@ -415,7 +476,13 @@
           "kind": "compute",
           "terminal": true
         }
-      ]
+      ],
+      "setup": {
+        "runsWithNoSetup": true,
+        "connectionCount": 0,
+        "settingCount": 0,
+        "degradedWithoutSetup": "Runs immediately with no setup and returns a greeting."
+      }
     },
     {
       "id": "human-in-the-loop",
@@ -496,7 +563,64 @@
           "capability": "email.send",
           "terminal": true
         }
-      ]
+      ],
+      "setup": {
+        "runsWithNoSetup": true,
+        "connectionCount": 0,
+        "settingCount": 2,
+        "degradedWithoutSetup": "Ranks the sample shortlist and stops at pending-approval; commits nothing (no approver)."
+      }
+    },
+    {
+      "id": "logged-in-screenshots",
+      "name": "Logged-In Page Screenshots",
+      "description": "Open a real browser, optionally log in, and capture the pages you list as hosted images — the view a signed-in user sees.",
+      "tags": ["browser", "screenshot", "authenticated", "visual"],
+      "category": "reliability-governance",
+      "discipline": "Reliability",
+      "cadence": "on-demand",
+      "complexity": "simple",
+      "sourcePath": "examples/logged-in-screenshots",
+      "capabilities": [
+        "browser.identity",
+        "browser.session",
+        "browser.screenshot"
+      ],
+      "steps": [
+        {
+          "name": "start",
+          "description": "Resolve the pages to capture and decide whether to log in — a login needs a URL, a username, and the password secret; miss any and it captures the public view.",
+          "kind": "compute",
+          "next": ["login", "capture"]
+        },
+        {
+          "name": "login",
+          "description": "Store the supplied credentials as a browser identity so the session opens signed in. If it fails, fall back to a public capture.",
+          "kind": "capability",
+          "capability": "browser.identity",
+          "next": ["capture"]
+        },
+        {
+          "name": "capture",
+          "description": "Open one browser session and screenshot every page in it; a page that fails becomes a row, the rest are still captured.",
+          "kind": "capability",
+          "capability": "browser.session",
+          "next": ["done"]
+        },
+        {
+          "name": "done",
+          "description": "Return one row per requested page — its image URL or its failure — with the captured count and whether it was authenticated.",
+          "kind": "compute",
+          "next": [],
+          "terminal": true
+        }
+      ],
+      "setup": {
+        "runsWithNoSetup": true,
+        "connectionCount": 1,
+        "settingCount": 0,
+        "degradedWithoutSetup": "Opens a browser session and captures two stable public pages as hosted images; no login, so authenticated is false."
+      }
     },
     {
       "id": "meeting-notes-crm",
@@ -542,7 +666,14 @@
           "capability": "email.send",
           "terminal": true
         }
-      ]
+      ],
+      "setup": {
+        "runsWithNoSetup": true,
+        "connectionCount": 0,
+        "settingCount": 2,
+        "provisions": ["postgres"],
+        "degradedWithoutSetup": "Turns sample meeting notes into a CRM update summary; emails nothing (no recipient)."
+      }
     },
     {
       "id": "news-roundup",
@@ -592,7 +723,14 @@
           "next": [],
           "terminal": true
         }
-      ]
+      ],
+      "setup": {
+        "runsWithNoSetup": true,
+        "connectionCount": 0,
+        "settingCount": 0,
+        "provisions": ["sandbox"],
+        "degradedWithoutSetup": "Searches the web for a well-covered default company and publishes a dated, illustrated roundup page at a live sandbox URL; a company with no recent coverage ends in a distinct no-news terminal instead."
+      }
     },
     {
       "id": "newsletter-autopilot",
@@ -640,12 +778,19 @@
           "kind": "compute",
           "terminal": true
         }
-      ]
+      ],
+      "setup": {
+        "runsWithNoSetup": true,
+        "connectionCount": 0,
+        "settingCount": 1,
+        "degradedWithoutSetup": "Writes a newsletter from researched sources; sends to nobody (empty subscriber list)."
+      }
     },
     {
       "id": "nl-db-query-endpoint",
       "name": "Ask Your Database",
       "description": "Deploy a live endpoint that turns a plain-English question into a read-only SQL query and returns the answer.",
+      "rank": 1,
       "tags": ["database", "sql", "endpoint", "llm", "natural-language"],
       "category": "data-knowledge",
       "discipline": "Data",
@@ -711,12 +856,20 @@
           "kind": "compute",
           "terminal": true
         }
-      ]
+      ],
+      "setup": {
+        "runsWithNoSetup": true,
+        "connectionCount": 1,
+        "settingCount": 0,
+        "provisions": ["postgres"],
+        "degradedWithoutSetup": "Translates a sample question to SQL, mints the endpoint its own scoped key, and deploys a working /query endpoint."
+      }
     },
     {
       "id": "personalized-media-at-scale",
       "name": "Personalized Media Per Lead",
       "description": "Read a table of leads and, per row, generate a personalized image or short clip, store it, and email each person a link — on a schedule.",
+      "rank": 3,
       "tags": ["marketing", "generative", "media", "scheduled"],
       "category": "revenue-marketing",
       "discipline": "Marketing",
@@ -765,12 +918,20 @@
           "capability": "email.send",
           "terminal": true
         }
-      ]
+      ],
+      "setup": {
+        "runsWithNoSetup": true,
+        "connectionCount": 0,
+        "settingCount": 0,
+        "provisions": ["postgres"],
+        "degradedWithoutSetup": "Renders personalized images; delivers nothing because no recipients are set."
+      }
     },
     {
       "id": "pr-review-bot",
       "name": "PR Review Bot",
       "description": "When a pull request opens, a coding agent reviews the code and flags missing tests, then posts the review to your email or Slack.",
+      "rank": 6,
       "tags": ["coding-agent", "review", "pause-resume", "webhook"],
       "category": "product-engineering",
       "discipline": "Engineering",
@@ -824,7 +985,13 @@
           "kind": "compute",
           "terminal": true
         }
-      ]
+      ],
+      "setup": {
+        "runsWithNoSetup": true,
+        "connectionCount": 1,
+        "settingCount": 1,
+        "degradedWithoutSetup": "Runs a coding agent to review the sample PR and returns a verdict; posts nothing (no webhook)."
+      }
     },
     {
       "id": "proposal-generator",
@@ -890,7 +1057,13 @@
           "kind": "compute",
           "terminal": true
         }
-      ]
+      ],
+      "setup": {
+        "runsWithNoSetup": false,
+        "connectionCount": 0,
+        "settingCount": 1,
+        "provisions": ["sandbox"]
+      }
     },
     {
       "id": "research-to-microsite",
@@ -971,12 +1144,18 @@
           "kind": "compute",
           "terminal": true
         }
-      ]
+      ],
+      "setup": {
+        "runsWithNoSetup": false,
+        "connectionCount": 0,
+        "settingCount": 0
+      }
     },
     {
       "id": "scene-to-video",
       "name": "Scene to Video",
       "description": "Turn one scene description into a short, multi-shot video with a consistent style.",
+      "rank": 4,
       "tags": ["generative", "video", "pipeline", "media"],
       "category": "revenue-marketing",
       "discipline": "Marketing",
@@ -1029,7 +1208,13 @@
           "kind": "compute",
           "terminal": true
         }
-      ]
+      ],
+      "setup": {
+        "runsWithNoSetup": true,
+        "connectionCount": 0,
+        "settingCount": 0,
+        "degradedWithoutSetup": "Shoots the built-in sample scene into a shot list with a style bible (dry run)."
+      }
     },
     {
       "id": "scheduled-compliance-audit",
@@ -1094,7 +1279,13 @@
           "kind": "compute",
           "terminal": true
         }
-      ]
+      ],
+      "setup": {
+        "runsWithNoSetup": true,
+        "connectionCount": 0,
+        "settingCount": 1,
+        "degradedWithoutSetup": "Runs the audit checks and drafts an attestation; files nothing (nobody signed off)."
+      }
     },
     {
       "id": "scheduled-db-insight-report",
@@ -1144,7 +1335,14 @@
           "capability": "email.send",
           "terminal": true
         }
-      ]
+      ],
+      "setup": {
+        "runsWithNoSetup": true,
+        "connectionCount": 1,
+        "settingCount": 1,
+        "provisions": ["postgres"],
+        "degradedWithoutSetup": "Snapshots the seeded demo database's own catalog, writes a real narrative report with a rendered chart, and returns it inline — nothing is emailed, because no `deliverTo` recipient is set."
+      }
     },
     {
       "id": "scheduled-research-brief",
@@ -1185,7 +1383,13 @@
           "kind": "compute",
           "terminal": true
         }
-      ]
+      ],
+      "setup": {
+        "runsWithNoSetup": true,
+        "connectionCount": 0,
+        "settingCount": 1,
+        "degradedWithoutSetup": "Researches the topic, writes a sourced brief, and emails it to the agent's own Sapiom-hosted demo inbox; set deliverTo to send it to your address."
+      }
     },
     {
       "id": "slack-notifier",
@@ -1229,86 +1433,13 @@
           "kind": "compute",
           "terminal": true
         }
-      ]
-    },
-    {
-      "id": "the-brain",
-      "name": "Workflow Fleet Monitor",
-      "description": "Watches a fleet of workflows, spots which member is off cadence, and launches it — with a model that may only pick from a fixed list of safe moves.",
-      "tags": ["orchestration", "agents-managing-agents", "meta-workflow"],
-      "category": "reliability-governance",
-      "discipline": "Reliability",
-      "cadence": "scheduled",
-      "complexity": "involved",
-      "sourcePath": "examples/the-brain",
-      "capabilities": ["models.run", "database.get", "database.create"],
-      "steps": [
-        {
-          "name": "scan",
-          "description": "Reads the event log and works out which members are off cadence — missed today, overdue, or launched with no result.",
-          "kind": "capability",
-          "capability": "database.get",
-          "next": ["assess"]
-        },
-        {
-          "name": "assess",
-          "description": "Hands those situations to a model that may only pick a move from a fixed list, then re-checks its answer in code.",
-          "kind": "llm",
-          "capability": "models.run",
-          "next": ["actuate"]
-        },
-        {
-          "name": "actuate",
-          "description": "Runs the plan behind guardrails, launching each due member as a child workflow and recording each launch.",
-          "kind": "compute",
-          "next": ["report"]
-        },
-        {
-          "name": "report",
-          "description": "Posts a short briefing to a Slack channel, records the run, and advances its place in the log.",
-          "kind": "compute",
-          "terminal": true
-        }
-      ]
-    },
-    {
-      "id": "wait-for-webhook",
-      "name": "Slow Job Callback",
-      "description": "Start a slow external job, pause until a webhook calls back, then summarize the result and decide whether to accept it.",
-      "tags": ["durable", "pause-resume", "webhook", "async"],
-      "category": "product-engineering",
-      "discipline": "Engineering",
-      "cadence": "on-demand",
-      "complexity": "simple",
-      "sourcePath": "examples/wait-for-webhook",
-      "capabilities": ["models.run"],
-      "steps": [
-        {
-          "name": "kickoff",
-          "description": "Register the resume contract with the external job and pause until it calls back — costing nothing while idle. With no register URL, no job was started, so it decides on an empty payload rather than waiting forever.",
-          "kind": "pause",
-          "next": ["decide"]
-        },
-        {
-          "name": "decide",
-          "description": "Wakes when the callback arrives; its input is the callback payload. A model summarizes the result and picks accept or reject.",
-          "kind": "llm",
-          "capability": "models.run",
-          "next": ["accept", "reject"]
-        },
-        {
-          "name": "accept",
-          "description": "Ends the run — the callback result looked complete and usable.",
-          "kind": "compute",
-          "terminal": true
-        },
-        {
-          "name": "reject",
-          "description": "Ends the run — the callback result failed or looked wrong.",
-          "kind": "compute",
-          "terminal": true
-        }
-      ]
+      ],
+      "setup": {
+        "runsWithNoSetup": true,
+        "connectionCount": 2,
+        "settingCount": 1,
+        "degradedWithoutSetup": "Composes the message and prints it; posts nothing to Slack (no bot token)."
+      }
     },
     {
       "id": "web-research-digest",
@@ -1335,7 +1466,13 @@
           "kind": "compute",
           "terminal": true
         }
-      ]
+      ],
+      "setup": {
+        "runsWithNoSetup": true,
+        "connectionCount": 0,
+        "settingCount": 0,
+        "degradedWithoutSetup": "Researches a default topic and returns a digest with cited sources."
+      }
     }
   ]
 }

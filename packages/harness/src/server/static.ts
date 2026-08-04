@@ -4,10 +4,18 @@
  * `pnpm build:web`), so the server is still useful for API/WS-only testing.
  *
  * Boot-token injection: every HTML response has a `<script>` block baked in
- * before `</head>` that sets `window.__HARNESS__ = { token: ${bootToken} }`.
+ * before `</head>` that sets `window.__HARNESS__ = { token, posthog }`.
  * This lets `getBootToken()` (web/src/lib/api.ts) resolve the token without
  * relying on the `?token=` query param — which is lost on navigation/reload
  * and caused every /api POST to 401 after the first page load (SAP-1898).
+ *
+ * PostHog config injection (SAP-1988): the same `<script>` also carries the
+ * client PostHog project key + hosts, resolved server-side from env so ONE
+ * shipped bundle (CLI + Electron) works across environments without a
+ * build-time key. The token is a public client key by design; a documented
+ * default points at the Sapiom product project (291192). Set
+ * `SAPIOM_POSTHOG_KEY=""` (empty) to disable client analytics entirely — the
+ * provider skips init when no key is present.
  *
  * Display-mode injection: the served `<html>` carries the persisted
  * `data-display-mode` (see readDisplayModeSync). The page's pre-paint script
@@ -32,9 +40,9 @@ import type { DisplayMode } from "../shared/types.js";
 
 const PLACEHOLDER_HTML = `<!doctype html>
 <html>
-  <head><meta charset="utf-8"><title>Sapiom Harness</title></head>
+  <head><meta charset="utf-8"><title>Agent Studio</title></head>
   <body style="font: 14px system-ui; padding: 2rem; color: #333;">
-    <h1>Sapiom Harness</h1>
+    <h1>Agent Studio</h1>
     <p>The web app hasn't been built yet. Run <code>pnpm --filter @sapiom/harness build:web</code>,
     or use <code>pnpm --filter @sapiom/harness dev:web</code> for a hot-reloading dev server.</p>
     <p>The API and WebSocket endpoints on this port are live.</p>
@@ -43,12 +51,44 @@ const PLACEHOLDER_HTML = `<!doctype html>
 `;
 
 /**
- * Builds the inline `<script>` that bakes the boot token into the page before
- * any SPA JS runs. JSON.stringify ensures the token is safely escaped even if
- * it contains characters that could break a bare string interpolation.
+ * The client PostHog config, or null when analytics is disabled (no key).
+ *
+ * `SAPIOM_POSTHOG_KEY` overrides the default; setting it to an empty string is
+ * an explicit opt-out that disables client capture (the provider skips init on
+ * a missing key). Hosts default to PostHog US cloud — `apiHost` is the ingest
+ * endpoint, `uiHost` keeps "view in PostHog" links pointing at the real app.
+ */
+interface PosthogClientConfig {
+  key: string;
+  apiHost: string;
+  uiHost: string;
+}
+
+/** Documented default client key — the Sapiom product project (291192). */
+const DEFAULT_POSTHOG_KEY = "phc_QmzsBloYUZJw7orDRBsEeV9Oz4lQ548cputd7RZ8pAq";
+
+function resolvePosthogConfig(): PosthogClientConfig | null {
+  // Explicit empty string disables; unset falls back to the default key.
+  const key = process.env.SAPIOM_POSTHOG_KEY ?? DEFAULT_POSTHOG_KEY;
+  if (!key.trim()) return null;
+  return {
+    key: key.trim(),
+    apiHost: process.env.SAPIOM_POSTHOG_HOST?.trim() || "https://us.i.posthog.com",
+    uiHost: process.env.SAPIOM_POSTHOG_UI_HOST?.trim() || "https://us.posthog.com",
+  };
+}
+
+/**
+ * Builds the inline `<script>` that bakes the boot token (and client PostHog
+ * config) into the page before any SPA JS runs. JSON.stringify ensures the
+ * values are safely escaped even if they contain characters that could break a
+ * bare string interpolation.
  */
 function buildTokenScript(bootToken: string): string {
-  const safeJson = JSON.stringify({ token: bootToken }).replace(/</g, "\\u003c");
+  const payload: { token: string; posthog?: PosthogClientConfig } = { token: bootToken };
+  const posthog = resolvePosthogConfig();
+  if (posthog) payload.posthog = posthog;
+  const safeJson = JSON.stringify(payload).replace(/</g, "\\u003c");
   return `<script>window.__HARNESS__ = ${safeJson};</script>`;
 }
 

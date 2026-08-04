@@ -45,8 +45,12 @@ import { historyDirs } from "./lib/history-meta";
 import { resolveProjectRoot } from "./lib/project-dir";
 import { useTemplatePrompt, type StudioTemplate } from "./lib/templates";
 import { track } from "./lib/track";
+import { initAnalytics } from "./lib/analytics/posthog";
+import { registerViewContext, track as trackProduct } from "./lib/analytics/events";
+import type { HarnessView } from "./lib/analytics/journeys";
 import { resolveMacroUrl } from "./lib/macro-gating";
 import { directActionKind } from "./lib/macro-actions";
+import { describeWorkflowPrompt } from "./lib/describe-prompt";
 import { sessionDisplayName } from "./lib/session-name";
 import { applyDisplayMode, getDisplayMode, registerDisplayModePersistence } from "./lib/theme";
 import { onOpenSettingsRequest } from "./lib/desktop";
@@ -245,6 +249,41 @@ export const App = (): JSX.Element => {
     setFocusedAgentPath(boundWorkflowPathOf(active) ?? harness.state.workflows[0]?.path ?? null);
   }, [harness.state, harness.activeSessionId]);
 
+  // Client PostHog (SAP-1988): init once state is known and re-sync identity +
+  // consent whenever they change. initAnalytics is idempotent and gates itself
+  // on the two consent tiers, so this is safe to call on every relevant change.
+  const st = harness.state;
+  useEffect(() => {
+    if (st) initAnalytics(st);
+  }, [
+    st,
+    st?.authenticated,
+    st?.userId,
+    st?.tenantId,
+    st?.consentSource,
+    st?.productAnalyticsOptIn,
+    st?.version,
+  ]);
+
+  // Stamp the current journey + view as PostHog super-properties so autocapture
+  // clicks group by arc of intent (the harness's replacement for the web app's
+  // pathname-derived journey — it has no router).
+  useEffect(() => {
+    if (!st) return;
+    const active = st.sessions.find((session) => session.id === harness.activeSessionId);
+    const view: HarnessView = {
+      firstRun: st.firstRun === true,
+      settingsOpen,
+      templatesOpen,
+      hasLiveSession: st.sessions.some((session) => session.status !== "exited"),
+      // Reviewing a finished session (active session has exited) is the observe
+      // arc — without this the dead-session view falls through to `unknown`.
+      inspectingDeadSession: active?.status === "exited",
+      rightTab,
+    };
+    registerViewContext(view);
+  }, [st, harness.activeSessionId, settingsOpen, templatesOpen, rightTab]);
+
   // Crossing the breakpoint resets both panes to that mode's default.
   const prevMobile = useRef(isMobile);
   useEffect(() => {
@@ -286,8 +325,29 @@ export const App = (): JSX.Element => {
     if (deadCwdNeedingHistory) void loadHistory([deadCwdNeedingHistory]);
   }, [deadCwdNeedingHistory, loadHistory]);
 
+  // Describe-with-AI outcome feedback. The run is a hidden background task that
+  // never takes over the board — but it must never finish SILENTLY either.
+  // Toast when a describe task leaves "running" (the exact "spins then stops
+  // with no result and no message" report). On success the canvas also
+  // re-renders on its own from the edited source.
+  const describeTaskStatus = useRef(new Map<string, string>());
+  useEffect(() => {
+    for (const task of harness.tasks) {
+      if (task.macroId !== "describe") continue;
+      const prev = describeTaskStatus.current.get(task.id);
+      if (prev === "running" && task.status !== "running") {
+        harness.showToast(
+          task.status === "failed"
+            ? "Couldn't generate descriptions — check the agent terminal for details."
+            : "Describe run finished — the canvas updates if the agent changed the source.",
+        );
+      }
+      describeTaskStatus.current.set(task.id, task.status);
+    }
+  }, [harness.tasks, harness.showToast]);
+
   if (harness.loading) {
-    return <div className="app-status">Loading Sapiom Studio…</div>;
+    return <div className="app-status">Loading Agent Studio…</div>;
   }
   // Boot failed (no state to render): degrade gracefully to a recoverable
   // state instead of a dead "Failed to load" white screen. The classifier
@@ -371,6 +431,7 @@ export const App = (): JSX.Element => {
     closeMobileDrawer();
     const session = await harness.createSession({ cwd, harness: agentHarness });
     track("session.created");
+    trackProduct("session.started", { harness_kind: agentHarness, origin: "user" });
     return session;
   };
 
@@ -419,8 +480,8 @@ export const App = (): JSX.Element => {
       session.id,
       trimmedIdea
         ? `${base} build this:\n\n${trimmedIdea}`
-        : `${base} define the first workflow.`,
-      "Couldn't send the scaffold prompt. Ask the agent to run sapiom agents init.",
+        : `${base} define the first agent.`,
+      "Couldn't send the scaffold prompt. Ask the coding agent to run sapiom agents init.",
     );
   };
 
@@ -447,8 +508,8 @@ export const App = (): JSX.Element => {
   const handleScaffoldInSession = (sessionId: string): void => {
     injectPromptWithRetry(
       sessionId,
-      "Scaffold a new Sapiom agent project in this directory: run `sapiom agents init .`, then use the sapiom-agent-authoring skill to define the first workflow.",
-      "Couldn't send the scaffold prompt. Ask the agent to run sapiom agents init.",
+      "Scaffold a new Sapiom agent project in this directory: run `sapiom agents init .`, then use the sapiom-agent-authoring skill to define the first agent.",
+      "Couldn't send the scaffold prompt. Ask the coding agent to run sapiom agents init.",
     );
   };
 
@@ -460,8 +521,8 @@ export const App = (): JSX.Element => {
       session.id,
       useTemplatePrompt(template, cwd),
       template.kind === "gallery"
-        ? "Couldn't send the clone prompt. Ask the agent to run sapiom_dev_agents_clone."
-        : "Couldn't send the starter prompt. Ask the agent to run sapiom agents init.",
+        ? "Couldn't send the clone prompt. Ask the coding agent to run sapiom_dev_agents_clone."
+        : "Couldn't send the starter prompt. Ask the coding agent to run sapiom agents init.",
     );
   };
 
@@ -610,7 +671,7 @@ export const App = (): JSX.Element => {
       if (direct !== null) {
         if (direct === "deploy") {
           if (!workflow) {
-            harness.showToast("Select a workflow first.");
+            harness.showToast("Select an agent first.");
           } else {
             void harness.deploy(workflow.path);
           }
@@ -633,7 +694,7 @@ export const App = (): JSX.Element => {
           }
         } else if (direct === "run-local") {
           if (!workflow) {
-            harness.showToast("Select a workflow first.");
+            harness.showToast("Select an agent first.");
           } else {
             void harness.runLocal(sessionId, workflow.path);
           }
@@ -645,6 +706,23 @@ export const App = (): JSX.Element => {
       void harness.runMacro(macro.id, {
         harnessSessionId: sessionId,
         workflowPath: workflow?.path,
+      });
+    })();
+  };
+
+  // "Describe with AI": run the describe macro HEADLESS (execution:"background")
+  // so the agent edits the workflow source out of sight — never the interactive
+  // terminal. The prompt is passed as the macro's `subject`; the source watcher
+  // re-renders the canvas when the agent saves. The button's loading state is
+  // driven by the resulting background task (see CanvasPane `describeRunning`).
+  const handleDescribeWithAI = (workflow: WorkflowInfo): void => {
+    void (async () => {
+      const sessionId = (await handleBindWorkflow(workflow.path)) ?? harness.activeSessionId;
+      if (!sessionId) return;
+      void harness.runMacro("describe", {
+        harnessSessionId: sessionId,
+        workflowPath: workflow.path,
+        subject: describeWorkflowPrompt(workflow),
       });
     })();
   };
@@ -696,7 +774,6 @@ export const App = (): JSX.Element => {
           onBrowseTemplates={() => setTemplatesOpen(true)}
           templatesActive={templatesOpen}
           onScanWorkflows={handleScanWorkflows}
-          onOpenInEditor={openInEditor}
           onToast={harness.showToast}
           telemetryOptIn={harness.settings?.telemetryOptIn ?? state.telemetryOptIn}
           consentSource={state.consentSource}
@@ -705,6 +782,10 @@ export const App = (): JSX.Element => {
           organizationName={state.organizationName}
           onToggleTelemetry={async (next) => {
             await harness.updateSettings({ telemetryOptIn: next });
+          }}
+          productAnalyticsOptIn={state.productAnalyticsOptIn}
+          onToggleProductAnalytics={async (next) => {
+            await harness.updateSettings({ productAnalyticsOptIn: next });
           }}
           rollingSummary={harness.settings?.rollingSummary === true}
           onToggleRollingSummary={async (next) => {
@@ -964,11 +1045,11 @@ export const App = (): JSX.Element => {
                   <a
                     className="status-tag status-tag-action workflow-deployed-tag right-pane-deployed"
                     data-testid="workflow-dashboard-link"
-                    href={`https://app.sapiom.ai/workflows/${rightPaneWorkflow.definitionId}`}
+                    href={`https://app.sapiom.ai/agents/${rightPaneWorkflow.definitionId}`}
                     target="_blank"
                     rel="noreferrer"
                     aria-label="Deployed — open in the Sapiom dashboard"
-                    data-tooltip="Open this workflow in the Sapiom dashboard"
+                    data-tooltip="Open this agent in the Sapiom dashboard"
                   >
                     <Icon name="Cloud" size={12} />
                     deployed
@@ -1027,6 +1108,7 @@ export const App = (): JSX.Element => {
                 onInjectPrompt={(text) => {
                   if (harness.activeSessionId) void harness.injectInput(harness.activeSessionId, text);
                 }}
+                onDescribeWorkflow={handleDescribeWithAI}
               />
             </div>
 
@@ -1083,6 +1165,10 @@ export const App = (): JSX.Element => {
           }}
           onDismiss={dismissWelcome}
           firstRun={state.firstRun === true}
+          telemetryOptIn={harness.settings?.telemetryOptIn ?? state.telemetryOptIn}
+          onToggleTelemetry={async (next) => {
+            await harness.updateSettings({ telemetryOptIn: next });
+          }}
         />
       )}
 

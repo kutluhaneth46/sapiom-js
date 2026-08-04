@@ -44,26 +44,96 @@ export function isReservedSecretKey(key) {
  * `registry.setup.provisions[]` must equal.
  */
 export function deriveProvisions(manifest) {
-  const resources = Array.isArray(manifest?.resources) ? manifest.resources : [];
+  const resources = Array.isArray(manifest?.resources)
+    ? manifest.resources
+    : [];
   return [...new Set(resources.map((r) => r?.kind))].filter(Boolean).sort();
 }
 
+/** zeroSetup.terminalState values that count as "reaches a meaningful terminal
+ * with no setup". A suspend (`paused_for_approval`) or an absent zeroSetup does
+ * not — the shelf's "pauses for approval" state is derived from steps[].checkpoint. */
+const MEANINGFUL_ZEROSETUP_TERMINALS = new Set([
+  "completed",
+  "completed_partial",
+]);
+
 /**
- * `setup.provisions[]` is denormalised into the thin registry index so the shelf
- * can render it without fetching a manifest. Denormalised data with no source of
- * truth is what let `capabilities[]` fill up with SDK method paths instead of
- * catalog ids, so this verifies rather than trusts.
+ * The full `registry.setup` block a template's manifest implies — the single
+ * source of truth for `pnpm examples:sync-setup` and the drift check below.
+ * Denormalised into the thin registry index so the gallery shelf renders it
+ * without fetching a manifest (an N+1 the shelf can't afford).
  *
- * @returns string[] — empty when `provisions` is absent (it is optional)
+ *   runsWithNoSetup      — true ONLY when the manifest carries a zeroSetup whose
+ *                          terminalState is a meaningful terminal; absent
+ *                          zeroSetup (unmeasured / hard-failed / the-brain) ⇒ false.
+ *   connectionCount      — number of requiredSecrets ("needs 1 credential").
+ *   settingCount         — number of declared settings.
+ *   provisions           — deriveProvisions(manifest); included only when non-empty.
+ *   degradedWithoutSetup — zeroSetup.narrative verbatim, when present (rendered
+ *                          on the card — never implies a send that won't happen).
  */
-export function checkSetupProvisions(template, manifest) {
-  const declared = template?.setup?.provisions;
-  if (!Array.isArray(declared)) return [];
-  const derived = deriveProvisions(manifest);
-  const actual = [...declared].sort();
-  if (JSON.stringify(actual) === JSON.stringify(derived)) return [];
+export function deriveSetup(manifest) {
+  const requiredSecrets = Array.isArray(manifest?.requiredSecrets)
+    ? manifest.requiredSecrets
+    : [];
+  const settings = Array.isArray(manifest?.settings) ? manifest.settings : [];
+  const zeroSetup = manifest?.zeroSetup;
+  const provisions = deriveProvisions(manifest);
+
+  const setup = {
+    runsWithNoSetup:
+      !!zeroSetup &&
+      MEANINGFUL_ZEROSETUP_TERMINALS.has(zeroSetup.terminalState),
+    connectionCount: requiredSecrets.length,
+    settingCount: settings.length,
+  };
+  if (provisions.length > 0) setup.provisions = provisions;
+  if (
+    typeof zeroSetup?.narrative === "string" &&
+    zeroSetup.narrative.length > 0
+  ) {
+    setup.degradedWithoutSetup = zeroSetup.narrative;
+  }
+  return setup;
+}
+
+/** Stable key-sorted serialisation, so two setup blocks compare equal regardless
+ * of key order or which optional fields are present. */
+function canonical(value) {
+  if (Array.isArray(value)) return value.map(canonical);
+  if (value && typeof value === "object") {
+    return Object.keys(value)
+      .sort()
+      .reduce((acc, k) => {
+        acc[k] = canonical(value[k]);
+        return acc;
+      }, {});
+  }
+  return value;
+}
+
+/**
+ * The registry `setup` block is GENERATED from the manifest by
+ * `pnpm examples:sync-setup`. This fails CI when the committed block drifts from
+ * what the manifest implies — the same verify-don't-trust rule as provisions,
+ * applied to the whole block so it can never be hand-edited out of sync.
+ */
+export function checkSetupSync(template, manifest) {
+  const derived = deriveSetup(manifest);
+  const actual = template?.setup;
+  if (actual === undefined) {
+    return [
+      `setup-sync: "${template?.id ?? "(unknown)"}" has no registry setup block — run \`pnpm examples:sync-setup\` (setup is generated from the manifest, never hand-maintained).`,
+    ];
+  }
+  if (
+    JSON.stringify(canonical(actual)) === JSON.stringify(canonical(derived))
+  ) {
+    return [];
+  }
   return [
-    `setup-provisions: "${template?.id ?? "(unknown)"}" registry setup.provisions is [${actual.join(", ")}] but the manifest's resources[] derive [${derived.join(", ")}] — provisions is generated from the manifest, never hand-maintained.`,
+    `setup-sync: "${template?.id ?? "(unknown)"}" registry setup is ${JSON.stringify(actual)} but the manifest derives ${JSON.stringify(derived)} — run \`pnpm examples:sync-setup\`.`,
   ];
 }
 
@@ -74,13 +144,122 @@ export function checkSetupProvisions(template, manifest) {
  * @param fileExists  (relativePath) => boolean, resolved against the example dir
  */
 export function checkResourceSeeds(templateId, manifest, fileExists) {
-  const resources = Array.isArray(manifest?.resources) ? manifest.resources : [];
+  const resources = Array.isArray(manifest?.resources)
+    ? manifest.resources
+    : [];
   const errors = [];
   resources.forEach((resource, i) => {
     if (typeof resource?.seed !== "string") return;
     if (!fileExists(resource.seed)) {
       errors.push(
         `manifest-resource-seed: "${templateId}" /resources/${i}/seed points at "${resource.seed}", which does not exist in the example directory.`,
+      );
+    }
+  });
+  return errors;
+}
+
+/**
+ * The set of injected-input keys the step code reads via `resolveResourceHandle`.
+ * A call's `key: "…"` option is the key it reads; a call that names no key reads
+ * the default `dbHandle`.
+ *
+ * Only each call's own ARGUMENT LIST is inspected — located by matching
+ * `resolveResourceHandle(` and scanning balanced parens — so a `key:` sitting in
+ * a comment, a JSDoc `@link`, or an unrelated object literal cannot forge a read.
+ * That closes the two loopholes a whole-source regex leaves open: (1) a declared
+ * `dbHandle` "satisfied" by any resolver call even when that call reads a
+ * different key, and (2) a non-default key "read" only because the string appears
+ * in a comment (e.g. the `reuse.key: "ledgerHandle"` note this file's own
+ * templates carry). The reuse check leans on this, and SAP-2320 leans on the
+ * reuse check, so a false positive here is a dishonest picker downstream.
+ *
+ * Value-side heuristics kept deliberately narrow: a `key` whose value is not a
+ * string literal (a variable) reads an unknown key and is intentionally NOT
+ * credited — the picker needs a statically declared key, so "compute the key at
+ * runtime" should fail the declaration, not pass it.
+ */
+function keysReadViaResolver(source) {
+  const keys = new Set();
+  const marker = "resolveResourceHandle";
+  for (
+    let at = source.indexOf(marker);
+    at !== -1;
+    at = source.indexOf(marker, at + marker.length)
+  ) {
+    // Skip a longer identifier that merely ends in the marker.
+    const before = source[at - 1];
+    if (before && /[A-Za-z0-9_$]/.test(before)) continue;
+    let i = at + marker.length;
+    while (i < source.length && /\s/.test(source[i])) i++;
+    if (source[i] !== "(") continue; // an import specifier or an @link, not a call.
+    let depth = 0;
+    let end = -1;
+    for (let j = i; j < source.length; j++) {
+      if (source[j] === "(") depth++;
+      else if (source[j] === ")" && --depth === 0) {
+        end = j;
+        break;
+      }
+    }
+    if (end === -1) continue;
+    const args = source.slice(i + 1, end);
+    const keyMatch = /\bkey\s*:\s*["']([^"']+)["']/.exec(args);
+    if (keyMatch) keys.add(keyMatch[1]);
+    else if (!/\bkey\s*:/.test(args)) keys.add("dbHandle"); // a bare call ⇒ the default key.
+  }
+  return keys;
+}
+
+/**
+ * True when `source` reads the injected handle under `key` via a real
+ * `resolveResourceHandle` call — see {@link keysReadViaResolver} for why this
+ * inspects call arguments rather than the whole source.
+ */
+function readsInjectedHandle(source, key) {
+  return keysReadViaResolver(source).has(key);
+}
+
+/**
+ * A `reuse` descriptor is the deploy-time picker's permission to offer "use a
+ * database you already have" for a resource. It is honest ONLY when the step
+ * actually opens the injected handle — otherwise the user picks a database the
+ * next run ignores, the dishonest affordance design-v2 § Landmines forbids
+ * ("a picker turns a latent hazard into a likely one"). Two rules the schema
+ * cannot express:
+ *   - reuse is a postgres concept — the picker lists databases, so a marker on a
+ *     sandbox / repository / inbox would offer a control with nothing to show.
+ *   - the declared `key` must be read by a `resolveResourceHandle(...)` call in
+ *     the step code, so a `reuse` marker can never sit on a hardcoded handle.
+ *
+ * @param indexSource  contents of the template's index.ts, or null when absent.
+ */
+export function checkResourceReuse(templateId, manifest, indexSource) {
+  const resources = Array.isArray(manifest?.resources)
+    ? manifest.resources
+    : [];
+  const errors = [];
+  const where = `"${templateId}" template.json`;
+  resources.forEach((resource, i) => {
+    const reuse = resource?.reuse;
+    if (reuse === undefined || reuse === null) return;
+    if (resource?.kind !== "postgres") {
+      errors.push(
+        `manifest-resource-reuse: ${where} /resources/${i} declares \`reuse\` on a "${resource?.kind}" resource — reuse is the postgres "use a database you already have" picker; only postgres resources may carry it.`,
+      );
+      return;
+    }
+    const key = reuse?.key;
+    if (typeof key !== "string") return; // the descriptor's shape is the schema's job.
+    if (indexSource === null) {
+      errors.push(
+        `manifest-resource-reuse: ${where} /resources/${i} is marked reusable but the template has no index.ts to read the injected "${key}" — a picker would repoint a handle no step opens.`,
+      );
+      return;
+    }
+    if (!readsInjectedHandle(indexSource, key)) {
+      errors.push(
+        `manifest-resource-reuse: ${where} /resources/${i}/reuse/key "${key}" is never read via resolveResourceHandle in index.ts — a reuse descriptor promises the run opens the picked handle, so the step must read it (the SAP-2191 migration pattern). Either wire the read or drop \`reuse\`.`,
       );
     }
   });
@@ -131,7 +310,9 @@ export function createManifestChecker(ajv, schema) {
     // (`ctx.sapiom.database.get(handle)`), so a duplicate is a silent collision
     // at lookup — the schema can constrain one handle's shape but not their
     // uniqueness as a set.
-    const resources = Array.isArray(manifest?.resources) ? manifest.resources : [];
+    const resources = Array.isArray(manifest?.resources)
+      ? manifest.resources
+      : [];
     const seenHandles = new Map();
     resources.forEach((resource, i) => {
       const handle = resource?.handle;

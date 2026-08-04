@@ -6,12 +6,13 @@ import {
   terminate,
   type AgentExecutionContext,
 } from "@sapiom/agent";
+import { z } from "zod/v4";
 
 /**
  * Proposal / Quote Generator — requirements in, a signed-off PDF quote out.
  *
  * The "draft → render → get sign-off → send" shape a salesperson or agency runs
- * by hand for every inbound request, done as one durable workflow:
+ * by hand for every inbound request, done as one durable agent:
  *
  *   draft ─▶ render ─▶ review ─(pause: proposal.decision, $0 while idle)─▶ onDecision
  *  (models.run) (sandbox+                                                    │
@@ -75,8 +76,8 @@ interface Party {
 }
 
 interface EntryInput {
-  /** The free-text requirement / RFP / brief to quote against. */
-  request: string;
+  /** The free-text requirement / RFP / brief to quote against. Omit ⇒ the sample. */
+  request?: string;
   /** The client the proposal is for. `email` is where the final PDF is sent. */
   client?: Party;
   /** Who the proposal is from (your company). Shown on the PDF. */
@@ -256,8 +257,67 @@ async function draftProposal(
 }
 
 // ─────────────────────────────────────────────────────────────── steps ──
+/**
+ * The entry contract — this agent's public API, and what the dashboard "Run
+ * once" form renders its labelled fields from. `request` stays optional so the
+ * tri-state holds: omitted ⇒ quote the built-in sample brief, explicitly empty
+ * ⇒ a rejection, present ⇒ quote it.
+ */
+const partySchema = z.object({
+  name: z.string().optional(),
+  company: z.string().optional(),
+  email: z.string().optional(),
+});
+const entryInput = z.object({
+  request: z
+    .string()
+    .optional()
+    .describe(
+      "The free-text requirement / RFP / brief to quote against. Omit to use the built-in sample.",
+    ),
+  client: partySchema
+    .optional()
+    .describe(
+      "The client the proposal is for. `email` is where the final PDF is sent.",
+    ),
+  from: partySchema
+    .optional()
+    .describe("Who the proposal is from (your company). Shown on the PDF."),
+  currency: z
+    .string()
+    .default("USD")
+    .describe("ISO 4217 currency code for the quote."),
+  taxRate: z
+    .number()
+    .default(0)
+    .describe("Tax rate as a fraction, e.g. 0.08 for 8% (0 ⇒ no tax line)."),
+  approver: z
+    .string()
+    .optional()
+    .describe(
+      "Who signs off before the client sees it. Falls back to config.APPROVER_EMAIL.",
+    ),
+  recipientEmail: z
+    .string()
+    .optional()
+    .describe(
+      "Where to send the approved proposal. Falls back to client.email / config.CLIENT_EMAIL.",
+    ),
+  dryRun: z
+    .boolean()
+    .optional()
+    .describe(
+      "Draft + render + get sign-off, but never send the client email.",
+    ),
+  config: z
+    .record(z.string(), z.string())
+    .optional()
+    .describe("String-only config bag (approver / client fallbacks)."),
+});
+
 const draft = defineStep({
   name: "draft",
+  inputSchema: entryInput,
   next: ["render", "rejected"],
   async run(input: EntryInput, ctx: Ctx) {
     // An omitted request drafts against the sample brief, so a zero-input run
@@ -268,7 +328,8 @@ const draft = defineStep({
       });
     }
     const usedSampleRequest = input.request === undefined;
-    const request = usedSampleRequest ? SAMPLE_REQUEST : input.request.trim();
+    const request =
+      input.request === undefined ? SAMPLE_REQUEST : input.request.trim();
     if (usedSampleRequest) {
       ctx.shared.set(
         "note",
@@ -333,7 +394,7 @@ function toBase64(text: string): string {
  * working dir at `/blaxel` and `node render.mjs` looks under `/blaxel/render-a0`.
  * Same filesystem, two different absolute paths — so the write is never where the
  * process reads, and the render dies with `Cannot find module`. (Known bug class:
- * Linear AGENT-231 fixed it for the MCP file tools; the SDK/workflow path still
+ * Linear AGENT-231 fixed it for the MCP file tools; the SDK agent-run path still
  * double-nests — run 263 is the runtime repro that ticket said it lacked.) Doing
  * everything in ONE `exec` sidesteps the whole root mismatch: `mkdir` + `cd` into
  * a per-attempt dir, decode the script and proposal from base64 into files right

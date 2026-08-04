@@ -106,10 +106,10 @@ export const MAX_IMAGE_UPLOAD_BYTES = 10 * 1024 * 1024;
 export const JSON_BODY_LIMIT_BYTES = Math.ceil((MAX_IMAGE_UPLOAD_BYTES * 4) / 3) + 1024 * 1024;
 
 /**
- * Workspace-state convention: the harness mirrors this session's binding,
- * the full workflow registry, and its own identity here, relative to the
- * session cwd, so the agent has an always-current, agent-legible answer to
- * "what am I working on" and "what workflows exist" without asking. Written
+ * Workspace-state convention: Agent Studio mirrors this session's binding,
+ * the full agent registry, and its own identity here, relative to the
+ * session cwd, so the coding agent has an always-current answer to
+ * "what am I working on" and "what agents exist" without asking. Written
  * on session create, on every `PATCH /api/sessions/:id/workflow`, and
  * whenever the workflow registry changes (scan/connect) — see
  * HarnessWorkspaceContext. Kept present (never deleted) even on unbind.
@@ -163,9 +163,9 @@ export interface HarnessSession {
   lastActiveAt: string;
   /** Exit code when status === "exited". */
   exitCode?: number | null;
-  /** The workflow (by path) this session is currently bound to, if any. Set
+  /** The deployable agent (by path) this session is currently bound to, if any. Set
    *  via `PATCH /api/sessions/:id/workflow`; mirrored into
-   *  HARNESS_CONTEXT_FILE in the session's cwd so the agent can read it. */
+   *  HARNESS_CONTEXT_FILE in the session's cwd so the coding agent can read it. */
   boundWorkflowPath: string | null;
   /**
    * The prior session this one was seeded from (portable continue — see
@@ -994,29 +994,32 @@ export interface BindWorkflowRequest {
   workflowPath: string | null;
 }
 
-/** The trimmed workflow shape embedded in HarnessWorkspaceContext — just
- *  enough for an agent to identify a workflow, not the full WorkflowInfo
- *  (e.g. `source` is registry bookkeeping the agent has no use for). */
-export interface HarnessWorkspaceContextWorkflow {
+/** The trimmed agent shape embedded in HarnessWorkspaceContext — just
+ *  enough for a coding agent to identify a deployable agent, not the full
+ *  internal WorkflowInfo (e.g. `source` is registry bookkeeping it has no
+ *  use for). */
+export interface HarnessWorkspaceContextAgent {
   name: string;
   path: string;
   definitionId: number | null;
 }
+
+/** @deprecated Use {@link HarnessWorkspaceContextAgent}. */
+export type HarnessWorkspaceContextWorkflow = HarnessWorkspaceContextAgent;
 
 /**
  * The shape written to HARNESS_CONTEXT_FILE in a session's cwd. Schemaless
  * by convention elsewhere in the harness, but this one file IS a contract —
  * the default system prompt tells the agent to read it, so its shape is
  * fixed here like any other REST payload. Deliberately small and
- * stable-ordered (`workflows` sorted by path) so an agent can diff it
+ * stable-ordered (`agents` sorted by path) so a coding agent can diff it
  * cheaply across reads rather than re-parsing a growing blob.
  */
 export interface HarnessWorkspaceContext {
-  boundWorkflow: HarnessWorkspaceContextWorkflow | null;
-  /** Every workflow currently known to this harness instance's registry,
-   *  selected or not — lets an agent answer "what workflows exist" without
-   *  a UI action, not just "which one is selected." */
-  workflows: HarnessWorkspaceContextWorkflow[];
+  boundAgent: HarnessWorkspaceContextAgent | null;
+  /** Every deployable agent currently known to this Studio instance's
+   *  registry, selected or not. */
+  agents: HarnessWorkspaceContextAgent[];
   session: { id: string; cwd: string; harness: HarnessKind };
   updatedAt: string;
 }
@@ -1025,8 +1028,24 @@ export interface AppState {
   version: string;
   authenticated: boolean;
   userId: string | null;
+  /**
+   * The Sapiom org/tenant id (SAP-1988). Exposed to the SPA so client PostHog
+   * can `group('organization', tenantId)` — segmenting studio usage by customer
+   * the same way the web app does. Null when unauthenticated. Today this equals
+   * `userId` (identity is org-scoped); kept as a distinct field so a real
+   * per-seat id can diverge later without touching the group binding.
+   */
+  tenantId: string | null;
   organizationName: string | null;
   telemetryOptIn: boolean;
+  /**
+   * Resolved light-product-analytics (PostHog) opt-in (SAP-1988). Defaults to
+   * true (on) when the user hasn't opted out. The SPA gates `posthog` capture
+   * on this AND on `consentSource !== "env-forced-off"` (the hard kill-switch,
+   * which always wins). Always present so the client never has to distinguish
+   * "absent" from "false".
+   */
+  productAnalyticsOptIn: boolean;
   /**
    * How telemetry consent was determined at CLI boot. The UI uses this to
    * decide whether to show the first-run notice: "default-silent" means the
@@ -1250,7 +1269,23 @@ export const DISPLAY_MODES = ["light", "dark", "system"] as const;
 export type DisplayMode = (typeof DISPLAY_MODES)[number];
 
 export interface HarnessSettings {
+  /**
+   * Opt-in to sending the *invasive* usage telemetry to Sapiom → BigQuery
+   * (prompts, tool calls, session detail). OFF by default (SAP-1988): a desktop
+   * tool that silently ships session content is a reputation risk, so this is
+   * opt-in via the setup screen with benefit-framed copy. Distinct from
+   * `productAnalyticsOptIn` (light PostHog clicks/journeys, on by default).
+   */
   telemetryOptIn: boolean;
+  /**
+   * Opt-OUT of light product analytics — PostHog autocapture clicks, journeys,
+   * and usage metrics with NO recording and NO prompt/user content (SAP-1988).
+   * ON by default (absent === true): this is non-invasive and mirrors the web
+   * app. Hard kill-switches (`SAPIOM_TELEMETRY_DISABLED` / `DO_NOT_TRACK` /
+   * `--no-telemetry`, surfaced as `AppState.consentSource === "env-forced-off"`)
+   * always win regardless of this flag.
+   */
+  productAnalyticsOptIn?: boolean;
   /** Most-recently-used project directories, newest first. */
   recentDirs: string[];
   /**

@@ -18,11 +18,14 @@ interface SettingsPopoverProps {
   authenticated: boolean;
   organizationName: string | null;
   telemetryOptIn: boolean;
-  /** How consent was determined - "env-forced-off" locks the toggle. */
+  /** Light product-analytics (PostHog clicks/journeys) opt-in — on by default. */
+  productAnalyticsOptIn: boolean;
+  /** How consent was determined - "env-forced-off" locks BOTH toggles. */
   consentSource?: AppState["consentSource"];
   /** Which env var forced telemetry off, when consentSource is "env-forced-off". */
   consentEnvReason?: string | null;
   onToggleTelemetry: (next: boolean) => Promise<void>;
+  onToggleProductAnalytics: (next: boolean) => Promise<void>;
   /** `HarnessSettings.rollingSummary` — see the toggle's own note below. */
   rollingSummary: boolean;
   onToggleRollingSummary: (next: boolean) => Promise<void>;
@@ -42,9 +45,11 @@ export function SettingsPopover({
   authenticated,
   organizationName,
   telemetryOptIn,
+  productAnalyticsOptIn,
   consentSource,
   consentEnvReason,
   onToggleTelemetry,
+  onToggleProductAnalytics,
   rollingSummary,
   onToggleRollingSummary,
   onStartAuth,
@@ -61,6 +66,8 @@ export function SettingsPopover({
   // would silently lose to it on the next boot, so the control locks instead.
   const envForced = consentSource === "env-forced-off";
   const effectiveOptIn = envForced ? false : telemetryOptIn;
+  // The env kill-switch turns off ALL telemetry, product analytics included.
+  const effectiveProductAnalytics = envForced ? false : productAnalyticsOptIn;
 
   const handleToggle = async (): Promise<void> => {
     const next = !telemetryOptIn;
@@ -68,6 +75,17 @@ export function SettingsPopover({
     try {
       await onToggleTelemetry(next);
       track("consent.changed", { optIn: next });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleToggleProductAnalytics = async (): Promise<void> => {
+    const next = !productAnalyticsOptIn;
+    setBusy(true);
+    try {
+      await onToggleProductAnalytics(next);
+      track("consent.changed", { productAnalytics: next });
     } finally {
       setBusy(false);
     }
@@ -190,7 +208,7 @@ export function SettingsPopover({
       </div>
 
       <label className="settings-toggle-row">
-        <span>Send usage analytics to Sapiom</span>
+        <span>Share session details with Sapiom</span>
         <button
           type="button"
           role="switch"
@@ -204,17 +222,39 @@ export function SettingsPopover({
         </button>
       </label>
 
-      {envForced && (
-        <p className="settings-note settings-env-note" data-testid="telemetry-env-note">
-          Analytics is turned off by {consentEnvReason ? `$${consentEnvReason}` : "an environment variable"}. Unset it
-          and restart the Studio server to manage consent here.
-        </p>
-      )}
+      <p className="settings-note">
+        Help us optimize your experience: with this on, your prompts, tool calls, and session
+        lifecycle events are shared with Sapiom so we can see where Agent Studio gets in your way.
+        Off by default. Always written locally to <code>{HARNESS_PATHS.events}</code> either way.
+      </p>
+
+      <label className="settings-toggle-row">
+        <span>Product analytics (clicks &amp; usage)</span>
+        <button
+          type="button"
+          role="switch"
+          aria-checked={effectiveProductAnalytics}
+          data-testid="product-analytics-toggle"
+          className={"toggle-switch" + (effectiveProductAnalytics ? " is-on" : "")}
+          disabled={busy || envForced}
+          onClick={() => void handleToggleProductAnalytics()}
+        >
+          <span className="toggle-knob" />
+        </button>
+      </label>
 
       <p className="settings-note">
-        Prompts, tool calls, and session lifecycle events are always written locally to{" "}
-        <code>{HARNESS_PATHS.events}</code>. With your consent, they&rsquo;re also sent to Sapiom.
+        Anonymous-by-default usage: which buttons and screens you use, and how you move through the
+        Agent Studio. No prompt text, no file contents, and never a screen recording. On by default; turn
+        it off here anytime.
       </p>
+
+      {envForced && (
+        <p className="settings-note settings-env-note" data-testid="telemetry-env-note">
+          All telemetry is turned off by {consentEnvReason ? `$${consentEnvReason}` : "an environment variable"}. Unset
+          it and restart the Agent Studio server to manage consent here.
+        </p>
+      )}
 
       <label className="settings-toggle-row">
         <span>Summarize sessions in the background</span>
@@ -233,8 +273,9 @@ export function SettingsPopover({
 
       <p className="settings-note">
         Off by default, because it uses tokens you didn&rsquo;t ask to use: every 10 turns, and
-        once at the end, a cheap one-shot agent run folds the session into a short summary.
-        Continuing a session the agent can no longer reattach to then explains what the work was{" "}
+        once at the end, a cheap one-shot coding-agent pass folds the session into a short summary.
+        Continuing a session the coding agent can no longer reattach to then explains what the work
+        was{" "}
         <em>for</em>, not just what it last did. With this off, continuing still works — it
         carries the last few turns instead.
       </p>

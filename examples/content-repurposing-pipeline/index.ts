@@ -7,6 +7,7 @@ import {
   type AgentExecutionContext,
 } from "@sapiom/agent";
 import { VIDEO_RESULT_SIGNAL, type VideoResultPayload } from "@sapiom/tools";
+import { z } from "zod/v4";
 
 /**
  * Content Repurposing Pipeline — one long-form source into a multi-channel pack.
@@ -76,8 +77,8 @@ interface Clip {
 
 /** Trigger input. Only `source` is required. */
 interface RepurposeInput {
-  /** The blog post or transcript to repurpose (raw text). */
-  source: string;
+  /** The blog post or transcript to repurpose (raw text). Omit ⇒ the sample. */
+  source?: string;
   /** Optional title/topic for context in the generated copy. */
   title?: string;
   /** Who the content is for; steers tone (default a general professional audience). */
@@ -101,6 +102,8 @@ interface Shared extends Record<string, unknown> {
   deliverTo: string | null;
   aspectRatio: string;
   model?: string;
+  /** Whether to render the (pricey) teaser clip. Off for the built-in sample run. */
+  renderClip: boolean;
   pack: Pack;
   graphics: Graphic[];
   clip: Clip | null;
@@ -381,8 +384,60 @@ function renderPackMarkdown(
   ].join("\n");
 }
 
+/**
+ * The entry contract — this agent's public API, and what the dashboard "Run
+ * once" form renders its labelled fields from. `source` stays optional so the
+ * tri-state holds: omitted ⇒ repurpose the built-in sample, explicitly empty ⇒
+ * a reported mistake, present ⇒ repurpose it.
+ */
+const entryInput = z.object({
+  source: z
+    .string()
+    .optional()
+    .describe(
+      "The blog post or transcript to repurpose (raw text). Omit to use the built-in sample.",
+    ),
+  title: z
+    .string()
+    .optional()
+    .describe("Optional title/topic for context in the generated copy."),
+  audience: z
+    .string()
+    .optional()
+    .describe(
+      "Who the content is for; steers tone (default a general professional audience).",
+    ),
+  numQuotes: z
+    .number()
+    .default(2)
+    .describe("How many quote graphics to make (clamped 1–4)."),
+  deliverTo: z
+    .string()
+    .optional()
+    .describe(
+      "Recipient email. Omit it and the pack is returned inline instead of emailed.",
+    ),
+  schedule: z
+    .string()
+    .optional()
+    .describe("Cron cadence this pipeline runs on (carried + reported)."),
+  model: z
+    .string()
+    .optional()
+    .describe(
+      "Optional image-to-video model id, passed through to video.launch.",
+    ),
+  dryRun: z
+    .boolean()
+    .optional()
+    .describe(
+      "Generate the copy only — skip graphics, clip, upload, and email.",
+    ),
+});
+
 const repurpose = defineStep({
   name: "repurpose",
+  inputSchema: entryInput,
   next: ["graphics"],
   terminal: true,
   async run(input: RepurposeInput, ctx: Ctx) {
@@ -397,7 +452,8 @@ const repurpose = defineStep({
       });
     }
     const usedSampleSource = input.source === undefined;
-    const source = usedSampleSource ? SAMPLE_SOURCE : input.source.trim();
+    const source =
+      input.source === undefined ? SAMPLE_SOURCE : input.source.trim();
     if (usedSampleSource) {
       ctx.shared.set(
         "note",
@@ -439,6 +495,12 @@ const repurpose = defineStep({
     ctx.shared.set("deliverTo", input.deliverTo?.trim() || null);
     ctx.shared.set("aspectRatio", ASPECT_RATIO);
     if (input.model) ctx.shared.set("model", input.model);
+    // The teaser clip (image-to-video) is the priciest, slowest leg. A run nobody
+    // configured — the built-in sample — renders the quote graphics but stops short of
+    // the clip, so a zero-setup run still fires a real visual artifact without becoming
+    // the most expensive one in the gallery. Supply your own `source` and the full pack
+    // (clip included) renders.
+    ctx.shared.set("renderClip", !usedSampleSource);
     ctx.shared.set("pack", pack);
     ctx.shared.set("graphics", []);
     ctx.shared.set("clip", null);
@@ -449,11 +511,10 @@ const repurpose = defineStep({
       quotes: pack.quoteGraphics.length,
     });
 
-    // dryRun: trace the graph and read the copy without paying for graphics/clip.
-    // It defaults on ONLY when the source was defaulted too — image and video are
-    // the priciest capabilities here, and a run nobody configured should not be the
-    // most expensive one in the gallery. Supply a source and the full pack renders.
-    if (input.dryRun ?? usedSampleSource) {
+    // dryRun is an explicit author opt-in — never inferred from a defaulted source —
+    // to trace the graph and read the copy without paying for any generated media. A
+    // zero-setup run (no dryRun) falls through to `graphics` and renders real artwork.
+    if (input.dryRun) {
       ctx.logger.info("dryRun — returning copy only");
       return terminate({
         dryRun: true,
@@ -461,7 +522,7 @@ const repurpose = defineStep({
         pack,
         note: [
           ctx.shared.get("note"),
-          "No quote graphics or teaser clip were rendered, and nothing was emailed — this is the copy only. Pass `dryRun: false` for the full pack.",
+          "No quote graphics or teaser clip were rendered, and nothing was emailed — this is the copy only. Omit `dryRun` for the full pack.",
         ]
           .filter(Boolean)
           .join(" "),
@@ -473,7 +534,7 @@ const repurpose = defineStep({
 
 const graphics = defineStep({
   name: "graphics",
-  next: ["clip"],
+  next: ["clip", "package"],
   async run(_input: unknown, ctx: Ctx) {
     const pack = must(ctx.shared.get("pack"), "pack");
     ctx.logger.info("generating quote graphics", {
@@ -525,7 +586,10 @@ const graphics = defineStep({
     });
     ctx.shared.set("graphics", results);
     ctx.logger.info("graphics ready", { count: results.length });
-    return goto("clip", {});
+    // The built-in sample run stops at the graphics (a real visual artifact) and skips
+    // the pricey teaser clip; a caller-supplied source renders the full pack.
+    const renderClip = ctx.shared.get("renderClip") ?? true;
+    return renderClip ? goto("clip", {}) : goto("package", {});
   },
 });
 
@@ -669,6 +733,12 @@ const deliver = defineStep({
         graphics: graphicsList.length,
         clip: Boolean(value?.fileId),
       },
+      // The rendered quote graphics, surfaced so the run's terminal carries a real,
+      // inspectable visual artifact (real links) even when nothing is emailed.
+      graphics: graphicsList.map((g) => ({
+        quote: g.quote,
+        downloadUrl: g.downloadUrl ?? g.url,
+      })),
       packFileId,
       packDownloadUrl,
       clipFileId: value?.fileId ?? null,
@@ -689,7 +759,7 @@ const deliver = defineStep({
         reason: "no-recipient",
         unmet: ["deliverTo"],
         note: [
-          "Nothing was emailed: no `deliverTo` address is set, so the pack is returned inline below.",
+          "Nothing was emailed: no `deliverTo` address is set — the rendered quote graphics and the full pack are returned inline below.",
           note,
         ]
           .filter(Boolean)

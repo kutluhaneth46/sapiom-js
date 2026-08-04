@@ -6,7 +6,13 @@ import {
   terminate,
   type AgentExecutionContext,
 } from "@sapiom/agent";
-import { CODING_RESULT_SIGNAL, type CodingResultPayload } from "@sapiom/tools";
+import {
+  CODING_RESULT_SIGNAL,
+  EXECUTION_ENVIRONMENT_BLAXEL_SANDBOX,
+  schedules,
+  type CodingResultPayload,
+} from "@sapiom/tools";
+import { z } from "zod/v4";
 
 /**
  * Research → Micro-Site Publisher — deep multi-source research that ends in a
@@ -20,8 +26,20 @@ import { CODING_RESULT_SIGNAL, type CodingResultPayload } from "@sapiom/tools";
  *
  * The graph, one legible line per capability:
  *   search (web.search) ─▶ scrape (web.scrape) ─▶ synthesize (models.run)
- *     ─▶ build (models.coding) ─▶ publish (sandboxes.deployPreview)
+ *     ─▶ build (models.coding → a git repo) ─▶ publish (durable sandbox + deployPreview from git)
  *     ─▶ mapDomain (domains.dns) ─▶ live
+ *
+ * Durability by decoupling hosting from coding. The coding agent's real output is a
+ * GIT REPO (`build` launches it with a `gitRepository`, then pushes the result) —
+ * its own sandbox is a throwaway. `publish` then creates a SEPARATE, long-lived
+ * (`ttl: "7d"`) hosting sandbox and `deployPreview`s the site FROM the repo
+ * (`source: { kind: "git" }`), and registers an uptime keeper. The repo is the
+ * durable source of truth: the keeper re-deploys from it (and re-creates the host
+ * if it's ever gone), so the URL stays up — the exact recipe that holds Sapiom's own
+ * dashboards up 24/7. On the LOCAL stack a coding run is host-mode (`local_host`),
+ * which can't be pushed/deployed, so `publish` degrades honestly via the
+ * `builtNotPublished` terminal instead of failing. (Run with the Blaxel coding
+ * substrate — or on the deployed stack — for a real live URL.)
  *
  * Async pause/resume: `build` LAUNCHES the coding agent and suspends on its result
  * signal (a coding run takes minutes), so the run costs nothing while the agent
@@ -60,10 +78,19 @@ const DEFAULT_SUBDOMAIN = "www";
  * credential, so a real search gives the coding agent something real to build
  * from — and `synthesize` refuses to build at all from an empty report.
  */
-const DEFAULT_TOPIC = "how durable workflow engines handle retries";
+const DEFAULT_TOPIC = "how durable agent runtimes handle retries";
 /** Build/start config for the static site the coding agent produces. */
 const SITE_PORT = 3000;
 const SITE_START = "node server.js";
+/** Health path the uptime keeper probes; the built server.js must answer 200 here. */
+const SITE_HEALTH_PATH = "/health";
+/**
+ * TTL for the DURABLE hosting sandbox `publish` creates. The site lives here, not
+ * in the coding agent's throwaway sandbox — decoupling hosting from coding.
+ */
+const SITE_SANDBOX_TTL = "7d";
+/** Keeper cron: probe /health + redeploy-from-git every 5 min (Sapiom's dashboard cadence). */
+const KEEPER_CRON = "*/5 * * * *";
 
 // ─────────────────────────────────────────────────────────────── shapes ──
 interface EntryInput {
@@ -84,6 +111,14 @@ interface EntryInput {
    * free. A report too empty to build a site from also stops before the build.
    */
   dryRun?: boolean;
+  /**
+   * Slug of a deployed uptime-keeper agent (e.g. `preview-keep-alive`) to register a
+   * heal schedule against, so the published site stays up 24/7. Omit to publish
+   * without a keeper (the site is up while its 7-day host sandbox lives, but nothing
+   * relaunches the process if it's recycled). Best-effort: a failure logs and the run
+   * still returns the URL + the `keeperTarget` to register by hand.
+   */
+  keeperDefinition?: string;
 }
 
 /** Slim search hit carried across the search → scrape boundary. */
@@ -131,10 +166,14 @@ interface Shared extends Record<string, unknown> {
   reportTitle: string;
   reportTagline: string;
   sources: Source[];
-  /** The sandbox the coding agent built in, captured on resume for the terminal. */
+  /** The DURABLE hosting sandbox the site is deployed to (set in publish). */
   sandboxName: string | null;
+  /** The git repo the coding agent built the site into — the durable source of truth. */
+  repoSlug: string | null;
   /** The live preview URL, once deployed. */
   liveUrl: string | null;
+  /** Slug of a deployed keeper to register an uptime schedule against (or null). */
+  keeperDefinition: string | null;
   /** Set when the run researched the default topic rather than the caller's. */
   note?: string;
 }
@@ -212,9 +251,9 @@ function buildSiteTask(report: Report): string {
   return [
     "Build a single-page static website that presents the research report below as a polished, shareable micro-site.",
     "",
-    "Create exactly these two files at the workspace root:",
+    "Create exactly these two files in your current working directory (the git repository checkout you were started in — do NOT cd elsewhere or use an absolute path):",
     "- `index.html`: a self-contained page (all CSS inline in a <style> tag, NO external stylesheets, fonts, scripts, or CDNs). Render a hero with the report title and tagline, then the summary, then each section as its own block, then a 'Sources' list whose entries are clickable links. Make it clean, readable, and responsive; use a system-font stack and generous spacing.",
-    "- `server.js`: a zero-dependency Node HTTP server (only the built-in `http`/`fs`/`path` modules) that serves files from its own directory, defaults to `index.html`, sets a sensible Content-Type, and listens on `process.env.PORT || 3000` bound to host `0.0.0.0`.",
+    "- `server.js`: a zero-dependency Node HTTP server (only the built-in `http`/`fs`/`path` modules) that serves files from its own directory, defaults to `index.html`, sets a sensible Content-Type, and listens on `process.env.PORT || 3000` bound to host `0.0.0.0`. It MUST answer `GET /health` with HTTP 200 and body `ok` (a liveness probe an uptime keeper hits — do not serve a file for that path).",
     "",
     "Do NOT create a package.json, add dependencies, or introduce a build step — `node server.js` must start the finished site directly.",
     "",
@@ -235,20 +274,65 @@ function hostOf(url: string): string | null {
 }
 
 // ─────────────────────────────────────────────────────────────── steps ──
+/**
+ * The entry contract — this agent's public API, and what the dashboard "Run
+ * once" form renders its labelled fields from. `topic` carries the sample as
+ * its `.default(...)` so a zero-input run builds a real site instead of being
+ * rejected for a missing field.
+ */
+const entryInput = z.object({
+  topic: z
+    .string()
+    .default(DEFAULT_TOPIC)
+    .describe("What to research and publish a site about."),
+  audience: z
+    .string()
+    .optional()
+    .describe(
+      'Who the site is for — tunes the report tone (e.g. "investors", "developers").',
+    ),
+  customDomain: z
+    .string()
+    .optional()
+    .describe(
+      "A domain you already own in Sapiom to map the site onto. Omit to publish at the preview URL only.",
+    ),
+  subdomain: z
+    .string()
+    .default(DEFAULT_SUBDOMAIN)
+    .describe('Host on the custom domain, e.g. "report" → report.your.dev.'),
+  dryRun: z
+    .boolean()
+    .optional()
+    .describe(
+      "Compute the report and return it as a preview, skipping the build, deploy, and DNS.",
+    ),
+  keeperDefinition: z
+    .string()
+    .optional()
+    .describe(
+      'Slug of a deployed uptime-keeper agent (e.g. "preview-keep-alive") to register a heal schedule against, so the published site stays up 24/7. Omit to publish without a keeper.',
+    ),
+});
+
 const search = defineStep({
   name: "search",
+  inputSchema: entryInput,
   next: ["scrape"],
   async run(input: EntryInput, ctx: Ctx) {
-    const suppliedTopic = input.topic?.trim() ?? "";
-    const topic = suppliedTopic || DEFAULT_TOPIC;
+    // The schema fills `topic` with DEFAULT_TOPIC on a zero-input run, so the
+    // value — not its absence — is what tells us the sample topic was used.
+    const topic = input.topic?.trim() || DEFAULT_TOPIC;
     ctx.shared.set("topic", topic);
     ctx.shared.set("audience", input.audience?.trim() || "a general audience");
     ctx.shared.set("customDomain", input.customDomain?.trim() || null);
     ctx.shared.set("subdomain", input.subdomain?.trim() || DEFAULT_SUBDOMAIN);
     ctx.shared.set("dryRun", input.dryRun === true);
     ctx.shared.set("sandboxName", null);
+    ctx.shared.set("repoSlug", null);
     ctx.shared.set("liveUrl", null);
-    if (!suppliedTopic) {
+    ctx.shared.set("keeperDefinition", input.keeperDefinition?.trim() || null);
+    if (topic === DEFAULT_TOPIC) {
       ctx.shared.set(
         "note",
         `Researched the default topic ("${DEFAULT_TOPIC}"). Pass a \`topic\` to build a site about yours.`,
@@ -399,22 +483,97 @@ const build = defineStep({
   pause: { signal: CODING_RESULT_SIGNAL, resumeStep: "publish" },
   async run(input: { report: Report }, ctx: Ctx) {
     const report = input.report;
-    ctx.logger.info("launching coding agent to build the site", {
+    // The coding agent's durable output is a git REPO, not its throwaway sandbox.
+    // Create the repo and clone it into the run (`gitRepository`); the agent builds
+    // the site inside that checkout, and `publish` pushes it + deploys a durable host
+    // FROM the repo. Decouples hosting from coding — the coding sandbox can vanish.
+    const repoSlug = `microsite-${ctx.executionId}`;
+    ctx.shared.set("repoSlug", repoSlug);
+    const repo = await ctx.sapiom.repositories.create(repoSlug);
+    ctx.logger.info("launching coding agent to build the site into a repo", {
       title: report.title,
       sections: report.sections.length,
+      repo: repoSlug,
     });
-    // Launch without a repo or sandbox: the run provisions a fresh sandbox and
-    // writes the site into it. `publish` re-attaches that sandbox on resume.
     const handle = await ctx.sapiom.models.coding.launch({
       task: buildSiteTask(report),
+      gitRepository: repo,
     });
     return await pauseUntilSignal(handle, { resumeStep: "publish" });
   },
 });
 
+/**
+ * Uptime-keeper target for the published site. Shape a deployed keeper agent
+ * (e.g. `preview-keep-alive`) accepts as its per-run schedule input: probe
+ * `url + healthPath`; on failure re-attach `sandboxName` and re-`deployPreview`.
+ * `source: git` lets a git-aware keeper resurrect the host from the repo even after
+ * full deletion (an fs-only keeper ignores it and heals from the host's own files).
+ */
+interface KeeperTarget {
+  sandboxName: string;
+  url: string;
+  healthPath: string;
+  start: string;
+  port: number;
+  source: { kind: "git"; repo: string; ref: string };
+}
+
+function buildKeeperTarget(
+  sandboxName: string,
+  url: string,
+  repo: string,
+): KeeperTarget {
+  return {
+    sandboxName,
+    url,
+    healthPath: SITE_HEALTH_PATH,
+    start: SITE_START,
+    port: SITE_PORT,
+    source: { kind: "git", repo, ref: "main" },
+  };
+}
+
+/**
+ * Best-effort: register a recurring heal schedule on a deployed keeper agent so the
+ * site stays up past process recycling. Non-fatal — if no keeper is configured, or
+ * the schedule API isn't reachable here, the site is still deployed and the caller
+ * returns the `keeperTarget` for an operator to register by hand.
+ */
+async function registerKeeper(
+  ctx: Ctx,
+  target: KeeperTarget,
+): Promise<boolean> {
+  const keeperDefinition = ctx.shared.get("keeperDefinition") as string | null;
+  if (!keeperDefinition) return false;
+  try {
+    await schedules.create({
+      definition: keeperDefinition,
+      kind: "schedule_cron",
+      cron: KEEPER_CRON,
+      input: target,
+    });
+    ctx.logger.info("registered uptime keeper", {
+      keeper: keeperDefinition,
+      sandbox: target.sandboxName,
+      cron: KEEPER_CRON,
+    });
+    return true;
+  } catch (err) {
+    ctx.logger.warn(
+      "could not register keeper — site up only while its host lives",
+      {
+        keeper: keeperDefinition,
+        err: String(err),
+      },
+    );
+    return false;
+  }
+}
+
 const publish = defineStep({
   name: "publish",
-  next: ["mapDomain", "live", "failed"],
+  next: ["mapDomain", "live", "failed", "builtNotPublished"],
   async run(result: CodingResultPayload, ctx: Ctx) {
     // The coding run must have finished cleanly and left a sandbox to deploy from.
     if (result.status !== "completed" || !result.executionEnvironment) {
@@ -430,21 +589,59 @@ const publish = defineStep({
       });
     }
 
-    const sandboxName = result.executionEnvironment.id;
-    ctx.shared.set("sandboxName", sandboxName);
-    ctx.logger.info("deploying the built site", { sandbox: sandboxName });
+    const env = result.executionEnvironment;
+    const repoSlug = ctx.shared.get("repoSlug");
 
+    // Local host-mode coding runs aren't a pushable/deployable Blaxel sandbox, so
+    // there's nothing to publish from here. Degrade honestly (the site WAS built in
+    // the checkout) rather than fail. On the Blaxel substrate this branch is skipped.
+    if (env.type !== EXECUTION_ENVIRONMENT_BLAXEL_SANDBOX || !repoSlug) {
+      ctx.logger.warn(
+        "coding run not on the Blaxel substrate; skipping publish",
+        {
+          environmentType: env.type,
+          repo: repoSlug,
+        },
+      );
+      return goto("builtNotPublished", { environmentType: env.type });
+    }
+
+    // 1) Push the agent's build to the repo — the durable source of truth. After
+    //    this the coding sandbox can be reaped; the repo is what we host from.
+    try {
+      const repo = await ctx.sapiom.repositories.get(repoSlug);
+      const codingBox = ctx.sapiom.sandboxes.attach(env.id);
+      await repo.pushFromSandbox(codingBox, {
+        message: `build: ${ctx.shared.get("reportTitle") ?? "microsite"}`,
+      });
+      ctx.logger.info("pushed built site to repo", { repo: repoSlug });
+    } catch (err) {
+      ctx.logger.error("pushFromSandbox failed", {
+        repo: repoSlug,
+        err: String(err),
+      });
+      return goto("failed", { stage: "push", logs: String(err) });
+    }
+
+    // 2) Create a DURABLE (7d) hosting sandbox and deploy the site FROM the repo —
+    //    decoupled from the coding sandbox entirely.
+    const hostName = `microsite-${ctx.executionId}`;
+    ctx.shared.set("sandboxName", hostName);
     let deploy: { url: string | null; status: string; logs: string };
     try {
-      const box = ctx.sapiom.sandboxes.attach(sandboxName);
-      deploy = await box.deployPreview({
-        // source defaults to { kind: "fs" } — the files the coding agent wrote.
+      const host = await ctx.sapiom.sandboxes.create({
+        name: hostName,
+        port: SITE_PORT,
+        ttl: SITE_SANDBOX_TTL,
+      });
+      deploy = await host.deployPreview({
+        source: { kind: "git", repo: repoSlug, ref: "main" },
         start: SITE_START,
         port: SITE_PORT,
       });
     } catch (err) {
-      ctx.logger.error("deployPreview threw", {
-        sandbox: sandboxName,
+      ctx.logger.error("deployPreview (git) threw", {
+        host: hostName,
         err: String(err),
       });
       return goto("failed", { stage: "deploy", logs: String(err) });
@@ -455,6 +652,13 @@ const publish = defineStep({
     }
     ctx.shared.set("liveUrl", deploy.url);
     ctx.logger.info("site is live", { url: deploy.url, status: deploy.status });
+
+    // 3) Keep it alive: register a keeper that re-deploys from the repo (source git)
+    //    on a schedule — resurrectable even if the host sandbox is ever deleted.
+    const keeperTarget = buildKeeperTarget(hostName, deploy.url, repoSlug);
+    const keptAlive = await registerKeeper(ctx, keeperTarget);
+    ctx.shared.set("keeperTarget", keeperTarget);
+    ctx.shared.set("keptAlive", keptAlive);
 
     // Map a custom domain onto it when one is configured; otherwise the preview
     // URL is the deliverable.
@@ -511,15 +715,27 @@ const live = defineStep({
   terminal: true,
   async run(input: { liveUrl: string; customUrl: string | null }, ctx: Ctx) {
     const topic = ctx.shared.get("topic") || "";
+    const keptAlive = ctx.shared.get("keptAlive") === true;
+    // The site is deployed to a durable (7d) host FROM a git repo. With a keeper
+    // registered it stays up 24/7 (probe /health → redeploy-from-git on failure);
+    // without one it's up while the host lives but the process isn't relaunched if
+    // recycled — so we say which, and hand back `keeperTarget` to register one.
+    const note = keptAlive
+      ? "Live and kept alive: an uptime keeper probes /health and redeploys from the repo, so the URL stays up (host sandbox TTL 7d, resurrectable from git)."
+      : "Live on a 7-day host, but NO keeper was registered — if the sandbox process is recycled the URL 502s until redeployed. Pass `keeperDefinition` (a deployed keeper agent's slug), or register a keeper against `keeperTarget`, to keep it up 24/7.";
     return terminate({
       published: true,
+      keptAlive,
       topic,
       title: ctx.shared.get("reportTitle") ?? topic,
       tagline: ctx.shared.get("reportTagline") ?? "",
       liveUrl: input.liveUrl,
       customUrl: input.customUrl ?? null,
       sandboxName: ctx.shared.get("sandboxName") ?? null,
+      repoSlug: ctx.shared.get("repoSlug") ?? null,
+      keeperTarget: ctx.shared.get("keeperTarget") ?? null,
       sources: ctx.shared.get("sources") ?? [],
+      note,
     });
   },
 });
@@ -566,6 +782,38 @@ const drafted = defineStep({
   },
 });
 
+const builtNotPublished = defineStep({
+  name: "builtNotPublished",
+  next: [],
+  terminal: true,
+  async run(input: { environmentType: string }, ctx: Ctx) {
+    // Honest degrade: the coding agent built the site, but its run executed in an
+    // environment `deployPreview` can't serve from (local host mode). This is the
+    // expected local-stack outcome — the same flow publishes a live preview URL in
+    // production, where the coding run lands in a Blaxel sandbox. We report the
+    // built report metadata so the run isn't a dead end, and name the limitation
+    // instead of surfacing a raw "Sandbox not found" 404.
+    const environmentType = input?.environmentType ?? "unknown";
+    return terminate({
+      published: false,
+      built: true,
+      reason: "non-deployable-environment",
+      environmentType,
+      topic: ctx.shared.get("topic") || "",
+      title: ctx.shared.get("reportTitle") ?? null,
+      tagline: ctx.shared.get("reportTagline") ?? "",
+      sources: ctx.shared.get("sources") ?? [],
+      sandboxName: ctx.shared.get("sandboxName") ?? null,
+      note: [
+        `The coding agent built the site, but its run executed in a "${environmentType}" environment, which can't be preview-deployed — only Blaxel cloud sandboxes can. On the deployed Sapiom stack this step publishes a live *preview* URL (short-lived — the platform recycles the sandbox process; durable hosting is tracked in SAP-2211).`,
+        ctx.shared.get("note"),
+      ]
+        .filter(Boolean)
+        .join(" "),
+    });
+  },
+});
+
 export const agent = defineAgent<EntryInput, Shared>({
   name: "research-to-microsite",
   entry: "search",
@@ -579,5 +827,6 @@ export const agent = defineAgent<EntryInput, Shared>({
     live,
     failed,
     drafted,
+    builtNotPublished,
   },
 });

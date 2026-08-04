@@ -48,6 +48,10 @@ interface CanvasPaneProps {
   /** Sends a prompt to the active session's agent (used by the render-error
    *  state's one-click fix). */
   onInjectPrompt: (text: string) => void;
+  /** Runs the "Describe with AI" background macro for a workflow — a headless
+   *  agent authors the source `description` fields (never the interactive
+   *  terminal). The button's loading state is driven by the resulting task. */
+  onDescribeWorkflow: (workflow: WorkflowInfo) => void;
   /** Which projection of the rendered document is showing: the board, or
    *  the Steps tab (list + per-step detail) built from its posted graph. */
   surface: "board" | "steps";
@@ -83,6 +87,7 @@ export function CanvasPane({
   tasks,
   onRunMacro,
   onInjectPrompt,
+  onDescribeWorkflow,
   surface,
   onOpenSteps,
   run,
@@ -658,9 +663,17 @@ export function CanvasPane({
       task.harnessSessionId === sessionId &&
       (task.workflowPath == null || task.workflowPath === boundWorkflowPath),
   );
-  const runningTask = sessionTasks.find((task) => task.status === "running") ?? null;
+  // A "describe" run is a HIDDEN background pass — its only surface is the
+  // overview button's loading state (below), never the board activity/overlay
+  // or the failure takeover. Every other background task keeps its board
+  // treatment, so it's filtered out of runningTask / latestFinished here.
+  const describeRunning = sessionTasks.some(
+    (task) => task.status === "running" && task.macroId === "describe",
+  );
+  const runningTask =
+    sessionTasks.find((task) => task.status === "running" && task.macroId !== "describe") ?? null;
   const latestFinished = sessionTasks
-    .filter((task) => task.status !== "running")
+    .filter((task) => task.status !== "running" && task.macroId !== "describe")
     .sort((a, b) => (b.endedAt ?? "").localeCompare(a.endedAt ?? ""))[0];
   const failedTask =
     !runningTask && latestFinished?.status === "failed" && !dismissedTaskIds.has(latestFinished.id)
@@ -722,7 +735,7 @@ export function CanvasPane({
             className="canvas-empty"
             icon="Radio"
             title="No session"
-            body="Start a session to see its workflow steps here."
+            body="Start a session to see the agent's steps here."
           />
         ) : (
           <EmptyState
@@ -801,7 +814,7 @@ export function CanvasPane({
           testId="canvas-empty-exited"
           icon="History"
           title="Session ended"
-          body={`Resume the session to see its ${surface === "steps" ? "workflow steps" : "workflow diagram"} here.`}
+          body={`Resume the session to see ${surface === "steps" ? "the agent's steps" : "the agent's diagram"} here.`}
         />
       ) : !showsContent ? (
         /* Header claim + one supporting line — no action. The diagram is
@@ -815,8 +828,8 @@ export function CanvasPane({
           title={surface === "steps" ? "No steps yet" : "Nothing generated yet"}
           body={
             surface === "steps"
-              ? "Steps are read from the bound workflow's diagram — generated automatically from its code."
-              : "Generated automatically from the bound workflow; it refreshes when the code changes."
+              ? "Steps are read from the bound agent's diagram — generated automatically from its code."
+              : "Generated automatically from the bound agent; it refreshes when the code changes."
           }
         />
       ) : (
@@ -923,7 +936,7 @@ export function CanvasPane({
               <p className="canvas-error-summary">
                 {(() => {
                   const reason = postedError.reason.trim();
-                  if (reason.length < 4) return "The workflow graph could not be extracted. Open the terminal for details.";
+                  if (reason.length < 4) return "The agent graph could not be extracted. Open the terminal for details.";
                   return reason.includes(": ") ? reason.slice(reason.indexOf(": ") + 2).split(". ")[0] : reason;
                 })()}
               </p>
@@ -933,11 +946,11 @@ export function CanvasPane({
                   data-testid="canvas-error-fix"
                   onClick={() =>
                     onInjectPrompt(
-                      `The canvas render for ${postedError.title || "this workflow"} failed: ${postedError.reason} Fix the project so the workflow graph extracts cleanly.`,
+                      `The canvas render for ${postedError.title || "this agent"} failed: ${postedError.reason} Fix the project so the agent graph extracts cleanly.`,
                     )
                   }
                 >
-                  Ask agent to fix
+                  Ask coding agent to fix
                 </button>
                 <button
                   className="btn-ghost"
@@ -992,8 +1005,8 @@ export function CanvasPane({
             <button
               className="theme-toggle canvas-overview-open"
               data-testid="canvas-overview-toggle"
-              aria-label="Show workflow overview"
-              data-tooltip="Show workflow overview"
+              aria-label="Show agent overview"
+              data-tooltip="Show agent overview"
               onClick={() => setOverviewOpen(true)}
             >
               i
@@ -1006,7 +1019,7 @@ export function CanvasPane({
               className={"theme-toggle canvas-chat-toggle" + (chatOpen ? " is-active" : "")}
               data-testid="canvas-chat-toggle"
               aria-label={chatOpen ? "Close chat" : "Open chat"}
-              data-tooltip="Chat — ask about this workflow or the selected step"
+              data-tooltip="Chat — ask about this agent or the selected step"
               onClick={() => setChatOpen((c) => !c)}
             >
               <Icon name="MessageSquare" size={14} />
@@ -1079,7 +1092,7 @@ export function CanvasPane({
                   className="canvas-empty"
                   icon="Workflow"
                   title="No steps yet"
-                  body="This diagram has no step graph. It regenerates automatically from the bound workflow — check the terminal if it never appears."
+                  body="This diagram has no step graph. It regenerates automatically from the bound agent — check the terminal if it never appears."
                 />
               )}
             </div>
@@ -1102,6 +1115,12 @@ export function CanvasPane({
               }}
               onDeselect={() => setSelectedNodeId(null)}
               onCollapse={() => setOverviewOpen(false)}
+              onDescribeWithAI={
+                boundWorkflow && sessionId && !sessionExited
+                  ? () => onDescribeWorkflow(boundWorkflow)
+                  : undefined
+              }
+              describing={describeRunning}
             />
           )}
           {/* Standalone chat panel — independent of the info panel above; shows

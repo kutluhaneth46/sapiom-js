@@ -4505,6 +4505,57 @@ input {
   color: var(--text);
 }
 
+/* "Describe with AI": authors the deterministic `description` fields via the
+   bound agent. Accent-tinted, self-sized — sits in the overview content flow. */
+.canvas-describe-ai {
+  align-self: center;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--accent-border);
+  background: var(--accent-dim);
+  color: var(--text);
+  font: inherit;
+  font-size: var(--type-meta);
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+.canvas-describe-ai svg {
+  color: var(--accent);
+}
+.canvas-describe-ai:hover {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-foreground);
+}
+.canvas-describe-ai:hover svg {
+  color: var(--accent-foreground);
+}
+.canvas-describe-ai:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+/* Loading: hold the resting accent wash (no hover fill) while the hidden agent
+   runs — the spinner + "Describing…" carry the state. */
+.canvas-describe-ai.is-loading,
+.canvas-describe-ai:disabled {
+  cursor: default;
+  background: var(--accent-dim);
+  border-color: var(--accent-border);
+  color: var(--text);
+}
+.canvas-describe-spinner {
+  flex: 0 0 auto;
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--accent-border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: canvas-run-spin 0.9s linear infinite;
+}
+
 .canvas-overview-notes {
   margin: 0;
   padding-left: var(--sp4);
@@ -5694,6 +5745,19 @@ input {
   padding: var(--sp3) var(--modal-pad-x);
 }
 
+/* Keep each action button's label on one line and let the row wrap to stack
+   whole buttons when the dialog is narrow — otherwise flexbox shrinks them
+   below their content width and labels like "Start from a template" and
+   "Scaffold an agent here" break mid-word (the "no agent project" state). */
+.modal-add-workspace .modal-actions {
+  flex-wrap: wrap;
+}
+
+.modal-add-workspace .modal-actions > button {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
 /* Harness dropdown: compact trigger in the footer — [brand icon][label]
    [caret], same anatomy as the composer's provider control. The menu itself
    is the shared popover recipe (see .harness-select-menu). */
@@ -6419,6 +6483,16 @@ input {
   font-size: var(--type-meta);
   color: var(--text-dim);
   line-height: 1.5;
+}
+
+/* The copy/setup-prompt buttons hold their size and keep their label on one
+   line; the descriptive text (flex 1, min-width 0) absorbs the row and wraps
+   instead, so "Copy setup prompt" never breaks onto three lines in the narrow
+   "no agent project" modal. Applies to the expandable per-agent list rows too. */
+.aw-mcp-row > .btn-ghost,
+.aw-mcp-list-row > .btn-ghost {
+  flex-shrink: 0;
+  white-space: nowrap;
 }
 
 .aw-mcp-dim {

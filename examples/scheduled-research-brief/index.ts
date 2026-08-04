@@ -6,6 +6,7 @@ import {
   type AgentExecutionContext,
 } from "@sapiom/agent";
 import type { Sapiom } from "@sapiom/tools";
+import { z } from "zod/v4";
 
 /**
  * Scheduled Research Brief — the scheduled, LLM-curated, delivered sibling of
@@ -31,7 +32,7 @@ import type { Sapiom } from "@sapiom/tools";
  *     graph offline (capabilities stubbed) for free before a billed, delivering
  *     deploy + run.
  *   - The recipient is ordinary run input (a declared setting), not a secret, and
- *     persisted in execution state — the same seam you'd read a delivery secret
+ *     persisted in agent-run state — the same seam you'd read a delivery secret
  *     from if you swapped in a bring-your-own channel (see `AGENTS.md`).
  *   - Each edge carries a slim payload; the large scraped bodies stay bounded and
  *     die at the `curate` boundary — they never enter `ctx.shared` (big shared
@@ -116,17 +117,47 @@ async function resolveSenderInbox(ctx: Ctx): Promise<string> {
 }
 
 // ─────────────────────────────────────────────────────────────── steps ──
+/**
+ * The entry contract — this agent's public API, and what the dashboard "Run
+ * once" form renders its labelled fields from. `topic` carries the sample as
+ * its `.default(...)` so the declared default and the runtime default are the
+ * same value: a zero-input tick researches the sample topic instead of being
+ * rejected for a missing field.
+ */
+const entryInput = z.object({
+  topic: z
+    .string()
+    .default(DEFAULT_TOPIC)
+    .describe("What to research on each tick."),
+  schedule: z
+    .string()
+    .optional()
+    .describe('Cron cadence this brief runs on (e.g. "0 8 * * *").'),
+  deliverTo: z
+    .string()
+    .optional()
+    .describe(
+      "Recipient email. Omit it and the brief is returned inline instead of emailed.",
+    ),
+  dryRun: z
+    .boolean()
+    .optional()
+    .describe("Compute the brief but skip the real send."),
+});
+
 const search = defineStep({
   name: "search",
+  inputSchema: entryInput,
   next: ["scrape"],
   async run(input: EntryInput, ctx: Ctx) {
-    const supplied = input.topic?.trim() ?? "";
-    const topic = supplied || DEFAULT_TOPIC;
+    // The schema fills `topic` with DEFAULT_TOPIC on a zero-input tick, so the
+    // value — not its absence — is what tells us the sample topic was used.
+    const topic = input.topic?.trim() || DEFAULT_TOPIC;
     ctx.shared.set("topic", topic);
     ctx.shared.set("schedule", input.schedule?.trim() || DEFAULT_SCHEDULE);
     ctx.shared.set("deliverTo", input.deliverTo?.trim() || null);
     ctx.shared.set("dryRun", input.dryRun === true);
-    if (!supplied) {
+    if (topic === DEFAULT_TOPIC) {
       ctx.shared.set(
         "note",
         `Researched the default topic ("${DEFAULT_TOPIC}"). Pass a \`topic\` to research yours.`,
@@ -257,44 +288,44 @@ const deliver = defineStep({
     // as a `deliverTo` setting in template.json) rather than from a write-only
     // secret store nothing in the product can populate.
     const deliverTo = ctx.shared.get("deliverTo");
+    const note = ctx.shared.get("note");
 
-    // The safe path: a dry run — or a live run with no recipient configured yet —
-    // returns the computed brief without sending anything.
-    if (dryRun || !deliverTo) {
-      ctx.logger.info("skipping delivery", {
-        dryRun,
-        hasRecipient: Boolean(deliverTo),
-      });
+    // dryRun is an explicit author opt-in: compute the brief and return it as a
+    // preview without emailing anyone.
+    if (dryRun) {
+      ctx.logger.info("dry run — skipping delivery", {});
       return terminate({
         topic,
         schedule,
         delivered: false,
-        dryRun,
-        reason: dryRun ? "dry-run" : "no-recipient",
-        ...(dryRun ? {} : { unmet: ["deliverTo"] }),
-        note: [
-          dryRun
-            ? "`dryRun` was set, so nothing was emailed."
-            : "Nothing was emailed: no `deliverTo` address is set, so the brief is returned inline below.",
-          ctx.shared.get("note"),
-        ]
+        dryRun: true,
+        reason: "dry-run",
+        note: ["`dryRun` was set, so nothing was emailed.", note]
           .filter(Boolean)
           .join(" "),
-        to: deliverTo ?? null,
+        to: null,
         subject,
         brief,
         sources,
       });
     }
 
+    // The "email" headline must fire on a zero-setup run, so with no `deliverTo`
+    // we deliver to this agent's own Sapiom-hosted inbox — a real, inspectable
+    // mailbox the platform provisions for us via `resolveSenderInbox` (an
+    // `inboxId` IS its email address). A caller-supplied `deliverTo` is the
+    // upgrade that sends to a real external address instead.
     const inboxId = await resolveSenderInbox(ctx);
+    const toDemoInbox = !deliverTo;
+    const recipient = deliverTo ?? inboxId;
     const sent = await ctx.sapiom.email.messages.send(inboxId, {
-      to: deliverTo,
+      to: recipient,
       subject,
       text: brief,
     });
     ctx.logger.info("brief delivered", {
-      to: deliverTo,
+      to: recipient,
+      demo: toDemoInbox,
       messageId: sent.messageId,
     });
     return terminate({
@@ -302,11 +333,21 @@ const deliver = defineStep({
       schedule,
       delivered: true,
       dryRun: false,
-      to: deliverTo,
+      demo: toDemoInbox,
+      to: recipient,
       subject,
       messageId: sent.messageId,
+      brief,
       sources,
-      ...(ctx.shared.get("note") ? { note: ctx.shared.get("note") } : {}),
+      note:
+        [
+          toDemoInbox
+            ? `Emailed the brief to this agent's Sapiom-hosted demo inbox (${recipient}) — the message above is real and inspectable. Set \`deliverTo\` to send it to your own address instead.`
+            : null,
+          note,
+        ]
+          .filter(Boolean)
+          .join(" ") || undefined,
     });
   },
 });
