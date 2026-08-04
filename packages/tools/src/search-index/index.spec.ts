@@ -629,6 +629,31 @@ describe("SearchIndex.fetchDocuments() / deleteDocuments()", () => {
     });
   });
 
+  it("fails closed when non-null fetch results do not match requested ID positions", async () => {
+    const { idx: swapped } = await makeHandle([
+      () => jsonResponse({ result: [{ id: "b" }, { id: "a" }] }),
+    ]);
+    await expect(swapped.fetchDocuments(["a", "b"])).rejects.toMatchObject({
+      name: "SearchIndexContractError",
+      operation: "fetchDocuments",
+    });
+
+    const { idx: wrong } = await makeHandle([
+      () => jsonResponse({ result: [{ id: "unexpected" }, null] }),
+    ]);
+    await expect(wrong.fetchDocuments(["a", "missing"])).rejects.toMatchObject({
+      name: "SearchIndexContractError",
+      operation: "fetchDocuments",
+    });
+
+    const { idx: positionalMiss } = await makeHandle([
+      () => jsonResponse({ result: [null, { id: "b" }] }),
+    ]);
+    await expect(
+      positionalMiss.fetchDocuments(["missing", "b"]),
+    ).resolves.toEqual([null, { id: "b" }]);
+  });
+
   it("DELETEs {url}/delete/default with the ids body", async () => {
     const { idx, calls } = await makeHandle([
       () => jsonResponse({ deleted: 2 }),

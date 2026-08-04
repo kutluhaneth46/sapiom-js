@@ -19,8 +19,9 @@ The public contract names provider-invisible meters: `searchindex.index`,
 `searchindex.range`, `searchindex.fetch_documents`, and
 `searchindex.delete_documents`.
 
-`search.map({ url })` exposes site mapping with structured
-`{ links: [{ url, title?, description? }] }` output.
+`search.map({ url })` exposes gateway-direct site mapping with structured
+`{ links: [{ url, title?, description? }] }` output. Malformed successful map
+responses fail closed with `SearchContractError`.
 
 Both are wired into the `Sapiom` client interface, `bind()`, the barrel, the
 `./search-index` subpath export, and a stateful, validation-faithful stub client

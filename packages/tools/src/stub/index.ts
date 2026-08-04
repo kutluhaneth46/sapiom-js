@@ -136,6 +136,7 @@ import {
   validateUpdateSearchIndexInput,
 } from "../search-index/validation.js";
 import type { MapResult } from "../search/index.js";
+import { validateMapInput } from "../search/validation.js";
 
 /** Per-capability overrides, keyed by capability path (see module docs). */
 export type StubOverrides = Record<
@@ -741,6 +742,14 @@ export function createStubClient(opts: StubClientOptions = {}): Sapiom {
   const deletedSearchIndexIds = new Set<string>();
   let searchIndexSeq = 0;
 
+  const nextStubSearchIndexId = (): string => {
+    let id: string;
+    do {
+      id = `res_${(++searchIndexSeq).toString(36).padStart(20, "0")}`;
+    } while (searchIndexRegistry.has(id));
+    return id;
+  };
+
   const stubSearchIndexInfo = (
     id: string,
     input: CreateSearchIndexInput,
@@ -854,6 +863,57 @@ export function createStubClient(opts: StubClientOptions = {}): Sapiom {
         }) as void;
       },
     };
+  };
+
+  const coerceStubSearchIndexInfo = (
+    value: unknown,
+    fallback: SearchIndexInfo,
+  ): SearchIndexInfo => {
+    const raw =
+      value !== null && typeof value === "object" && !Array.isArray(value)
+        ? (value as Record<string, unknown>)
+        : {};
+    const statuses = new Set([
+      "provisioning",
+      "active",
+      "expired",
+      "deleting",
+      "deleted",
+    ]);
+    return {
+      id:
+        typeof raw.id === "string" && raw.id.length > 0 ? raw.id : fallback.id,
+      name: typeof raw.name === "string" ? raw.name : fallback.name,
+      status: statuses.has(String(raw.status))
+        ? (raw.status as SearchIndexInfo["status"])
+        : fallback.status,
+      url: typeof raw.url === "string" ? raw.url : fallback.url,
+      region:
+        raw.region === null || typeof raw.region === "string"
+          ? raw.region
+          : fallback.region,
+      expiresAt:
+        raw.expiresAt === null || typeof raw.expiresAt === "string"
+          ? raw.expiresAt
+          : fallback.expiresAt,
+      createdAt:
+        typeof raw.createdAt === "string" ? raw.createdAt : fallback.createdAt,
+    };
+  };
+
+  /**
+   * Turn a wire-shaped control-plane stub value into the same state-bound handle
+   * the built-in implementation returns. Registering before binding makes all
+   * data-plane methods usable and keeps subsequent control-plane calls coherent.
+   */
+  const registerStubSearchIndex = (
+    value: unknown,
+    fallback: SearchIndexInfo,
+  ): SearchIndex => {
+    const info = coerceStubSearchIndexInfo(value, fallback);
+    searchIndexRegistry.set(info.id, info);
+    deletedSearchIndexIds.delete(info.id);
+    return bindStubSearchIndex(info);
   };
 
   // Resolve a coding run result, then re-wrap its `sandbox` as a handle so the
@@ -1351,13 +1411,13 @@ export function createStubClient(opts: StubClientOptions = {}): Sapiom {
             ],
           })) as WebSearchResponse,
         ),
-      map: (input) =>
-        Promise.resolve(
-          r("search.map", [input], () => ({
-            success: true,
-            links: [{ url: input.url, title: "Stub Page", description: null }],
-          })) as MapResult,
-        ),
+      map: async (input) => {
+        validateMapInput(input);
+        return r("search.map", [input], () => ({
+          success: true,
+          links: [{ url: input.url, title: "Stub Page", description: null }],
+        })) as MapResult;
+      },
       emailSearch: {
         findEmail: (input) =>
           Promise.resolve(
@@ -1412,43 +1472,87 @@ export function createStubClient(opts: StubClientOptions = {}): Sapiom {
     searchindex: {
       create: async (input) => {
         validateCreateSearchIndexInput(input);
-        return r("searchindex.create", [input], () => {
-          const id = `stub-searchindex-${++searchIndexSeq}`;
-          const info = stubSearchIndexInfo(id, input);
-          searchIndexRegistry.set(id, info);
-          return bindStubSearchIndex(info);
-        }) as SearchIndex;
+        const resolved = await r("searchindex.create", [input], () =>
+          stubSearchIndexInfo(nextStubSearchIndexId(), input),
+        );
+        const resolvedId =
+          resolved !== null &&
+          typeof resolved === "object" &&
+          !Array.isArray(resolved) &&
+          typeof (resolved as { id?: unknown }).id === "string"
+            ? (resolved as { id: string }).id
+            : nextStubSearchIndexId();
+        return registerStubSearchIndex(
+          resolved,
+          stubSearchIndexInfo(resolvedId, input),
+        );
       },
       get: async (id) => {
         validateSearchIndexId(id);
-        return r("searchindex.get", [id], () => {
+        const existing = searchIndexRegistry.get(id);
+        const resolved = await r("searchindex.get", [id], () => {
           const info = searchIndexRegistry.get(id);
           if (!info) throw stubSearchIndexNotFound(id);
-          return bindStubSearchIndex(info);
-        }) as SearchIndex;
+          return info;
+        });
+        return registerStubSearchIndex(
+          resolved,
+          existing ?? stubSearchIndexInfo(id, { name: "stub-search-index" }),
+        );
       },
-      list: () =>
-        Promise.resolve(
-          r("searchindex.list", [], () =>
-            [...searchIndexRegistry.values()].map(bindStubSearchIndex),
-          ) as SearchIndex[],
-        ),
+      list: async () => {
+        const resolved = await r("searchindex.list", [], () => [
+          ...searchIndexRegistry.values(),
+        ]);
+        if (!Array.isArray(resolved)) {
+          opts.warnings?.add(
+            `'searchindex.list' stub must be an array of search indexes; got ${describeShape(resolved)}. Returning an empty list.`,
+          );
+          return [];
+        }
+        return resolved.map((value, index) => {
+          const raw =
+            value !== null && typeof value === "object" && !Array.isArray(value)
+              ? (value as Record<string, unknown>)
+              : {};
+          const id =
+            typeof raw.id === "string" && raw.id.length > 0
+              ? raw.id
+              : nextStubSearchIndexId();
+          const name =
+            typeof raw.name === "string"
+              ? raw.name
+              : `stub-search-index-${index + 1}`;
+          return registerStubSearchIndex(
+            value,
+            stubSearchIndexInfo(id, { name }),
+          );
+        });
+      },
       update: async (id, input) => {
         validateSearchIndexId(id);
         validateUpdateSearchIndexInput(input);
-        return r("searchindex.update", [id, input], () => {
+        const existing = searchIndexRegistry.get(id);
+        const resolved = await r("searchindex.update", [id, input], () => {
           const existing = searchIndexRegistry.get(id);
           if (!existing) throw stubSearchIndexNotFound(id, "update");
-          const updated: SearchIndexInfo = {
+          return {
             ...existing,
             ...(input.name !== undefined && { name: input.name }),
             ...(input.expiresAt !== undefined && {
               expiresAt: input.expiresAt,
             }),
           };
-          searchIndexRegistry.set(id, updated);
-          return bindStubSearchIndex(updated);
-        }) as SearchIndex;
+        });
+        const fallback = {
+          ...(existing ??
+            stubSearchIndexInfo(id, { name: "stub-search-index" })),
+          ...(input.name !== undefined && { name: input.name }),
+          ...(input.expiresAt !== undefined && {
+            expiresAt: input.expiresAt,
+          }),
+        };
+        return registerStubSearchIndex(resolved, fallback);
       },
       delete: async (id) => {
         validateSearchIndexId(id);

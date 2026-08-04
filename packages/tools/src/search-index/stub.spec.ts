@@ -1,7 +1,84 @@
 import { createStubClient } from "../stub/index.js";
 import { SearchIndexHttpError } from "./index.js";
 
+const searchIndexInfo = (id: string, name: string) => ({
+  id,
+  name,
+  status: "active" as const,
+  url: `https://${id}.search.data.stub.invalid`,
+  region: null,
+  expiresAt: null,
+  createdAt: "2026-08-04T00:00:00.000Z",
+});
+
 describe("searchindex stateful stub", () => {
+  it("generates deterministic resource IDs compatible with every SearchIndex surface", async () => {
+    const firstClient = createStubClient();
+    const first = await firstClient.searchindex.create({ name: "first" });
+    const second = await firstClient.searchindex.create({ name: "second" });
+    const repeatedClient = createStubClient();
+    const repeated = await repeatedClient.searchindex.create({ name: "first" });
+
+    expect(first.id).toBe("res_00000000000000000001");
+    expect(second.id).toBe("res_00000000000000000002");
+    expect(repeated.id).toBe(first.id);
+    expect(first.id).toMatch(/^res_[a-z0-9]{20}$/);
+    expect(first.url).toBe(`https://${first.id}.search.data.stub.invalid`);
+    await expect(firstClient.searchindex.get(first.id)).resolves.toMatchObject({
+      id: first.id,
+    });
+  });
+
+  it("coerces plain JSON control-plane overrides into registry-backed handles", async () => {
+    const createdId = "res_0000000000000000000a";
+    const fetchedId = "res_0000000000000000000b";
+    const listedId = "res_0000000000000000000c";
+    const sapiom = createStubClient({
+      overrides: {
+        "searchindex.create": searchIndexInfo(createdId, "created override"),
+        "searchindex.get": (id: unknown) =>
+          searchIndexInfo(String(id), "get override"),
+        "searchindex.list": [searchIndexInfo(listedId, "listed override")],
+        "searchindex.update": searchIndexInfo(createdId, "updated override"),
+      },
+    });
+
+    const created = await sapiom.searchindex.create({ name: "ignored" });
+    expect(created).toMatchObject({ id: createdId, name: "created override" });
+    expect(typeof created.upsert).toBe("function");
+    await created.upsert([{ id: "created-doc", content: { body: "kept" } }]);
+
+    const fetched = await sapiom.searchindex.get(fetchedId);
+    expect(fetched).toMatchObject({ id: fetchedId, name: "get override" });
+    expect(typeof fetched.query).toBe("function");
+    await fetched.upsert([{ id: "fetched-doc", content: { body: "found" } }]);
+    await expect(fetched.query({ query: "found" })).resolves.toMatchObject([
+      { id: "fetched-doc" },
+    ]);
+
+    const listed = await sapiom.searchindex.list();
+    expect(listed).toHaveLength(1);
+    expect(listed[0]).toMatchObject({ id: listedId, name: "listed override" });
+    expect(typeof listed[0]!.range).toBe("function");
+    await listed[0]!.upsert([
+      { id: "listed-doc", content: { body: "listed" } },
+    ]);
+    await expect(
+      listed[0]!.range({ includeData: true }),
+    ).resolves.toMatchObject({
+      documents: [{ id: "listed-doc", content: { body: "listed" } }],
+    });
+
+    const updated = await sapiom.searchindex.update(createdId, {
+      name: "requested update",
+    });
+    expect(updated).toMatchObject({ id: createdId, name: "updated override" });
+    expect(typeof updated.fetchDocuments).toBe("function");
+    await expect(
+      updated.fetchDocuments(["created-doc"], { includeData: true }),
+    ).resolves.toEqual([{ id: "created-doc", content: { body: "kept" } }]);
+  });
+
   it("matches pagination and payload-inclusion semantics", async () => {
     const sapiom = createStubClient();
     const index = await sapiom.searchindex.create({

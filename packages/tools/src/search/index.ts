@@ -18,11 +18,13 @@
  *
  * Or via an explicit client: `createClient({ apiKey }).search.webSearch(...)`.
  *
- * Every operation here is **routed**: it goes through the shared
+ * Web search, scrape, and email operations are **routed** through the shared
  * {@link capabilityCall} seam to `POST /v1/capabilities/<id>` on the single Core
  * base URL (SAP-1116). The dotted capability id (`web.scrape`, `web.search`,
- * `email.find` / `email.verify` / `email.domain.search`) appears only on the wire —
- * the public verb names and shapes below are unchanged. Failed requests throw
+ * `email.find` / `email.verify` / `email.domain.search`) appears only on the wire.
+ * `map` is the exception: it calls the Firecrawl gateway directly at `/v2/map`
+ * because that endpoint has no routed capability id. The public verb names and
+ * shapes remain provider-neutral in both cases. Failed requests throw
  * {@link SearchHttpError} (carries `status` + parsed `body`).
  */
 import {
@@ -32,9 +34,10 @@ import {
   resolveCoreBaseUrl,
 } from "../_client/index.js";
 import { resolveServiceUrl } from "../_client/service-url.js";
-import { ensureOk, SearchHttpError } from "./errors.js";
+import { ensureOk, SearchContractError, SearchHttpError } from "./errors.js";
+import { validateMapInput } from "./validation.js";
 
-export { SearchHttpError };
+export { SearchContractError, SearchHttpError };
 
 /** Build the capability-specific error the routed call throws on a non-2xx. */
 const searchError = (message: string, status: number, body: unknown): Error =>
@@ -657,9 +660,72 @@ export interface MapResult {
   success?: boolean;
 }
 
-interface RawMapResponse {
-  success?: boolean;
-  links?: Array<{ url?: string; title?: string | null; description?: string | null }>;
+function mapContractError(message: string, body: unknown): never {
+  throw new SearchContractError("map", message, body);
+}
+
+async function readMapResponse(response: Response): Promise<unknown> {
+  const text = await response.text().catch(() => "");
+  if (!text) mapContractError("expected a JSON body", undefined);
+  try {
+    return JSON.parse(text);
+  } catch {
+    mapContractError("response body is not valid JSON", text);
+  }
+}
+
+function parseMapResponse(raw: unknown): MapResult {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    mapContractError("expected an object with a links array", raw);
+  }
+  const response = raw as Record<string, unknown>;
+  if (!Array.isArray(response.links)) {
+    mapContractError("expected a links array", raw);
+  }
+  if (response.success !== undefined && typeof response.success !== "boolean") {
+    mapContractError("expected success to be a boolean when present", raw);
+  }
+
+  const links = response.links.map((item, index): MapLink => {
+    if (item === null || typeof item !== "object" || Array.isArray(item)) {
+      mapContractError(`link at index ${index} must be an object`, item);
+    }
+    const link = item as Record<string, unknown>;
+    if (typeof link.url !== "string" || link.url.trim().length === 0) {
+      mapContractError(
+        `link at index ${index} requires a non-empty string url`,
+        item,
+      );
+    }
+    for (const field of ["title", "description"] as const) {
+      if (
+        link[field] !== undefined &&
+        link[field] !== null &&
+        typeof link[field] !== "string"
+      ) {
+        mapContractError(
+          `link at index ${index} field '${field}' must be a string or null when present`,
+          item,
+        );
+      }
+    }
+    return {
+      url: link.url,
+      ...(link.title !== undefined && {
+        title: link.title as string | null,
+      }),
+      ...(link.description !== undefined && {
+        description: link.description as string | null,
+      }),
+    };
+  });
+
+  return {
+    links,
+    ...(response.success !== undefined && {
+      success: response.success as boolean,
+    }),
+  };
 }
 
 /**
@@ -667,16 +733,16 @@ interface RawMapResponse {
  * discovery from a starting page ($0.009 flat). Returns structured links
  * (unlike the MCP tool of the same capability, which renders markdown text).
  *
- * Failed requests throw {@link SearchHttpError}.
+ * Non-2xx responses throw {@link SearchHttpError}; malformed successful
+ * responses throw {@link SearchContractError} rather than fabricating an empty
+ * result.
  */
 export async function map(
   input: MapInput,
   transport: Transport = defaultTransport(),
   baseUrl: string = MAP_BASE_URL,
 ): Promise<MapResult> {
-  if (!input?.url) {
-    throw new SearchHttpError("map requires a url", 400, undefined);
-  }
+  validateMapInput(input);
   const res = await ensureOk(
     await transport.fetch(`${baseUrl}/v2/map`, {
       method: "POST",
@@ -685,18 +751,5 @@ export async function map(
     }),
     `Failed to map ${input.url}`,
   );
-  const raw = (await res.json()) as RawMapResponse;
-  const links = Array.isArray(raw.links)
-    ? raw.links
-        .filter((l): l is { url: string } & typeof l => typeof l?.url === "string")
-        .map((l) => ({
-          url: l.url,
-          ...(l.title !== undefined && { title: l.title }),
-          ...(l.description !== undefined && { description: l.description }),
-        }))
-    : [];
-  return {
-    links,
-    ...(raw.success !== undefined && { success: raw.success }),
-  };
+  return parseMapResponse(await readMapResponse(res));
 }

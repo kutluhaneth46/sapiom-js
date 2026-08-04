@@ -147,6 +147,11 @@ site.links; // [{ url, title?, description? }, …]
 }
 ```
 
+Unlike the routed web-search, scrape, and email operations, `map` calls the
+Firecrawl gateway directly at `/v2/map`; authentication is still handled by the
+same Sapiom client. A successful response that does not contain a valid `links`
+array throws `SearchContractError` instead of being mistaken for an empty site.
+
 Each map call is priced at $0.009, independent of the number of discovered
 links.
 

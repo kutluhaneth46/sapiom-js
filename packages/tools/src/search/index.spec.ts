@@ -1,5 +1,6 @@
 import { createClient } from "../index.js";
 import { Transport } from "../_client/index.js";
+import { createStubClient, type StubCallRecord } from "../stub/index.js";
 import {
   scrape,
   webSearch,
@@ -7,6 +8,7 @@ import {
   verifyEmail,
   domainSearch,
   map,
+  SearchContractError,
   SearchHttpError,
 } from "./index.js";
 
@@ -15,9 +17,10 @@ import {
 // a scripted fetch mock, so URL/method/header/body assertions are exact and we
 // verify the Transport injects the tenant credential.
 //
-// Every verb here is routed (SAP-1116): `POST /v1/capabilities/<id>` on the Core
-// base URL, authenticated via `x-api-key` (NOT the gateway-direct x-sapiom-api-key
-// — wrong header = silent 401), with the router's normalized DTO as the response.
+// Unless a section explicitly says otherwise, verbs here are routed (SAP-1116):
+// `POST /v1/capabilities/<id>` on the Core base URL, authenticated via `x-api-key`
+// (NOT the gateway-direct x-sapiom-api-key — wrong header = silent 401), with the
+// router's normalized DTO as the response. `search.map` is the direct exception.
 // ---------------------------------------------------------------------------
 
 interface FetchCall {
@@ -1016,14 +1019,21 @@ describe("search.map()", () => {
         jsonResponse({
           success: true,
           links: [
-            { url: "https://docs.example.com/", title: "Home", description: null },
+            {
+              url: "https://docs.example.com/",
+              title: "Home",
+              description: null,
+            },
             { url: "https://docs.example.com/verify/" },
-            { notAUrl: true },
           ],
         }),
     ]);
 
-    const result = await map({ url: "https://docs.example.com" }, transport, BASE);
+    const result = await map(
+      { url: "https://docs.example.com" },
+      transport,
+      BASE,
+    );
 
     expect(calls[0]!.url).toBe(`${BASE}/v2/map`);
     expect(calls[0]!.init.method).toBe("POST");
@@ -1039,18 +1049,91 @@ describe("search.map()", () => {
     ]);
   });
 
-  it("returns empty links when the upstream omits them", async () => {
-    const { transport } = makeTransport([() => jsonResponse({ success: true })]);
-    const result = await map({ url: "https://x.test" }, transport, BASE);
-    expect(result.links).toEqual([]);
+  it("accepts a valid empty links array when the optional success flag is absent", async () => {
+    const { transport } = makeTransport([() => jsonResponse({ links: [] })]);
+
+    await expect(
+      map({ url: "https://x.test" }, transport, BASE),
+    ).resolves.toEqual({ links: [] });
   });
 
-  it("throws before fetching on a missing url", async () => {
+  it.each([
+    ["empty body", () => new Response(null, { status: 200 })],
+    [
+      "invalid JSON",
+      () =>
+        new Response("{not-json", {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+    ],
+    ["null", () => jsonResponse(null)],
+    ["an array root", () => jsonResponse([])],
+    ["an object without links", () => jsonResponse({ success: true })],
+    ["non-array links", () => jsonResponse({ links: {} })],
+    ["a null link", () => jsonResponse({ links: [null] })],
+    ["a link without a url", () => jsonResponse({ links: [{}] })],
+    ["an empty link url", () => jsonResponse({ links: [{ url: "  " }] })],
+    ["a non-string link url", () => jsonResponse({ links: [{ url: 42 }] })],
+    [
+      "a malformed link title",
+      () => jsonResponse({ links: [{ url: "https://x.test", title: 42 }] }),
+    ],
+    [
+      "a malformed link description",
+      () =>
+        jsonResponse({
+          links: [{ url: "https://x.test", description: {} }],
+        }),
+    ],
+    [
+      "a malformed success flag",
+      () => jsonResponse({ success: "yes", links: [] }),
+    ],
+  ])(
+    "fails closed with a deterministic contract error for %s",
+    async (_label, response) => {
+      const { transport } = makeTransport([response]);
+
+      const error = await map({ url: "https://x.test" }, transport, BASE).catch(
+        (caught: unknown) => caught,
+      );
+
+      expect(error).toBeInstanceOf(SearchContractError);
+      expect(error).toMatchObject({
+        name: "SearchContractError",
+        operation: "map",
+      });
+      expect(error).toHaveProperty("body");
+      expect((error as Error).message).toMatch(
+        /^Invalid Search map response: /,
+      );
+    },
+  );
+
+  it.each([
+    ["undefined input", undefined],
+    ["null input", null],
+    ["array input", []],
+    ["missing url", {}],
+    ["empty url", { url: "" }],
+    ["whitespace url", { url: "   " }],
+    ["non-string url", { url: 42 }],
+  ])("shares fail-fast live/stub validation for %s", async (_label, input) => {
     const { transport, calls } = makeTransport([]);
-    await expect(map({ url: "" }, transport, BASE)).rejects.toBeInstanceOf(
-      SearchHttpError,
-    );
+    const stubCalls: StubCallRecord[] = [];
+    const stub = createStubClient({ calls: stubCalls });
+
+    await expect(map(input as never, transport, BASE)).rejects.toMatchObject({
+      name: "SearchHttpError",
+      status: 400,
+    });
+    await expect(stub.search.map(input as never)).rejects.toMatchObject({
+      name: "SearchHttpError",
+      status: 400,
+    });
     expect(calls).toHaveLength(0);
+    expect(stubCalls).toHaveLength(0);
   });
 
   it("throws SearchHttpError with status + body on a non-2xx", async () => {

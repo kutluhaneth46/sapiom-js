@@ -21,6 +21,7 @@ import {
   searchindex,
   Sandbox,
   Repository,
+  SearchContractError,
   SearchHttpError,
   MemoryHttpError,
   SpeechHttpError,
@@ -112,6 +113,7 @@ describe("@sapiom/tools public surface", () => {
     expect(typeof browserAutomation).toBe("object");
     expect(typeof keys).toBe("object");
     expect(typeof searchindex).toBe("object");
+    expect(typeof SearchContractError).toBe("function");
     expect(typeof SearchHttpError).toBe("function"); // error class constructor
     expect(typeof MemoryHttpError).toBe("function");
     expect(typeof SpeechHttpError).toBe("function");

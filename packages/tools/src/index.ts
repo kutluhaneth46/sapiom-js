@@ -113,7 +113,7 @@ export { toVideoResumePayload } from "./content-generation/index.js";
 export { toImageResumePayload } from "./content-generation/index.js";
 
 export * as search from "./search/index.js";
-export { SearchHttpError } from "./search/index.js";
+export { SearchContractError, SearchHttpError } from "./search/index.js";
 export type { MapInput, MapLink, MapResult } from "./search/index.js";
 
 // searchindex — provisioned search indexes (auto-embedding); control plane + a

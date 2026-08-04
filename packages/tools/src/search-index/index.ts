@@ -375,22 +375,31 @@ function parseRangeResponse(raw: unknown): SearchIndexRangeResult {
 
 function parseFetchResponse(
   raw: unknown,
-  expectedCount: number,
+  expectedIds: readonly string[],
 ): Array<SearchDocument | null> {
   const results = isRecord(raw) && "result" in raw ? raw.result : raw;
   if (!Array.isArray(results)) {
     contractError("fetchDocuments", "expected { result: [...] }", raw);
   }
-  if (results.length !== expectedCount) {
+  if (results.length !== expectedIds.length) {
     contractError(
       "fetchDocuments",
-      `expected ${expectedCount} positional results, received ${results.length}`,
+      `expected ${expectedIds.length} positional results, received ${results.length}`,
       raw,
     );
   }
-  return results.map((item, index) =>
-    item === null ? null : parseDocument(item, "fetchDocuments", index),
-  );
+  return results.map((item, index) => {
+    if (item === null) return null;
+    const document = parseDocument(item, "fetchDocuments", index);
+    if (document.id !== expectedIds[index]) {
+      contractError(
+        "fetchDocuments",
+        `expected document id '${expectedIds[index]}' at index ${index}, received '${document.id}'`,
+        item,
+      );
+    }
+    return document;
+  });
 }
 
 function parseListResponse(raw: unknown): SearchIndexInfo[] {
@@ -514,7 +523,7 @@ function bindIndex(info: SearchIndexInfo, transport: Transport): SearchIndex {
       );
       return parseFetchResponse(
         await readRequiredJson(response, "fetchDocuments"),
-        ids.length,
+        ids,
       );
     },
 
