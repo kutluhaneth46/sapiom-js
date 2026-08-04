@@ -84,7 +84,7 @@
         "connectionCount": 0,
         "settingCount": 1,
         "provisions": ["postgres"],
-        "degradedWithoutSetup": "Runs the outreach engine with no leads, so there is nobody to write to and nothing is sent."
+        "degradedWithoutSetup": "Works 3 built-in demo leads end to end: enrichment and verification are simulated for these fabricated companies, but the opener comes from a real model call and the first touch is a real, inspectable send to this agent's own Sapiom-hosted demo inbox. Pass your own `leads` to run a real campaign, including the multi-touch drip and reply-to-stop."
       }
     },
     {
@@ -456,46 +456,58 @@
         },
         {
           "name": "resolve",
-          "description": "Reads the target Postgres connection string from a Sapiom database handle to inject into the endpoint.",
+          "description": "Reads the target Postgres connection string from a Sapiom database handle; on the built-in demo database it also seeds the sample schema so the query returns real rows.",
           "kind": "capability",
           "capability": "database.get",
           "next": ["plan", "rejected"]
         },
         {
           "name": "plan",
-          "description": "Previews the pipeline: translates the sample question into SQL with an LLM.",
+          "description": "Translates the sample question into SQL with an LLM — or, for the built-in demo question, uses a fixed known-safe SELECT so the zero-setup path needs no model.",
           "kind": "llm",
           "capability": "models.run",
           "next": ["guard"]
         },
         {
           "name": "guard",
-          "description": "Applies the read-only guardrail to the sample SQL; anything that isn't a single read-only statement is rejected.",
+          "description": "Applies the read-only guardrail to the SQL; anything that isn’t a single read-only statement is rejected.",
           "kind": "compute",
-          "next": ["deploy", "rejected"]
+          "next": ["execute", "rejected"]
+        },
+        {
+          "name": "execute",
+          "description": "Runs the guarded SELECT for real inside a READ ONLY transaction — statement-timeout-bounded and row-capped — and returns the actual rows.",
+          "kind": "compute",
+          "next": ["deploy", "query_failed"]
         },
         {
           "name": "deploy",
-          "description": "Write the endpoint server into a sandbox and expose it at a stable URL, injecting DATABASE_URL and the endpoint's own API key. With no key, nothing is deployed.",
+          "description": "Write the endpoint server into a sandbox and expose it at a stable URL, injecting DATABASE_URL and the endpoint’s own minted API key. With no key, nothing is deployed.",
           "kind": "capability",
           "capability": "sandboxes.deployPreview",
           "next": ["deployed", "deploy_failed", "endpoint_skipped"]
         },
         {
-          "name": "endpoint_skipped",
-          "description": "The endpoint needs an API key of its own to translate each request; without one nothing is deployed, and the run returns the translated, guarded SQL instead of a URL that cannot answer.",
-          "kind": "compute",
-          "terminal": true
-        },
-        {
           "name": "deployed",
-          "description": "The endpoint is live — returns its URL and the previewed sample query.",
+          "description": "The endpoint is live — returns its URL plus the real rows from the sample query.",
           "kind": "compute",
           "terminal": true
         },
         {
           "name": "deploy_failed",
-          "description": "The deploy failed — surfaces the deployPreview logs.",
+          "description": "The deploy failed — surfaces the deployPreview logs alongside the real sample rows already fetched.",
+          "kind": "compute",
+          "terminal": true
+        },
+        {
+          "name": "endpoint_skipped",
+          "description": "Without an API key of its own the endpoint is not deployed; the run still returns the real rows from the guarded sample query.",
+          "kind": "compute",
+          "terminal": true
+        },
+        {
+          "name": "query_failed",
+          "description": "The guarded query could not run against the database; nothing was deployed and the failing SQL is surfaced.",
           "kind": "compute",
           "terminal": true
         },
@@ -511,7 +523,7 @@
         "connectionCount": 1,
         "settingCount": 0,
         "provisions": ["postgres"],
-        "degradedWithoutSetup": "Translates a sample question to SQL, mints the endpoint its own scoped key, and deploys a working /query endpoint."
+        "degradedWithoutSetup": "Runs the built-in sample question against the seeded demo database for real rows, mints the endpoint its own scoped key, and deploys a working /query endpoint."
       }
     },
     {
@@ -819,17 +831,23 @@
       "steps": [
         {
           "name": "decompose",
-          "description": "An LLM turns your scene into a style guide and an ordered shot list. If you set dryRun, it stops here and returns the plan.",
+          "description": "An LLM turns your scene into a style guide and an ordered shot list. A zero-setup run plans a single shot; pass dryRun to stop here and return just the plan.",
           "kind": "llm",
           "capability": "models.run",
-          "next": ["keyframes"]
+          "next": ["keyframe"]
         },
         {
-          "name": "keyframes",
-          "description": "Make one keyframe image per shot, all at once, and save each one.",
-          "kind": "capability",
+          "name": "keyframe",
+          "description": "Launch an image job for one shot’s keyframe, then pause until it finishes.",
+          "kind": "pause",
           "capability": "contentGeneration.images",
-          "next": ["animate"]
+          "next": ["collectKeyframe"]
+        },
+        {
+          "name": "collectKeyframe",
+          "description": "Save the finished keyframe, then loop back for the next shot’s frame, or move on once every keyframe is in.",
+          "kind": "compute",
+          "next": ["keyframe", "animate"]
         },
         {
           "name": "animate",
@@ -846,14 +864,14 @@
         },
         {
           "name": "stitch",
-          "description": "Join every clip with the synchronous merge endpoint, using a bounded polling fallback if the provider unexpectedly queues it.",
+          "description": "Join every clip with the synchronous merge endpoint; a single clip skips the merge, and a bounded polling fallback covers a provider that unexpectedly queues it.",
           "kind": "capability",
           "capability": "contentGeneration.video",
           "next": ["finalize"]
         },
         {
           "name": "finalize",
-          "description": "Return the stitched video's file id and download link.",
+          "description": "Return the stitched video’s file id and download link.",
           "kind": "compute",
           "terminal": true
         }
@@ -862,7 +880,7 @@
         "runsWithNoSetup": true,
         "connectionCount": 0,
         "settingCount": 0,
-        "degradedWithoutSetup": "Shoots the built-in sample scene into a shot list with a style bible (dry run)."
+        "degradedWithoutSetup": "Shoots the built-in sample scene as a single real keyframe and clip, and returns the finished video's download link."
       }
     },
     {
