@@ -230,38 +230,45 @@
     },
     {
       "id": "eval-gate",
-      "name": "Output Quality Check",
-      "description": "Score an output against your own rubric with an LLM judge, then branch to publish or revise on whether it clears a threshold.",
-      "tags": ["evals", "quality-gate", "llm-judge", "composition"],
+      "name": "Self-Editing Writer",
+      "description": "Draft a piece against your brief, grade it against your own rubric with an LLM judge, and revise in a bounded loop until it clears the bar.",
+      "tags": ["writing", "llm-judge", "self-revision", "bounded-loop"],
       "category": "product-engineering",
       "discipline": "AI operations",
       "cadence": "on-demand",
-      "complexity": "moderate",
+      "complexity": "advanced",
       "sourcePath": "examples/eval-gate",
       "capabilities": ["models.run"],
       "steps": [
         {
-          "name": "judge",
-          "description": "Build a judge prompt from your rubric, call the LLM (models.run), and parse a 0-to-1 score from the reply.",
-          "kind": "llm",
-          "capability": "models.run",
-          "next": ["gate"]
+          "name": "parse",
+          "description": "Validate the brief and rubric, defaulting to a built-in sample, and seed the attempt counter.",
+          "kind": "compute",
+          "next": ["draft"]
         },
         {
-          "name": "gate",
-          "description": "Compare the score to your threshold. At or above goes to publish, below goes to revise. No LLM call here.",
+          "name": "draft",
+          "description": "Write the piece from the brief — on a revision, address the rejected draft and the judge's critique too.",
+          "kind": "llm",
+          "capability": "models.run",
+          "next": ["judge"]
+        },
+        {
+          "name": "judge",
+          "description": "Score the draft against your rubric with a second model call and parse a 0-to-1 score plus a critique.",
+          "kind": "llm",
+          "capability": "models.run",
+          "next": ["decide"]
+        },
+        {
+          "name": "decide",
+          "description": "Compare the score to your threshold and the attempt count to the cap: below both, loop back to draft; otherwise publish. No model call here.",
           "kind": "compute",
-          "next": ["publish", "revise"]
+          "next": ["draft", "publish"]
         },
         {
           "name": "publish",
-          "description": "The output cleared the threshold. Return the decision, score, threshold, and rationale.",
-          "kind": "compute",
-          "terminal": true
-        },
-        {
-          "name": "revise",
-          "description": "The output fell below the threshold. Return the decision, score, threshold, and rationale.",
+          "description": "The one terminal — return the final draft, whether it passed, the score, and how many attempts it took.",
           "kind": "compute",
           "terminal": true
         }
@@ -270,58 +277,71 @@
         "runsWithNoSetup": true,
         "connectionCount": 0,
         "settingCount": 0,
-        "degradedWithoutSetup": "Grades the built-in sample against a rubric and returns a decision with rationale."
+        "degradedWithoutSetup": "Drafts and grades the built-in sample brief against a rubric, revising once if needed, and publishes the final draft with its score."
       }
     },
     {
       "id": "logged-in-screenshots",
-      "name": "Logged-In Page Screenshots",
-      "description": "Open a real browser, optionally log in, and capture the pages you list as hosted images — the view a signed-in user sees.",
-      "tags": ["browser", "screenshot", "authenticated", "visual"],
+      "name": "Website QA Crawler",
+      "description": "Crawl a site's pages, screenshot each one, audit content with a model, and check that Terms and Privacy links resolve.",
+      "tags": ["crawler", "qa", "content-audit", "broken-links"],
       "category": "reliability-governance",
       "discipline": "Reliability",
       "cadence": "on-demand",
-      "complexity": "simple",
+      "complexity": "moderate",
       "sourcePath": "examples/logged-in-screenshots",
       "capabilities": [
-        "browser.identity",
+        "web.scrape",
         "browser.session",
-        "browser.screenshot"
+        "browser.screenshot",
+        "models.run"
       ],
       "steps": [
         {
-          "name": "start",
-          "description": "Resolve the pages to capture and decide whether to log in — a login needs a URL, a username, and the password secret; miss any and it captures the public view.",
-          "kind": "compute",
-          "next": ["login", "capture"]
-        },
-        {
-          "name": "login",
-          "description": "Store the supplied credentials as a browser identity so the session opens signed in. If it fails, fall back to a public capture.",
+          "name": "crawl",
+          "description": "Read the homepage's markdown and links, then crawl a bounded set of internal pages — prioritizing anything that looks like a Terms or Privacy link.",
           "kind": "capability",
-          "capability": "browser.identity",
-          "next": ["capture"]
+          "capability": "web.scrape",
+          "next": ["render", "rejected"]
         },
         {
-          "name": "capture",
-          "description": "Open one browser session and screenshot every page in it; a page that fails becomes a row, the rest are still captured.",
+          "name": "render",
+          "description": "Open one browser session and screenshot every crawled page in it; a page that fails to render becomes a row, the rest are still captured.",
           "kind": "capability",
           "capability": "browser.session",
-          "next": ["done"]
+          "next": ["audit"]
         },
         {
-          "name": "done",
-          "description": "Return one row per requested page — its image URL or its failure — with the captured count and whether it was authenticated.",
+          "name": "audit",
+          "description": "Ask a model to read every crawled page's content in one call and flag concrete content and structure issues.",
+          "kind": "llm",
+          "capability": "models.run",
+          "next": ["linkCheck"]
+        },
+        {
+          "name": "linkCheck",
+          "description": "Turn the crawl and render results into a link-integrity verdict: which pages didn't resolve, and whether Terms and Privacy are present and resolve.",
           "kind": "compute",
-          "next": [],
+          "next": ["report"]
+        },
+        {
+          "name": "report",
+          "description": "Compile the screenshots, content findings, and link integrity into one QA report.",
+          "kind": "compute",
+          "terminal": true
+        },
+        {
+          "name": "rejected",
+          "description": "Terminal off-ramp when siteUrl isn't a usable URL or the site can't be reached at all.",
+          "kind": "compute",
           "terminal": true
         }
       ],
       "setup": {
         "runsWithNoSetup": true,
-        "connectionCount": 1,
-        "settingCount": 0,
-        "degradedWithoutSetup": "Opens a browser session and captures two stable public pages as hosted images; no login, so authenticated is false."
+        "connectionCount": 0,
+        "settingCount": 1,
+        "degradedWithoutSetup": "Crawls a bounded set of sapiom.ai pages, screenshots each one, audits the content with a model, and checks link integrity — reporting whatever it finds broken, including whether Terms and Privacy links resolve."
       }
     },
     {
@@ -720,10 +740,11 @@
         }
       ],
       "setup": {
-        "runsWithNoSetup": false,
+        "runsWithNoSetup": true,
         "connectionCount": 0,
         "settingCount": 1,
-        "provisions": ["sandbox"]
+        "provisions": ["sandbox"],
+        "degradedWithoutSetup": "Drafts the built-in sample brief into a priced proposal and renders it to a real PDF, then stops at the sign-off gate — no approver is configured, so nothing is emailed yet."
       }
     },
     {
@@ -891,7 +912,7 @@
       "category": "data-knowledge",
       "discipline": "Data",
       "cadence": "scheduled",
-      "complexity": "involved",
+      "complexity": "advanced",
       "sourcePath": "examples/scheduled-db-insight-report",
       "capabilities": [
         "database.get",
@@ -905,28 +926,42 @@
       "steps": [
         {
           "name": "snapshot",
-          "description": "Runs the read-only queries against the database and normalizes each result into a metric — a labeled series or a scalar KPI.",
+          "description": "Resolve the target database (self-provisioning and seeding the demo DB if needed) and snapshot its current catalog metrics.",
           "kind": "capability",
           "capability": "database.get",
+          "next": ["detectAnomalies"]
+        },
+        {
+          "name": "detectAnomalies",
+          "description": "A model flags the one table most worth attention, trusting only labels the snapshot actually returned.",
+          "kind": "llm",
+          "capability": "models.run",
           "next": ["narrate"]
         },
         {
           "name": "narrate",
-          "description": "Hands the metrics to a model to write a short markdown report — a summary, insights that cite the numbers, and what to watch.",
+          "description": "A model writes the narrative around the movement, leading with the flagged anomaly.",
           "kind": "llm",
           "capability": "models.run",
+          "next": ["followUp"]
+        },
+        {
+          "name": "followUp",
+          "description": "Run a parameterized read into the flagged table's recent write activity for a second, data-driven angle.",
+          "kind": "capability",
+          "capability": "database.get",
           "next": ["chart"]
         },
         {
           "name": "chart",
-          "description": "Renders the series into an SVG bar chart inside a sandbox, hosts it in file storage, and takes a shareable link.",
+          "description": "Render the metrics and the follow-up read into a chart image in a sandbox and upload it.",
           "kind": "capability",
           "capability": "sandboxes.create",
           "next": ["deliver"]
         },
         {
           "name": "deliver",
-          "description": "Emails the report — narrative, chart link, and a metrics table. A dry run or a missing recipient returns it as a preview instead.",
+          "description": "Compile the report with the chart inline and email it to the configured recipient; with none set, return it in the run.",
           "kind": "capability",
           "capability": "email.send",
           "terminal": true
@@ -937,7 +972,7 @@
         "connectionCount": 1,
         "settingCount": 1,
         "provisions": ["postgres"],
-        "degradedWithoutSetup": "Snapshots the seeded demo database's own catalog, writes a real narrative report with a rendered chart, and returns it inline — nothing is emailed, because no `deliverTo` recipient is set."
+        "degradedWithoutSetup": "Snapshots the seeded demo database's own catalog, has a model flag the one table most worth attention, runs a second query into that table's write activity, writes a real narrative around both, and returns the full report with a rendered chart inline — nothing is emailed, because no `deliverTo` recipient is set."
       }
     },
     {
