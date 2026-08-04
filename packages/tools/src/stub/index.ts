@@ -1006,6 +1006,13 @@ export function createStubClient(opts: StubClientOptions = {}): Sapiom {
             expiresAt: "2099-01-01T00:00:00Z",
           })) as DownloadUrlResponse,
         ),
+      // Pure/synchronous in the real client — mirror that here (no Promise wrap).
+      getPublicUrl: (fileId) =>
+        r(
+          "fileStorage.getPublicUrl",
+          [fileId],
+          () => `https://storage.local/public/${fileId}`,
+        ) as string,
       list: (listOpts) =>
         Promise.resolve(
           r("fileStorage.list", [listOpts], () => ({

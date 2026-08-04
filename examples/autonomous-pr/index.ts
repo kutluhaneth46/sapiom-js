@@ -103,6 +103,8 @@ interface Shared extends Record<string, unknown> {
   checkCommand: string;
   branchName: string;
   sandboxName: string | null;
+  /** The sandbox dir the checkout was actually verified in (never assumed). */
+  checkoutCwd: string | null;
   codingSummary: string | null;
   diffStat: string | null;
   checkTail: string | null;
@@ -156,6 +158,7 @@ const plan = defineStep({
     ctx.shared.set("checkCommand", checkCommand);
     ctx.shared.set("branchName", `autonomous-pr/${slugify(ctx.executionId)}`);
     ctx.shared.set("sandboxName", null);
+    ctx.shared.set("checkoutCwd", null);
     ctx.shared.set("codingSummary", null);
     ctx.shared.set("diffStat", null);
     ctx.shared.set("checkTail", null);
@@ -273,10 +276,25 @@ const verify = defineStep({
     const installCommand = ctx.shared.get("installCommand") ?? "npm install";
     const checkCommand = ctx.shared.get("checkCommand") ?? "npm run typecheck";
     const repoSlug = ctx.shared.get("repoSlug") ?? "";
-    // `gitRepository` clones into the sandbox at `/workspace/<slug>` — every
-    // exec here has to target that checkout, not the sandbox's bare root.
-    const cwd = repoSlug;
     const box = ctx.sapiom.sandboxes.attach(sandboxName);
+
+    // `gitRepository` is DOCUMENTED to clone into the sandbox at
+    // `/workspace/<slug>`, but that's the platform's word, not a guarantee
+    // this run kept — verify it before trusting it, and if it doesn't hold,
+    // locate the checkout instead of silently running every command in the
+    // wrong directory.
+    const resolved = await resolveCheckoutCwd(box, repoSlug, ctx);
+    if (!resolved.cwd) {
+      ctx.shared.set("checkTail", resolved.probe);
+      return goto("rejected", {
+        reason: "checkout-not-found",
+        detail:
+          `Could not find the coding run's checkout in sandbox \`${sandboxName}\` ` +
+          `(expected \`/workspace/${repoSlug}\`): ${resolved.probe}`,
+      });
+    }
+    const cwd = resolved.cwd;
+    ctx.shared.set("checkoutCwd", cwd);
 
     // Capture what changed, for the self-review — uncommitted, so a plain
     // `diff --stat` (no ref range) is exactly the agent's working-tree edits.
@@ -295,10 +313,21 @@ const verify = defineStep({
 
     const install = await box.exec(installCommand, { cwd, timeout: 300_000 });
     if (install.exitCode !== 0) {
-      ctx.shared.set("checkTail", tail(install.stdout, install.stderr));
+      const installTail = tail(install.stdout, install.stderr);
+      ctx.shared.set("checkTail", installTail);
       return goto("rejected", {
         reason: "install-failed",
-        detail: `\`${installCommand}\` exited ${install.exitCode}`,
+        // The seeded `package.json` pins `@sapiom/agent`/`@sapiom/tools` to
+        // ranges confirmed resolvable on the public npm registry — if this
+        // is a resolution error rather than a real dependency problem, the
+        // sandbox's npm is very likely pointed somewhere else. `installTail`
+        // (echoed below) carries npm's own error, so this isn't a guess.
+        detail:
+          `\`${installCommand}\` exited ${install.exitCode} in \`${cwd}\` ` +
+          "(if this is a package-resolution error rather than a real " +
+          "dependency problem, check the sandbox's npm registry — the " +
+          "seeded deps are pinned to versions published on the public " +
+          `npm registry). Install output:\n${installTail}`,
       });
     }
 
@@ -332,16 +361,24 @@ const push = defineStep({
     const task = ctx.shared.get("task") ?? DEFAULT_TASK;
     const box = ctx.sapiom.sandboxes.attach(sandboxName);
 
-    // `gitRepository` clones into the sandbox at `/workspace/<slug>` — the
-    // checkout `pushFromSandbox` below pushes from by default.
+    // `verify` already found and confirmed the checkout's real directory —
+    // reuse it rather than re-assume `/workspace/<slug>`, so the branch this
+    // creates is the SAME checkout `verify` just ran the checks against.
+    const cwd = ctx.shared.get("checkoutCwd") ?? `/workspace/${repoSlug}`;
     await box.exec(`git checkout -b ${branchName}`, {
-      cwd: repoSlug,
+      cwd,
       timeout: 30_000,
     });
 
     const repo = await ctx.sapiom.repositories.get(repoSlug);
     const message = truncate(`feat: ${task}`, 72);
-    const result = await repo.pushFromSandbox(box, { message });
+    // Pass the confirmed working directory explicitly rather than relying on
+    // `pushFromSandbox`'s own `/workspace/<slug>` default — the same
+    // directory the branch above was just created in.
+    const result = await repo.pushFromSandbox(box, {
+      message,
+      workingDirectory: cwd,
+    });
 
     ctx.shared.set("pushed", result.pushed);
     ctx.shared.set("pushSha", result.sha);
@@ -461,6 +498,81 @@ function slugify(value: string): string {
 
 function truncate(value: string, max: number): string {
   return value.length > max ? value.slice(0, max) : value;
+}
+
+/**
+ * Resolve the sandbox directory the coding run's checkout actually lives in,
+ * instead of trusting that `gitRepository` cloned to exactly
+ * `/workspace/<slug>`. That path is `models.coding`'s documented convention,
+ * not a contract this run necessarily kept, so it's verified — a `test -d
+ * .git` at the candidate — before anything is `exec`'d there. If it doesn't
+ * hold, falls back to locating the checkout by its `.git` directory anywhere
+ * in the sandbox, then re-verifies that candidate too. Returns `{ cwd: null,
+ * probe }` (never a guess) when nothing can be confirmed, so the caller can
+ * route to a clear, diagnosable rejection instead of running commands in the
+ * wrong directory.
+ */
+async function resolveCheckoutCwd(
+  box: ReturnType<Ctx["sapiom"]["sandboxes"]["attach"]>,
+  repoSlug: string,
+  ctx: Ctx,
+): Promise<{ cwd: string | null; probe: string }> {
+  const probeLines: string[] = [];
+
+  const hasGit = async (cwd: string): Promise<boolean> => {
+    try {
+      const res = await box.exec("test -d .git", { cwd, timeout: 15_000 });
+      return res.exitCode === 0;
+    } catch (err) {
+      probeLines.push(`checking \`${cwd}\` threw: ${String(err)}`);
+      return false;
+    }
+  };
+
+  const candidate = `/workspace/${repoSlug}`;
+  if (await hasGit(candidate)) {
+    return { cwd: candidate, probe: `confirmed at \`${candidate}\`` };
+  }
+  probeLines.push(`\`${candidate}\` has no checkout (no .git)`);
+
+  // Fall back: locate any `.git` directory in the sandbox and prefer one
+  // whose parent directory name matches the repo slug.
+  try {
+    const find = await box.exec(
+      "find / -maxdepth 6 -type d -name .git -not -path '*/node_modules/*' 2>/dev/null",
+      { cwd: "/", timeout: 20_000 },
+    );
+    const gitDirs = find.stdout
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+    probeLines.push(
+      gitDirs.length
+        ? `discovery found ${gitDirs.length} checkout(s): ${gitDirs.join(", ")}`
+        : "discovery found no checkouts anywhere in the sandbox",
+    );
+
+    const checkoutDirs = gitDirs.map((g) => g.replace(/\/\.git$/, ""));
+    const bySlug = checkoutDirs.filter((d) => d.split("/").pop() === repoSlug);
+    const winner =
+      bySlug.length === 1
+        ? bySlug[0]
+        : checkoutDirs.length === 1
+          ? checkoutDirs[0]
+          : null;
+
+    if (winner && (await hasGit(winner))) {
+      ctx.logger.info("checkout wasn't at the documented path; located it", {
+        repoSlug,
+        resolved: winner,
+      });
+      return { cwd: winner, probe: probeLines.join("; ") };
+    }
+  } catch (err) {
+    probeLines.push(`discovery threw: ${String(err)}`);
+  }
+
+  return { cwd: null, probe: probeLines.join("; ") };
 }
 
 /** Last `max` chars of the combined stdout/stderr — enough to see a failure. */

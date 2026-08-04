@@ -67,6 +67,14 @@ const SEED_ECHO_TEMPLATE = `{
 }
 `;
 
+// The pinned ranges below resolve on the public npm registry today (checked
+// via `npm view @sapiom/agent@^0.9.0 version` → 0.9.3, and
+// `npm view @sapiom/tools@^0.25.0 version` → 0.25.0) — `verify`'s `npm
+// install` assumes the sandbox reaches the public registry for `@sapiom/*`,
+// same as it would for `zod`/`typescript`. If a failure here turns out to be
+// resolution rather than a real dependency problem, that assumption — not
+// these versions — is the thing to check first (see `verify`'s
+// `install-failed` detail).
 const SEED_ROOT_PACKAGE_JSON = `{
   "name": "examples-repo",
   "private": true,

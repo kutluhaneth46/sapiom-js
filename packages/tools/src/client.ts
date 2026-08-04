@@ -234,6 +234,11 @@ export interface Sapiom {
   readonly fileStorage: {
     upload(input: UploadInput): Promise<UploadResponse>;
     getDownloadUrl(fileId: string): Promise<DownloadUrlResponse>;
+    /**
+     * Build the durable PUBLIC permalink for a file. Pure and synchronous — no
+     * network call. See `fileStorage.getPublicUrl` for the full doc.
+     */
+    getPublicUrl(fileId: string): string;
     list(opts?: ListOptions): Promise<ListResponse>;
     delete(fileId: string): Promise<void>;
     setVisibility(
@@ -561,6 +566,7 @@ function bind(transport: Transport): Sapiom {
     fileStorage: {
       upload: (input) => fileStorage.upload(input, transport),
       getDownloadUrl: (fileId) => fileStorage.getDownloadUrl(fileId, transport),
+      getPublicUrl: (fileId) => fileStorage.getPublicUrl(fileId),
       list: (opts) => fileStorage.list(opts, transport),
       delete: (fileId) => fileStorage.delete(fileId, transport),
       setVisibility: (fileId, visibility) =>
