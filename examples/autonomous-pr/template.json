@@ -12,7 +12,7 @@
     "Bootstrap a scratch repo demo",
     "Green checks gate every push"
   ],
-  "notes": "Click **Use this template** — Sapiom builds and deploys it for you, then run it from the workflow page. Your $5 signup credit covers first runs.\n\nLeave `repoSlug` empty to see the whole thing end to end: Sapiom provisions its own scratch repo, seeds it with a tiny examples contract, and the agent adds one more example to it — nothing you own is touched. Set `repoSlug` to an in-network repo you already have to put it to real work, and set `task` to describe what you want built; `installCommand` / `checkCommand` default to `npm install` / `npm run typecheck`.\n\nPrefer to work from the code? Run it locally with `run_local` to trace the whole flow for free (every capability is stubbed, so the push always looks green), or edit and deploy it with the Sapiom MCP.",
+  "notes": "Click **Use this template** — Sapiom builds and deploys it for you; open it on the **Agents** page and run it. Your $5 signup credit covers first runs.\n\nLeave `repoSlug` empty to see the whole thing end to end: Sapiom provisions its own scratch repo, seeds it with a tiny examples contract, and the agent adds one more example to it — nothing you own is touched. Set `repoSlug` to an in-network repo you already have to put it to real work, and set `task` to describe what you want built; `installCommand` / `checkCommand` default to `npm install` / `npm run typecheck`.\n\nPrefer to work from the code? Run it locally with `run_local` to trace the whole flow for free (every capability is stubbed, so the push always looks green), or edit and deploy it with the Sapiom MCP.",
   "settings": [
     {
       "path": "repoSlug",
