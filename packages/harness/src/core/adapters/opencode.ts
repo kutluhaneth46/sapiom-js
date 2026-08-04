@@ -14,7 +14,7 @@ const INSTALL_MCP_PROMPT = [
   "",
   "   {",
   '     "mcp": {',
-  '       "sapiom-dev": {',
+  '       "sapiom": {',
   '         "type": "local",',
   '         "command": ["npx", "-y", "@sapiom/mcp"],',
   '         "enabled": true',

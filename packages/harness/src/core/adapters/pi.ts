@@ -13,7 +13,7 @@ const INSTALL_MCP_PROMPT = [
   "npm package — a local stdio MCP server started with `npx -y @sapiom/mcp`.",
   "MCP support varies between pi versions: check `pi --help` and pi's",
   "documentation for how your version registers stdio MCP servers, and",
-  "register the command above under the name `sapiom-dev`. If your pi",
+  "register the command above under the client alias `sapiom`. If your pi",
   "version has no MCP support, say so instead of guessing.",
 ].join("\n");
 

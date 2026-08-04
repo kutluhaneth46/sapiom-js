@@ -137,11 +137,24 @@ describe("adapter contract — shape of every built-in entry", () => {
       expect(prompt.length).toBeGreaterThan(0);
       // Every install prompt names the Sapiom MCP server package.
       expect(prompt).toContain("@sapiom/mcp");
+      // `sapiom-dev` is the package/server identity, not the supported
+      // client-local registration alias. Keep every adapter on `sapiom` so
+      // its setup copy agrees with the public Claude authoring path.
+      expect(prompt).not.toMatch(/\bmcp add(?: --scope project)? sapiom-dev\b/);
+      expect(prompt).not.toContain("[mcp_servers.sapiom-dev]");
+      expect(prompt).not.toContain('"sapiom-dev":');
+      expect(prompt).not.toContain("under the name `sapiom-dev`");
 
       const installed = await adapter.detectInstalled();
       expect(typeof installed).toBe("boolean");
     },
   );
+
+  it("keeps Claude Code on the exact supported local authoring command", () => {
+    expect(getHarnessAdapter("claude-code").installMcpPrompt()).toContain(
+      "claude mcp add sapiom -- npx -y @sapiom/mcp",
+    );
+  });
 
   it("embedded adapters have mode 'embedded'; external adapters have mode 'external'", () => {
     for (const adapter of listHarnessAdapters()) {

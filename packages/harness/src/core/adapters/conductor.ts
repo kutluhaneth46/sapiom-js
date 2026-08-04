@@ -18,7 +18,7 @@ const INSTALL_MCP_PROMPT = [
   "",
   "1. From the repository root, run:",
   "",
-  "   claude mcp add --scope project sapiom-dev -- npx -y @sapiom/mcp",
+  "   claude mcp add --scope project sapiom -- npx -y @sapiom/mcp",
   "",
   "   This writes the server into the repository's `.mcp.json`, which",
   "   Conductor workspaces pick up. The `@sapiom/mcp` npm package ships the",
