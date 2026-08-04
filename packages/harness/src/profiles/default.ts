@@ -22,7 +22,7 @@ active for the whole session. Follow them.
   ctx.sapiom.* methods; a deployed run routes those calls through Sapiom cloud,
   not through this client MCP configuration. Don't substitute ${HOSTED_CAPABILITY_MCP_ALIAS}
   for the authoring tools below.
-- **${LOCAL_AUTHORING_MCP_ALIAS}** (local, stdio; wire name \`sapiom-dev\`) — the
+- **${LOCAL_AUTHORING_MCP_ALIAS}** (local, stdio; wire identity **sapiom-dev**) — the
   developer surface for this session. Its scaffold, check, and Local Run paths
   use no Sapiom capability spend; Deploy and Prod Run are authenticated cloud
   operations. Use its sapiom_dev_agents_*
