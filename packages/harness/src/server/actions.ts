@@ -17,11 +17,13 @@
  * settles. Prod-run is a single request/response returning `{ executionId }`,
  * which the existing live-canvas path then polls via the runs router.
  *
- * Run-local (`POST /api/runs/local`) is the offline sibling: it spawns the
- * run-local bootstrap child, which runs the workflow in-process against stub
- * capabilities and streams NDJSON back — one {@link LocalStepTrace} per line,
- * then a terminal summary carrying `unusedStubs`/`stubWarnings`. It needs no
- * API key and makes no network call, so it works signed-out and at zero cost.
+ * Run-local (`POST /api/runs/local`) is the signed-out sibling: it spawns the
+ * run-local bootstrap child, which runs the workflow in-process with Sapiom
+ * capability calls served by stubs and streams NDJSON back — one
+ * {@link LocalStepTrace} per line, then a terminal summary carrying
+ * `unusedStubs`/`stubWarnings`. The runner needs no API key and makes no Sapiom
+ * capability request. Arbitrary user step code still executes on the machine
+ * and may use its network.
  */
 
 import { spawn as spawnChildProcess } from "node:child_process";
@@ -330,7 +332,9 @@ function readProjectConfigState(
   }
   const definitionId = config?.definitionId;
   if (definitionId) return { kind: "linked", definitionId };
-  return config?.name ? { kind: "unlinked", name: config.name } : { kind: "unlinked" };
+  return config?.name
+    ? { kind: "unlinked", name: config.name }
+    : { kind: "unlinked" };
 }
 
 /**
@@ -406,10 +410,11 @@ async function withKeyRefreshRetry<T>(
  * Create the actions router. Mounts:
  *   - `POST /api/workflows/:id/deploy` — NDJSON build-status stream.
  *   - `POST /api/runs` — `{ executionId }` for a started prod execution.
- *   - `POST /api/runs/local` — NDJSON offline stub-run trace + summary.
+ *   - `POST /api/runs/local` — NDJSON local stub-run trace + summary.
  *
- * Deploy and prod-run run server-side with the held API key; run-local is fully
- * offline and needs no key. None of them ever involve an AI coding agent.
+ * Deploy and prod-run run server-side with the held API key; run-local needs no
+ * key and replaces ctx.sapiom calls with stubs, while ordinary author-code side
+ * effects remain real. None of them ever involve an AI coding agent.
  */
 export function createActionsRouter(opts: ActionsRouterOpts): Router {
   const router = Router();
@@ -527,8 +532,7 @@ export function createActionsRouter(opts: ActionsRouterOpts): Router {
       } catch (cacheErr) {
         write({
           phase: "warning",
-          message:
-            `The agent "${linked.name}" was created on Sapiom (${linked.definitionId}) but not recorded locally: ${cacheErr instanceof Error ? cacheErr.message : String(cacheErr)}. The build continues; re-deploying re-resolves it by name.`,
+          message: `The agent "${linked.name}" was created on Sapiom (${linked.definitionId}) but not recorded locally: ${cacheErr instanceof Error ? cacheErr.message : String(cacheErr)}. The build continues; re-deploying re-resolves it by name.`,
         });
       }
       // Best-effort, same as the cache write above, and run whether or not it
@@ -623,13 +627,15 @@ export function createActionsRouter(opts: ActionsRouterOpts): Router {
   /**
    * POST /api/runs/local  { sourceDir, input?, stubs?, maxAttemptsPerStep? }
    *
-   * Runs the workflow at `sourceDir` entirely offline against stub
-   * capabilities, in a child process (the run-local bootstrap), and streams the
+   * Runs the workflow at `sourceDir` with Sapiom capability calls served by
+   * stubs, in a child process (the run-local bootstrap), and streams the
    * result back as NDJSON: one {@link LocalStepTrace} per line, then a terminal
    * summary line `{ kind: "summary", outcome, output, error, unusedStubs,
    * stubWarnings }`. A run that could not be invoked at all (bad project, bad
    * stub file) yields a terminal `{ kind: "error", outcome: "failed", error }`
-   * line instead. Needs no API key and makes no network call — zero cost.
+   * line instead. The runner needs no API key and makes no Sapiom capability
+   * request; user-authored step code is still ordinary local code and may use
+   * the network.
    *
    * The child owns the wire shapes; this handler validates the request, pipes
    * it to the child's stdin, forwards each stdout line unchanged, and (only if
@@ -723,7 +729,9 @@ export function createActionsRouter(opts: ActionsRouterOpts): Router {
             kind: "error",
             outcome: "failed",
             error:
-              stderrTail.trim() || crashReason || "run-local produced no output",
+              stderrTail.trim() ||
+              crashReason ||
+              "run-local produced no output",
           }) + "\n",
         );
       }

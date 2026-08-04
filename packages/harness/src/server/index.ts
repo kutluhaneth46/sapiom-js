@@ -121,10 +121,7 @@ import { createFsRouter } from "./fs.js";
 import { createRunsRouter } from "./runs.js";
 import { createTemplatesRouter } from "./templates.js";
 import { createActionsRouter } from "./actions.js";
-import {
-  createAuthRouter,
-  createMutableAuthState,
-} from "./auth-routes.js";
+import { createAuthRouter, createMutableAuthState } from "./auth-routes.js";
 // resolveAgentsBaseUrl is imported above from definition-slug-resolver.js
 // (an identical helper); the runs router reuses it for its agents base URL.
 
@@ -271,7 +268,7 @@ function workflowListsEqual(
   // written as the escape `\u0000` — a literal NUL byte in the source makes
   // grep and ripgrep classify this whole file as binary and silently skip it.
   const key = (w: WorkflowInfo): string =>
-    `${w.path}\u0000${w.name}\u0000${w.definitionId ?? ""}\u0000${w.source}`;
+    `${w.path}\u0000${w.name}\u0000${w.definitionId ?? ""}\u0000${w.definitionSlug ?? ""}\u0000${w.activeBuildRunId ?? ""}\u0000${w.activeBuildRunStatus ?? ""}\u0000${w.source}`;
   const setA = new Set(a.map(key));
   return b.every((w) => setA.has(key(w)));
 }
@@ -356,7 +353,9 @@ function createDefaultBuildLaunchOpts(
       ...(pluginDir ? { pluginDir } : {}),
       // Set on BOTH channels: the post-ready path hasn't delivered yet, but a
       // brief exists and will, and this is the flag that tells it to.
-      ...(brief !== null && rehydrateFrom ? { rehydratedFrom: rehydrateFrom } : {}),
+      ...(brief !== null && rehydrateFrom
+        ? { rehydratedFrom: rehydrateFrom }
+        : {}),
     };
   };
 }
@@ -387,11 +386,15 @@ export const startServer = async (
   const machineId =
     options.machineId ?? (await getOrCreateMachineId(statePaths.machineId));
 
-  // One-way identity migration: seed ~/.sapiom/analytics.json from the
+  // One-way identity migration: seed ~/.sapiom/analytics.json from the real
   // legacy harness machine-id so existing installs keep the same anonymous_id
-  // after the upgrade (longitudinal join key survives). No-op when analytics.json
-  // already exists or when HOME is unwritable.
-  await migrateHarnessIdentity(statePaths.machineId);
+  // after the upgrade (longitudinal join key survives). An explicit stateRoot is
+  // a throwaway Harness installation: never let its fresh machine id mutate the
+  // shared analytics identity outside that root. With telemetry hard-off, that
+  // makes a clean-room boot leave normal user state untouched.
+  if (options.stateRoot === undefined) {
+    await migrateHarnessIdentity(statePaths.machineId);
+  }
   const launchDir = options.launchDir ?? process.cwd();
 
   // Serve-time slug enrichment: resolves each workflow's definitionSlug from
@@ -400,29 +403,30 @@ export const startServer = async (
   // boot; caches successful id→slug resolutions in-memory (ids are stable).
   // Never throws — a failed resolution leaves definitionSlug as-is.
   const slugResolver = createDefinitionSlugResolver({
-    apiKey: identity?.apiKey ?? null,
+    apiKey: () => apiKeyProvider.getKey(),
     baseUrl: resolveAgentsBaseUrl(),
   });
 
-  /** Returns a copy of the workflow list with definitionSlug filled in from
-   *  the Agents API for any workflow that has a definitionId but no slug.
+  /** Returns a copy of the workflow list with definition metadata filled in
+   *  from the Agents API for every linked workflow. Build status is mutable,
+   *  so it is refreshed even when the stable slug is already present.
    *  Resolves all lookups in parallel. Never mutates the registry. */
   const enrichWorkflows = async (
     workflows: WorkflowInfo[],
   ): Promise<WorkflowInfo[]> => {
     return Promise.all(
       workflows.map(async (workflow) => {
-        if (
-          workflow.definitionId == null ||
-          (workflow.definitionSlug != null && workflow.definitionSlug !== "")
-        ) {
-          return workflow;
-        }
-        const resolved = await slugResolver.resolve(
+        if (workflow.definitionId == null) return workflow;
+        const metadata = await slugResolver.resolveMetadata(
           String(workflow.definitionId),
         );
-        if (resolved == null) return workflow;
-        return { ...workflow, definitionSlug: resolved };
+        if (metadata == null) return workflow;
+        return {
+          ...workflow,
+          definitionSlug: metadata.slug ?? workflow.definitionSlug,
+          activeBuildRunId: metadata.activeBuildRunId,
+          activeBuildRunStatus: metadata.activeBuildRunStatus,
+        };
       }),
     );
   };
@@ -443,9 +447,11 @@ export const startServer = async (
     // preserve-on-failure path: while an agent is mid-edit the sources are
     // transiently un-buildable, and flashing an extraction-error panel over a
     // perfectly good diagram reads as broken. So keep the last good render until
-    // the edit builds cleanly, then swap it in (the write flows back through
-    // onChange above as the iframe reload, with its loading skeleton). Only a
-    // workflow that has never rendered shows the honest error.
+    // a later watched .ts/.tsx edit extracts successfully, then swap it in (the
+    // write flows back through onChange above as the iframe reload). Other fixes
+    // need an explicit Visualize retry because the watcher is intentionally
+    // source-limited. Only a workflow that has never rendered shows the honest
+    // error immediately.
     onSourceChange: (harnessSessionId) => {
       const session = sessionManager.get(harnessSessionId);
       if (session) void autoRenderCanvas(session).catch(() => {});
@@ -529,9 +535,13 @@ export const startServer = async (
   }, WORKFLOWS_CACHE_REFRESH_MS);
   workflowsCacheTimer.unref?.();
 
-  const boundWorkflowForSession = (session: HarnessSession): WorkflowInfo | null =>
+  const boundWorkflowForSession = (
+    session: HarnessSession,
+  ): WorkflowInfo | null =>
     session.boundWorkflowPath
-      ? (workflowsCache.find((workflow) => workflow.path === session.boundWorkflowPath) ?? null)
+      ? (workflowsCache.find(
+          (workflow) => workflow.path === session.boundWorkflowPath,
+        ) ?? null)
       : null;
 
   /**
@@ -545,19 +555,31 @@ export const startServer = async (
   const writeSessionContext = async (
     session: HarnessSession,
   ): Promise<void> => {
-    await writeHarnessContext(session, boundWorkflowForSession(session), workflowsCache);
+    await writeHarnessContext(
+      session,
+      boundWorkflowForSession(session),
+      workflowsCache,
+    );
   };
 
   const initializeSessionContext = async (
     session: HarnessSession,
   ): Promise<void> => {
-    await writeHarnessContextForLaunch(session, boundWorkflowForSession(session), workflowsCache);
+    await writeHarnessContextForLaunch(
+      session,
+      boundWorkflowForSession(session),
+      workflowsCache,
+    );
   };
 
   const prepareSessionContext = async (
     session: HarnessSession,
   ): Promise<void> => {
-    await prepareHarnessContextForResume(session, boundWorkflowForSession(session), workflowsCache);
+    await prepareHarnessContextForResume(
+      session,
+      boundWorkflowForSession(session),
+      workflowsCache,
+    );
   };
 
   // Declared before the launch-opts builder (rather than beside the ingest
@@ -598,7 +620,9 @@ export const startServer = async (
    * grows the store — enforcing the caps at the moment they can be exceeded
    * beats waiting for the next boot.
    */
-  const archiveSessionRecord = async (harnessSessionId: string): Promise<void> => {
+  const archiveSessionRecord = async (
+    harnessSessionId: string,
+  ): Promise<void> => {
     const record = await sessionRecordReader.readFromEvents(harnessSessionId);
     if (!record) return;
     if (!(await recordArchive.write(record))) return;
@@ -626,13 +650,18 @@ export const startServer = async (
    * doesn't apply to a single deliberate action). Null for a harness whose
    * transcript doesn't record a branch, and never throws.
    */
-  const priorGitBranch = async (record: SessionRecord): Promise<string | null> => {
+  const priorGitBranch = async (
+    record: SessionRecord,
+  ): Promise<string | null> => {
     if (!record.cwd || !record.agentSessionId) return null;
     const adapter = adapters[record.harness];
     if (!adapter) return null;
     try {
       const rows = await adapter.listPastSessions(record.cwd);
-      return rows.find((row) => row.agentSessionId === record.agentSessionId)?.gitBranch ?? null;
+      return (
+        rows.find((row) => row.agentSessionId === record.agentSessionId)
+          ?.gitBranch ?? null
+      );
     } catch {
       return null;
     }
@@ -647,10 +676,13 @@ export const startServer = async (
    * safe because nothing can create a session before the manager that creates
    * them exists.
    */
-  const resolveRehydrationBrief = (rehydrateFrom: string): Promise<string | null> =>
+  const resolveRehydrationBrief = (
+    rehydrateFrom: string,
+  ): Promise<string | null> =>
     buildRehydrationBrief(rehydrateFrom, {
       readRecord: (id) => sessionRecordReader.read(id),
-      readSummary: (harnessSessionId) => readRollingSummary(generatedRoot, harnessSessionId),
+      readSummary: (harnessSessionId) =>
+        readRollingSummary(generatedRoot, harnessSessionId),
       resolveContext: async (record) => {
         // The earliest merged session the registry still knows — the record's
         // own primary id first, so a conversation that spans a resume reports
@@ -666,7 +698,11 @@ export const startServer = async (
           title: prior?.title ?? null,
           gitBranch: await priorGitBranch(record),
           workflow: workflow
-            ? { name: workflow.name, path: workflow.path, definitionId: workflow.definitionId }
+            ? {
+                name: workflow.name,
+                path: workflow.path,
+                definitionId: workflow.definitionId,
+              }
             : null,
         };
       },
@@ -719,7 +755,11 @@ export const startServer = async (
     }
     const rehydratedFrom = session.rehydratedFrom;
     if (!session.ready || !rehydratedFrom) return;
-    if (systemPromptDeliveryFor(adapters[session.harness]) !== "post-ready-injection") return;
+    if (
+      systemPromptDeliveryFor(adapters[session.harness]) !==
+      "post-ready-injection"
+    )
+      return;
     if (briefsDelivered.has(session.id)) return;
     // Claimed before the await so a burst of status frames can't double-inject.
     briefsDelivered.add(session.id);
@@ -769,11 +809,15 @@ export const startServer = async (
   // last-N-turns, which is also the default for everyone with the setting off.
   const rollingSummarizer = createRollingSummarizer({
     generatedRoot,
-    enabled: async () => (await loadSettings(statePaths.settings)).rollingSummary === true,
-    readRecord: (harnessSessionId) => sessionRecordReader.read(harnessSessionId),
+    enabled: async () =>
+      (await loadSettings(statePaths.settings)).rollingSummary === true,
+    readRecord: (harnessSessionId) =>
+      sessionRecordReader.read(harnessSessionId),
     getSession: (harnessSessionId) => {
       const session = sessionManager.get(harnessSessionId);
-      return session ? { harness: session.harness, cwd: session.cwd } : undefined;
+      return session
+        ? { harness: session.harness, cwd: session.cwd }
+        : undefined;
     },
     runTask: (req) => taskManager.run(req),
   });
@@ -798,12 +842,12 @@ export const startServer = async (
   // agent scaffolds a new workflow directory, or one gets deleted — and the
   // rail must keep up rather than stay frozen at whatever the boot/session-
   // create scan found. On a (debounced) structural change under a session's
-  // workspace, prune dead paths, re-scan its cwd, and — only when the workflow
+  // workspace, prune dead paths, reconcile its cwd, and — only when the workflow
   // list actually changed — rewrite every open session's context file and
   // broadcast `workflows.changed` (the SPA refetches /api/workflows on it).
-  // Pruning here is what lets a deleted workflow drop out (a plain scan only
-  // ever merges in); it respects the same ENOENT/ENOTDIR-only guard as the
-  // boot prune, so a merely-unbuilt or unreadable project stays put.
+  // Path pruning respects the ENOENT/ENOTDIR-only guard. The scan additionally
+  // removes scan-sourced rows in this cwd's traversal envelope when their
+  // marker disappears or becomes invalid; manually connected folders remain.
   const rescanWorkspaceForSession = async (
     harnessSessionId: string,
   ): Promise<void> => {
@@ -814,6 +858,21 @@ export const startServer = async (
     await workflowRegistry.scan(session.cwd);
     const after = await workflowRegistry.list();
     workflowsCache = after;
+
+    // A removed project must not leave a live session permanently bound to a
+    // path that the registry can no longer resolve. Clear only stale bindings;
+    // the triggering session may immediately auto-bind to another candidate
+    // below its cwd in the block that follows.
+    const registeredPaths = new Set(after.map((workflow) => workflow.path));
+    for (const openSession of sessionManager.list()) {
+      if (
+        openSession.status !== "exited" &&
+        openSession.boundWorkflowPath &&
+        !registeredPaths.has(openSession.boundWorkflowPath)
+      ) {
+        sessionManager.setBoundWorkflowPath(openSession.id, null);
+      }
+    }
 
     // Auto-bind: if this session is still unbound, find the workflow at or
     // directly under its cwd and bind it — same mechanism as
@@ -1222,7 +1281,8 @@ export const startServer = async (
       renderCanvas: async (harnessSessionId) => {
         const session = sessionManager.get(harnessSessionId);
         if (!session) return;
-        if (session.boundWorkflowPath) invalidateExtractionCache(session.boundWorkflowPath);
+        if (session.boundWorkflowPath)
+          invalidateExtractionCache(session.boundWorkflowPath);
         await renderCanvas(session);
       },
       injectInput: async (harnessSessionId, text, submit) => {
@@ -1320,7 +1380,8 @@ export const startServer = async (
       // store, so the archived record carries the whole conversation including
       // its `endedAt`. (The "exited" status handler archives too, for sessions
       // that never get here.)
-      if (event.type === "session.end") archiveSessionRecordDetached(event.harnessSessionId);
+      if (event.type === "session.end")
+        archiveSessionRecordDetached(event.harnessSessionId);
     },
     onError: (err) => console.error("[harness] ingest processing error:", err),
     seqCounter,

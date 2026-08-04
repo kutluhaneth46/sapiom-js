@@ -60,12 +60,12 @@ after every small edit.
 ### Firing the resume signals in dev
 
 A real `run` pauses twice. To resume without a real approver/candidate, fire the
-signals via the MCP `signal_workflow` / `workflow_signal` tool — the manual
-stand-in. Approve, then accept:
+signals via local MCP `sapiom_dev_agents_signal` — the manual stand-in. Run Inspector
+does not provide a one-click signal control. Approve, then accept:
 
 ```json
-{ "signal": "approval.decision", "correlationId": "<executionId>", "payload": { "decision": "approve" } }
-{ "signal": "candidate.confirm", "correlationId": "<executionId>", "payload": { "decision": "accept" } }
+{ "executionId": "<executionId>", "name": "approval.decision", "correlationId": "<executionId>", "payload": { "decision": "approve" } }
+{ "executionId": "<executionId>", "name": "candidate.confirm", "correlationId": "<executionId>", "payload": { "decision": "accept" } }
 ```
 
 Send `{ "decision": "decline" }` on `candidate.confirm` to walk the fallback to

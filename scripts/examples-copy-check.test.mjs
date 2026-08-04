@@ -263,6 +263,28 @@ test("manifest copy uses the same precise Local Run boundary", () => {
   );
 });
 
+test("registered project copy rejects a nonexistent Run Inspector resume control", () => {
+  const errors = checkRegisteredProjectCopyAsset(
+    template,
+    "examples/fixture/README.md",
+    "Click **Resume run** in Run Inspector to deliver the signal.",
+  );
+
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /^copy-unsupported-control: "fixture" /);
+  assert.match(errors[0], /sapiom_dev_agents_signal/);
+});
+
+test("manifest copy rejects the same nonexistent control", () => {
+  const errors = check(
+    {},
+    { notes: "Use **Resume run** in Run Inspector to deliver the signal." },
+  );
+
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /^copy-unsupported-control: "fixture" /);
+});
+
 test("compatibility literals do not hide surrounding deployable prose", () => {
   const errors = checkRegisteredProjectCopyAsset(
     template,

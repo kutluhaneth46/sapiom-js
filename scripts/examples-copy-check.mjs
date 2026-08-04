@@ -63,6 +63,7 @@ const PROJECT_DEPLOYABLE_TERM_RE = /\b(?:workflows?|orchestrations?)\b/i;
 const LOCAL_RUN_TERM_RE = /\b(?:run_local|local run)\b/i;
 const OVERBROAD_LOCAL_RUN_GUARANTEE_RE =
   /\b(?:offline|for free|zero[- ]cost|no cost)\b/i;
+const UNSUPPORTED_RUN_INSPECTOR_CONTROL_RE = /\bResume run\b/i;
 
 function overbroadLocalRunClaims(source) {
   const lines = String(source).split(/\r?\n/);
@@ -179,6 +180,13 @@ export function checkRegisteredProjectCopyAsset(template, assetPath, source) {
   for (const claim of overbroadLocalRunClaims(source)) {
     errors.push(
       `copy-local-run-boundary: "${id}" ${assetPath}:${claim.line} describes Local Run as "${claim.guarantee}" — say that Sapiom capabilities are stubbed and name any project-specific dry-run guards; authored code and its side effects still execute.`,
+    );
+  }
+
+  for (let index = 0; index < lines.length; index++) {
+    if (!UNSUPPORTED_RUN_INSPECTOR_CONTROL_RE.test(lines[index])) continue;
+    errors.push(
+      `copy-unsupported-control: "${id}" ${assetPath}:${index + 1} promises a Resume run control that Run Inspector does not expose — use sapiom_dev_agents_signal or the API.`,
     );
   }
 
@@ -309,6 +317,12 @@ export function checkCopy(template, manifest) {
       fail(
         "copy-local-run-boundary",
         `manifest${path.slice(1)}:${claim.line} describes Local Run as "${claim.guarantee}" — say that Sapiom capabilities are stubbed and name any project-specific dry-run guards; authored code and its side effects still execute.`,
+      );
+    }
+    if (UNSUPPORTED_RUN_INSPECTOR_CONTROL_RE.test(copy)) {
+      fail(
+        "copy-unsupported-control",
+        `manifest${path.slice(1)} promises a Resume run control that Run Inspector does not expose — use sapiom_dev_agents_signal or the API.`,
       );
     }
   }

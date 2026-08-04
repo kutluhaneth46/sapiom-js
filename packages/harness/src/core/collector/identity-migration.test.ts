@@ -2,11 +2,11 @@
  * Unit tests for the harness→analytics-core identity migration.
  *
  * Covers the four scenarios from the acceptance criteria:
- * (a) fresh HOME → analytics.json created 0600, events carry its id
- * (b) HOME with legacy machine-id and no analytics.json → analytics.json
+ * (a) fresh target → migration alone does not create analytics.json
+ * (b) legacy machine-id with no analytics.json → analytics.json
  *     seeded with the SAME id
  * (c) both files exist → analytics.json wins, no rewrite
- * (d) unwritable HOME → id null, nothing crashes
+ * (d) unwritable explicit target → nothing crashes and no fallback file appears
  */
 
 import * as fs from "node:fs";
@@ -30,9 +30,16 @@ interface TempDir {
 }
 
 function makeTempDir(): TempDir {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "harness-identity-migration-"));
+  const dir = fs.mkdtempSync(
+    path.join(os.tmpdir(), "harness-identity-migration-"),
+  );
   const analyticsJsonPath = path.join(dir, ".sapiom", "analytics.json");
-  const legacyMachineIdPath = path.join(dir, ".sapiom", "harness", "machine-id");
+  const legacyMachineIdPath = path.join(
+    dir,
+    ".sapiom",
+    "harness",
+    "machine-id",
+  );
   return {
     dir,
     analyticsJsonPath,
@@ -50,7 +57,9 @@ function writeLegacyMachineId(machineIdPath: string, id: string): void {
 
 function readAnalyticsId(analyticsPath: string): string | null {
   try {
-    const parsed = JSON.parse(fs.readFileSync(analyticsPath, "utf8")) as { anonymous_id: string };
+    const parsed = JSON.parse(fs.readFileSync(analyticsPath, "utf8")) as {
+      anonymous_id: string;
+    };
     return parsed.anonymous_id;
   } catch {
     return null;
@@ -61,28 +70,25 @@ function readAnalyticsId(analyticsPath: string): string | null {
 
 describe("migrateHarnessIdentity", () => {
   let tmp: TempDir;
-  const originalHome = process.env.HOME;
-  const originalUserProfile = process.env.USERPROFILE;
 
   beforeEach(() => {
+    // Every case passes explicit paths. Do not mutate HOME: Vitest executes
+    // other files concurrently, and a process-global override can redirect an
+    // unrelated analytics write into this fixture and invalidate the contract.
     tmp = makeTempDir();
-    // Point HOME at our temp dir so analytics-core writes to a sandboxed location
-    process.env.HOME = tmp.dir;
-    process.env.USERPROFILE = tmp.dir;
   });
 
   afterEach(() => {
     tmp.cleanup();
-    if (originalHome === undefined) delete process.env.HOME;
-    else process.env.HOME = originalHome;
-    if (originalUserProfile === undefined) delete process.env.USERPROFILE;
-    else process.env.USERPROFILE = originalUserProfile;
   });
 
-  it("(a) fresh HOME: analytics.json does not exist → analytics.json NOT created by migration alone (analytics-core does that on first track)", async () => {
+  it("(a) fresh target: analytics.json is not created by migration alone (analytics-core does that on first track)", async () => {
     // No legacy machine-id either → nothing to migrate
     expect(fs.existsSync(tmp.analyticsJsonPath)).toBe(false);
-    await migrateHarnessIdentity(tmp.legacyMachineIdPath, tmp.analyticsJsonPath);
+    await migrateHarnessIdentity(
+      tmp.legacyMachineIdPath,
+      tmp.analyticsJsonPath,
+    );
     // Migration only seeds when legacy file exists; with neither file it's a no-op
     expect(fs.existsSync(tmp.analyticsJsonPath)).toBe(false);
   });
@@ -92,7 +98,10 @@ describe("migrateHarnessIdentity", () => {
     writeLegacyMachineId(tmp.legacyMachineIdPath, legacyId);
 
     expect(fs.existsSync(tmp.analyticsJsonPath)).toBe(false);
-    await migrateHarnessIdentity(tmp.legacyMachineIdPath, tmp.analyticsJsonPath);
+    await migrateHarnessIdentity(
+      tmp.legacyMachineIdPath,
+      tmp.analyticsJsonPath,
+    );
 
     expect(fs.existsSync(tmp.analyticsJsonPath)).toBe(true);
     // Permissions must be 0600
@@ -108,11 +117,15 @@ describe("migrateHarnessIdentity", () => {
     fs.mkdirSync(path.dirname(tmp.analyticsJsonPath), { recursive: true });
     fs.writeFileSync(
       tmp.analyticsJsonPath,
-      JSON.stringify({ anonymous_id: analyticsId, first_run_notice_at: null }) + "\n",
+      JSON.stringify({ anonymous_id: analyticsId, first_run_notice_at: null }) +
+        "\n",
       { mode: 0o600 },
     );
 
-    await migrateHarnessIdentity(tmp.legacyMachineIdPath, tmp.analyticsJsonPath);
+    await migrateHarnessIdentity(
+      tmp.legacyMachineIdPath,
+      tmp.analyticsJsonPath,
+    );
 
     // analytics.json unchanged
     expect(readAnalyticsId(tmp.analyticsJsonPath)).toBe(analyticsId);
@@ -120,7 +133,7 @@ describe("migrateHarnessIdentity", () => {
     expect(readAnalyticsId(tmp.analyticsJsonPath)).not.toBe(legacyId);
   });
 
-  it("(d) unwritable HOME → nothing crashes, returns silently", async () => {
+  it("(d) unwritable explicit target → nothing crashes, returns silently", async () => {
     // Point legacy id at a real file
     const legacyId = crypto.randomUUID();
     writeLegacyMachineId(tmp.legacyMachineIdPath, legacyId);
@@ -133,12 +146,18 @@ describe("migrateHarnessIdentity", () => {
     await expect(
       migrateHarnessIdentity(tmp.legacyMachineIdPath, unwritablePath),
     ).resolves.toBeUndefined();
+    // The explicit target is the contract. A failed write there must not fall
+    // back to HOME and silently mutate a different identity file.
+    expect(fs.existsSync(tmp.analyticsJsonPath)).toBe(false);
   });
 
   it("ignores a non-UUID machine-id (malformed content)", async () => {
     writeLegacyMachineId(tmp.legacyMachineIdPath, "not-a-uuid");
 
-    await migrateHarnessIdentity(tmp.legacyMachineIdPath, tmp.analyticsJsonPath);
+    await migrateHarnessIdentity(
+      tmp.legacyMachineIdPath,
+      tmp.analyticsJsonPath,
+    );
 
     // analytics.json should NOT have been created
     expect(fs.existsSync(tmp.analyticsJsonPath)).toBe(false);
@@ -148,11 +167,17 @@ describe("migrateHarnessIdentity", () => {
     const legacyId = crypto.randomUUID();
     writeLegacyMachineId(tmp.legacyMachineIdPath, legacyId);
 
-    await migrateHarnessIdentity(tmp.legacyMachineIdPath, tmp.analyticsJsonPath);
+    await migrateHarnessIdentity(
+      tmp.legacyMachineIdPath,
+      tmp.analyticsJsonPath,
+    );
     const firstRead = readAnalyticsId(tmp.analyticsJsonPath);
 
     // Second call: analytics.json now exists, should be a no-op
-    await migrateHarnessIdentity(tmp.legacyMachineIdPath, tmp.analyticsJsonPath);
+    await migrateHarnessIdentity(
+      tmp.legacyMachineIdPath,
+      tmp.analyticsJsonPath,
+    );
     expect(readAnalyticsId(tmp.analyticsJsonPath)).toBe(firstRead);
   });
 });

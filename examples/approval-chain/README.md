@@ -119,15 +119,17 @@ capability spend. Keep
 ## Resuming a paused run in dev
 
 A real `run` pauses at each gate. Instead of a real approver, fire the signals
-yourself via the MCP `signal_workflow` / `workflow_signal` tool. The
+yourself via local MCP `sapiom_dev_agents_signal`. The
 `correlationId` is the paused run's `executionId`, and each `payload` becomes the
 resumed `decide` step's input.
+Run Inspector does not provide a one-click signal control.
 
 **Approve** the current gate (advances to the next, or finalises on the last):
 
 ```json
 {
-  "signal": "approval.decision",
+  "executionId": "<executionId>",
+  "name": "approval.decision",
   "correlationId": "<executionId of the paused run>",
   "payload": { "decision": "approve" }
 }

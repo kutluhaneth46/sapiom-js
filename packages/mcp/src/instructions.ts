@@ -43,11 +43,13 @@ hosted capability MCP or the TypeScript SDK for a single action.
    READ the project's \`AGENTS.md\` first, plus the \`sapiom-agent-authoring\` skill in
    \`.claude/skills/\` where present (scaffolded projects include it; auto-loads in Claude Code).
    Then \`npm install\`.
-2. Test locally: \`npm run typecheck\` → \`sapiom_dev_agents_check\` (validates the step graph,
-   offline) → \`sapiom_dev_agents_run_local\` (Sapiom capabilities are stubbed with no Sapiom
+2. Test locally: \`npm run typecheck\` → \`sapiom_dev_agents_check\` (typechecks, imports the
+   definition, and validates its graph; no Sapiom account or service call) →
+   \`sapiom_dev_agents_run_local\` (\`ctx.sapiom.*\` calls are stubbed, so there is no Sapiom
    capability spend; authored code and its ordinary side effects still execute).
 3. Before the first cloud action, call \`sapiom_authenticate\`; browser login caches the shared
-   credential required by link/deploy/run. Confirm with \`sapiom_status\`.
+   API-key principal required by link, deploy, run, inspect, schedules, and signals. Confirm with
+   \`sapiom_status\`.
 4. Ship: \`sapiom_dev_agents_link\` → \`_deploy\` → \`_run\` (real, billed) → \`_inspect\`.
 
 ## Preview a web app
