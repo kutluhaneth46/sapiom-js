@@ -90,8 +90,8 @@ Input:
 A real `run` pauses at `review`. Instead of a real approver, fire the sign-off
 signal yourself via local MCP `sapiom_dev_agents_signal`. The
 `correlationId` is the paused run's `executionId`, and the `payload` becomes
-`onSignoff`'s input.
-Run Inspector does not provide a one-click signal control.
+`onSignoff`'s input. The **Resume run** form in Run Inspector can deliver the
+same signal.
 
 **Approve** (resumes `onSignoff` → `archive`):
 

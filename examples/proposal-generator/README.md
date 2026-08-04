@@ -79,8 +79,8 @@ the client email.
 A real `run` pauses once, at `review`. Instead of a real approver, fire the signal
 yourself via local MCP `sapiom_dev_agents_signal`. The
 `correlationId` is the paused run's `executionId`, and the `payload` becomes the
-resumed step's input.
-Run Inspector does not provide a one-click signal control.
+resumed step's input. The **Resume run** form in Run Inspector can deliver the
+same signal.
 
 **Approve** (resumes `onDecision` → `send`, emailing the client):
 

@@ -64,9 +64,9 @@ degrades to a skip (it still completes) so you can trace the graph first.
 ## Resuming a paused run in dev
 
 A real `run` pauses at `watch` and waits for the `pr.opened` signal. Instead of
-a real webhook, fire it yourself with local MCP `sapiom_dev_agents_signal`. Run
-Inspector does not provide a one-click signal control. The `correlationId` is the
-paused run's `executionId`, and the `payload` becomes `review`'s input:
+a real webhook, fire it yourself with the **Resume run** form in Run Inspector
+or local MCP `sapiom_dev_agents_signal`. The `correlationId` is the paused run's
+`executionId`, and the `payload` becomes `review`'s input:
 
 ```json
 {

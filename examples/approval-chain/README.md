@@ -121,8 +121,8 @@ capability spend. Keep
 A real `run` pauses at each gate. Instead of a real approver, fire the signals
 yourself via local MCP `sapiom_dev_agents_signal`. The
 `correlationId` is the paused run's `executionId`, and each `payload` becomes the
-resumed `decide` step's input.
-Run Inspector does not provide a one-click signal control.
+resumed `decide` step's input. The **Resume run** form in Run Inspector can
+deliver the same signal.
 
 **Approve** the current gate (advances to the next, or finalises on the last):
 

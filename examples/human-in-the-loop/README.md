@@ -83,8 +83,8 @@ The `approver` and `escalateTo` addresses fall back to `config.APPROVER_EMAIL` /
 A real `run` pauses twice. Instead of a real approver / candidate, fire the
 signals yourself via local MCP `sapiom_dev_agents_signal`. The
 `correlationId` is the paused run's `executionId`, and each `payload` becomes the
-resumed step's input.
-Run Inspector does not provide a one-click signal control.
+resumed step's input. The **Resume run** form in Run Inspector can deliver the
+same signal.
 
 **Approve** (resumes `onDecision`):
 
