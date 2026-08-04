@@ -28,27 +28,6 @@
     "reason": "The literal MCP signal tool ID is compatibility-sensitive."
   },
   {
-    "id": "eval-gate-agents-backend-route",
-    "path": "examples/eval-gate/AGENTS.md",
-    "pattern": "/v1/workflows/executions",
-    "occurrences": 1,
-    "reason": "The backend execution route remains stable for compatibility."
-  },
-  {
-    "id": "eval-gate-readme-backend-routes",
-    "path": "examples/eval-gate/README.md",
-    "pattern": "/v1/workflows/executions",
-    "occurrences": 2,
-    "reason": "The backend execution route remains stable for compatibility."
-  },
-  {
-    "id": "eval-gate-readme-signal-tools",
-    "path": "examples/eval-gate/README.md",
-    "pattern": "signal_workflow|workflow_signal",
-    "occurrences": 2,
-    "reason": "Literal MCP signal tool IDs are compatibility-sensitive."
-  },
-  {
     "id": "pr-review-agents-signal-tools",
     "path": "examples/pr-review-bot/AGENTS.md",
     "pattern": "signal_workflow|workflow_signal",
