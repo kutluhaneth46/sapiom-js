@@ -23,7 +23,7 @@
       "steps": [
         {
           "name": "plan",
-          "description": "Resolves the repo — an existing one you name, or a scratch repo it provisions when none is given.",
+          "description": "Resolves the repo, using an existing one you name or provisioning a scratch repo when none is given.",
           "kind": "compute",
           "next": ["implement", "rejected"]
         },
@@ -100,7 +100,7 @@
       "steps": [
         {
           "name": "enrich",
-          "description": "Resolve a real contact for each lead with Hunter — look up the named person, or surface a decision-maker when you only have the company.",
+          "description": "Resolve a real contact for each lead with Hunter, looking up the named person or surfacing a decision-maker when you only have the company.",
           "kind": "capability",
           "capability": "email.domain.search",
           "next": ["scrape"]
@@ -135,7 +135,7 @@
         },
         {
           "name": "send",
-          "description": "Deliver the current touch to everyone still active and log it, then pause at $0 until the drip interval elapses or a prospect replies.",
+          "description": "Deliver the current touch to everyone still active and log it, then pause until the drip interval elapses or a prospect replies.",
           "kind": "pause",
           "capability": "email.send",
           "next": ["advance", "done"]
@@ -148,7 +148,7 @@
         },
         {
           "name": "done",
-          "description": "Return the campaign summary — who was enriched, how many were deliverable, what was sent, and who replied.",
+          "description": "Return the campaign summary, covering who was enriched, how many were deliverable, what was sent, and who replied.",
           "kind": "compute",
           "terminal": true
         }
@@ -164,7 +164,7 @@
     {
       "id": "content-repurposing-pipeline",
       "name": "Content Pack",
-      "description": "Turn one post into a full channel pack — thread, LinkedIn, newsletter, quote graphics, and a short clip — then email it to your list.",
+      "description": "Turn one post into a full channel pack, including a thread, LinkedIn post, newsletter, quote graphics, and a short clip, then email it to your list.",
       "tags": ["content", "marketing", "media", "fan-out"],
       "category": "revenue-marketing",
       "discipline": "Marketing",
@@ -221,7 +221,7 @@
         },
         {
           "name": "deliver",
-          "description": "Fan the pack out — one email per recipient on your list — and end the run with a summary of everything produced and how many recipients it reached.",
+          "description": "Fan the pack out, one email per recipient on your list, and end the run with a summary of everything produced and how many recipients it reached.",
           "kind": "capability",
           "capability": "email.send",
           "terminal": true
@@ -254,7 +254,7 @@
         },
         {
           "name": "draft",
-          "description": "Write the piece from the brief — on a revision, address the rejected draft and the judge's critique too.",
+          "description": "Write the piece from the brief. On a revision, address the rejected draft and the judge's critique too.",
           "kind": "llm",
           "capability": "models.run",
           "next": ["judge"]
@@ -274,7 +274,7 @@
         },
         {
           "name": "publish",
-          "description": "The one terminal — return the final draft, whether it passed, the score, and how many attempts it took.",
+          "description": "The one terminal, returning the final draft, whether it passed, the score, and how many attempts it took.",
           "kind": "compute",
           "terminal": true
         }
@@ -305,7 +305,7 @@
       "steps": [
         {
           "name": "crawl",
-          "description": "Read the homepage's markdown and links, then crawl a bounded set of internal pages — prioritizing anything that looks like a Terms or Privacy link.",
+          "description": "Read the homepage's markdown and links, then crawl a bounded set of internal pages, prioritizing anything that looks like a Terms or Privacy link.",
           "kind": "capability",
           "capability": "web.scrape",
           "next": ["render", "rejected"]
@@ -446,7 +446,7 @@
         },
         {
           "name": "plan",
-          "description": "Translates the sample question into SQL with an LLM — or, for the built-in demo question, uses a fixed known-safe SELECT so the zero-setup path needs no model.",
+          "description": "Translates the sample question into SQL with an LLM, or, for the built-in demo question, uses a fixed known-safe SELECT so the zero-setup path needs no model.",
           "kind": "llm",
           "capability": "models.run",
           "next": ["guard"]
@@ -459,7 +459,7 @@
         },
         {
           "name": "execute",
-          "description": "Runs the guarded SELECT for real inside a READ ONLY transaction — statement-timeout-bounded and row-capped — and returns the actual rows.",
+          "description": "Runs the guarded SELECT for real inside a READ ONLY transaction, statement-timeout-bounded and row-capped, and returns the actual rows.",
           "kind": "compute",
           "next": ["deploy", "query_failed"]
         },
@@ -472,13 +472,13 @@
         },
         {
           "name": "deployed",
-          "description": "The endpoint is live — returns its URL plus the real rows from the sample query.",
+          "description": "The endpoint is live, returning its URL plus the real rows from the sample query.",
           "kind": "compute",
           "terminal": true
         },
         {
           "name": "deploy_failed",
-          "description": "The deploy failed — surfaces the deployPreview logs alongside the real sample rows already fetched.",
+          "description": "The deploy failed, surfacing the deployPreview logs alongside the real sample rows already fetched.",
           "kind": "compute",
           "terminal": true
         },
@@ -528,7 +528,7 @@
       "steps": [
         {
           "name": "draft",
-          "description": "An LLM turns the request into a structured proposal — title, summary, scope, and priced line items — then the totals are computed in code, not trusted from the model.",
+          "description": "An LLM turns the request into a structured proposal, including a title, summary, scope, and priced line items, then the totals are computed in code, not trusted from the model.",
           "kind": "llm",
           "capability": "models.run",
           "next": ["render", "rejected"]
@@ -542,7 +542,7 @@
         },
         {
           "name": "review",
-          "description": "Email the approver a summary and the PDF link, then pause and wait for their decision — costing nothing while idle. With no approver set, stop at the gate with the drafted proposal instead of waiting forever.",
+          "description": "Email the approver a summary and the PDF link, then pause and wait for their decision. With no approver set, stop at the gate with the drafted proposal instead of waiting forever.",
           "kind": "pause",
           "checkpoint": true,
           "capability": "email.send",
@@ -556,7 +556,7 @@
         },
         {
           "name": "send",
-          "description": "The one outward step — email the approved proposal to the client. A dry run skips the send.",
+          "description": "The one outward step, emailing the approved proposal to the client. A dry run skips the send.",
           "kind": "capability",
           "capability": "email.send",
           "terminal": true
@@ -569,7 +569,7 @@
         },
         {
           "name": "rejected",
-          "description": "Rejected at review — nothing goes to the client, and the draft PDF stays on file.",
+          "description": "Rejected at review. Nothing goes to the client, and the draft PDF stays on file.",
           "kind": "compute",
           "terminal": true
         }
@@ -617,7 +617,7 @@
         },
         {
           "name": "synthesize",
-          "description": "Hand the sources to an LLM to write a structured, cited report — or revise one after a critique. No sources at all stops here with an empty report.",
+          "description": "Hand the sources to an LLM to write a structured, cited report, or revise one after a critique. No sources at all stops here with an empty report.",
           "kind": "llm",
           "capability": "models.run",
           "next": ["critique", "drafted"]
@@ -631,7 +631,7 @@
         },
         {
           "name": "illustrate",
-          "description": "Launch an image-generation job for the next section, then pause until it finishes — or skip straight to the build when no illustrations are wanted.",
+          "description": "Launch an image-generation job for the next section, then pause until it finishes, or skip straight to the build when no illustrations are wanted.",
           "kind": "pause",
           "capability": "contentGeneration.images",
           "next": ["collectIllustration", "build"]
@@ -644,7 +644,7 @@
         },
         {
           "name": "build",
-          "description": "Launch a coding agent to build a self-contained static site from the report and any illustrations, then pause until it finishes — costing nothing while it works.",
+          "description": "Launch a coding agent to build a self-contained static site from the report and any illustrations, then pause until it finishes.",
           "kind": "pause",
           "capability": "models.coding",
           "next": ["publish"]
@@ -658,7 +658,7 @@
         },
         {
           "name": "mapDomain",
-          "description": "If a domain you own is configured, point a subdomain at the live site with a free CNAME; otherwise this is skipped.",
+          "description": "If a domain you own is configured, point a subdomain at the live site with a CNAME; otherwise this is skipped.",
           "kind": "capability",
           "capability": "domains.dns.create",
           "next": ["live"]
@@ -677,7 +677,7 @@
         },
         {
           "name": "drafted",
-          "description": "The off-ramp: the report was computed but nothing was illustrated, built, or deployed — a dry run after self-critique, or no sources to research from.",
+          "description": "The off-ramp: the report was computed but nothing was illustrated, built, or deployed, a dry run after self-critique, or no sources to research from.",
           "kind": "compute",
           "terminal": true
         },

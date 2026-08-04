@@ -5,14 +5,14 @@
     "name": "Sapiom",
     "url": "https://sapiom.ai/"
   },
-  "whatItDoes": "Stand up a live endpoint that answers plain-English questions about a read-only database. One run deploys it and runs a sample question for real rows, holding the generated SQL to read-only the whole way.",
-  "longDescription": "Deploy a live endpoint that answers questions about your database in plain English. One run stands up the endpoint; then anyone can `POST /query` a question and get the data back — no SQL required.\n\nEach request introspects your schema, asks an LLM (`models.run`) for a single `SELECT`, and returns the rows. The read-only guardrail is the point: the model (or, for the built-in sample question, a fixed query written once by us) is held to a single `SELECT`, the SQL is checked (single statement, starts with `SELECT`/`WITH`, no write or DDL keywords), and it runs inside a `READ ONLY` transaction that Postgres enforces at the engine level — with a statement timeout and a row cap. A write can't slip through even if the model misbehaves.\n\nThe agent itself is the deployer, and it proves the pipeline before it ships anything: it reads the connection string from a Sapiom database handle (`database.get`), seeding the managed demo database if it hasn't been already, translates a sample question into guarded SQL, and actually RUNS that query against the resolved database — the returned rows are what the run reports, not a preview. Only then does it write a small server into a sandbox and expose it at a stable URL (`sandboxes.deployPreview`). The endpoint gets its OWN Sapiom credential — the deploy step mints a durable, narrowly-scoped key (`keys.mintScoped`) and hands it to the server as an environment variable, never baked into source. No manual key needed: the engine's per-run token expires with the step, so the long-lived endpoint is minted one that lasts.\n\nYou pay for the deploy (one sandbox) plus the model reasoning on each question the endpoint answers — the endpoint sitting idle is free.",
+  "whatItDoes": "Stand up a live endpoint that turns plain-English questions into safe, read-only database queries. One run deploys the endpoint and demonstrates it end to end with a sample question.",
+  "longDescription": "Deploy a live endpoint that answers questions about your database in plain English. One run stands up the endpoint. After that, anyone can `POST /query` a question and get the data back.\n\nEach request introspects your schema, asks an LLM for a single `SELECT`, and returns the rows. The read-only guardrail is the point. The query is checked: a single statement, `SELECT` or `WITH` only, no writes or DDL. It runs inside a `READ ONLY` transaction that Postgres enforces at the engine level, with a statement timeout and a row cap.",
   "useCases": [
     "Plain-English question box",
     "Read-only SQL",
     "Live POST endpoint"
   ],
-  "notes": "**Use this template.** Click **Use this template** — Sapiom builds and deploys it for you; open it on the **Agents** page and run it to stand up the endpoint. Your $5 signup credit covers first runs.\n\nNothing is required: with no `dbHandle`/`connectionString`, the run provisions and seeds a small demo database (`customers`, `invoices`), answers the built-in sample question with a known-safe query, and reports the real rows — then deploys the endpoint, minting it a scoped Sapiom key automatically. Pass your own Sapiom Postgres handle as `dbHandle` (or a full `connectionString`) to query yours instead. Once deployed, `POST /query { \"question\": \"…\" }` to the returned URL. (Advanced: set `ENDPOINT_SAPIOM_API_KEY` to make the endpoint run as a key you control instead.)\n\n**Advanced (prefer to work from the code?):** Run it locally with `run_local` to trace the whole flow for free. `database.get` is stubbed to an unreachable connection string, so on defaults the built-in sample SQL still passes the guardrail but the real query at `execute` fails — a legible trace of `query_failed`. Pass `{ \"dryRun\": true }` to trace the whole graph offline over fixed sample rows instead (see `AGENTS.md`). Then edit and deploy with the Sapiom MCP.",
+  "notes": "Click **Use this template**. Sapiom builds and deploys it for you; open it on the **Agents** page and run it to stand up the endpoint.\n\nNothing is required to get started. With no `dbHandle` or `connectionString`, the run provisions and seeds a small demo database (`customers`, `invoices`), answers the built-in sample question with a known-safe query, and reports the real rows. It then deploys the endpoint and mints it a scoped Sapiom key automatically. Pass your own Sapiom Postgres handle as `dbHandle` (or a full `connectionString`) to query yours instead. Once deployed, send `POST /query { \"question\": \"...\" }` to the returned URL. Advanced: set `ENDPOINT_SAPIOM_API_KEY` to make the endpoint run as a key you control instead.\n\nPrefer to work from the code? Run it locally with `run_local` to trace the whole flow. `database.get` is stubbed to an unreachable connection string, so on defaults the built-in sample SQL still passes the guardrail but the real query at `execute` fails, giving a legible trace of `query_failed`. Pass `{ \"dryRun\": true }` to trace the whole graph offline over fixed sample rows instead (see `AGENTS.md`). Then edit and deploy with the Sapiom MCP.",
   "resources": [
     {
       "kind": "postgres",
@@ -20,7 +20,9 @@
       "duration": "7d",
       "seed": "seed.sql",
       "ephemeral": false,
-      "reuse": { "key": "dbHandle" }
+      "reuse": {
+        "key": "dbHandle"
+      }
     }
   ],
   "requiredSecrets": [
@@ -49,8 +51,14 @@
         "sampleSql": "SELECT 'customers' AS table_name, count(*)::int AS row_count FROM customers\nUNION ALL\nSELECT 'invoices' AS table_name, count(*)::int AS row_count FROM invoices\nORDER BY table_name",
         "sampleColumns": ["table_name", "row_count"],
         "sampleRows": [
-          { "table_name": "customers", "row_count": 6 },
-          { "table_name": "invoices", "row_count": 60 }
+          {
+            "table_name": "customers",
+            "row_count": 6
+          },
+          {
+            "table_name": "invoices",
+            "row_count": 60
+          }
         ],
         "sampleRowCount": 2,
         "sampleTruncated": false
@@ -72,10 +80,23 @@
   "zeroSetup": {
     "terminalState": "completed",
     "expect": [
-      { "path": "sampleSql", "assert": "nonEmptyString" },
-      { "path": "sampleRows", "assert": "nonEmptyArray" },
-      { "path": "deployed", "assert": "equals", "value": true },
-      { "path": "queryEndpoint", "assert": "nonEmptyString" }
+      {
+        "path": "sampleSql",
+        "assert": "nonEmptyString"
+      },
+      {
+        "path": "sampleRows",
+        "assert": "nonEmptyArray"
+      },
+      {
+        "path": "deployed",
+        "assert": "equals",
+        "value": true
+      },
+      {
+        "path": "queryEndpoint",
+        "assert": "nonEmptyString"
+      }
     ],
     "narrative": "Runs the built-in sample question against the seeded demo database for real rows, mints the endpoint its own scoped key, and deploys a working /query endpoint."
   }
