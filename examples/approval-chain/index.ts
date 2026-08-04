@@ -71,9 +71,10 @@ import { z } from "zod/v4";
  * handle, a `dryRun`, or an unreachable DB degrades to `ctx.shared` + logs and
  * never fails the chain.
  *
- * Offline: `run_local` stubs the capabilities and auto-resumes each pause with no
- * payload — so the default trace walks present → reminder(s) → escalate for free
- * (no `ledgerHandle` ⇒ no live Postgres). Fire real `approval.decision` signals
+ * Local Run: `run_local` stubs the capabilities and auto-resumes each pause with no
+ * payload — so the default trace walks present → reminder(s) → escalate with no
+ * Sapiom capability spend (no `ledgerHandle` ⇒ no live Postgres). Fire real
+ * `approval.decision` signals
  * (in dev, via the MCP `signal_workflow` / `workflow_signal` tool — see README)
  * to drive the approve → next-gate → finalize and reject → compensate paths.
  */

@@ -19,14 +19,14 @@ capabilities are pre-auth'd on `ctx.sapiom` (here, `ctx.sapiom.models.run` and
   Safe default: only `{ decision: "approve" }` proceeds; anything else (including
   a `run_local` resume with no payload) routes to `revert` — nothing commits
   without a deliberate human yes.
-- **`offer`** makes a *provisional, non-committing* offer to `ranked[index]` and
+- **`offer`** makes a _provisional, non-committing_ offer to `ranked[index]` and
   pauses on `candidate.confirm`, resuming at `resolve`.
 - **`resolve`** reads the confirm payload as its input. `accept` → `commit`;
   `decline`/`timeout`/absent → `index + 1` and loop back to `offer` while
   candidates remain, else `escalate`. The loop edge is `resolve → offer`; the
   loop counter (`index`) lives in `ctx.shared` and survives every pause.
 - **`commit`** holds the single irreversible/expensive action, reached only after
-  approval AND an accept. A `dryRun` guard makes it a no-op offline.
+  approval AND an accept. A `dryRun` guard makes it a no-op during local tracing.
 - `pauseUntilSignal` is a **runtime primitive, not a metered capability** — don't
   list it in `capabilities`. The billed calls are `ctx.sapiom.models.run` (the
   live x402 path — note `ctx.sapiom.llm` does **not** exist) and `ctx.sapiom.email`.
@@ -54,7 +54,7 @@ after every small edit.
 - **run_local** — runs your **real** step code against **stub capabilities** and
   auto-resumes both pauses. With no payload injected, the approval resume takes
   the safe branch and the `dryRun` guard keeps `commit` a no-op, so you get a full
-  offline trace for free.
+  trace with no Sapiom capability spend.
 - **deploy**, then **run** — ship it, then perform a real run that pauses.
 
 ### Firing the resume signals in dev

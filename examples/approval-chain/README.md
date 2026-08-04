@@ -55,7 +55,7 @@ external audit copy that never blocks the chain.
 ## Reminders, escalation, and why the gates wait forever
 
 Each gate pauses **indefinitely** at $0 — it carries no pause `timeoutMs`. That is
-deliberate: the engine has a paused-run reaper that *terminates* a lapsed pause
+deliberate: the engine has a paused-run reaper that _terminates_ a lapsed pause
 with a `PauseTimeoutError` (it does not resume the step), so a deadline here would
 silently fail any approval slower than the deadline and never run the graceful
 `escalate` step. A legitimately slow approver must not lose the run.
@@ -66,11 +66,11 @@ signal, not by an engine deadline:
 - the run-detail **one-click Approve/Reject** (a human acting whenever they get to it),
 - a **cron** you wire to fire `{ "decision": "remind" }` on a cadence, escalating
   to `{ "decision": "timeout" }` when you want to give up, or
-- a `run_local` **auto-resume** (offline), which fires an empty payload and so
-  walks `remind` → … → `escalate` for free.
+- a `run_local` **auto-resume** with Sapiom capabilities stubbed, which fires an
+  empty payload and walks `remind` → … → `escalate` with no Sapiom capability spend.
 
 `maxReminders` (default 2) bounds how many reminder ticks a gate takes before it
-escalates. (The mirror template `wait-for-webhook` *wants* the terminal timeout and
+escalates. (The mirror template `wait-for-webhook` _wants_ the terminal timeout and
 so opts into `timeoutMs`; this chain wants a reminder, so it must not — don't add a
 gate `timeoutMs` back without switching to that terminal model.)
 
@@ -111,8 +111,9 @@ in `ctx.shared` only (no Postgres touched).
    `sapiom_dev_agents_deploy` → `sapiom_dev_agents_run` (a real run that pauses
    at each gate).
 
-Offline, the default `run_local` trace walks `present → reminder(s) → escalate` —
-with no `ledgerHandle` no live Postgres is touched, so it's free. Keep
+With local stubs, the default `run_local` trace walks `present → reminder(s) → escalate` —
+with no `ledgerHandle` no live Postgres is touched, and there is no Sapiom
+capability spend. Keep
 `maxReminders` small so it terminates quickly.
 
 ## Resuming a paused run in dev

@@ -14,7 +14,7 @@ went silent). Inside a step's `run`, Sapiom capabilities are pre-auth'd on
   returns `pauseUntilSignal({ signal: "approval.decision", resumeStep: "decide", correlationId: ctx.executionId })`.
   It carries a static `pause: { signal, resumeStep: "decide" }` annotation — the
   build-time graph edge that must match the directive. **No `timeoutMs`:** the
-  engine's paused-run reaper *terminates* a lapsed pause (`PauseTimeoutError`)
+  engine's paused-run reaper _terminates_ a lapsed pause (`PauseTimeoutError`)
   instead of resuming it, so a gate deadline would hard-fail a slow approval and
   skip `escalate`. The gates wait indefinitely; the reminder/escalation cadence
   comes from the signal (see below), never the engine deadline.
@@ -69,8 +69,8 @@ after every small edit.
   the static `pause` annotations (the cycle through `remind` is legal).
 - **run_local** — runs your **real** step code against **stub capabilities** and
   auto-resumes each pause with no payload, so the default trace walks
-  `present → reminder(s) → escalate` to a terminal for free. With no
-  `ledgerHandle`, no live Postgres is touched.
+  `present → reminder(s) → escalate` to a terminal with no Sapiom capability
+  spend. With no `ledgerHandle`, no live Postgres is touched.
 - **deploy**, then **run** — ship it, then perform a real run that pauses at each
   gate.
 
