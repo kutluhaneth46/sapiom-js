@@ -63,12 +63,13 @@ after every small edit.
 ### Firing the resume signal in dev
 
 A real `run` pauses once, at `review`. To resume without a real approver, fire the
-signal via the MCP `signal_workflow` / `workflow_signal` tool — the manual
-stand-in:
+signal via local MCP `sapiom_dev_agents_signal` — the manual stand-in. Run Inspector
+does not provide a one-click signal control. The request is:
 
 ```json
 {
-  "signal": "proposal.decision",
+  "executionId": "<executionId>",
+  "name": "proposal.decision",
   "correlationId": "<executionId>",
   "payload": { "decision": "approve" }
 }

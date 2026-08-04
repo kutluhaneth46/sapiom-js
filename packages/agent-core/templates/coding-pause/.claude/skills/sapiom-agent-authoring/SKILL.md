@@ -58,11 +58,15 @@ Install deps: `npm install`. Templates: `"default"` (minimal two-step starter) o
 
 ### 2. Write steps → typecheck → check → run_local
 
-| Command                       | What it does                                                                                                            |
-| ----------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `npm run typecheck`           | Confirms types compile and every `ctx.sapiom.*` call exists                                                             |
-| `sapiom_dev_agents_check`     | Bundles and imports `index.ts`, then validates the step graph; top-level author code can execute on this machine        |
-| `sapiom_dev_agents_run_local` | Runs real step code with Sapiom capabilities stubbed; no account, Sapiom capability request, or Sapiom capability spend |
+| Command                       | What it does                                                                                                                  |
+| ----------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `npm run typecheck`           | Confirms types compile and every `ctx.sapiom.*` call exists                                                                   |
+| `sapiom_dev_agents_check`     | Typechecks, bundles, and imports `index.ts`, then validates its manifest and graph; top-level author code can execute locally |
+| `sapiom_dev_agents_run_local` | Runs real step code with `ctx.sapiom.*` calls stubbed; no Sapiom capability request or spend                                  |
+
+Neither tool contacts a Sapiom service, but `check` imports your definition and `run_local`
+executes your real step bodies. Author-written code can still use the local filesystem,
+process, environment, network, and third-party services.
 
 ### 3. Authenticate before the first cloud action
 
@@ -118,7 +122,7 @@ Export exactly one `defineAgent(...)` from `index.ts`.
 | `canFail`         | `boolean`                | no       | Must be `true` to return `fail()`                                                                                                                                               |
 | `pause`           | `{ signal, resumeStep }` | no       | Required when returning `pauseUntilSignal(...)`                                                                                                                                 |
 | `inputSchema`     | `ZodType`                | no       | Zod schema validating this step's input. On the **entry** step it is the agent's public API (see [The Entry Input Contract](#the-entry-input-contract--your-agents-public-api)) |
-| `timeoutMs`       | `number`                 | no       | Per-step timeout; no automatic retry cap                                                                                                                                        |
+| `timeoutMs`       | `number`                 | no       | Per-attempt step timeout; the engine separately caps attempts (three by default)                                                                                                |
 | `run(input, ctx)` | `async function`         | yes      | Returns a directive                                                                                                                                                             |
 
 Import Zod via the `zod/v4` subpath — `import { z } from "zod/v4"` — to match the SDK's
@@ -126,13 +130,13 @@ schema types. Don't import from bare `"zod"` or add a second zod dependency.
 
 ### Directives — what `run` must return
 
-| Directive                         | Function                       | Constraint                                        |
-| --------------------------------- | ------------------------------ | ------------------------------------------------- |
-| `goto(target, output?)`           | Advance to another step        | `target` must be in `next[]`                      |
-| `terminate(output?, opts?)`       | End the execution successfully | Step must have `terminal: true`                   |
-| `fail(reason?, opts?)`            | End the execution as failed    | Step must have `canFail: true`                    |
-| `retry(opts?)`                    | Re-run this step               | Bound with `ctx.attempts` — no automatic cap      |
-| `pauseUntilSignal(handle, opts?)` | Suspend until a signal fires   | Step must declare `pause: { signal, resumeStep }` |
+| Directive                         | Function                       | Constraint                                                |
+| --------------------------------- | ------------------------------ | --------------------------------------------------------- |
+| `goto(target, output?)`           | Advance to another step        | `target` must be in `next[]`                              |
+| `terminate(output?, opts?)`       | End the execution successfully | Step must have `terminal: true`                           |
+| `fail(reason?, opts?)`            | End the execution as failed    | Step must have `canFail: true`                            |
+| `retry(opts?)`                    | Re-run this step               | Explicit retry, capped at three total attempts by default |
+| `pauseUntilSignal(handle, opts?)` | Suspend until a signal fires   | Step must declare `pause: { signal, resumeStep }`         |
 
 TypeScript enforces these constraints at compile time — a `terminate` in a non-terminal step,
 or a `fail` without `canFail: true`, is a type error.
@@ -267,8 +271,9 @@ surface guide lives at [docs.sapiom.ai/capabilities](https://docs.sapiom.ai/capa
 
 ## Failure Handling & Retries
 
-There is no automatic per-step retry. Express it explicitly — this keeps the graph readable.
-The common pattern is a bounded loop that escalates:
+Thrown step errors and explicit `retry()` directives both consume the same three-attempt
+default ceiling. Use explicit, bounded control flow when the retry decision belongs in the
+agent graph:
 
 ```typescript
 const reconsider = defineStep({
@@ -299,8 +304,8 @@ async run(input, ctx) {
 }
 ```
 
-`timeoutMs` on a step caps how long its `run` may take. There is no engine-level retry cap —
-you own the bound.
+`timeoutMs` caps one attempt of a step's `run`. The engine allows three attempts per step by
+default, counting the initial attempt; keep author-controlled retry logic inside that ceiling.
 
 ## Pause & Resume (Long-Running Dispatched Steps)
 
@@ -387,8 +392,8 @@ return pauseUntilSignal({
 ```
 
 Under `run_local`, a dispatch pause auto-resumes with the stub result; a manual gate
-auto-resumes with `{}` unless stubbed — type the resumed step's input with optional fields
-accordingly.
+auto-resumes with `{}`. There is no manual-signal payload override in the local runner, so
+type the resumed step's input with optional fields accordingly.
 
 ## Determinism
 
@@ -433,10 +438,13 @@ Stub naming rules:
 - `run_local` reports `unusedStubs` (key matched nothing — usually a typo or plural/singular
   slip) and `stubWarnings` (key matched but wrong shape). A green run with either non-empty
   means the stub silently didn't apply.
-- **Local retry cap:** the `run_local` tool defaults to `maxAttemptsPerStep: 3`. If a step's
-  own retry bound allows ≥3 retries, pass a higher `maxAttemptsPerStep` so the local harness
-  doesn't stop the loop before your `fail()` fires. This cap is local-test only — production
-  has no engine-level retry cap.
+- **Attempt cap:** local and production execution both allow three attempts per step by
+  default, counting the initial attempt. The local tool exposes `maxAttemptsPerStep` for
+  targeted testing, but raising it does not change production's default ceiling.
+
+Only `ctx.sapiom.*` calls are replaced. The definition import and each step body are ordinary
+local code, so direct network requests, filesystem writes, environment reads, and child
+processes still happen. Inspect those effects and any third-party billing before running.
 
 Write each step the way it should run in production — never weaken logic to shape a local run.
 

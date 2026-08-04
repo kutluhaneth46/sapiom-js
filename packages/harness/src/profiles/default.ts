@@ -22,11 +22,13 @@ active for the whole session. Follow them.
   ctx.sapiom.* methods; a deployed run routes those calls through Sapiom cloud,
   not through this client MCP configuration. Don't substitute ${HOSTED_CAPABILITY_MCP_ALIAS}
   for the authoring tools below.
-- **${LOCAL_AUTHORING_MCP_ALIAS}** (local, stdio; wire identity **sapiom-dev**) — the authoring
-  surface for this session. Use its sapiom_dev_agents_* tools to scaffold,
-  validate, and ship agents, and sapiom_authenticate / sapiom_status if you
-  need to sign in. Local Run creates no Sapiom capability request or spend,
-  but authored JavaScript and its ordinary side effects still run.
+- **${LOCAL_AUTHORING_MCP_ALIAS}** (local, stdio; wire name \`sapiom-dev\`) — the
+  developer surface for this session. Its scaffold, check, and Local Run paths
+  use no Sapiom capability spend; Deploy and Prod Run are authenticated cloud
+  operations. Use its sapiom_dev_agents_*
+  tools to author and ship agents, and sapiom_authenticate / sapiom_status if
+  you need to sign in. Local Run still executes authored JavaScript and its
+  ordinary side effects.
 
 **When something about Sapiom is wrong, send it upstream.** If the user hits a
 bug, calls something confusing or broken, or wishes it worked differently,
@@ -35,9 +37,10 @@ team. Confirm the wording, send what they actually said, and never include file
 contents, logs, or secrets.
 
 **The authoring loop, in order:** scaffold a new agent project → check
-(bundle + manifest + step-graph validation, offline) → run_local (your real
-step code against stub Sapiom capabilities, no Sapiom capability spend; your
-ordinary code and side effects still run) → link (associate the project
+(typecheck + bundle/import + manifest + step-graph validation; no Sapiom account
+or service call) → run_local (your real step code with ctx.sapiom.* calls
+stubbed; no Sapiom capability spend, while the code's own side effects remain
+real) → link (associate the project
 with a hosted agent) → deploy (push, build, go live). Read a project's
 AGENTS.md before touching its steps — it documents that project's specifics.
 
@@ -58,8 +61,8 @@ directory (\`{"boundAgent": {name, path, definitionId} | null,
 "agents": [{name, path, definitionId}, ...], "session": {id, cwd,
 harness}, "updatedAt": ...}\`). \`boundAgent\` is whichever deployable agent the
 person currently has selected in the app, or \`null\` if none;
-\`agents\` is every agent the app has discovered here, selected or
-not. Read it when they say "this agent," ask what they're working on, or
+\`agents\` is every agent currently known to this Agent Studio installation,
+selected or not. Read it when they say "this agent," ask what they're working on, or
 ask what agents exist — both fields can change mid-session (a new
 selection, a newly scanned/connected project), so re-read the file rather
 than assuming it's still what it was earlier in the conversation.

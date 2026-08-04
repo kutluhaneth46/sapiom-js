@@ -75,7 +75,7 @@ import { z } from "zod/v4";
  * payload — so the default trace walks present → reminder(s) → escalate with no
  * Sapiom capability spend (no `ledgerHandle` ⇒ no live Postgres). Fire real
  * `approval.decision` signals
- * (in dev, via the MCP `signal_workflow` / `workflow_signal` tool — see README)
+ * (in dev, via local MCP `sapiom_dev_agents_signal` — see README)
  * to drive the approve → next-gate → finalize and reject → compensate paths.
  */
 

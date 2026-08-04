@@ -39,8 +39,16 @@ Input:
 ```json
 {
   "resources": [
-    { "id": "api-config", "url": "https://example.com/security.txt", "label": "API security policy" },
-    { "id": "status", "url": "https://example.com/status", "label": "Service status" }
+    {
+      "id": "api-config",
+      "url": "https://example.com/security.txt",
+      "label": "API security policy"
+    },
+    {
+      "id": "status",
+      "url": "https://example.com/status",
+      "label": "Service status"
+    }
   ],
   "policy": "All services must publish a security contact and enforce TLS. Status page must show 99.9% uptime.",
   "schedule": "0 6 * * 1",
@@ -80,15 +88,17 @@ Input:
 ## Resuming a paused run in dev
 
 A real `run` pauses at `review`. Instead of a real approver, fire the sign-off
-signal yourself via the MCP `workflow_signal` / `signal_workflow` tool. The
+signal yourself via local MCP `sapiom_dev_agents_signal`. The
 `correlationId` is the paused run's `executionId`, and the `payload` becomes
 `onSignoff`'s input.
+Run Inspector does not provide a one-click signal control.
 
 **Approve** (resumes `onSignoff` → `archive`):
 
 ```json
 {
-  "signal": "attestation.signoff",
+  "executionId": "<executionId>",
+  "name": "attestation.signoff",
   "correlationId": "<executionId of the paused run>",
   "payload": { "decision": "approve", "signer": "compliance@example.com" }
 }

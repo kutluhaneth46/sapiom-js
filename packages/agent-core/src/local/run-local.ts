@@ -2,9 +2,10 @@
  * runLocal — execute an agent entirely in-process, resolving every
  * `ctx.sapiom.*` capability call from a stub file. Runs the author's actual
  * step bodies on the `@sapiom/agent-runtime` walker, so a local pass is real
- * evidence without Sapiom capability calls or Sapiom capability spend. It is
- * not a process sandbox: ordinary network, filesystem, process, and environment
- * effects in the author's code remain real unless that project guards them.
+ * evidence without a Sapiom account, capability request, or capability spend.
+ * It is not a process sandbox: ordinary network, filesystem, process, and
+ * environment effects in the author's code remain real unless that project
+ * guards them.
  *
  * Returns a structured per-step trace plus `unusedStubs` (supplied keys that
  * matched no call) and `stubWarnings` (keys that matched but carried the wrong
@@ -60,8 +61,8 @@ export interface RunLocalOptions {
 export type LocalRunOutcome = "completed" | "failed" | "paused" | "running";
 
 /** A supplied stub key that no capability call in its step ever matched — almost
- *  always a typo or the wrong path form (e.g. `models.coding.launch` instead of
- *  `models.coding.run`, or the plural `repositories.pushFromSandbox` instead of
+ *  always a typo or the wrong path form (e.g. `agent.coding.launch` instead of
+ *  `models.coding.launch`, or the plural `repositories.pushFromSandbox` instead of
  *  the handle-method `repository.pushFromSandbox`). */
 export interface UnusedStub {
   step: string;
