@@ -188,6 +188,18 @@ test.describe("Fix 3 — deploy failure persists in Prod-run disabled reason", (
     await page.getByTestId("session-step-deploy").click();
     await expect(page.getByTestId("toast")).toContainText("Deploy failed", { timeout: 5_000 });
     await expect(chip).toContainText("Deploy failed", { timeout: 3_000 });
+    await expect(chip).toHaveAttribute("data-deployment-state", "failed");
+    // The mock persists a definition id before the failed first build, just
+    // like production. That link must not enable Prod Run or Code snippets.
+    await expect(page.getByTestId("workflow-dashboard-link")).toContainText(
+      "deploy failed",
+    );
+    await expect(page.getByTestId("session-step-run")).toBeDisabled();
+    await page.getByTestId("right-tab-code").click();
+    await expect(page.getByTestId("snippet-panel")).toHaveCount(0);
+    await expect(page.getByTestId("right-panel-code")).toContainText(
+      "Deploy did not produce a ready build",
+    );
   });
 
   test("a successful retry clears the deploy-failed state — chip and Prod-run return to normal", async ({

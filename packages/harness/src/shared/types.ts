@@ -12,7 +12,8 @@
 
 export const DEFAULT_PORT = 4100;
 
-/** All harness-owned state lives under this directory. Uninstall = delete it. */
+/** Default root for Harness-owned state. Shared credentials, analytics identity,
+ * coding-agent history, desktop userData, and agent projects live elsewhere. */
 export const HARNESS_HOME = "~/.sapiom/harness";
 
 export const HARNESS_PATHS = {
@@ -52,9 +53,11 @@ export const HARNESS_PATHS = {
 export const AGENT_PROJECT_MARKER = "sapiom.json";
 
 /**
- * Canvas convention: agents write static HTML here, relative to the session
- * cwd. The server watches this directory and serves it at
- * `/canvas/<harnessSessionId>/`.
+ * Canvas convention: Studio-owned deterministic renders and optional custom
+ * HTML live here, relative to the session cwd. The server watches this
+ * directory and serves the active workflow at `/canvas/<harnessSessionId>/`.
+ * Deterministic workflow files use `CANVAS_RENDERS_DIR`; `index.html` remains
+ * the optional custom-canvas fallback and is never rewritten by that pipeline.
  */
 export const CANVAS_DIR = ".sapiom/canvas";
 export const CANVAS_INDEX = `${CANVAS_DIR}/index.html`;
@@ -103,7 +106,8 @@ export const MAX_IMAGE_UPLOAD_BYTES = 10 * 1024 * 1024;
  * so the two can't disagree. The real per-image cap is still enforced (after
  * decode) in the image handler; other routes validate their own small shapes.
  */
-export const JSON_BODY_LIMIT_BYTES = Math.ceil((MAX_IMAGE_UPLOAD_BYTES * 4) / 3) + 1024 * 1024;
+export const JSON_BODY_LIMIT_BYTES =
+  Math.ceil((MAX_IMAGE_UPLOAD_BYTES * 4) / 3) + 1024 * 1024;
 
 /**
  * Workspace-state convention: Agent Studio mirrors this session's binding,
@@ -467,7 +471,12 @@ export type TerminalControlMessage = TerminalResizeMessage;
 export type BusMessage =
   | { type: "session.status"; session: HarnessSession }
   | { type: "canvas.reload"; harnessSessionId: string }
-  | { type: "port.detected"; harnessSessionId: string; port: number; url: string }
+  | {
+      type: "port.detected";
+      harnessSessionId: string;
+      port: number;
+      url: string;
+    }
   /**
    * A run just started (the CLI printed `✓ Started execution <id>`, caught by
    * the ExecutionDetector). The SPA starts polling `/api/runs/:id/state` on
@@ -525,7 +534,7 @@ export type BusMessage =
  * `web.search`, `models.coding.run`) — never a provider or model name.
  * `stubUsed` records whether this call was served by a supplied stub instead
  * of a real capability call, which is the single most load-bearing fact when
- * explaining a local (offline) run. Optional fields are ABSENT (not null)
+ * explaining a local stub-served run. Optional fields are ABSENT (not null)
  * when the source does not carry the value — honest absence.
  */
 export interface StepCall {
@@ -599,7 +608,7 @@ export interface UnusedStubView {
  *  to the four states the UI distinguishes; `steps` is order-preserving.
  *
  *  Stub fields are RUN-LEVEL and honest-absence: they are set only by
- *  {@link renderLocalRun} for an offline stub run (prod runs from renderRunState
+ *  {@link renderLocalRun} for a local stub-served run (prod runs from renderRunState
  *  never carry them), and only when they carry real signal. A local run is
  *  stub-served by construction — every `ctx.sapiom.*` call resolves from a stub —
  *  so `stubbed` is the honest per-run truth the inspector marks each executed
@@ -611,8 +620,8 @@ export interface RunView {
   executionId: string;
   status: "running" | "completed" | "failed" | "cancelled";
   steps: StepView[];
-  /** True when this run was served entirely by stub capabilities (an offline
-   *  local run). Absent for real (prod / local-backend) runs. Drives the
+  /** True when this run was served entirely by stub capabilities. Absent for
+   *  real (prod / local-backend) runs. Drives the
    *  per-step "stubbed" chip. */
   stubbed?: boolean;
   /** Supplied stub keys that matched no capability call this run (likely a typo
@@ -1177,7 +1186,7 @@ export interface TemplateSummary {
   capabilities: string[];
   /**
    * How involved the template is. Replaced an estimated per-run cost that core
-   * could only compute for 5 of 26 templates; a band is defined for every one.
+   * could only compute for a subset of templates; a band is defined for every one.
    *
    * NULLABLE HERE THOUGH CORE TYPES IT REQUIRED, and that is not belt-and-braces.
    * The Studio is a published npm package: an old copy can point at any backend,
@@ -1243,7 +1252,11 @@ export interface TemplateDetailView extends TemplateSummary {
   notes: string | null;
   examples: Array<{ title: string | null; input: unknown; output: unknown }>;
   /** Credentials the template needs supplied before a deployed run works. */
-  requiredSecrets: Array<{ key: string; label: string; description: string | null }>;
+  requiredSecrets: Array<{
+    key: string;
+    label: string;
+    description: string | null;
+  }>;
 }
 
 /**
@@ -1357,6 +1370,14 @@ export interface WorkflowInfo {
    *  caches as `name`, used as the executions-API handle
    *  (`/agents/v1/definitions/{slug}/executions`). Null before first link. */
   definitionSlug: string | null;
+  /**
+   * Cloud build evidence from the definition-detail projection. An id alone
+   * only proves that this local project is linked to a cloud definition;
+   * `activeBuildRunStatus === "ready"` is the signal that the definition has a
+   * runnable build. Optional for compatibility with older harness servers.
+   */
+  activeBuildRunId?: string | null;
+  activeBuildRunStatus?: string | null;
   /** How it entered the registry. */
   source: "scan" | "connect";
 }
