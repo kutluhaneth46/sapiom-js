@@ -14,21 +14,23 @@
  * skill and `AGENTS.md`, and the full reference on docs.sapiom.ai; this primer
  * points there rather than restating them.
  */
-export const AUTHORING_INSTRUCTIONS = `# Sapiom dev MCP (sapiom-dev)
+export const AUTHORING_INSTRUCTIONS = `# Sapiom dev MCP
 
-\`sapiom-dev\` is Sapiom's local developer MCP — the terminal surface for building and managing
-your Sapiom projects. Today it drives **agent authoring and sandbox app previews** (more
-dev/management tools will land here over time). Agent authoring: build, test, and deploy a
-Sapiom agent — a \`defineAgent({ name, entry, steps })\` (from \`@sapiom/agent\`) where each
-step's \`run(input, ctx)\` does work and returns a directive. All from the terminal; no
-dashboard required.
+This is Sapiom's local developer MCP — register it under the client alias \`sapiom\`. It reports
+\`sapiom-dev\` as its MCP \`serverInfo.name\`, and its authoring tools keep the \`sapiom_dev_*\`
+namespace. It is the terminal surface for building and managing your Sapiom projects. Today it
+drives **agent authoring and sandbox app previews** (more dev/management tools will land here over
+time). Agent authoring: build, test, and deploy a Sapiom agent — a
+\`defineAgent({ name, entry, steps })\` (from \`@sapiom/agent\`) where each step's
+\`run(input, ctx)\` does work and returns a directive. All from the terminal; no dashboard required.
 
 ## Two ways to use Sapiom
-This server (\`sapiom-dev\`) is where you **author agents** — the \`sapiom_dev_agents_*\` tools
-scaffold, typecheck, run with stubs, and deploy from a local checkout. For a **one-off
+This local server (client alias \`sapiom\`) is where you **author agents** — the
+\`sapiom_dev_agents_*\` tools scaffold, typecheck, run with stubs, and deploy from a local
+checkout. For a **one-off
 capability call** without an agent (a search, a scrape, one image), or from **hosted clients
 that cannot run npx** (ChatGPT), use Sapiom's **remote MCP** at \`https://api.sapiom.ai/v1/mcp\`
-(\`claude mcp add sapiom --transport http https://api.sapiom.ai/v1/mcp\`) — it exposes every
+(\`claude mcp add --scope user --transport http sapiom-direct https://api.sapiom.ai/v1/mcp --header "x-api-key: $SAPIOM_API_KEY"\`) — it exposes every
 capability as a direct \`sapiom_*\` tool (run \`tool_discover\` to find the right one) plus cloud
 workflow tools (\`sapiom_workflow_*\`: create → deploy with a \`files\` map → run → inspect/signal).
 Rule of thumb: author an agent for anything multi-step, scheduled, or deployable; use the
