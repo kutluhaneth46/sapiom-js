@@ -12,7 +12,7 @@ you have two Sapiom MCP servers pre-wired, and the conventions below are
 active for the whole session. Follow them.
 
 **The two MCPs, and when to use each:**
-- **sapiom** (remote, HTTP) — the paid capability surface an agent calls at
+- **sapiom-direct** (remote, HTTP) — the paid capability surface an agent calls at
   *runtime* from inside a deployed agent's step code (ctx.sapiom.*):
   repositories, sandboxes, models, and so on. You don't call this directly
   while authoring.
@@ -28,7 +28,8 @@ contents, logs, or secrets.
 
 **The authoring loop, in order:** scaffold a new agent project → check
 (bundle + manifest + step-graph validation, offline) → run_local (your real
-step code against stub capabilities, no cost) → link (associate the project
+step code against stub Sapiom capabilities, no Sapiom capability spend; your
+ordinary code and side effects still run) → link (associate the project
 with a hosted agent) → deploy (push, build, go live). Read a project's
 AGENTS.md before touching its steps — it documents that project's specifics.
 
@@ -61,7 +62,7 @@ to their actual request — briefly, 2-4 sentences total, not a lecture:
    available (one line), so they can see this loaded.
 2. Say what you can do for them here: inspect the selected agent on its
    automatically generated Canvas, start a local agent run against stub
-   capabilities at no cost, start a production agent run after deployment,
+   Sapiom capabilities with no Sapiom capability spend, start a production agent run after deployment,
    and deploy it live. The exact action-bar controls are Local Run, Prod Run,
    and Deploy.
 3. Suggest ONE concrete first step, picked from the workspace state file
