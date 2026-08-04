@@ -322,6 +322,13 @@ export interface ImageResultPayload {
     downloadUrl?: string;
     /** ISO expiry of `downloadUrl`, when present — may already be past by the time a step resumes. */
     downloadUrlExpiresAt?: string;
+    /**
+     * `true` when the output persisted (so `fileId` is set) but the gateway could not mint a
+     * `downloadUrl` for this resume payload. An explicit signal to re-fetch from `fileId` — a
+     * fresh presigned URL via `fileStorage.getDownloadUrl(fileId)`, or a durable link via
+     * `fileStorage.getPublicUrl(fileId)` — rather than treating a missing `downloadUrl` as "no asset".
+     */
+    downloadUrlUnavailable?: boolean;
     /** Present when storage was requested but persisting this output failed. */
     storageError?: string;
   }>;
@@ -715,6 +722,13 @@ export interface VideoResultPayload {
     downloadUrl?: string;
     /** ISO expiry of `downloadUrl`, when present — may already be past by the time a step resumes. */
     downloadUrlExpiresAt?: string;
+    /**
+     * `true` when the output persisted (so `fileId` is set) but the gateway could not mint a
+     * `downloadUrl` for this resume payload. An explicit signal to re-fetch from `fileId` — a
+     * fresh presigned URL via `fileStorage.getDownloadUrl(fileId)`, or a durable link via
+     * `fileStorage.getPublicUrl(fileId)` — rather than treating a missing `downloadUrl` as "no asset".
+     */
+    downloadUrlUnavailable?: boolean;
     /** Present when storage was requested but persisting this output failed. */
     storageError?: string;
   }>;
