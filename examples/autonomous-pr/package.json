@@ -1,9 +1,9 @@
 {
-  "name": "@sapiom/example-logged-in-screenshots",
+  "name": "@sapiom/example-autonomous-pr",
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Sapiom agent template: crawl a bounded set of a site's pages, render-check and screenshot each one, audit content with a model, and verify link integrity (broken links, Terms/Privacy present and resolving).",
+  "description": "Sapiom agent template: a coding agent implements a task in a sandbox, runs the repo's checks, and pushes a self-reviewed branch.",
   "scripts": {
     "typecheck": "tsc --noEmit",
     "format": "prettier --write \"**/*.ts\"",
