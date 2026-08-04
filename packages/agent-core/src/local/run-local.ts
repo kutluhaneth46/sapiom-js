@@ -1,8 +1,10 @@
 /**
  * runLocal — execute an agent entirely in-process, resolving every
  * `ctx.sapiom.*` capability call from a stub file. Runs the author's actual
- * step bodies on the `@sapiom/agent-runtime` walker, so a local pass is
- * real evidence, offline and at zero cost.
+ * step bodies on the `@sapiom/agent-runtime` walker, so a local pass is real
+ * evidence without Sapiom capability calls or Sapiom capability spend. It is
+ * not a process sandbox: ordinary network, filesystem, process, and environment
+ * effects in the author's code remain real unless that project guards them.
  *
  * Returns a structured per-step trace plus `unusedStubs` (supplied keys that
  * matched no call) and `stubWarnings` (keys that matched but carried the wrong
@@ -11,10 +13,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 
-import type {
-  AgentDefinition,
-  AgentManifest,
-} from "@sapiom/agent";
+import type { AgentDefinition, AgentManifest } from "@sapiom/agent";
 import {
   DEFAULT_MAX_ATTEMPTS_PER_STEP,
   InMemoryExecutionStore,
