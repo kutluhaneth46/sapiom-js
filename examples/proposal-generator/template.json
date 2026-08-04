@@ -12,7 +12,7 @@
     "Approval before send",
     "Repeatable quote flow"
   ],
-  "notes": "Click **Use this template** — Sapiom builds and deploys it for you; open it on the **Agents** page and run it with your request. Your $5 signup credit covers first runs.\n\nThis agent run pauses once and waits for a real approval, so you drive it as it runs. It drafts the proposal, renders the PDF, emails your approver, then pauses. Send the decision with the MCP `workflow_signal` tool: signal `proposal.decision`, `correlationId` set to the run's executionId, payload `{ \"decision\": \"approve\" }` to email the client (or `{ \"decision\": \"reject\" }` to stop). Set an `approver` and a client `email` (or pass `config.APPROVER_EMAIL` / `config.CLIENT_EMAIL`) so the notifications have somewhere to go; pass `dryRun: true` to run the whole thing but skip the client email.\n\nPrefer to work from the code? Run it locally with `run_local` — it stubs the capabilities and auto-resumes the pause (a resume with no decision takes the safe reject branch, and the stubbed sandbox skips the real byte upload), so the whole graph traces end to end for free. Then edit and deploy it with the Sapiom MCP.",
+  "notes": "Click **Use this template** — Sapiom builds and deploys it for you; open it on the **Agents** page and run it with your request. Your $5 signup credit covers first runs.\n\nRun it with nothing set and it still does real work: it drafts a proposal from a built-in sample brief and renders it to a real PDF, then stops at the sign-off gate because no approver is configured. The run's output carries the PDF's download link and `outcome: \"pending-approval\"` — nothing is emailed yet.\n\nSet an **Approver** and it emails them a summary and the PDF link instead, then pauses and waits for a real decision. Send it with the MCP `workflow_signal` tool: signal `proposal.decision`, `correlationId` set to the run's executionId, payload `{ \"decision\": \"approve\" }` to email the client (or `{ \"decision\": \"reject\" }` to stop). Set a client `email` too (or pass `config.APPROVER_EMAIL` / `config.CLIENT_EMAIL`) so the notifications have somewhere to go; pass `dryRun: true` to run the whole thing but skip the client email.\n\nPrefer to work from the code? Run it locally with `run_local` — it stubs the capabilities and auto-resumes the pause (a resume with no decision takes the safe reject branch, and the stubbed sandbox skips the real byte upload), so the whole graph traces end to end for free. Then edit and deploy it with the Sapiom MCP.",
   "resources": [
     {
       "kind": "sandbox",
@@ -29,6 +29,16 @@
       "example": "you@yourcompany.com"
     }
   ],
+  "zeroSetup": {
+    "terminalState": "completed_partial",
+    "expect": [
+      { "path": "outcome", "assert": "equals", "value": "pending-approval" },
+      { "path": "sent", "assert": "equals", "value": false },
+      { "path": "downloadUrl", "assert": "nonEmptyString" },
+      { "path": "fileId", "assert": "nonEmptyString" }
+    ],
+    "narrative": "Drafts the built-in sample brief into a priced proposal and renders it to a real PDF, then stops at the sign-off gate — no approver is configured, so nothing is emailed yet."
+  },
   "examples": [
     {
       "title": "Draft, render, approve, and send a quote",

@@ -14,28 +14,39 @@ import { z } from "zod/v4";
  * The "draft → render → get sign-off → send" shape a salesperson or agency runs
  * by hand for every inbound request, done as one durable agent:
  *
- *   draft ─▶ render ─▶ review ─(pause: proposal.decision, $0 while idle)─▶ onDecision
- *  (models.run) (sandbox+                                                    │
- *               fileStorage)                                approve ◀─────────┼─▶ reject
- *                                                             ▼               ▼
- *                                                           send          rejected
- *                                                        (terminal)       (terminal)
+ *   draft ─▶ render ─▶ review ─┬─(pause: proposal.decision, $0 while idle)─▶ onDecision
+ *  (models.run) (sandbox+      │ (approver set)                                 │
+ *               fileStorage)   │                            approve ◀─────────┼─▶ reject
+ *                              │                              ▼               ▼
+ *                              │                            send          rejected
+ *                              │                         (terminal)       (terminal)
+ *                              └─(no approver)─▶ pending
+ *                                                (terminal)
  *
  *   1. draft — an LLM (`ctx.sapiom.models.run`) turns the free-text requirement
  *      into a structured proposal: a title, a summary, a scope list, priced line
- *      items, and terms. Deterministic code then totals the line items.
+ *      items, and terms. Deterministic code then totals the line items. Omit
+ *      `request` entirely and it drafts against a built-in sample brief, so a
+ *      zero-input run still produces a real, priced quote.
  *   2. render — spin up a sandbox (`ctx.sapiom.sandboxes.create`), lay the
  *      proposal out as a PDF with a tiny self-contained Node script, and persist
  *      the bytes to file storage (`ctx.sapiom.fileStorage.upload`). The sandbox
  *      is torn down before the step returns.
- *   3. review — email the internal approver a summary and the PDF link
- *      (`ctx.sapiom.email`), then **block on a human approval signal**. The run
- *      suspends at $0 until someone decides.
+ *   3. review — with an approver assigned, email them a summary and the PDF
+ *      link (`ctx.sapiom.email`), then **block on a human approval signal**; the
+ *      run suspends at $0 until someone decides. With no approver assigned —
+ *      the zero-setup default — nothing will ever fire that signal, so this
+ *      step does NOT pause: it takes the `pending` branch instead, terminating
+ *      honestly with the rendered PDF and `outcome: "pending-approval"`.
  *   4. onDecision — its input IS the approval payload. Only an explicit
  *      `{ decision: "approve" }` proceeds; anything else takes the safe reject
  *      branch — nothing goes out to the client without a deliberate yes.
  *   5. send — the one outward action: email the finished proposal to the client.
  *      A `dryRun` guard makes it a no-op so a deployed run can be traced safely.
+ *   6. pending — the gate's off-ramp when no approver is assigned. Terminal,
+ *      carrying the drafted proposal, its real PDF link, and the signal that
+ *      would continue the run — never `rejected`, because nobody decided
+ *      anything.
  *
  * Offline: `run_local` stubs the capabilities and auto-resumes the pause. A
  * resume with no payload takes the safe reject branch, so the whole graph traces
