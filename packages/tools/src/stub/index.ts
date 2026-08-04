@@ -56,6 +56,7 @@ import type {
   ListResponse,
   FileMetadata,
 } from "../file-storage/index.js";
+import { getPublicUrl } from "../file-storage/index.js";
 import {
   VIDEO_RESULT_SIGNAL,
   IMAGE_RESULT_SIGNAL,
@@ -1006,6 +1007,7 @@ export function createStubClient(opts: StubClientOptions = {}): Sapiom {
             expiresAt: "2099-01-01T00:00:00Z",
           })) as DownloadUrlResponse,
         ),
+      getPublicUrl: (fileId) => getPublicUrl(fileId),
       list: (listOpts) =>
         Promise.resolve(
           r("fileStorage.list", [listOpts], () => ({
