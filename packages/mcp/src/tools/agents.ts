@@ -1,8 +1,9 @@
 /**
  * Agent authoring tools. Thin wrappers over @sapiom/agent-core.
- * Local tools (scaffold / check / run_local) need no network; networked tools
- * (link / deploy / run / inspect / signal) build a client from the cached
- * credential and the environment's API host.
+ * Local tools (scaffold / check / run_local) need no Sapiom account or real
+ * capability calls; scaffold may query npm for current dependency versions.
+ * Networked tools (link / deploy / run / inspect / signal) build a client from
+ * the cached credential and the environment's API host.
  *
  * Results are returned as JSON text so the calling agent can parse them. In
  * particular, `run_local` returns a per-step trace plus `unusedStubs` /
@@ -91,7 +92,7 @@ function scheduleHint(schedule: ScheduleDetail): string | undefined {
 }
 
 export function register(server: McpServer, env: ResolvedEnvironment): void {
-  // ── Local tools (no network) ──────────────────────────────────────────────
+  // ── Local authoring tools (no account or capability spend) ───────────────────
 
   registerTool(
     server,
@@ -102,7 +103,7 @@ export function register(server: McpServer, env: ResolvedEnvironment): void {
         .string()
         .min(1)
         .describe(
-          "Target directory for the new project (created if absent; must be empty).",
+          "Target directory for the new project (created if absent; must otherwise be empty, except for Agent Studio's private .sapiom directory).",
         ),
       template: z
         .string()

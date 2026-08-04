@@ -638,9 +638,10 @@ function ResultBlock({
 
 /**
  * A folder is unavoidable here, which is the whole reason this door has two
- * fields instead of one: a session is a PTY with a `cwd`, `sapiom agents init .`
- * writes into it, and `scaffold()` refuses a non-empty target — so the folder
- * must exist, be empty, and be NAMED before the agent can read the idea. The
+ * fields instead of one: a session is a PTY with a `cwd`, the local scaffold
+ * tool writes into it, and `scaffold()` refuses pre-existing user content — so
+ * the folder must exist, contain no user files, and be NAMED before the agent
+ * can read the idea. The
  * name is therefore derived client-side (nothing smarter can run yet) and the
  * resolved path is a statement rather than a field.
  */
