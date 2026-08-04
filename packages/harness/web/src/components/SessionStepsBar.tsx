@@ -3,8 +3,13 @@ import type { JSX } from "react";
 import type { MacroDef, WorkflowInfo } from "@shared/types";
 
 import { Icon } from "./Icon";
+import { macroNeedsReadySession } from "../lib/macro-actions";
 import { macroDisabledReason } from "../lib/macro-gating";
 import { track } from "../lib/track";
+import {
+  prodRunDisabledReason,
+  workflowDeploymentState,
+} from "../lib/workflow-deployment";
 
 interface SessionStepsBarProps {
   workflow: WorkflowInfo;
@@ -41,8 +46,9 @@ interface SessionStepsBarProps {
  * The agent's action bar on the shared subheader row. NOT a stepper: per
  * Sapiom's own model (docs.sapiom.ai /agents) these are repeatable ACTIONS,
  * not one-way stages — you run local as often as you test, deploy as often
- * as you ship. The only durable state is "deployed" (definitionId), shown as
- * the left-anchored status chip. Actions sit right-anchored, Deploy at the
+ * as you ship. The left-anchored status chip distinguishes local draft, linked
+ * cloud definition, in-flight/failed build, and a runnable deployment. Actions
+ * sit right-anchored, Deploy at the
  * right edge as the primary:
  *   Local Run = run_local  (test run, capabilities stubbed)
  *   Prod Run  = prod_run   (real cloud execution; needs a deploy)
@@ -62,15 +68,36 @@ export function SessionStepsBar({
   authenticated,
   directActionSettleSeq,
 }: SessionStepsBarProps): JSX.Element {
-  const macroFor = (id: string): MacroDef | undefined => macros.find((m) => m.id === id);
-  const deployed = workflow.definitionId != null;
+  const macroFor = (id: string): MacroDef | undefined =>
+    macros.find((m) => m.id === id);
+  const deploymentState = workflowDeploymentState(workflow, lastDeployError);
+  const lifecycleLabel =
+    deploymentState === "ready"
+      ? "Deployed"
+      : deploymentState === "building"
+        ? "Building"
+        : deploymentState === "failed"
+          ? "Deploy failed"
+          : deploymentState === "linked"
+            ? "Linked"
+            : "Draft";
+  const lifecycleTooltip =
+    deploymentState === "ready"
+      ? `Deployed to Sapiom (definition ${workflow.definitionId}) with a ready cloud build.`
+      : deploymentState === "building"
+        ? "Linked to Sapiom. The cloud build is still in progress."
+        : deploymentState === "failed"
+          ? "The latest deploy did not produce a ready build. Retry Deploy after fixing the agent."
+          : deploymentState === "linked"
+            ? "Linked to Sapiom, but Studio cannot confirm a ready cloud build yet."
+            : "Draft: exists locally only. Authoring prompts use Claude Code; direct Deploy does not.";
 
   // Launched-but-not-durable feedback: a clicked action shows a dotted
   // "in flight" ring until a durable signal lands. The ring clears on ANY
   // terminal outcome — success OR failure — by including all relevant settled
   // state in the useEffect deps:
   //   - workflow.path: re-binding a session clears the pending id.
-  //   - deployed: a first-time deploy succeeds and flips definitionId.
+  //   - deploymentState: the cloud build advances or fails.
   //   - lastDeployError: a failed deploy sets this; ring must not persist.
   //   - directActionSettleSeq: bumped by the parent on EVERY direct-action
   //     settle (success or failure), covering the cases where deployed and
@@ -80,7 +107,7 @@ export function SessionStepsBar({
 
   useEffect(() => {
     setPendingId(null);
-  }, [workflow.path, deployed, lastDeployError, directActionSettleSeq]);
+  }, [workflow.path, deploymentState, lastDeployError, directActionSettleSeq]);
 
   const actions: {
     id: string;
@@ -99,7 +126,7 @@ export function SessionStepsBar({
       icon: "FlaskConical",
       macro: macroFor("run_local"),
       testId: "session-step-local",
-      hint: "Test: run locally with every capability stubbed - no real calls.",
+      hint: "Test locally with Sapiom capability calls stubbed — no real Sapiom capability calls.",
     },
     {
       id: "run",
@@ -124,27 +151,27 @@ export function SessionStepsBar({
   ].filter((action) => action.macro);
 
   return (
-    <div className="session-steps" data-testid="session-steps" aria-label="Agent actions">
-      {/* The one durable truth, left-anchored: has this agent been deployed? */}
+    <div
+      className="session-steps"
+      data-testid="session-steps"
+      aria-label="Agent actions"
+    >
+      {/* Cloud state, grounded in link + active-build evidence. */}
       <span
         className="status-tag session-lifecycle-chip"
         data-testid="session-lifecycle-chip"
-        data-deployed={deployed}
-        data-deploy-error={lastDeployError != null && !deployed ? "" : undefined}
-        data-tooltip={
-          deployed
-            ? `Deployed to Sapiom (definition ${workflow.definitionId}). Run starts real cloud executions.`
-            : lastDeployError != null
-              ? "Last deploy failed. Retry Deploy to push to Sapiom."
-              : "Draft: exists locally only. Building here uses your Claude Code account; Deploy publishes to Sapiom."
-        }
+        data-deployed={deploymentState === "ready"}
+        data-deploy-error={deploymentState === "failed" ? "" : undefined}
+        data-deployment-state={deploymentState}
+        data-tooltip={lifecycleTooltip}
       >
-        <Icon name={deployed ? "Cloud" : "CloudOff"} size={13} />
+        <Icon
+          name={deploymentState === "ready" ? "Cloud" : "CloudOff"}
+          size={13}
+        />
         {/* display: contents at rest, hidden by the bar's container query
             below 380px — the icon + tooltip keep carrying the state. */}
-        <span className="session-lifecycle-label">
-          {deployed ? "Deployed" : lastDeployError != null ? "Deploy failed" : "Draft"}
-        </span>
+        <span className="session-lifecycle-label">{lifecycleLabel}</span>
       </span>
 
       {/* One-click preview loop, v0: the server detected a dev
@@ -170,24 +197,26 @@ export function SessionStepsBar({
         {actions.map((action) => {
           // Auth gate: actions requiring authentication are disabled when not
           // signed in — never a silent dead-click. Local Run (no needsAuth) is
-          // always available since it is fully offline.
+          // available while signed out; Sapiom capability calls are stubbed.
           const authReason =
-            action.needsAuth && !authenticated ? "Connect your account first" : null;
-          // Deploy-gate: prod-run needs a definitionId. Surface "Last deploy
-          // failed" (distinct from the virgin "Not deployed yet") when we know
-          // the user has already tried and it broke — points to the right fix.
-          const funnelReason =
-            action.needsDeploy && !deployed
-              ? lastDeployError != null
-                ? "Last deploy failed — retry Deploy"
-                : "Not deployed yet"
+            action.needsAuth && !authenticated
+              ? "Connect your account first"
               : null;
-          // Inject-kind actions type into the session's pty — a session that
-          // is still starting (or parked on a trust prompt) would 409 the
-          // click into an after-the-fact toast. Disable with the reason up
-          // front; open-url actions never touch the pty and stay live.
+          // Deploy gate: only the cloud definition's ready-build projection
+          // proves a production run can start. A definition id alone is merely
+          // a link and can exist after a failed first build.
+          const funnelReason = action.needsDeploy
+            ? prodRunDisabledReason(workflow, lastDeployError)
+            : null;
+          // Only an action that EFFECTIVELY types into the session's pty
+          // needs Claude to be ready. The registry retains legacy `inject`
+          // shapes for Local Run / Prod Run / Deploy, but App routes those
+          // ids directly before they can touch the pty. A trust/auth prompt
+          // must not disable work that bypasses Claude.
           const readyReason =
-            !sessionReady && action.macro && action.macro.action.kind !== "open-url"
+            !sessionReady &&
+            action.macro &&
+            macroNeedsReadySession(action.macro)
               ? "Session is starting"
               : null;
           const disabledReason =
