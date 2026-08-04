@@ -312,12 +312,12 @@ export interface Sapiom {
     };
   };
   /**
-   * Provisioned Upstash Search indexes with server-side auto-embedding —
-   * full-text + semantic search over JSON documents. Control plane manages
-   * indexes; `create`/`get`/`list` return a bound {@link SearchIndex} handle
-   * carrying the per-request-priced data-plane operations (upsert / query /
-   * range / fetchDocuments / deleteDocuments) against the index's own
-   * data-plane URL. Distinct from `search` (web search / scrape).
+   * Provisioned search indexes with server-side auto-embedding — full-text +
+   * semantic search over JSON documents. Control plane manages indexes;
+   * `create`/`get`/`list` return a bound {@link SearchIndex} handle carrying
+   * logically-metered data-plane operations (upsert / query / range /
+   * fetchDocuments / deleteDocuments) against the index's own data-plane URL.
+   * Distinct from `search` (web search / scrape).
    */
   readonly searchindex: {
     /** Create an index. Omit `ttl` for long-lived — expired indexes are reaped. */

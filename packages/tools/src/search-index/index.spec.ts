@@ -1,7 +1,57 @@
 import { Transport } from "../_client/index.js";
 import * as searchindex from "./index.js";
-import { SearchIndexHttpError } from "./index.js";
-import type { SearchIndex } from "./index.js";
+import { SearchIndexContractError, SearchIndexHttpError } from "./index.js";
+import type { SearchDocument, SearchIndex } from "./index.js";
+
+/**
+ * Wire-contract fixtures rather than invented empty mocks:
+ *
+ * - Gateway index/list values follow `SearchDatabaseResponse` and
+ *   `SearchService.list()` in
+ *   `sapiom/Sapiom@4ba50cd31f7ec36d141f28174a22e211ddc19bd4`.
+ * - Provider query/range/fetch values follow the raw REST envelopes consumed by
+ *   Upstash's official `search-js` client. The range value also matches the live
+ *   response captured while provisioning the Assistant corpus on 2026-08-03.
+ */
+const gatewayIndexFixture = {
+  id: "res_abc123",
+  type: "search",
+  name: "docs-corpus",
+  status: "active",
+  url: "https://res_abc123.search.data.test",
+  region: "us-central1",
+  expiresAt: null,
+  createdAt: "2026-08-01T00:00:00.000Z",
+} as const;
+
+const gatewayListFixture = {
+  databases: [{ ...gatewayIndexFixture, region: null }],
+} as const;
+
+const providerQueryFixture = {
+  result: [
+    {
+      id: "getting-started",
+      content: { title: "Get Started" },
+      metadata: { url: "https://docs.example.com/" },
+      score: 0.92,
+    },
+  ],
+} as const;
+
+const providerRangeFixture = {
+  result: {
+    nextCursor: "42",
+    vectors: [
+      { id: "a", metadata: { contentHash: "h1" } },
+      { id: "b", content: { title: "Second" } },
+    ],
+  },
+} as const;
+
+const providerFetchFixture = {
+  result: [{ id: "a", metadata: { contentHash: "h1" } }, null],
+} as const;
 
 // Capability fns are tested directly with a real Transport plus a scripted fetch
 // mock, so URL/method/header/body assertions are exact and we verify the Transport
@@ -56,14 +106,7 @@ const headerOf = (c: FetchCall, k: string) =>
 const bodyOf = (c: FetchCall) => JSON.parse(c.init.body as string);
 
 const indexDto = (overrides: Record<string, unknown> = {}) => ({
-  id: "res_abc123",
-  type: "search",
-  name: "docs-corpus",
-  status: "active",
-  url: DATA_URL,
-  region: "us-central1",
-  expiresAt: null,
-  createdAt: "2026-08-01T00:00:00.000Z",
+  ...gatewayIndexFixture,
   ...overrides,
 });
 
@@ -151,6 +194,23 @@ describe("searchindex.create()", () => {
     expect(calls).toHaveLength(0);
   });
 
+  it("rejects a ttl over 30 days before fetching", async () => {
+    const { transport, calls } = makeTransport([]);
+    await expect(
+      searchindex.create({ name: "x", ttl: "31d" }, transport, BASE),
+    ).rejects.toMatchObject({ status: 400 });
+    expect(calls).toHaveLength(0);
+  });
+
+  it("throws a contract error when a successful create body is malformed", async () => {
+    const { transport } = makeTransport([
+      () => jsonResponse({ id: "res_bad" }),
+    ]);
+    await expect(
+      searchindex.create({ name: "docs-corpus" }, transport, BASE),
+    ).rejects.toBeInstanceOf(SearchIndexContractError);
+  });
+
   it("throws SearchIndexHttpError with status + body on a non-2xx (e.g. 422 limit)", async () => {
     const { transport } = makeTransport([
       () =>
@@ -174,7 +234,9 @@ describe("searchindex.create()", () => {
 
 describe("searchindex.get() / list() / update() / delete()", () => {
   it("GETs /v1/search/indexes/:id (URL-encoded) and binds the handle", async () => {
-    const { transport, calls } = makeTransport([() => jsonResponse(indexDto())]);
+    const { transport, calls } = makeTransport([
+      () => jsonResponse(indexDto()),
+    ]);
     const idx = await searchindex.get("res_abc123", transport, BASE);
     expect(calls[0]!.url).toBe(`${BASE}/v1/search/indexes/res_abc123`);
     expect(calls[0]!.init.method ?? "GET").toBe("GET");
@@ -183,36 +245,98 @@ describe("searchindex.get() / list() / update() / delete()", () => {
     expect(typeof idx.range).toBe("function");
   });
 
-  it("lists indexes as bound handles and tolerates a non-array response", async () => {
+  it("parses the canonical { databases } fixture into bound handles", async () => {
     const { transport } = makeTransport([
       (c) =>
         c.url === `${BASE}/v1/search/indexes`
-          ? jsonResponse([indexDto(), indexDto({ id: "res_def456", name: "other" })])
+          ? jsonResponse({
+              databases: [
+                ...gatewayListFixture.databases,
+                indexDto({ id: "res_def456", name: "other" }),
+              ],
+            })
           : undefined,
     ]);
     const all = await searchindex.list(transport, BASE);
     expect(all).toHaveLength(2);
     expect(all[0]!.name).toBe("docs-corpus");
+    expect(all[0]!.region).toBeNull();
     expect(typeof all[1]!.upsert).toBe("function");
+  });
 
-    const { transport: t2 } = makeTransport([() => jsonResponse({})]);
-    expect(await searchindex.list(t2, BASE)).toEqual([]);
+  it("retains the explicitly documented bare-array list compatibility shape", async () => {
+    const { transport } = makeTransport([() => jsonResponse([indexDto()])]);
+    await expect(searchindex.list(transport, BASE)).resolves.toHaveLength(1);
+  });
+
+  it("fails closed for unknown list envelopes and malformed entries", async () => {
+    const { transport } = makeTransport([() => jsonResponse({})]);
+    await expect(searchindex.list(transport, BASE)).rejects.toMatchObject({
+      name: "SearchIndexContractError",
+      operation: "list",
+    });
+
+    const { transport: malformedEntry } = makeTransport([
+      () => jsonResponse({ databases: [{ id: "res_only" }] }),
+    ]);
+    await expect(searchindex.list(malformedEntry, BASE)).rejects.toBeInstanceOf(
+      SearchIndexContractError,
+    );
   });
 
   it("PATCHes only the provided fields on update", async () => {
     const { transport, calls } = makeTransport([
-      () => jsonResponse(indexDto({ expiresAt: "2027-01-01T00:00:00.000Z" })),
+      () => jsonResponse(indexDto({ expiresAt: "2099-01-01T00:00:00.000Z" })),
     ]);
     const idx = await searchindex.update(
       "res_abc123",
-      { expiresAt: "2027-01-01T00:00:00.000Z" },
+      { expiresAt: "2099-01-01T00:00:00.000Z" },
       transport,
       BASE,
     );
     expect(calls[0]!.url).toBe(`${BASE}/v1/search/indexes/res_abc123`);
     expect(calls[0]!.init.method).toBe("PATCH");
-    expect(bodyOf(calls[0]!)).toEqual({ expiresAt: "2027-01-01T00:00:00.000Z" });
-    expect(idx.expiresAt).toBe("2027-01-01T00:00:00.000Z");
+    expect(bodyOf(calls[0]!)).toEqual({
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    });
+    expect(idx.expiresAt).toBe("2099-01-01T00:00:00.000Z");
+  });
+
+  it("accepts a future ISO-8601 calendar date like the gateway DTO", async () => {
+    const { transport, calls } = makeTransport([
+      () => jsonResponse(indexDto({ expiresAt: "2099-01-01T00:00:00.000Z" })),
+    ]);
+    await searchindex.update(
+      "res_abc123",
+      { expiresAt: "2099-01-01" },
+      transport,
+      BASE,
+    );
+    expect(bodyOf(calls[0]!)).toEqual({ expiresAt: "2099-01-01" });
+  });
+
+  it("shares fail-fast id/update validation across control-plane calls", async () => {
+    const { transport, calls } = makeTransport([]);
+    await expect(searchindex.get("", transport, BASE)).rejects.toMatchObject({
+      status: 400,
+    });
+    await expect(
+      searchindex.update("res_abc123", { name: "" }, transport, BASE),
+    ).rejects.toMatchObject({ status: 400 });
+    await expect(
+      searchindex.update(
+        "res_abc123",
+        { expiresAt: "January 1, 2099" },
+        transport,
+        BASE,
+      ),
+    ).rejects.toMatchObject({ status: 400 });
+    await expect(searchindex.delete("", transport, BASE)).rejects.toMatchObject(
+      {
+        status: 400,
+      },
+    );
+    expect(calls).toHaveLength(0);
   });
 
   it("DELETEs the index and accepts a 204 with no body", async () => {
@@ -226,7 +350,7 @@ describe("searchindex.get() / list() / update() / delete()", () => {
     expect(calls[0]!.init.method).toBe("DELETE");
   });
 
-  it("surfaces a 404 (not-found / ownership mismatch) as SearchIndexHttpError", async () => {
+  it("surfaces control-plane not-found / ownership mismatch as 404", async () => {
     const { transport } = makeTransport([
       () =>
         new Response(JSON.stringify({ message: "Not found" }), {
@@ -234,9 +358,23 @@ describe("searchindex.get() / list() / update() / delete()", () => {
           headers: { "Content-Type": "application/json" },
         }),
     ]);
-    await expect(
-      searchindex.get("res_missing", transport, BASE),
-    ).rejects.toMatchObject({ status: 404 });
+    const calls = [
+      () => searchindex.get("res_missing", transport, BASE),
+      () =>
+        searchindex.update(
+          "res_missing",
+          { name: "still-missing" },
+          transport,
+          BASE,
+        ),
+      () => searchindex.delete("res_missing", transport, BASE),
+    ];
+    for (const call of calls) {
+      await expect(call()).rejects.toMatchObject({
+        name: "SearchIndexHttpError",
+        status: 404,
+      });
+    }
   });
 });
 
@@ -278,23 +416,23 @@ describe("SearchIndex.upsert()", () => {
     await expect(
       idx.upsert([{ id: "a", content: {} }], { indexName: "bad name!" }),
     ).rejects.toMatchObject({ status: 400 });
+    await expect(
+      idx.upsert([{ id: "a", content: null } as never]),
+    ).rejects.toMatchObject({ status: 400 });
     expect(calls).toHaveLength(0);
   });
 });
 
 describe("SearchIndex.query()", () => {
   const hits = [
-    {
-      id: "getting-started",
-      content: { title: "Get Started" },
-      metadata: { url: "https://docs.example.com/" },
-      score: 0.92,
-    },
+    ...providerQueryFixture.result,
     { id: "verify", content: { title: "Verify Users" } },
   ];
 
   it("POSTs {url}/search/default with query/limit/reranking/filter and maps hits", async () => {
-    const { idx, calls } = await makeHandle([() => jsonResponse(hits)]);
+    const { idx, calls } = await makeHandle([
+      () => jsonResponse({ result: hits }),
+    ]);
     const results = await idx.query({
       query: "how do I authenticate?",
       limit: 3,
@@ -304,7 +442,9 @@ describe("SearchIndex.query()", () => {
     expect(calls[0]!.url).toBe(`${DATA_URL}/search/default`);
     expect(bodyOf(calls[0]!)).toEqual({
       query: "how do I authenticate?",
-      limit: 3,
+      topK: 3,
+      includeData: true,
+      includeMetadata: true,
       reranking: true,
       filter: "tags = 'auth'",
     });
@@ -318,26 +458,39 @@ describe("SearchIndex.query()", () => {
     expect(results[1]!.score).toBeUndefined();
   });
 
-  it("unwraps a { result: [...] } envelope", async () => {
-    const { idx } = await makeHandle([() => jsonResponse({ result: hits })]);
+  it("retains the documented bare-array query compatibility shape", async () => {
+    const { idx, calls } = await makeHandle([() => jsonResponse(hits)]);
     const results = await idx.query({ query: "verify" });
+    expect(bodyOf(calls[0]!)).toEqual({
+      query: "verify",
+      topK: 5,
+      includeData: true,
+      includeMetadata: true,
+    });
     expect(results.map((h) => h.id)).toEqual(["getting-started", "verify"]);
   });
 
-  it("returns [] for a non-array response and drops malformed hits", async () => {
+  it("fails closed for unknown query envelopes and malformed hits", async () => {
     const { idx } = await makeHandle([
       () => jsonResponse({ result: [{ notAnId: true }, hits[0]] }),
     ]);
-    const results = await idx.query({ query: "x" });
-    expect(results.map((h) => h.id)).toEqual(["getting-started"]);
+    await expect(idx.query({ query: "x" })).rejects.toBeInstanceOf(
+      SearchIndexContractError,
+    );
 
     const { idx: idx2 } = await makeHandle([() => jsonResponse("weird")]);
-    expect(await idx2.query({ query: "x" })).toEqual([]);
+    await expect(idx2.query({ query: "x" })).rejects.toMatchObject({
+      name: "SearchIndexContractError",
+      operation: "query",
+    });
   });
 
-  it("throws before fetching on an empty query", async () => {
+  it("throws before fetching on invalid query inputs", async () => {
     const { idx, calls } = await makeHandle([]);
-    await expect(idx.query({ query: "" })).rejects.toMatchObject({
+    await expect(idx.query({ query: "   " })).rejects.toMatchObject({
+      status: 400,
+    });
+    await expect(idx.query({ query: "x", limit: 0 })).rejects.toMatchObject({
       status: 400,
     });
     expect(calls).toHaveLength(0);
@@ -345,28 +498,31 @@ describe("SearchIndex.query()", () => {
 });
 
 describe("SearchIndex.range()", () => {
+  it("allows an id-only read result without fabricating payload fields", () => {
+    const document: SearchDocument = { id: "id-only" };
+    expect(document).toEqual({ id: "id-only" });
+  });
+
   it("POSTs {url}/range/default with cursor/limit/include flags and maps the live `vectors` page shape", async () => {
-    // Live-verified upstream shape (2026-08-03): { result: { nextCursor, vectors } }.
+    // Captured live shape (2026-08-03): { result: { nextCursor, vectors } }.
     const { idx, calls } = await makeHandle([
-      () =>
-        jsonResponse({
-          result: {
-            nextCursor: "42",
-            vectors: [
-              { id: "a", metadata: { contentHash: "h1" } },
-              { id: "b", content: { t: 2 } },
-            ],
-          },
-        }),
+      () => jsonResponse(providerRangeFixture),
     ]);
-    const page = await idx.range({ cursor: "0", limit: 100, includeMetadata: true });
+    const page = await idx.range({
+      cursor: "0",
+      limit: 100,
+      includeMetadata: true,
+    });
     expect(calls[0]!.url).toBe(`${DATA_URL}/range/default`);
-    expect(bodyOf(calls[0]!)).toEqual({ cursor: "0", limit: 100, includeMetadata: true });
+    expect(bodyOf(calls[0]!)).toEqual({
+      cursor: "0",
+      limit: 100,
+      includeMetadata: true,
+    });
     expect(page.nextCursor).toBe("42");
     expect(page.documents.map((d) => d.id)).toEqual(["a", "b"]);
     expect(page.documents[0]!.metadata).toEqual({ contentHash: "h1" });
-    // Items without payloads (flags off upstream) still map with empty content.
-    expect(page.documents[0]!.content).toEqual({});
+    expect(page.documents[0]).not.toHaveProperty("content");
   });
 
   it("falls back to a `documents` page key and maps it identically", async () => {
@@ -382,27 +538,95 @@ describe("SearchIndex.range()", () => {
     expect(page.documents.map((d) => d.id)).toEqual(["a"]);
   });
 
-  it("sends an empty body on the first page and normalizes an empty nextCursor to null", async () => {
+  it("sends valid first-page defaults and normalizes an empty nextCursor to null", async () => {
     const { idx, calls } = await makeHandle([
       () => jsonResponse({ result: { nextCursor: "", vectors: [] } }),
     ]);
     const page = await idx.range();
-    expect(bodyOf(calls[0]!)).toEqual({});
+    expect(bodyOf(calls[0]!)).toEqual({ cursor: "0", limit: 100 });
     expect(page).toEqual({ nextCursor: null, documents: [] });
+  });
+
+  it("fails closed for malformed pages/documents", async () => {
+    const { idx } = await makeHandle([
+      () => jsonResponse({ result: { nextCursor: "", wrong: [] } }),
+    ]);
+    await expect(idx.range()).rejects.toBeInstanceOf(SearchIndexContractError);
+
+    const { idx: malformedDocument } = await makeHandle([
+      () =>
+        jsonResponse({
+          result: { nextCursor: "", vectors: [{ id: "a", content: null }] },
+        }),
+    ]);
+    await expect(malformedDocument.range()).rejects.toBeInstanceOf(
+      SearchIndexContractError,
+    );
+  });
+
+  it("rejects undocumented range envelope combinations", async () => {
+    const { idx: topLevelVectors } = await makeHandle([
+      () => jsonResponse({ nextCursor: "", vectors: [] }),
+    ]);
+    await expect(topLevelVectors.range()).rejects.toBeInstanceOf(
+      SearchIndexContractError,
+    );
+
+    const { idx: nestedDocuments } = await makeHandle([
+      () => jsonResponse({ result: { nextCursor: "", documents: [] } }),
+    ]);
+    await expect(nestedDocuments.range()).rejects.toBeInstanceOf(
+      SearchIndexContractError,
+    );
+  });
+
+  it("validates cursor, limit, and include flags before fetching", async () => {
+    const { idx, calls } = await makeHandle([]);
+    await expect(idx.range({ cursor: "" })).rejects.toMatchObject({
+      status: 400,
+    });
+    await expect(idx.range({ limit: 1001 })).rejects.toMatchObject({
+      status: 400,
+    });
+    await expect(
+      idx.range({ includeMetadata: "yes" } as never),
+    ).rejects.toMatchObject({ status: 400 });
+    expect(calls).toHaveLength(0);
   });
 });
 
 describe("SearchIndex.fetchDocuments() / deleteDocuments()", () => {
   it("POSTs {url}/fetch/default with ids + include flags and preserves nulls for misses", async () => {
     const { idx, calls } = await makeHandle([
-      () => jsonResponse({ result: [{ id: "a", metadata: { contentHash: "h1" } }, null] }),
+      () => jsonResponse(providerFetchFixture),
     ]);
-    const docs = await idx.fetchDocuments(["a", "missing"], { includeMetadata: true });
+    const docs = await idx.fetchDocuments(["a", "missing"], {
+      includeMetadata: true,
+    });
     expect(calls[0]!.url).toBe(`${DATA_URL}/fetch/default`);
-    expect(bodyOf(calls[0]!)).toEqual({ ids: ["a", "missing"], includeMetadata: true });
+    expect(bodyOf(calls[0]!)).toEqual({
+      ids: ["a", "missing"],
+      includeMetadata: true,
+    });
     expect(docs[0]!.id).toBe("a");
     expect(docs[0]!.metadata).toEqual({ contentHash: "h1" });
+    expect(docs[0]).not.toHaveProperty("content");
     expect(docs[1]).toBeNull();
+  });
+
+  it("fails closed for malformed fetch envelopes and positional cardinality", async () => {
+    const { idx } = await makeHandle([() => jsonResponse({})]);
+    await expect(idx.fetchDocuments(["a"])).rejects.toBeInstanceOf(
+      SearchIndexContractError,
+    );
+
+    const { idx: short } = await makeHandle([
+      () => jsonResponse({ result: [{ id: "a" }] }),
+    ]);
+    await expect(short.fetchDocuments(["a", "b"])).rejects.toMatchObject({
+      name: "SearchIndexContractError",
+      operation: "fetchDocuments",
+    });
   });
 
   it("DELETEs {url}/delete/default with the ids body", async () => {
@@ -421,10 +645,13 @@ describe("SearchIndex.fetchDocuments() / deleteDocuments()", () => {
     await expect(idx.deleteDocuments([])).rejects.toMatchObject({
       status: 400,
     });
+    await expect(idx.fetchDocuments([""])).rejects.toMatchObject({
+      status: 400,
+    });
     expect(calls).toHaveLength(0);
   });
 
-  it("surfaces a data-plane 404 (ownership mismatch) as SearchIndexHttpError", async () => {
+  it("surfaces data-plane not-found / ownership mismatch as 404", async () => {
     const { idx } = await makeHandle([
       () =>
         new Response(JSON.stringify({ message: "Not found" }), {
@@ -432,9 +659,18 @@ describe("SearchIndex.fetchDocuments() / deleteDocuments()", () => {
           headers: { "Content-Type": "application/json" },
         }),
     ]);
-    await expect(idx.fetchDocuments(["a"])).rejects.toMatchObject({
-      name: "SearchIndexHttpError",
-      status: 404,
-    });
+    const calls = [
+      () => idx.upsert([{ id: "a", content: {} }]),
+      () => idx.query({ query: "anything" }),
+      () => idx.range(),
+      () => idx.fetchDocuments(["a"]),
+      () => idx.deleteDocuments(["a"]),
+    ];
+    for (const call of calls) {
+      await expect(call()).rejects.toMatchObject({
+        name: "SearchIndexHttpError",
+        status: 404,
+      });
+    }
   });
 });

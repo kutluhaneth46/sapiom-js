@@ -1,11 +1,12 @@
 # `searchindex` — provisioned search indexes with auto-embedding
 
-Upstash Search behind the Sapiom gateway: create an index, upsert JSON
-documents, and query them with combined full-text + semantic search. Documents
-are auto-embedded server-side — there is no embedding pipeline to run.
+Create an index, upsert JSON documents, and query them with combined full-text
+and semantic search. Documents are auto-embedded server-side, so there is no
+embedding pipeline to run. The backing provider is an implementation detail;
+the public contract is the `searchindex` namespace and its logical meters.
 
-Not to be confused with the `search` namespace (web search / page scrape /
-email lookup): `searchindex` is a data store you fill and query.
+This is distinct from `search` (web search, page scrape, and email lookup):
+`searchindex` is a data store you fill and query.
 
 ## Usage
 
@@ -17,60 +18,76 @@ import { searchindex } from "@sapiom/tools"; // ambient auth
 // Control plane — create/list/get/update/delete indexes.
 const idx = await searchindex.create({ name: "docs-corpus" }); // no ttl: long-lived
 
-// Data plane — the returned handle is bound to the index's own URL.
+// Data plane — the returned handle is bound to the index's own Sapiom URL.
 await idx.upsert([
   {
     id: "getting-started",
     content: { title: "Get Started", body: "…" }, // auto-embedded
-    metadata: { url: "https://docs.example.com/", contentHash: "…" }, // NOT embedded
+    metadata: { url: "https://docs.example.com/", contentHash: "…" },
   },
 ]);
 
 const hits = await idx.query({ query: "how do I authenticate?", limit: 3 });
-// hits: [{ id, content, metadata, score }] — best first
+// hits: [{ id, content?, metadata?, score? }] — best first
 
-// Reconciliation: enumerate everything, page by page. Range items carry only
-// `id` unless you ask for payloads — `includeMetadata: true` is the
-// hash-diff reconciler's flag (verified against the live data plane).
+// Reconciliation starts at cursor "0" with a bounded default page size of 100.
+// Range/fetch payload fields are omitted unless their include flag is true.
 let cursor: string | null = null;
 do {
   const page = await idx.range({
     cursor: cursor ?? undefined,
-    limit: 100,
     includeMetadata: true,
   });
-  // page.documents[].metadata.contentHash → diff against fresh hashes
+  // page.documents[].metadata?.contentHash → diff against fresh hashes
   cursor = page.nextCursor;
 } while (cursor);
 
 await idx.deleteDocuments(["stale-doc"]);
 
-// Resolve an existing index by name:
+// Resolve an existing index by name. The canonical wire envelope is
+// `{ databases: [...] }`; the SDK unwraps it and returns bound handles.
 const again = (await searchindex.list()).find((i) => i.name === "docs-corpus");
 ```
 
 ## Semantics worth knowing
 
-- **`content` is embedded, `metadata` is not.** Put searchable text in
-  `content`; put bookkeeping (URLs, hashes, timestamps) in `metadata` so it
-  doesn't pollute relevance.
-- **`ttl` means reaping.** An index created with `ttl` (max 30d) is deleted
-  when it expires. Omit `ttl` for anything long-lived; `update(id,
-  { expiresAt })` adjusts expiry later.
-- **`indexName` is a namespace** inside the index (default `"default"`). Most
-  callers never set it.
-- **`delete(id)` destroys the whole index and all its data.** Use the handle's
-  `deleteDocuments(ids)` for document-level deletes.
-- Errors throw `SearchIndexHttpError` carrying `status` + parsed `body`. A 404
-  also covers ownership mismatches; 422 is the per-account index limit (50).
+- `content` is embedded; `metadata` is not. Put searchable text in `content`
+  and bookkeeping such as URLs, hashes, and timestamps in `metadata`.
+- `ttl` means reaping. It must be greater than zero and no more than 30 days.
+  Omit it for long-lived indexes; `update(id, { expiresAt })` adjusts expiry.
+- `region` can be `null` on a read when a legacy record has no region.
+- `indexName` is a namespace within the index (default `"default"`).
+- `query()` defaults to 5 results; public `limit` is sent as the data-plane
+  `topK` field.
+- `range()` defaults to `{ cursor: "0", limit: 100 }`; pass each non-null
+  `nextCursor` to the next call.
+- Range and fetch results always contain `id`. `content` and `metadata` remain
+  absent unless requested, so omitted data cannot be mistaken for `{}`.
+- `delete(id)` destroys an entire index. Use `deleteDocuments(ids)` for
+  document-level deletion.
+- HTTP failures throw `SearchIndexHttpError`. A successful HTTP response with a
+  malformed list/query/range/fetch envelope throws `SearchIndexContractError`
+  instead of masquerading as an empty index.
+- List responses canonically use `{ databases: [...] }`. The SDK retains a bare
+  array only as an explicitly documented pre-envelope compatibility shape; any
+  other object envelope throws `SearchIndexContractError`.
+- Query/fetch responses canonically use `{ result: [...] }`; legacy bare arrays
+  remain supported. Range canonically uses
+  `{ result: { nextCursor, vectors } }`; the documented Search SDK page
+  `{ nextCursor, documents }` remains supported. Other shapes fail closed.
 
-## Pricing
+## Logical meters
 
-Data-plane operations are priced **per request, not per document** — batch your
-upserts:
+The customer contract is provider-invisible. The effective plan/catalog is the
+authority for allowance and price; each data-plane call consumes one request,
+regardless of batch size.
 
-| Operation                                            | Price     |
-| ---------------------------------------------------- | --------- |
-| `upsert` / `query` / `range` / `fetchDocuments` / `deleteDocuments` | $0.000050 |
-| `query` with `reranking: true`                        | +$0.001   |
-| Control plane (create/get/list/update/delete)         | identity-first (nominal) |
+| SDK operation                | Logical meter                  | Current catalog unit rate |
+| ---------------------------- | ------------------------------ | ------------------------: |
+| active index allocation      | `searchindex.index`            |           plan allocation |
+| `upsert`                     | `searchindex.upsert`           |                 $0.000050 |
+| `query`                      | `searchindex.query`            |                 $0.000050 |
+| `query({ reranking: true })` | `searchindex.query_rerank`     |                 $0.001050 |
+| `range`                      | `searchindex.range`            |                 $0.000050 |
+| `fetchDocuments`             | `searchindex.fetch_documents`  |                 $0.000050 |
+| `deleteDocuments`            | `searchindex.delete_documents` |                 $0.000050 |

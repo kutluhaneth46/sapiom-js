@@ -20,6 +20,24 @@ export class SearchIndexHttpError extends Error {
 }
 
 /**
+ * A successful HTTP response that does not match the documented SearchIndex
+ * wire contract. This is deliberately distinct from an empty result: callers
+ * performing reconciliation must never interpret a gateway/provider regression
+ * as an empty index.
+ */
+export class SearchIndexContractError extends Error {
+  readonly operation: string;
+  readonly body: unknown;
+
+  constructor(operation: string, message: string, body: unknown) {
+    super(`Invalid SearchIndex ${operation} response: ${message}`);
+    this.name = "SearchIndexContractError";
+    this.operation = operation;
+    this.body = body;
+  }
+}
+
+/**
  * Return the response when 2xx, otherwise throw a {@link SearchIndexHttpError}.
  * Parses the error body as JSON when possible; falls back to raw text.
  */

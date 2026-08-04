@@ -1,8 +1,8 @@
 /**
- * `searchindex` capability — provisioned Upstash Search indexes with
- * auto-embedding: full-text + semantic search over JSON documents, no embedding
- * pipeline to run. Distinct from the `search` namespace (web search / scrape);
- * this one is a data store you fill and query.
+ * `searchindex` capability — provisioned search indexes with auto-embedding:
+ * full-text + semantic search over JSON documents, with no embedding pipeline to
+ * run. Distinct from the `search` namespace (web search / scrape); this one is a
+ * data store you fill and query.
  *
  *   import { searchindex } from "@sapiom/tools";            // ambient auth
  *   const idx = await searchindex.create({ name: "docs-corpus" });
@@ -32,17 +32,41 @@
  * Omit `ttl` for a long-lived index (e.g. a docs corpus); `update(id,
  * { expiresAt })` can extend or set expiry later.
  *
- * Pricing (per request, not per document): upsert / query / range /
- * fetchDocuments / deleteDocuments are $0.000050 each; `query` with
- * `reranking: true` adds a $0.001 surcharge. Control-plane calls are
- * identity-first (nominal). Batch upserts — one call with 50 documents costs
- * the same as one call with 1.
+ * Customer usage is expressed through provider-invisible logical meters:
+ * `searchindex.index` for active allocations and one of `searchindex.upsert`,
+ * `searchindex.query`, `searchindex.query_rerank`, `searchindex.range`,
+ * `searchindex.fetch_documents`, or `searchindex.delete_documents` per
+ * data-plane request. Batch upserts — one call with 50 documents uses the same
+ * request count as one call with 1.
  */
 import { Transport, defaultTransport } from "../_client/index.js";
 import { resolveServiceUrl } from "../_client/service-url.js";
-import { ensureOk, SearchIndexHttpError } from "./errors.js";
+import {
+  ensureOk,
+  SearchIndexContractError,
+  SearchIndexHttpError,
+} from "./errors.js";
+import {
+  DEFAULT_SEARCH_INDEX_QUERY_LIMIT,
+  DEFAULT_SEARCH_INDEX_RANGE_CURSOR,
+  DEFAULT_SEARCH_INDEX_RANGE_LIMIT,
+  normalizeSearchIndexRangeInput,
+  resolveSearchIndexName,
+  validateCreateSearchIndexInput,
+  validateSearchDocumentIds,
+  validateSearchDocumentInputs,
+  validateSearchIndexId,
+  validateSearchIndexIncludeOptions,
+  validateSearchQueryInput,
+  validateUpdateSearchIndexInput,
+} from "./validation.js";
 
-export { SearchIndexHttpError };
+export {
+  DEFAULT_SEARCH_INDEX_RANGE_CURSOR,
+  DEFAULT_SEARCH_INDEX_RANGE_LIMIT,
+  SearchIndexContractError,
+  SearchIndexHttpError,
+};
 
 const DEFAULT_BASE_URL = resolveServiceUrl(
   "upstash",
@@ -88,8 +112,8 @@ export interface SearchIndexInfo {
   status: SearchIndexStatus;
   /** The index's own data-plane base URL (`https://<id>.search.data.sapiom.ai`). */
   url: string;
-  /** Region the index is provisioned in. */
-  region: string;
+  /** Region the index is provisioned in, or `null` for legacy/unknown records. */
+  region: string | null;
   /** ISO-8601 expiry, or `null` when the index does not expire. */
   expiresAt: string | null;
   /** ISO-8601 creation timestamp. */
@@ -97,12 +121,23 @@ export interface SearchIndexInfo {
 }
 
 /** One document to store: `content` is auto-embedded, `metadata` is not. */
-export interface SearchDocument {
+export interface SearchDocumentInput {
   /** Unique document id within the index. */
   id: string;
   /** The searchable fields (auto-embedded server-side), e.g. `{ title, body }`. */
   content: Record<string, unknown>;
   /** Stored verbatim, never embedded — URLs, content hashes, timestamps, … */
+  metadata?: Record<string, unknown>;
+}
+
+/**
+ * One document returned by range/fetch. Payload fields are absent unless the
+ * corresponding include flag was requested; absence is never fabricated as an
+ * empty object.
+ */
+export interface SearchDocument {
+  id: string;
+  content?: Record<string, unknown>;
   metadata?: Record<string, unknown>;
 }
 
@@ -117,9 +152,9 @@ export interface SearchHit {
 export interface SearchQueryInput {
   /** The search query (semantic + full-text). */
   query: string;
-  /** Max results to return (1–1000). */
+  /** Max results to return (defaults to 5; valid range 1–1000). */
   limit?: number;
-  /** Re-rank results server-side for better relevance (+$0.001 per query). */
+  /** Re-rank results server-side; selects the `searchindex.query_rerank` meter. */
   reranking?: boolean;
   /** Optional metadata filter expression. */
   filter?: string;
@@ -134,9 +169,9 @@ export interface SearchIndexIncludeOptions {
 }
 
 export interface SearchIndexRangeInput extends SearchIndexIncludeOptions {
-  /** Opaque pagination cursor from a previous page (start with none or `"0"`). */
+  /** Numeric pagination cursor from a previous page (defaults to `"0"`). */
   cursor?: string;
-  /** Page size. */
+  /** Page size (defaults to 100; valid range 1–1000). */
   limit?: number;
 }
 
@@ -156,12 +191,15 @@ export interface DataPlaneOptions {
 }
 
 /**
- * A bound search-index handle: the index's metadata plus its data-plane
- * operations, each priced per request ($0.000050; query reranking +$0.001).
+ * A bound search-index handle: the index's metadata plus its logically-metered
+ * data-plane operations.
  */
 export interface SearchIndex extends SearchIndexInfo {
   /** Insert or replace documents — ONE priced request regardless of count. */
-  upsert(documents: SearchDocument[], opts?: DataPlaneOptions): Promise<void>;
+  upsert(
+    documents: SearchDocumentInput[],
+    opts?: DataPlaneOptions,
+  ): Promise<void>;
   /** Search the index. Returns ranked hits (best first). */
   query(input: SearchQueryInput, opts?: DataPlaneOptions): Promise<SearchHit[]>;
   /**
@@ -188,95 +226,204 @@ export interface SearchIndex extends SearchIndexInfo {
 // ----- Internal wire shapes -----
 
 /** The gateway's `SearchDatabaseResponse` DTO. */
-interface RawSearchIndexResponse {
-  id: string;
-  type?: string;
-  name: string;
-  status: string;
-  url: string;
-  region: string;
-  expiresAt: string | null;
-  createdAt: string;
+const SEARCH_INDEX_STATUSES = new Set<SearchIndexStatus>([
+  "provisioning",
+  "active",
+  "expired",
+  "deleting",
+  "deleted",
+]);
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-function mapInfo(raw: RawSearchIndexResponse): SearchIndexInfo {
-  return {
-    id: raw.id,
-    name: raw.name,
-    status: raw.status as SearchIndexStatus,
-    url: raw.url,
-    region: raw.region,
-    expiresAt: raw.expiresAt ?? null,
-    createdAt: raw.createdAt,
-  };
+function contractError(
+  operation: string,
+  message: string,
+  body: unknown,
+): never {
+  throw new SearchIndexContractError(operation, message, body);
 }
 
-const INDEX_NAME_PATTERN = /^[a-zA-Z0-9_-]+$/;
-const TTL_PATTERN = /^\d+[mhd]$/;
-
-function resolveIndexName(opts?: DataPlaneOptions): string {
-  const indexName = opts?.indexName ?? "default";
-  if (!INDEX_NAME_PATTERN.test(indexName)) {
-    throw new SearchIndexHttpError(
-      `indexName must match ${INDEX_NAME_PATTERN} (got "${indexName}")`,
-      400,
-      { indexName },
+function parseInfo(raw: unknown, operation: string): SearchIndexInfo {
+  if (!isRecord(raw)) contractError(operation, "expected an index object", raw);
+  if (raw.type !== "search") {
+    contractError(operation, "expected resource type 'search'", raw);
+  }
+  const requiredStrings = ["id", "name", "status", "url", "createdAt"] as const;
+  for (const field of requiredStrings) {
+    if (typeof raw[field] !== "string" || raw[field].length === 0) {
+      contractError(
+        operation,
+        `expected non-empty string field '${field}'`,
+        raw,
+      );
+    }
+  }
+  if (!SEARCH_INDEX_STATUSES.has(raw.status as SearchIndexStatus)) {
+    contractError(
+      operation,
+      `unknown lifecycle status '${String(raw.status)}'`,
+      raw,
     );
   }
-  return indexName;
-}
-
-/**
- * Unwrap an Upstash data-plane response defensively: the API returns either the
- * value directly or wrapped as `{ result: value }` depending on the endpoint.
- */
-function unwrapResult(raw: unknown): unknown {
-  if (raw && typeof raw === "object" && "result" in raw) {
-    return (raw as { result: unknown }).result;
+  if (raw.region !== null && typeof raw.region !== "string") {
+    contractError(operation, "expected 'region' to be a string or null", raw);
   }
-  return raw;
-}
-
-function toDocument(raw: unknown): SearchDocument | null {
-  if (!raw || typeof raw === "string" || typeof raw !== "object") return null;
-  const doc = raw as {
-    id?: unknown;
-    content?: Record<string, unknown>;
-    metadata?: Record<string, unknown>;
-  };
-  if (typeof doc.id !== "string") return null;
+  if (raw.expiresAt !== null && typeof raw.expiresAt !== "string") {
+    contractError(
+      operation,
+      "expected 'expiresAt' to be a string or null",
+      raw,
+    );
+  }
   return {
-    id: doc.id,
-    content: doc.content ?? {},
-    ...(doc.metadata !== undefined && { metadata: doc.metadata }),
+    id: raw.id as string,
+    name: raw.name as string,
+    status: raw.status as SearchIndexStatus,
+    url: raw.url as string,
+    region: raw.region as string | null,
+    expiresAt: raw.expiresAt as string | null,
+    createdAt: raw.createdAt as string,
   };
 }
 
-function toHit(raw: unknown): SearchHit | null {
-  const doc = toDocument(raw);
-  if (!doc) return null;
-  const score = (raw as { score?: unknown }).score;
+function parseDocument(
+  raw: unknown,
+  operation: string,
+  position: number,
+): SearchDocument {
+  if (!isRecord(raw) || typeof raw.id !== "string" || raw.id.length === 0) {
+    contractError(
+      operation,
+      `document at index ${position} requires a non-empty id`,
+      raw,
+    );
+  }
+  if (raw.content !== undefined && !isRecord(raw.content)) {
+    contractError(operation, `document '${raw.id}' has malformed content`, raw);
+  }
+  if (raw.metadata !== undefined && !isRecord(raw.metadata)) {
+    contractError(
+      operation,
+      `document '${raw.id}' has malformed metadata`,
+      raw,
+    );
+  }
   return {
-    ...doc,
-    ...(typeof score === "number" && { score }),
+    id: raw.id,
+    ...(raw.content !== undefined && { content: raw.content }),
+    ...(raw.metadata !== undefined && { metadata: raw.metadata }),
   };
 }
 
-async function dataPlaneJson(
+function parseQueryResponse(raw: unknown): SearchHit[] {
+  // Canonical provider envelope is `{ result: [...] }`. A bare array is the
+  // explicitly retained pre-envelope compatibility shape.
+  const results = isRecord(raw) && "result" in raw ? raw.result : raw;
+  if (!Array.isArray(results)) {
+    contractError("query", "expected { result: [...] }", raw);
+  }
+  return results.map((item, index) => {
+    const document = parseDocument(item, "query", index);
+    const score = (item as Record<string, unknown>).score;
+    if (score !== undefined && typeof score !== "number") {
+      contractError(
+        "query",
+        `document '${document.id}' has malformed score`,
+        item,
+      );
+    }
+    return {
+      ...document,
+      ...(score !== undefined && { score }),
+    };
+  });
+}
+
+function parseRangeResponse(raw: unknown): SearchIndexRangeResult {
+  let page: Record<string, unknown>;
+  let items: unknown[];
+  if (isRecord(raw) && "result" in raw) {
+    // Canonical raw data-plane envelope.
+    if (!isRecord(raw.result) || !Array.isArray(raw.result.vectors)) {
+      contractError(
+        "range",
+        "expected { result: { nextCursor, vectors: [...] } }",
+        raw,
+      );
+    }
+    page = raw.result;
+    items = raw.result.vectors;
+  } else {
+    // Explicit compatibility with the documented Search SDK page.
+    if (!isRecord(raw) || !Array.isArray(raw.documents)) {
+      contractError("range", "expected { nextCursor, documents: [...] }", raw);
+    }
+    page = raw;
+    items = raw.documents;
+  }
+  if (typeof page.nextCursor !== "string") {
+    contractError("range", "expected a string nextCursor", raw);
+  }
+  return {
+    nextCursor: page.nextCursor === "" ? null : page.nextCursor,
+    documents: items.map((item, index) => parseDocument(item, "range", index)),
+  };
+}
+
+function parseFetchResponse(
+  raw: unknown,
+  expectedCount: number,
+): Array<SearchDocument | null> {
+  const results = isRecord(raw) && "result" in raw ? raw.result : raw;
+  if (!Array.isArray(results)) {
+    contractError("fetchDocuments", "expected { result: [...] }", raw);
+  }
+  if (results.length !== expectedCount) {
+    contractError(
+      "fetchDocuments",
+      `expected ${expectedCount} positional results, received ${results.length}`,
+      raw,
+    );
+  }
+  return results.map((item, index) =>
+    item === null ? null : parseDocument(item, "fetchDocuments", index),
+  );
+}
+
+function parseListResponse(raw: unknown): SearchIndexInfo[] {
+  // Canonical Unified contract: `{ databases: SearchDatabaseResponse[] }`.
+  // Retain the original bare-array response only as an explicit compatibility
+  // shape; every other envelope fails closed.
+  const databases = isRecord(raw) && "databases" in raw ? raw.databases : raw;
+  if (!Array.isArray(databases)) {
+    contractError("list", "expected { databases: [...] }", raw);
+  }
+  return databases.map((item, index) => parseInfo(item, `list[${index}]`));
+}
+
+async function readRequiredJson(
+  response: Response,
+  operation: string,
+): Promise<unknown> {
+  const text = await response.text().catch(() => "");
+  if (!text) contractError(operation, "expected a JSON body", undefined);
+  try {
+    return JSON.parse(text);
+  } catch {
+    contractError(operation, "response body is not valid JSON", text);
+  }
+}
+
+async function dataPlaneRequest(
   transport: Transport,
   url: string,
   init: RequestInit,
   errorPrefix: string,
-): Promise<unknown> {
-  const res = await ensureOk(await transport.fetch(url, init), errorPrefix);
-  if (res.status === 204) return undefined;
-  const text = await res.text().catch(() => "");
-  if (!text) return undefined;
-  try {
-    return JSON.parse(text);
-  } catch {
-    return text;
-  }
+): Promise<Response> {
+  return ensureOk(await transport.fetch(url, init), errorPrefix);
 }
 
 // ----- The handle -----
@@ -287,17 +434,11 @@ function bindIndex(info: SearchIndexInfo, transport: Transport): SearchIndex {
     ...info,
 
     async upsert(documents, opts) {
-      if (!Array.isArray(documents) || documents.length === 0) {
-        throw new SearchIndexHttpError(
-          "upsert requires at least one document",
-          400,
-          undefined,
-        );
-      }
-      const indexName = resolveIndexName(opts);
-      // The gateway forwards the array body verbatim and remaps to Upstash's
-      // auto-embedding upsert. Priced per REQUEST — batch your documents.
-      await dataPlaneJson(
+      validateSearchDocumentInputs(documents);
+      const indexName = resolveSearchIndexName(opts);
+      // The gateway forwards the array body verbatim to the current provider.
+      // Logical usage is per request, so callers should batch documents.
+      await dataPlaneRequest(
         transport,
         `${info.url}/upsert/${indexName}`,
         {
@@ -310,20 +451,20 @@ function bindIndex(info: SearchIndexInfo, transport: Transport): SearchIndex {
     },
 
     async query(input, opts) {
-      if (!input?.query) {
-        throw new SearchIndexHttpError(
-          "query requires a non-empty query string",
-          400,
-          undefined,
-        );
-      }
-      const indexName = resolveIndexName(opts);
-      const body: Record<string, unknown> = { query: input.query };
-      if (input.limit != null) body.limit = input.limit;
+      validateSearchQueryInput(input);
+      const indexName = resolveSearchIndexName(opts);
+      // Public `limit` maps to the provider's raw `topK`; query reads request
+      // their payloads explicitly instead of relying on provider defaults.
+      const body: Record<string, unknown> = {
+        query: input.query,
+        topK: input.limit ?? DEFAULT_SEARCH_INDEX_QUERY_LIMIT,
+        includeData: true,
+        includeMetadata: true,
+      };
       if (input.reranking != null) body.reranking = input.reranking;
       if (input.filter != null) body.filter = input.filter;
 
-      const raw = await dataPlaneJson(
+      const response = await dataPlaneRequest(
         transport,
         `${info.url}/search/${indexName}`,
         {
@@ -333,23 +474,14 @@ function bindIndex(info: SearchIndexInfo, transport: Transport): SearchIndex {
         },
         `Failed to query search index '${info.id}'`,
       );
-      const results = unwrapResult(raw);
-      if (!Array.isArray(results)) return [];
-      return results
-        .map(toHit)
-        .filter((hit): hit is SearchHit => hit !== null);
+      return parseQueryResponse(await readRequiredJson(response, "query"));
     },
 
     async range(input, opts) {
-      const indexName = resolveIndexName(opts);
-      const body: Record<string, unknown> = {};
-      if (input?.cursor != null) body.cursor = input.cursor;
-      if (input?.limit != null) body.limit = input.limit;
-      if (input?.includeMetadata != null)
-        body.includeMetadata = input.includeMetadata;
-      if (input?.includeData != null) body.includeData = input.includeData;
+      const indexName = resolveSearchIndexName(opts);
+      const body = normalizeSearchIndexRangeInput(input);
 
-      const raw = await dataPlaneJson(
+      const response = await dataPlaneRequest(
         transport,
         `${info.url}/range/${indexName}`,
         {
@@ -359,41 +491,18 @@ function bindIndex(info: SearchIndexInfo, transport: Transport): SearchIndex {
         },
         `Failed to range search index '${info.id}'`,
       );
-      // Verified live 2026-08-03: the upstream page shape is
-      // `{ nextCursor, vectors: [...] }` (Search rides the vector API's range;
-      // `documents` kept as a defensive fallback should upstream rename).
-      const page = unwrapResult(raw) as
-        | { nextCursor?: unknown; vectors?: unknown; documents?: unknown }
-        | undefined;
-      const items = Array.isArray(page?.vectors)
-        ? page.vectors
-        : Array.isArray(page?.documents)
-          ? page.documents
-          : [];
-      const documents = items
-        .map(toDocument)
-        .filter((doc): doc is SearchDocument => doc !== null);
-      const nextCursor =
-        typeof page?.nextCursor === "string" && page.nextCursor !== ""
-          ? page.nextCursor
-          : null;
-      return { nextCursor, documents };
+      return parseRangeResponse(await readRequiredJson(response, "range"));
     },
 
     async fetchDocuments(ids, opts) {
-      if (!Array.isArray(ids) || ids.length === 0) {
-        throw new SearchIndexHttpError(
-          "fetchDocuments requires at least one id",
-          400,
-          undefined,
-        );
-      }
-      const indexName = resolveIndexName(opts);
+      validateSearchDocumentIds(ids, "fetchDocuments");
+      validateSearchIndexIncludeOptions(opts);
+      const indexName = resolveSearchIndexName(opts);
       const body: Record<string, unknown> = { ids };
       if (opts?.includeMetadata != null)
         body.includeMetadata = opts.includeMetadata;
       if (opts?.includeData != null) body.includeData = opts.includeData;
-      const raw = await dataPlaneJson(
+      const response = await dataPlaneRequest(
         transport,
         `${info.url}/fetch/${indexName}`,
         {
@@ -403,21 +512,16 @@ function bindIndex(info: SearchIndexInfo, transport: Transport): SearchIndex {
         },
         `Failed to fetch documents from search index '${info.id}'`,
       );
-      const results = unwrapResult(raw);
-      if (!Array.isArray(results)) return ids.map(() => null);
-      return results.map(toDocument);
+      return parseFetchResponse(
+        await readRequiredJson(response, "fetchDocuments"),
+        ids.length,
+      );
     },
 
     async deleteDocuments(ids, opts) {
-      if (!Array.isArray(ids) || ids.length === 0) {
-        throw new SearchIndexHttpError(
-          "deleteDocuments requires at least one id",
-          400,
-          undefined,
-        );
-      }
-      const indexName = resolveIndexName(opts);
-      await dataPlaneJson(
+      validateSearchDocumentIds(ids, "deleteDocuments");
+      const indexName = resolveSearchIndexName(opts);
+      await dataPlaneRequest(
         transport,
         `${info.url}/delete/${indexName}`,
         {
@@ -443,20 +547,7 @@ export async function create(
   transport: Transport = defaultTransport(),
   baseUrl = DEFAULT_BASE_URL,
 ): Promise<SearchIndex> {
-  if (!input?.name || input.name.length > 128) {
-    throw new SearchIndexHttpError(
-      "create requires a name of 1-128 characters",
-      400,
-      { name: input?.name },
-    );
-  }
-  if (input.ttl !== undefined && !TTL_PATTERN.test(input.ttl)) {
-    throw new SearchIndexHttpError(
-      `ttl must match ${TTL_PATTERN} (e.g. "1h", "24h", "7d"), got "${input.ttl}"`,
-      400,
-      { ttl: input.ttl },
-    );
-  }
+  validateCreateSearchIndexInput(input);
   const body: Record<string, unknown> = { name: input.name };
   if (input.region !== undefined) body.region = input.region;
   if (input.ttl !== undefined) body.ttl = input.ttl;
@@ -469,7 +560,10 @@ export async function create(
     }),
     "Failed to create search index",
   );
-  return bindIndex(mapInfo((await res.json()) as RawSearchIndexResponse), transport);
+  return bindIndex(
+    parseInfo(await readRequiredJson(res, "create"), "create"),
+    transport,
+  );
 }
 
 /** Retrieve a search index by id and return its bound handle. */
@@ -478,13 +572,17 @@ export async function get(
   transport: Transport = defaultTransport(),
   baseUrl = DEFAULT_BASE_URL,
 ): Promise<SearchIndex> {
+  validateSearchIndexId(id);
   const res = await ensureOk(
     await transport.fetch(
       `${baseUrl}/v1/search/indexes/${encodeURIComponent(id)}`,
     ),
     `Failed to get search index '${id}'`,
   );
-  return bindIndex(mapInfo((await res.json()) as RawSearchIndexResponse), transport);
+  return bindIndex(
+    parseInfo(await readRequiredJson(res, "get"), "get"),
+    transport,
+  );
 }
 
 /**
@@ -501,10 +599,9 @@ export async function list(
     await transport.fetch(`${baseUrl}/v1/search/indexes`),
     "Failed to list search indexes",
   );
-  const raw = (await res.json()) as RawSearchIndexResponse[];
-  return Array.isArray(raw)
-    ? raw.map((r) => bindIndex(mapInfo(r), transport))
-    : [];
+  return parseListResponse(await readRequiredJson(res, "list")).map((info) =>
+    bindIndex(info, transport),
+  );
 }
 
 /** Update an index's `name` and/or `expiresAt`; returns the updated handle. */
@@ -514,6 +611,8 @@ export async function update(
   transport: Transport = defaultTransport(),
   baseUrl = DEFAULT_BASE_URL,
 ): Promise<SearchIndex> {
+  validateSearchIndexId(id);
+  validateUpdateSearchIndexInput(input);
   const body: Record<string, unknown> = {};
   if (input?.name !== undefined) body.name = input.name;
   if (input?.expiresAt !== undefined) body.expiresAt = input.expiresAt;
@@ -529,12 +628,15 @@ export async function update(
     ),
     `Failed to update search index '${id}'`,
   );
-  return bindIndex(mapInfo((await res.json()) as RawSearchIndexResponse), transport);
+  return bindIndex(
+    parseInfo(await readRequiredJson(res, "update"), "update"),
+    transport,
+  );
 }
 
 /**
- * Delete a whole index and ALL its data (idempotent server-side). For deleting
- * individual documents use the handle's `deleteDocuments`. Exported as `delete`:
+ * Delete a whole index and ALL its data. For deleting individual documents use
+ * the handle's `deleteDocuments`. Exported as `delete`:
  * `await searchindex.delete(id)`.
  */
 async function deleteIndex(
@@ -542,6 +644,7 @@ async function deleteIndex(
   transport: Transport = defaultTransport(),
   baseUrl = DEFAULT_BASE_URL,
 ): Promise<void> {
+  validateSearchIndexId(id);
   await ensureOk(
     await transport.fetch(
       `${baseUrl}/v1/search/indexes/${encodeURIComponent(id)}`,

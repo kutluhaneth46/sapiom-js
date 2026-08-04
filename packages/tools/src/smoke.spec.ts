@@ -26,7 +26,10 @@ import {
   SpeechHttpError,
   BrowserAutomationHttpError,
   KeysHttpError,
+  SearchIndexContractError,
   SearchIndexHttpError,
+  DEFAULT_SEARCH_INDEX_RANGE_CURSOR,
+  DEFAULT_SEARCH_INDEX_RANGE_LIMIT,
 } from "./index.js";
 
 describe("@sapiom/tools public surface", () => {
@@ -114,7 +117,10 @@ describe("@sapiom/tools public surface", () => {
     expect(typeof SpeechHttpError).toBe("function");
     expect(typeof BrowserAutomationHttpError).toBe("function");
     expect(typeof KeysHttpError).toBe("function");
+    expect(typeof SearchIndexContractError).toBe("function");
     expect(typeof SearchIndexHttpError).toBe("function");
+    expect(DEFAULT_SEARCH_INDEX_RANGE_CURSOR).toBe("0");
+    expect(DEFAULT_SEARCH_INDEX_RANGE_LIMIT).toBe(100);
     expect(typeof Sandbox).toBe("function"); // class constructor
     expect(typeof Repository).toBe("function");
   });

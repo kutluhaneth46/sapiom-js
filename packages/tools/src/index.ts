@@ -116,16 +116,22 @@ export * as search from "./search/index.js";
 export { SearchHttpError } from "./search/index.js";
 export type { MapInput, MapLink, MapResult } from "./search/index.js";
 
-// searchindex — provisioned Upstash Search indexes (auto-embedding); control
-// plane + a bound per-index handle for the data-plane operations.
+// searchindex — provisioned search indexes (auto-embedding); control plane + a
+// bound per-index handle for the data-plane operations.
 export * as searchindex from "./search-index/index.js";
-export { SearchIndexHttpError } from "./search-index/index.js";
+export {
+  DEFAULT_SEARCH_INDEX_RANGE_CURSOR,
+  DEFAULT_SEARCH_INDEX_RANGE_LIMIT,
+  SearchIndexContractError,
+  SearchIndexHttpError,
+} from "./search-index/index.js";
 export type {
   SearchIndex,
   SearchIndexInfo,
   SearchIndexStatus,
   CreateSearchIndexInput,
   UpdateSearchIndexInput,
+  SearchDocumentInput,
   SearchDocument,
   SearchHit,
   SearchQueryInput,
