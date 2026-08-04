@@ -111,6 +111,10 @@ test("walks the whole product repository and skips only declared fixtures", () =
       join(root, "scripts/docs-links-check.test.mjs"),
       "Docs.sapiom.ai/how-it-works",
     );
+    writeFileSync(
+      join(root, "packages/example/negative.test.ts"),
+      "claude mcp add sapiom-dev -- npx -y @sapiom/mcp",
+    );
 
     assert.throws(
       () => validateRepository(root),
@@ -121,7 +125,7 @@ test("walks the whole product repository and skips only declared fixtures", () =
       join(root, "packages/example/emitter.ts"),
       "Docs.sapiom.ai/guides/build",
     );
-    assert.deepEqual(validateRepository(root), { files: 2, links: 8 });
+    assert.deepEqual(validateRepository(root), { files: 3, links: 8 });
   } finally {
     rmSync(root, { force: true, recursive: true });
   }

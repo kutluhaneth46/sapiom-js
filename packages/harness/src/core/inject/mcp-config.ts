@@ -2,6 +2,10 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { HARNESS_PATHS } from "../../shared/types.js";
 import { expandHome } from "../../cli/paths.js";
+import {
+  HOSTED_CAPABILITY_MCP_ALIAS,
+  LOCAL_AUTHORING_MCP_ALIAS,
+} from "../mcp-registration.js";
 
 export interface McpConfigOptions {
   /** SAPIOM_ENVIRONMENT to pass through to the local authoring child process. */
@@ -57,12 +61,12 @@ export async function generateMcpConfig(
 
   const config = {
     mcpServers: {
-      "sapiom-direct": {
+      [HOSTED_CAPABILITY_MCP_ALIAS]: {
         type: "http",
         url: "https://api.sapiom.ai/v1/mcp",
         ...(options.apiKey ? { headers: { "x-api-key": options.apiKey } } : {}),
       },
-      sapiom: {
+      [LOCAL_AUTHORING_MCP_ALIAS]: {
         command: "npx",
         // Pin the dist-tag (`@latest`) rather than the bare name so npx always
         // resolves the PUBLISHED package from the registry. A bare

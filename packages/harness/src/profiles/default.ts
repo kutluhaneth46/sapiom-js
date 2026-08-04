@@ -1,3 +1,8 @@
+import {
+  HOSTED_CAPABILITY_MCP_ALIAS,
+  LOCAL_AUTHORING_MCP_ALIAS,
+} from "../core/mcp-registration.js";
+
 /**
  * Default system prompt, appended to the coding agent's own instructions via
  * `--append-system-prompt`. Orients a fresh session to the Sapiom-specific
@@ -12,12 +17,12 @@ you have two Sapiom MCP servers pre-wired, and the conventions below are
 active for the whole session. Follow them.
 
 **The two MCPs, and when to use each:**
-- **sapiom-direct** (remote, HTTP) — the hosted direct-capability surface for
+- **${HOSTED_CAPABILITY_MCP_ALIAS}** (remote, HTTP) — the hosted direct-capability surface for
   ad hoc calls from this coding client. Agent source instead calls typed
   ctx.sapiom.* methods; a deployed run routes those calls through Sapiom cloud,
-  not through this client MCP configuration. Don't substitute sapiom-direct
+  not through this client MCP configuration. Don't substitute ${HOSTED_CAPABILITY_MCP_ALIAS}
   for the authoring tools below.
-- **sapiom** (local, stdio; wire identity **sapiom-dev**) — the authoring
+- **${LOCAL_AUTHORING_MCP_ALIAS}** (local, stdio; wire identity **sapiom-dev**) — the authoring
   surface for this session. Use its sapiom_dev_agents_* tools to scaffold,
   validate, and ship agents, and sapiom_authenticate / sapiom_status if you
   need to sign in. Local Run creates no Sapiom capability request or spend,

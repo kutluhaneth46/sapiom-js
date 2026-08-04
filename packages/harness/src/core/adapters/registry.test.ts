@@ -13,6 +13,7 @@ import {
 import { HarnessError } from "../errors.js";
 import { SPAWNABLE_HARNESS_KINDS } from "../../shared/types.js";
 import type { EmbeddedHarnessAdapterInfo, ExternalHarnessAdapterInfo, HarnessAdapterId } from "./adapter.js";
+import { LOCAL_AUTHORING_MCP_ALIAS } from "../mcp-registration.js";
 
 const EXPECTED_IDS: HarnessAdapterId[] = [
   "claude-code",
@@ -143,6 +144,7 @@ describe("adapter contract — shape of every built-in entry", () => {
       expect(prompt).not.toMatch(/\bmcp add(?: --scope project)? sapiom-dev\b/);
       expect(prompt).not.toContain("[mcp_servers.sapiom-dev]");
       expect(prompt).not.toContain('"sapiom-dev":');
+      expect(prompt).toContain(LOCAL_AUTHORING_MCP_ALIAS);
       expect(prompt).not.toContain("under the name `sapiom-dev`");
 
       const installed = await adapter.detectInstalled();

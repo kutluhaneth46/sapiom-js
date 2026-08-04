@@ -107,6 +107,10 @@ function normalizeRelativePath(root, path) {
   return relative(root, path).split(sep).join("/");
 }
 
+function isTestFixturePath(path) {
+  return /(?:^|\/)(?:__tests__\/|[^/]+\.(?:test|spec)\.)/i.test(path);
+}
+
 function walk(root, directory = root) {
   return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
     if (entry.isSymbolicLink()) return [];
@@ -201,7 +205,9 @@ export function validateRepository(root = REPOSITORY_ROOT) {
   }));
   const errors = files.flatMap(({ relativePath, content }) => [
     ...validateDocsLinkContent(relativePath, content),
-    ...validateSupportedMcpSetupContent(relativePath, content),
+    ...(isTestFixturePath(relativePath)
+      ? []
+      : validateSupportedMcpSetupContent(relativePath, content)),
   ]);
   if (errors.length) throw new Error(errors.join("\n"));
 
