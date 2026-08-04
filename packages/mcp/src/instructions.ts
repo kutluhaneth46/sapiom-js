@@ -15,17 +15,19 @@
  * skill and `AGENTS.md`, and the full reference on docs.sapiom.ai; this primer
  * points there rather than restating them.
  */
-export const AUTHORING_INSTRUCTIONS = `# Sapiom dev MCP (sapiom-dev)
+export const AUTHORING_INSTRUCTIONS = `# Sapiom local authoring MCP
 
-\`sapiom-dev\` is Sapiom's local developer MCP — the terminal surface for building and managing
-your Sapiom projects. Today it drives **agent authoring and sandbox app previews** (more
+\`sapiom-dev\` is this package's MCP server identity. In Claude Code, register it under the
+supported local alias \`sapiom\` with \`claude mcp add sapiom -- npx -y @sapiom/mcp\`.
+It is the terminal surface for building and managing your Sapiom projects. Today it drives
+**agent authoring and sandbox app previews** (more
 dev/management tools will land here over time). Agent authoring: build, test, and deploy a
 Sapiom agent — a \`defineAgent({ name, entry, steps })\` (from \`@sapiom/agent\`) where each
 step's \`run(input, ctx)\` does work and returns a directive. All from the terminal; no
 dashboard required.
 
 ## Two ways to use Sapiom
-Register this local server as \`sapiom\`. It is where you **author agents** — the \`sapiom_dev_agents_*\` tools
+Use the local \`sapiom\` alias to **author agents** — the \`sapiom_dev_agents_*\` tools
 scaffold, typecheck, run with stubs, and deploy from a local checkout. For a **one-off
 capability call** without an agent (a search, a scrape, one image), use the hosted capability
 MCP under the distinct \`sapiom-direct\` alias:

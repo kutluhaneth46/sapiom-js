@@ -50,6 +50,12 @@ describe("server instructions", () => {
     expect(AUTHORING_INSTRUCTIONS).toContain("api.sapiom.ai/v1/mcp");
     expect(AUTHORING_INSTRUCTIONS).toContain("tool_discover");
     expect(AUTHORING_INSTRUCTIONS).toContain(
+      "`sapiom-dev` is this package's MCP server identity",
+    );
+    expect(AUTHORING_INSTRUCTIONS).toContain(
+      "supported local alias `sapiom` with `claude mcp add sapiom -- npx -y @sapiom/mcp`",
+    );
+    expect(AUTHORING_INSTRUCTIONS).toContain(
       "claude mcp add --scope user --transport http sapiom-direct",
     );
     expect(AUTHORING_INSTRUCTIONS).not.toContain("exposes every capability");
@@ -58,6 +64,9 @@ describe("server instructions", () => {
     );
     expect(AUTHORING_INSTRUCTIONS).toContain(
       "authored code and its ordinary side effects still execute",
+    );
+    expect(AUTHORING_INSTRUCTIONS).not.toContain(
+      "# Sapiom dev MCP (sapiom-dev)",
     );
   });
 
