@@ -381,19 +381,6 @@ test.describe("templates journey (from the composer)", () => {
   });
 });
 
-test("the 'start from a template' door hands straight off to the templates browser", async ({
-  page,
-}) => {
-  await page.goto("/");
-  await expect(page.locator(".rail-workflows")).toBeVisible();
-  await page.getByTestId("add-workspace").click();
-  await page.getByTestId("aw-door-template").click();
-  // No intermediate step, and the dialog it came from closes behind it: the
-  // door IS the browser.
-  await expect(page.getByTestId("templates-panel")).toBeVisible();
-  await expect(page.locator(".modal-add-workspace")).toHaveCount(0);
-});
-
 test("the rail navigates to templates, and says so while you are there", async ({
   page,
 }) => {

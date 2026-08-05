@@ -12,7 +12,7 @@ import {
 import { formatComplexity, type GalleryTemplate } from "../lib/templates";
 import { loadUiPrefs, saveUiPrefs } from "../lib/ui-prefs";
 import { AnchoredPopover } from "./AnchoredPopover";
-import { AddWorkspaceDialog } from "./AddWorkspaceDialog";
+import { StartDialog } from "./StartDialog";
 import { HarnessBrandIcon } from "./HarnessBrandIcon";
 import { HarnessMenuItems } from "./HarnessMenuItems";
 import { Icon } from "./Icon";
@@ -387,22 +387,14 @@ export function NewSessionComposer({
       )}
 
       {addOpen && (
-        <AddWorkspaceDialog
+        <StartDialog
           recentDirs={recentDirs}
           projectRoot={projectRoot}
           listDir={listDir}
           onClose={() => setAddOpen(false)}
           onConnect={onConnect}
           onScan={onScan}
-          onScaffold={onScaffold}
-          onSaveProjectRoot={onSaveProjectRoot}
-          listHarnesses={listHarnesses}
-          onBrowseTemplates={() => {
-            setAddOpen(false);
-            onBrowseTemplates();
-          }}
           triggerRef={addTriggerRef as RefObject<HTMLElement | null>}
-          initialDoor="have"
         />
       )}
     </div>
