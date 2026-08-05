@@ -592,8 +592,16 @@ export const App = (): JSX.Element => {
 
   // Templates journey v0: "Use template" starts a session in the destination
   // folder and hands the agent the real operation.
-  const handleUseTemplate = async (cwd: string, template: StudioTemplate): Promise<void> => {
+  const handleUseTemplate = async (
+    cwd: string,
+    template: StudioTemplate,
+    surface: "welcome" | "template_gallery" | "template_detail" = "template_gallery",
+  ): Promise<void> => {
     const session = await createSessionAt(cwd, "claude-code");
+    // Product metric — "templates used". Fires at the choke point every
+    // template surface funnels through; `agent.created` fires later when the
+    // clone produces a real sapiom.json, so built ≥ templates holds.
+    trackProduct("agent.template_cloned", { template_slug: template.id, surface });
     injectPromptWithRetry(
       session.id,
       useTemplatePrompt(template, cwd),
@@ -638,7 +646,7 @@ export const App = (): JSX.Element => {
       return;
     }
     setRightCollapsed(true);
-    void handleUseTemplate(cwd, template);
+    void handleUseTemplate(cwd, template, "welcome");
   };
 
   // Bulk discovery from the add dialog.
