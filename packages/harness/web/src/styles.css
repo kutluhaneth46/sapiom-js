@@ -4063,31 +4063,21 @@ input {
   color: var(--text-faint);
 }
 
+/* The step detail now opens inline in its list row, so there is no board↔detail
+   slide — the track holds a single, full-width pane (the active surface). */
 .canvas-slide-track {
   display: flex;
-  width: 200%;
+  width: 100%;
   flex: 1;
   min-height: 0;
-  transform: translateX(0);
-  transition: transform 260ms var(--ease);
-}
-
-.canvas-frame-wrap[data-view="detail"] .canvas-slide-track {
-  transform: translateX(-50%);
 }
 
 .canvas-slide-pane {
-  width: 50%;
-  flex: 0 0 50%;
+  width: 100%;
+  flex: 1;
   min-height: 0;
   display: flex;
   flex-direction: column;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .canvas-slide-track {
-    transition: none;
-  }
 }
 
 /* Detail subheader chrome: the main action sits right-anchored before the
@@ -4138,6 +4128,30 @@ input {
   flex-direction: column;
   gap: var(--sp2);
   padding: var(--sp1) var(--sp2) var(--sp3) calc(var(--sp2) + 7px + var(--sp2));
+}
+
+/* The step detail rendered INLINE inside a row's dropdown drops its full-pane
+   chrome: no independent scroll and no pane padding (the row already pads), and
+   it sizes to its content instead of filling a pane. */
+.canvas-step-expand .canvas-detail {
+  flex: initial;
+}
+.canvas-step-expand .canvas-detail-body {
+  overflow-y: visible;
+  padding: 0;
+  gap: var(--sp2);
+}
+
+/* Per-step coding-agent actions, a compact ghost-button row in the inline
+   detail (ported from the retired detail-pane header). */
+.canvas-detail-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp1);
+}
+.canvas-detail-actions .btn-ghost {
+  gap: 4px;
+  font-size: var(--type-meta);
 }
 
 .canvas-step-desc {
@@ -4506,6 +4520,257 @@ input {
   overflow: auto;
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+/* --------------------------------------------------------------------------
+   Run observability: the payload copy affordance, the run-summary card, and
+   the deploy banner. Motion-light and reduced-motion-aware; CTAs stay within
+   the flat .status-tag idiom (the cards are the only bordered chrome).
+   -------------------------------------------------------------------------- */
+
+/* PayloadBlock: label on the left, Copy on the right. The disclosure marker is
+   dropped in favour of the whole row being the toggle (scoped to .payload-block
+   so the capability-call disclosures keep their default triangle). */
+.payload-block > summary {
+  display: flex;
+  align-items: center;
+  gap: var(--sp1);
+  list-style: none;
+  padding: 4px 6px;
+  border-radius: var(--radius-sm);
+  color: var(--text-dim);
+  transition: background-color var(--transition-fast);
+}
+.payload-block > summary::-webkit-details-marker {
+  display: none;
+}
+.payload-block > summary:hover {
+  background: var(--surface-hover, var(--bg-hover));
+}
+.payload-block-caret {
+  display: inline-flex;
+  color: var(--text-faint);
+  transition: transform var(--transition-fast);
+}
+.payload-block[open] > summary .payload-block-caret {
+  transform: rotate(90deg);
+}
+.payload-block .payload-block-label {
+  margin-right: auto;
+  color: var(--text-dim);
+  font-weight: 560;
+}
+@media (prefers-reduced-motion: reduce) {
+  .payload-block-caret,
+  .payload-block > summary {
+    transition: none;
+  }
+}
+.payload-copy {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 1px 6px;
+  border: 1px solid var(--ui-line);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-faint);
+  font-size: var(--type-micro);
+  font-weight: 510;
+  cursor: pointer;
+  transition:
+    color var(--transition-fast),
+    border-color var(--transition-fast);
+}
+.payload-copy:hover {
+  color: var(--text-dim);
+  border-color: var(--border-strong, var(--ui-line));
+}
+.payload-copy.is-copied {
+  color: var(--green-text, var(--green));
+  border-color: color-mix(in srgb, var(--green) 40%, var(--ui-line));
+}
+.payload-copy:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+
+/* Run-summary card: the headline of the Steps surface — outcome, duration,
+   the one relevant result CTA, and (terminal) the final output. */
+.canvas-run-summary {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp2);
+  padding: var(--sp3);
+  margin-bottom: var(--sp3);
+  border: 1px solid var(--ui-line);
+  border-radius: var(--radius);
+  background: var(--surface-inset);
+}
+.canvas-run-summary-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp2);
+}
+.canvas-run-summary-status {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp1);
+  font-size: var(--type-meta);
+  font-weight: 600;
+}
+.canvas-run-summary-status.is-completed {
+  color: var(--green-text, var(--green));
+}
+.canvas-run-summary-status.is-failed {
+  color: var(--red-text, var(--red));
+}
+.canvas-run-summary-status.is-running {
+  color: var(--text);
+}
+.canvas-run-summary-status.is-cancelled {
+  color: var(--text-faint);
+}
+.canvas-run-summary-meta {
+  font-family: var(--font-mono);
+  font-size: var(--type-micro);
+  color: var(--text-dim);
+}
+.canvas-run-summary-target {
+  margin-left: auto;
+  font-size: var(--type-micro);
+  color: var(--text-faint);
+}
+/* Primary "Open result" CTA: a FILLED brand button — the produced artifact is
+   the payoff, so this is the one prominent control in the otherwise-flat card.
+   (--brand-ink IS correct here: light text on the brand green.) */
+.run-summary-open {
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp1);
+  min-height: var(--control-h-xs, 28px);
+  padding: 4px 12px;
+  border-radius: var(--radius-md, var(--radius));
+  background: var(--brand);
+  color: var(--brand-ink, #fff);
+  font-size: var(--type-meta);
+  font-weight: 590;
+  text-decoration: none;
+  transition: filter var(--transition-fast);
+}
+.run-summary-open svg {
+  flex: 0 0 auto;
+}
+.run-summary-open:hover {
+  filter: brightness(1.06);
+}
+.run-summary-open:active {
+  filter: brightness(0.96);
+}
+.run-summary-open:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .run-summary-open {
+    transition: none;
+  }
+}
+/* Secondary destinations — flat brand-green links under the primary. */
+.run-summary-secondary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp3);
+}
+.run-summary-secondary-link.status-tag-action {
+  color: var(--brand);
+}
+/* Final output gets a brand-tinted frame so it reads as the result, not a log. */
+.canvas-run-logs.canvas-run-result {
+  border: 1px solid color-mix(in srgb, var(--brand) 28%, var(--ui-line));
+  border-radius: var(--radius);
+  padding: var(--sp2) var(--sp2) var(--sp2) var(--sp2);
+  background: color-mix(in srgb, var(--brand) 4%, transparent);
+}
+.canvas-run-logs.canvas-run-result > summary .payload-block-label {
+  color: var(--text);
+  font-weight: 600;
+}
+
+/* Deploy banner: a deploy landing in the Steps surface — phase, then on ready
+   the dashboard + code CTAs. Reuses the .canvas-task-spinner while in flight. */
+.deploy-status-banner {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp2);
+  padding: var(--sp3);
+  margin-bottom: var(--sp3);
+  border: 1px solid var(--ui-line);
+  border-radius: var(--radius);
+  background: var(--surface-inset);
+}
+.deploy-status-banner.is-ready {
+  border-color: color-mix(in srgb, var(--green) 35%, var(--ui-line));
+  background: color-mix(in srgb, var(--green) 6%, transparent);
+}
+.deploy-status-banner.is-error {
+  border-color: color-mix(in srgb, var(--red, #e05a57) 35%, var(--ui-line));
+  background: color-mix(in srgb, var(--red, #e05a57) 6%, transparent);
+}
+.deploy-status-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp2);
+}
+.deploy-status-label {
+  font-size: var(--type-meta);
+  font-weight: 590;
+  color: var(--text);
+}
+.deploy-status-dismiss {
+  margin-left: auto;
+  display: inline-flex;
+  padding: 2px;
+  border: 0;
+  background: transparent;
+  color: var(--text-faint);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.deploy-status-dismiss:hover {
+  color: var(--text-dim);
+}
+.deploy-status-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp3);
+}
+.deploy-status-actions .status-tag-action {
+  color: var(--brand);
+  font-weight: 560;
+}
+
+/* Action button, RUN in progress: a brand pulse tied to the real run status,
+   distinct from the dashed [data-pending] hand-off ring. */
+.session-step[data-running] {
+  animation: session-step-running 1.4s ease-in-out infinite;
+}
+@keyframes session-step-running {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--brand) 42%, transparent);
+  }
+  50% {
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--brand) 22%, transparent);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .session-step[data-running] {
+    animation: none;
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--brand) 30%, transparent);
+  }
 }
 
 /* Steps subheader run chip: the flat .status-tag recipe — run truth is a

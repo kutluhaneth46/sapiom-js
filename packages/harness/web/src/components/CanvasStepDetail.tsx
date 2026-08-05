@@ -1,5 +1,5 @@
 import { useState } from "react";
-import type { JSX } from "react";
+import type { JSX, MouseEvent } from "react";
 import type { RunView, StepView, WorkflowInfo } from "@shared/types";
 import { stepIsStubbed, stubNotice } from "@shared/stub-feedback";
 
@@ -11,7 +11,8 @@ import {
   extractStepContext,
   extractStepLinks,
 } from "../lib/extract-step-context";
-import type { RunTarget } from "../lib/use-harness-state";
+import type { DeployProgress, RunTarget } from "../lib/use-harness-state";
+import { agentUrl } from "../lib/urls";
 import { Icon } from "./Icon";
 
 /**
@@ -34,6 +35,73 @@ function StubbedChip(): JSX.Element {
 }
 
 /**
+ * A labelled disclosure for a run payload (Input / Output / Logs / Result) with
+ * a Copy button — the one place these render, so every payload gets the same
+ * copy affordance. `text` is pre-stringified by the caller (formatPayload for
+ * JSON values, the raw string for logs). Copying reuses the SnippetPanel copy
+ * pattern (writeText → "Copied" for 1.5s, errors swallowed). The Copy button
+ * lives in the summary but stops the click from toggling the disclosure.
+ * Callers gate on `!== undefined` so honest-absence still holds (this only
+ * renders a payload that exists).
+ */
+function PayloadBlock({
+  label,
+  text,
+  testid,
+  copyTestid,
+  className,
+  defaultOpen = false,
+}: {
+  label: string;
+  text: string;
+  testid?: string;
+  copyTestid?: string;
+  className?: string;
+  defaultOpen?: boolean;
+}): JSX.Element {
+  const [copied, setCopied] = useState(false);
+  const copy = (event: MouseEvent<HTMLButtonElement>): void => {
+    // Don't let the button toggle the <details> it sits inside.
+    event.stopPropagation();
+    event.preventDefault();
+    void navigator.clipboard?.writeText(text).then(
+      () => {
+        setCopied(true);
+        window.setTimeout(() => setCopied(false), 1500);
+      },
+      () => {
+        /* clipboard blocked — silent, mirrors SnippetPanel */
+      },
+    );
+  };
+  return (
+    <details
+      className={"canvas-run-logs payload-block" + (className ? " " + className : "")}
+      data-testid={testid}
+      open={defaultOpen}
+    >
+      <summary>
+        <span className="payload-block-caret" aria-hidden="true">
+          <Icon name="ChevronRight" size={12} />
+        </span>
+        <span className="payload-block-label">{label}</span>
+        <button
+          type="button"
+          className={"payload-copy" + (copied ? " is-copied" : "")}
+          data-testid={copyTestid}
+          onClick={copy}
+          aria-label={`Copy ${label.toLowerCase()}`}
+        >
+          <Icon name={copied ? "Check" : "Copy"} size={11} />
+          {copied ? "Copied" : "Copy"}
+        </button>
+      </summary>
+      <pre>{text}</pre>
+    </details>
+  );
+}
+
+/**
  * "Links" block: scans the step's output, log slice, and call results for
  * http(s) URLs and renders them as clickable thumbnails (images) or labelled
  * anchor links (other URLs). Rendered in BOTH surfaces (inspector + full pane).
@@ -42,45 +110,324 @@ function StubbedChip(): JSX.Element {
  * All links open in a new tab: image URLs render as thumbnails, other URLs as
  * a labelled "Open" anchor.
  */
+/** The clickable list of extracted URLs — image URLs as thumbnails, others as
+ *  labelled "Open" anchors. Shared by the per-step links block and the run
+ *  summary's aggregated results, so both render links identically. */
+function LinksList({
+  links,
+  testid,
+}: {
+  links: ReturnType<typeof extractStepLinks>;
+  testid?: string;
+}): JSX.Element {
+  return (
+    <div className="canvas-links-list" data-testid={testid}>
+      {links.map(({ url, kind }) =>
+        kind === "image" ? (
+          <a
+            key={url}
+            href={url}
+            target="_blank"
+            rel="noreferrer"
+            className="canvas-link-thumb-wrap"
+            data-testid="canvas-link-image"
+          >
+            <img src={url} alt="" className="canvas-link-thumb" loading="lazy" />
+          </a>
+        ) : (
+          <a
+            key={url}
+            href={url}
+            target="_blank"
+            rel="noreferrer"
+            className="canvas-link-item"
+            data-testid="canvas-link-other"
+          >
+            <Icon name="ExternalLink" size={12} />
+            <span className="canvas-link-url">Open</span>
+          </a>
+        ),
+      )}
+    </div>
+  );
+}
+
 function StepLinksBlock({ step }: { step: StepView }): JSX.Element | null {
   const links = extractStepLinks(step);
   if (links.length === 0) return null;
   return (
     <section className="canvas-detail-section" data-testid="canvas-detail-links">
       <h4>Links</h4>
-      <div className="canvas-links-list">
-        {links.map(({ url, kind }) =>
-          kind === "image" ? (
-            <a
-              key={url}
-              href={url}
-              target="_blank"
-              rel="noreferrer"
-              className="canvas-link-thumb-wrap"
-              data-testid="canvas-link-image"
-            >
-              <img
-                src={url}
-                alt=""
-                className="canvas-link-thumb"
-                loading="lazy"
-              />
-            </a>
-          ) : (
-            <a
-              key={url}
-              href={url}
-              target="_blank"
-              rel="noreferrer"
-              className="canvas-link-item"
-              data-testid="canvas-link-other"
-            >
-              <Icon name="ExternalLink" size={12} />
-              <span className="canvas-link-url">Open</span>
-            </a>
-          ),
+      <LinksList links={links} />
+    </section>
+  );
+}
+
+/** The run-status glyph for the summary header — reuses the per-step status
+ *  vocabulary. `running` is the bare pulse dot; terminal states get an icon. */
+function RunStatusGlyph({ status }: { status: RunView["status"] }): JSX.Element {
+  if (status === "completed")
+    return (
+      <span className="canvas-run-status is-passed" aria-label="completed">
+        <Icon name="Check" size={11} />
+      </span>
+    );
+  if (status === "failed")
+    return (
+      <span className="canvas-run-status is-failed" aria-label="failed">
+        <Icon name="X" size={11} />
+      </span>
+    );
+  if (status === "cancelled")
+    return (
+      <span className="canvas-run-status is-pending" aria-label="cancelled">
+        <Icon name="Minus" size={11} />
+      </span>
+    );
+  return <span className="canvas-run-status is-running" aria-label="running" />;
+}
+
+/**
+ * The run's headline card at the top of the Steps surface: outcome, live
+ * progress while running, total duration, and the single most relevant "final
+ * data" CTA so the user doesn't have to scroll into a step to find the payoff.
+ * Result priority: the deployed agent's dashboard link → a running dev-server
+ * preview → any URLs the run produced (aggregated across steps) → the final
+ * step's output. Every part is honest-absence: duration only when a step
+ * reported latency, the output only once the run is terminal, links only when
+ * some exist — never a fabricated value.
+ */
+export function RunSummaryBlock({
+  run,
+  runTarget,
+  workflow,
+  preview,
+}: {
+  run: RunView;
+  runTarget: RunTarget | null;
+  workflow: WorkflowInfo | null;
+  preview: { port: number; url: string } | null;
+}): JSX.Element {
+  const total = run.steps.length;
+  const passed = run.steps.filter((s) => s.status === "passed").length;
+  const running = run.status === "running";
+  const durationMs = run.steps.reduce((sum, s) => sum + (s.latencyMs ?? 0), 0);
+  const hasDuration = run.steps.some((s) => s.latencyMs !== undefined);
+
+  // Aggregate every URL the run produced, deduped, so the results surface at the
+  // top instead of hiding inside a per-step disclosure.
+  const seen = new Set<string>();
+  const links: ReturnType<typeof extractStepLinks> = [];
+  for (const step of run.steps) {
+    for (const link of extractStepLinks(step)) {
+      if (seen.has(link.url)) continue;
+      seen.add(link.url);
+      links.push(link);
+    }
+  }
+
+  const finalOutputStep = [...run.steps].reverse().find((s) => s.output !== undefined);
+  const dashboardUrl = workflow?.definitionId != null ? agentUrl(workflow.definitionId) : null;
+
+  // The first produced URL is the run's payoff → the primary "Open result" CTA;
+  // any others drop to the secondary row. The dashboard link shows as secondary
+  // whenever it isn't already the primary (i.e. the run produced something).
+  const resultLink = links[0] ?? null;
+  const restLinks = resultLink ? links.slice(1) : [];
+  const secondaryDashboard = dashboardUrl != null && resultLink != null;
+
+  const statusLabel = running
+    ? `Running — ${passed} of ${total} step${total === 1 ? "" : "s"}`
+    : run.status === "completed"
+      ? "Completed"
+      : run.status === "failed"
+        ? "Failed"
+        : "Cancelled";
+
+  return (
+    <section className="canvas-run-summary" data-testid="run-summary">
+      <div className="canvas-run-summary-head">
+        <span
+          className={"canvas-run-summary-status is-" + run.status}
+          data-testid="run-summary-status"
+        >
+          <RunStatusGlyph status={run.status} />
+          {statusLabel}
+        </span>
+        {hasDuration && (
+          <span className="canvas-run-summary-meta" data-testid="run-summary-duration">
+            {formatTimeout(durationMs)}
+          </span>
+        )}
+        {runTarget && (
+          <span className="canvas-run-summary-target">{runKindLabel(runTarget)}</span>
         )}
       </div>
+
+      {/* The payoff CTA. What the run PRODUCED (its first result URL) is the
+          primary, prominent action; a deployed dashboard link and preview drop
+          to secondary. When the run produced nothing, the dashboard (or
+          preview) takes the primary slot so there's always a real destination. */}
+      {resultLink ? (
+        <a
+          className="run-summary-open"
+          data-testid="run-summary-open"
+          href={resultLink.url}
+          target="_blank"
+          rel="noreferrer"
+        >
+          <Icon name="ArrowUpRight" size={14} />
+          Open result
+        </a>
+      ) : preview ? (
+        <a
+          className="run-summary-open"
+          data-testid="run-summary-preview-link"
+          href={preview.url}
+          target="_blank"
+          rel="noreferrer"
+        >
+          <Icon name="ArrowUpRight" size={14} />
+          Open preview
+        </a>
+      ) : dashboardUrl ? (
+        <a
+          className="run-summary-open"
+          data-testid="run-summary-dashboard-link"
+          href={dashboardUrl}
+          target="_blank"
+          rel="noreferrer"
+          data-tooltip="Open this agent in the Sapiom dashboard"
+        >
+          <Icon name="Cloud" size={14} />
+          Open in Sapiom
+        </a>
+      ) : null}
+
+      {/* Secondary destinations — flat links beneath the primary CTA. */}
+      {(secondaryDashboard || preview || restLinks.length > 0) && (
+        <div className="run-summary-secondary">
+          {secondaryDashboard && (
+            <a
+              className="status-tag status-tag-action run-summary-secondary-link"
+              data-testid="run-summary-dashboard-link"
+              href={dashboardUrl!}
+              target="_blank"
+              rel="noreferrer"
+              data-tooltip="Open this agent in the Sapiom dashboard"
+            >
+              <Icon name="Cloud" size={12} />
+              Open in Sapiom
+            </a>
+          )}
+          {resultLink && preview && (
+            <a
+              className="status-tag status-tag-action run-summary-secondary-link"
+              data-testid="run-summary-preview-link"
+              href={preview.url}
+              target="_blank"
+              rel="noreferrer"
+            >
+              <Icon name="ExternalLink" size={12} />
+              Open preview
+            </a>
+          )}
+          {restLinks.length > 0 && <LinksList links={restLinks} testid="run-summary-links" />}
+        </div>
+      )}
+
+      {!running && finalOutputStep?.output !== undefined && (
+        <PayloadBlock
+          label="Result"
+          text={formatPayload(finalOutputStep.output)}
+          className="canvas-run-result"
+          testid="run-summary-output"
+          copyTestid="payload-copy-result"
+        />
+      )}
+    </section>
+  );
+}
+
+/**
+ * A deploy landing in the Steps surface, so Deploy reads as an ACTION with
+ * progress and a payoff (like a run) rather than a silent toast. Shows the live
+ * phase (linking → building) with a spinner, and on `ready` a completion banner
+ * with the dashboard link + a jump to the integration snippet ("Trigger from
+ * your code"). Dismissable; on error it surfaces the server's message.
+ */
+export function DeployStatusBanner({
+  deployState,
+  workflow,
+  onDismiss,
+  onOpenCode,
+}: {
+  deployState: DeployProgress;
+  workflow: WorkflowInfo | null;
+  onDismiss: () => void;
+  onOpenCode: () => void;
+}): JSX.Element {
+  const dashboardUrl = workflow?.definitionId != null ? agentUrl(workflow.definitionId) : null;
+  const inFlight = deployState.phase === "linking" || deployState.phase === "building";
+  const label =
+    deployState.phase === "linking"
+      ? "Creating the agent on Sapiom…"
+      : deployState.phase === "building"
+        ? "Deploying — building on Sapiom…"
+        : deployState.phase === "ready"
+          ? "Deployed to Sapiom"
+          : "Deploy failed";
+  return (
+    <section
+      className={"deploy-status-banner is-" + deployState.phase}
+      data-testid="deploy-status-banner"
+      data-phase={deployState.phase}
+    >
+      <div className="deploy-status-head">
+        {inFlight ? (
+          <span className="canvas-task-spinner" aria-hidden="true" />
+        ) : (
+          <RunStatusGlyph status={deployState.phase === "ready" ? "completed" : "failed"} />
+        )}
+        <span className="deploy-status-label">{label}</span>
+        <button
+          type="button"
+          className="deploy-status-dismiss"
+          data-testid="deploy-status-dismiss"
+          aria-label="Dismiss"
+          onClick={onDismiss}
+        >
+          <Icon name="X" size={12} />
+        </button>
+      </div>
+      {deployState.phase === "error" && deployState.message && (
+        <pre className="canvas-run-error">{deployState.message}</pre>
+      )}
+      {deployState.phase === "ready" && (
+        <div className="deploy-status-actions">
+          {dashboardUrl && (
+            <a
+              className="status-tag status-tag-action"
+              data-testid="deploy-open-dashboard"
+              href={dashboardUrl}
+              target="_blank"
+              rel="noreferrer"
+            >
+              <Icon name="Cloud" size={12} />
+              Open in Sapiom
+            </a>
+          )}
+          <button
+            type="button"
+            className="status-tag status-tag-action"
+            data-testid="deploy-open-code"
+            onClick={onOpenCode}
+          >
+            <Icon name="Code" size={12} />
+            Trigger from your code
+          </button>
+        </div>
+      )}
     </section>
   );
 }
@@ -368,10 +715,11 @@ export function RunStepsList({ run, target }: { run: RunView; target: RunTarget 
               <div className="canvas-step-expand">
                 {step.error && <pre className="canvas-run-error">{step.error}</pre>}
                 {step.logSlice && (
-                  <details className="canvas-run-logs">
-                    <summary>Logs</summary>
-                    <pre>{step.logSlice}</pre>
-                  </details>
+                  <PayloadBlock
+                    label="Logs"
+                    text={step.logSlice}
+                    copyTestid={`payload-copy-logs-${step.id}`}
+                  />
                 )}
               </div>
             )}
@@ -405,9 +753,9 @@ export function CanvasStepsList({
   runTarget,
   workflows,
   onOpenWorkflow,
+  onAskAgent,
   expandedId,
   onToggle,
-  onOpenDetail,
 }: {
   graph: CanvasGraph;
   /** The session's shown run; per-step status/latency render only
@@ -419,9 +767,11 @@ export function CanvasStepsList({
   /** Registry workflows — launched-workflow nodes link through to theirs. */
   workflows: WorkflowInfo[];
   onOpenWorkflow: (path: string) => void;
+  /** Sends a prompt to the terminal's coding agent (per-step actions in the
+   *  inline detail). */
+  onAskAgent: (text: string) => void;
   expandedId: string | null;
   onToggle: (id: string) => void;
-  onOpenDetail: (id: string) => void;
 }): JSX.Element {
   // Same validity rule as the board's group bands: a group referencing a
   // step that no longer exists is stale enrichment and renders nowhere, so
@@ -497,18 +847,16 @@ export function CanvasStepsList({
             </button>
             {open && (
               <div className="canvas-step-expand" data-testid={`canvas-step-expand-${node.id}`}>
-                {node.description && <p className="canvas-step-desc">{node.description}</p>}
-                <StepInputContract node={node} />
-                <StepCapabilities node={node} />
-                <StepTransitions graph={graph} node={node} />
-                <OpenLaunchedWorkflow node={node} workflows={workflows} onOpenWorkflow={onOpenWorkflow} />
-                <button
-                  className="canvas-step-open"
-                  data-testid={`canvas-step-open-${node.id}`}
-                  onClick={() => onOpenDetail(node.id)}
-                >
-                  Full details <Icon name="ArrowRight" size={12} />
-                </button>
+                {/* The full step detail lives HERE, inline — clicking a step
+                    opens it as a dropdown, not a separate slide-in view. */}
+                <CanvasStepDetail
+                  graph={graph}
+                  node={node}
+                  run={run}
+                  workflows={workflows}
+                  onOpenWorkflow={onOpenWorkflow}
+                  onAskAgent={onAskAgent}
+                />
               </div>
             )}
           </div>
@@ -528,14 +876,16 @@ interface CanvasStepDetailProps {
   /** Registry workflows — launched-workflow nodes link through to theirs. */
   workflows: WorkflowInfo[];
   onOpenWorkflow: (path: string) => void;
+  /** Sends a prompt to the terminal's coding agent — powers the per-step
+   *  "Ask coding agent" / "Ask to modify" actions. Absent = no actions row. */
+  onAskAgent?: (text: string) => void;
 }
 
 /**
- * Per-step drill-down BODY (its chrome — back, name, kind, actions — lives
- * in the canvas subheader; see WorkflowActionsHeader). Driven entirely by
- * the posted graph: the step's role and description, then its real
- * transitions — what it leads to (with branch condition / pause signal) and
- * what reaches it, shown as read-only lineage.
+ * Per-step detail, rendered INLINE inside the step's list-row dropdown (see
+ * CanvasStepsList) — the step's role and description, its per-step run IO/logs,
+ * capability calls, contract, and read-only lineage (what it leads to / what
+ * reaches it), plus a compact row of coding-agent actions.
  */
 export function CanvasStepDetail({
   graph,
@@ -543,6 +893,7 @@ export function CanvasStepDetail({
   run,
   workflows,
   onOpenWorkflow,
+  onAskAgent,
 }: CanvasStepDetailProps): JSX.Element {
   const runStep = runStepFor(run, node.id);
   const outgoing = graph.edges.filter((e) => e.from === node.id);
@@ -559,6 +910,48 @@ export function CanvasStepDetail({
           <p className="canvas-detail-groups">
             Part of {groups.map((g) => g.label).join(", ")}
           </p>
+        )}
+        {onAskAgent && (
+          <div className="canvas-detail-actions">
+            <button
+              type="button"
+              className="btn-ghost canvas-detail-ask"
+              data-testid="canvas-detail-ask"
+              data-tooltip="Ask the coding agent in the terminal"
+              onClick={() =>
+                onAskAgent(
+                  `Walk me through the "${node.label}" step of this agent: what it does, its inputs and outputs, and its transitions.`,
+                )
+              }
+            >
+              <Icon name="MessageSquare" size={13} />
+              Ask coding agent
+            </button>
+            <button
+              type="button"
+              className="btn-ghost"
+              data-testid="canvas-detail-modify"
+              data-tooltip="Ask the coding agent to change this step"
+              onClick={() =>
+                onAskAgent(
+                  `Modify the "${node.label}" step of this agent. Show me the step's code first, then propose the change.`,
+                )
+              }
+            >
+              <Icon name="Wand2" size={13} />
+              Ask to modify
+            </button>
+            <button
+              type="button"
+              className="btn-ghost"
+              data-testid="canvas-detail-copy-name"
+              data-tooltip="Copy the step name"
+              onClick={() => void navigator.clipboard?.writeText(node.label).catch(() => {})}
+            >
+              <Icon name="Copy" size={13} />
+              Copy name
+            </button>
+          </div>
         )}
         <OpenLaunchedWorkflow node={node} workflows={workflows} onOpenWorkflow={onOpenWorkflow} />
 
@@ -586,23 +979,28 @@ export function CanvasStepDetail({
                 Capability, not model: these are the step's own payloads, with
                 no provider/model surfaced anywhere. */}
             {runStep.input !== undefined && (
-              <details className="canvas-run-logs" data-testid={`canvas-detail-run-input-${node.id}`}>
-                <summary>Input</summary>
-                <pre>{formatPayload(runStep.input)}</pre>
-              </details>
+              <PayloadBlock
+                label="Input"
+                text={formatPayload(runStep.input)}
+                testid={`canvas-detail-run-input-${node.id}`}
+                copyTestid={`payload-copy-input-${node.id}`}
+              />
             )}
             {runStep.output !== undefined && (
-              <details className="canvas-run-logs" data-testid={`canvas-detail-run-output-${node.id}`}>
-                <summary>Output</summary>
-                <pre>{formatPayload(runStep.output)}</pre>
-              </details>
+              <PayloadBlock
+                label="Output"
+                text={formatPayload(runStep.output)}
+                testid={`canvas-detail-run-output-${node.id}`}
+                copyTestid={`payload-copy-output-${node.id}`}
+              />
             )}
             {runStep.error && <pre className="canvas-run-error">{runStep.error}</pre>}
             {runStep.logSlice && (
-              <details className="canvas-run-logs">
-                <summary>Logs</summary>
-                <pre>{runStep.logSlice}</pre>
-              </details>
+              <PayloadBlock
+                label="Logs"
+                text={runStep.logSlice}
+                copyTestid={`payload-copy-logs-${node.id}`}
+              />
             )}
           </section>
         )}
@@ -784,23 +1182,29 @@ export function CanvasStepInspector({
       {/* Per-step IO — same honest-absence gate as the full-pane detail:
           gated on !==undefined so null/false/0/"" still render. */}
       {runStep?.input !== undefined && (
-        <details className="canvas-run-logs" data-testid={`canvas-inspector-run-input-${node.id}`}>
-          <summary>Input</summary>
-          <pre>{formatPayload(runStep.input)}</pre>
-        </details>
+        <PayloadBlock
+          label="Input"
+          text={formatPayload(runStep.input)}
+          testid={`canvas-inspector-run-input-${node.id}`}
+          copyTestid={`payload-copy-input-${node.id}`}
+        />
       )}
       {runStep?.output !== undefined && (
-        <details className="canvas-run-logs" data-testid={`canvas-inspector-run-output-${node.id}`}>
-          <summary>Output</summary>
-          <pre>{formatPayload(runStep.output)}</pre>
-        </details>
+        <PayloadBlock
+          label="Output"
+          text={formatPayload(runStep.output)}
+          testid={`canvas-inspector-run-output-${node.id}`}
+          copyTestid={`payload-copy-output-${node.id}`}
+        />
       )}
       {runStep?.error && <pre className="canvas-run-error">{runStep.error}</pre>}
       {runStep?.logSlice && (
-        <details className="canvas-run-logs" data-testid={`canvas-inspector-run-logs-${node.id}`}>
-          <summary>Logs</summary>
-          <pre>{runStep.logSlice}</pre>
-        </details>
+        <PayloadBlock
+          label="Logs"
+          text={runStep.logSlice}
+          testid={`canvas-inspector-run-logs-${node.id}`}
+          copyTestid={`payload-copy-logs-${node.id}`}
+        />
       )}
       {/* Capability calls: local runs carry per-call stub traces; absent for
           prod runs — that is correct, not a bug. */}
