@@ -4,7 +4,7 @@ Agent Studio is a local workspace for building, testing, deploying, and running
 Sapiom agents with Claude Code or Codex.
 
 ```bash
-npx @sapiom/harness@latest [dir]
+npx @sapiom/agent-studio@latest [dir]
 ```
 
 The optional directory defaults to the current working directory. The command

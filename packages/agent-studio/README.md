@@ -13,14 +13,10 @@ Studio launch flag is passed through unchanged, including `--port`, `--login`,
 
 This package is the branded public launcher. It delegates to an exact,
 release-tested version of the `@sapiom/harness` implementation package; it does
-not contain a second copy of the application. The supported direct command
-continues to work:
-
-```bash
-npx @sapiom/harness@latest [dir]
-```
+not contain a second copy of the application. Use the branded Agent Studio
+command above for local setup.
 
 Agent Studio requires Node.js 20 or newer and at least one supported coding agent
-on `PATH`: Claude Code or Codex. The supported direct launch command and current
-setup requirements are documented at [Install Agent
+on `PATH`: Claude Code or Codex. The current setup requirements are documented
+at [Install Agent
 Studio](https://docs.sapiom.ai/agent-studio/install).
