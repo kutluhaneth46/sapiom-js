@@ -2,7 +2,7 @@
   "name": "@sapiom/harness-desktop",
   "version": "0.1.5",
   "private": true,
-  "description": "Agent Studio desktop app — a native workspace for building, testing, deploying, and running Sapiom agents with Claude Code.",
+  "description": "Agent Studio desktop app — a native workspace for building, testing, deploying, and running Sapiom agents with Claude Code or Codex.",
   "homepage": "https://sapiom.ai",
   "author": {
     "name": "Sapiom",

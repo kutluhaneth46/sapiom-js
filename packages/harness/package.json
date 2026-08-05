@@ -1,7 +1,7 @@
 {
   "name": "@sapiom/harness",
   "version": "0.2.7",
-  "description": "Agent Studio — a CLI-launched local workspace for building, testing, deploying, and running Sapiom agents with Claude Code.",
+  "description": "Agent Studio — a CLI-launched local workspace for building, testing, deploying, and running Sapiom agents with Claude Code or Codex.",
   "keywords": [
     "sapiom",
     "harness",

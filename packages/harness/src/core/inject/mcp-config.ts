@@ -2,17 +2,14 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { HARNESS_PATHS } from "../../shared/types.js";
 import { expandHome } from "../../cli/paths.js";
-import {
-  HOSTED_CAPABILITY_MCP_ALIAS,
-  LOCAL_AUTHORING_MCP_ALIAS,
-} from "../mcp-registration.js";
+import { CLOUD_MCP_ALIAS, PROJECT_MCP_ALIAS } from "../mcp-registration.js";
 
 export interface McpConfigOptions {
   /** SAPIOM_ENVIRONMENT to pass through to the local authoring child process. */
   environment?: string;
   /**
    * Cached Sapiom API key (from CLI auth), if signed in. Sent as
-   * `x-api-key` on the remote `sapiom-direct` MCP — empirically verified against
+   * `x-api-key` on the remote `sapiom-cloud` MCP — empirically verified against
    * api.sapiom.ai/v1/mcp (both `x-api-key` and `Authorization: Bearer` are
    * accepted for `sk_`-prefixed keys; `x-api-key` matches its CORS
    * allow-list order and needs no prefix formatting). Omitted entirely when
@@ -36,8 +33,8 @@ export interface McpConfigOptions {
 
 /**
  * Writes the `--mcp-config` file for a harness session: the remote HTTP
- * capability MCP (`sapiom-direct`) and the local stdio authoring MCP
- * (`sapiom`; wire identity `sapiom-dev`).
+ * Cloud MCP (`sapiom-cloud`) and the local stdio Project MCP
+ * (`sapiom-project`; wire identity `sapiom-dev`).
  * Written under `HARNESS_PATHS.generated/<harnessSessionId>/` so concurrent
  * sessions never share (or race on) a config file. Returns the file's
  * absolute path for the adapter to pass as `--mcp-config <path>`.
@@ -46,10 +43,14 @@ export async function generateMcpConfig(
   harnessSessionId: string,
   options: McpConfigOptions = {},
 ): Promise<string> {
-  const dir = path.join(expandHome(options.generatedRoot ?? HARNESS_PATHS.generated), harnessSessionId);
+  const dir = path.join(
+    expandHome(options.generatedRoot ?? HARNESS_PATHS.generated),
+    harnessSessionId,
+  );
   await fs.mkdir(dir, { recursive: true });
 
-  const sapiomEnvironment = options.environment ?? process.env.SAPIOM_ENVIRONMENT;
+  const sapiomEnvironment =
+    options.environment ?? process.env.SAPIOM_ENVIRONMENT;
   const devEnvEntries: Record<string, string> = {
     ...(sapiomEnvironment ? { SAPIOM_ENVIRONMENT: sapiomEnvironment } : {}),
     ...(options.harnessVersion
@@ -61,12 +62,12 @@ export async function generateMcpConfig(
 
   const config = {
     mcpServers: {
-      [HOSTED_CAPABILITY_MCP_ALIAS]: {
+      [CLOUD_MCP_ALIAS]: {
         type: "http",
         url: "https://api.sapiom.ai/v1/mcp",
         ...(options.apiKey ? { headers: { "x-api-key": options.apiKey } } : {}),
       },
-      [LOCAL_AUTHORING_MCP_ALIAS]: {
+      [PROJECT_MCP_ALIAS]: {
         command: "npx",
         // Pin the dist-tag (`@latest`) rather than the bare name so npx always
         // resolves the PUBLISHED package from the registry. A bare
@@ -83,8 +84,10 @@ export async function generateMcpConfig(
   };
 
   const filePath = path.join(dir, "mcp-config.json");
-  // May now carry a live API key (the `sapiom-direct` entry's headers) — restrict
+  // May now carry a live API key (the `sapiom-cloud` entry's headers) — restrict
   // to the owner, matching how ~/.sapiom/credentials.json is written.
-  await fs.writeFile(filePath, JSON.stringify(config, null, 2) + "\n", { mode: 0o600 });
+  await fs.writeFile(filePath, JSON.stringify(config, null, 2) + "\n", {
+    mode: 0o600,
+  });
   return filePath;
 }

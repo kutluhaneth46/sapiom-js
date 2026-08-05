@@ -56,12 +56,13 @@ The `approver` and client `email` fall back to `config.APPROVER_EMAIL` /
 `config.CLIENT_EMAIL` when omitted. Pass `dryRun: true` to run everything but skip
 the client email.
 
-## Run it with Claude + the Sapiom MCP
+## Run it with your coding agent + Sapiom Project MCP
 
-1. Add the MCP:
+1. Add Project MCP to Claude Code or Codex:
 
    ```bash
-   claude mcp add sapiom -- npx -y @sapiom/mcp
+   claude mcp add sapiom-project -- npx -y @sapiom/mcp
+   codex mcp add sapiom-project -- npx -y @sapiom/mcp
    ```
 
 2. In your client, authenticate: run `sapiom_authenticate`, then confirm with

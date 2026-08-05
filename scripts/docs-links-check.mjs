@@ -5,9 +5,13 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const REPOSITORY_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const DOCS_ORIGIN = "https://docs.sapiom.ai";
 const SUPPORTED_LOCAL_CLAUDE_COMMAND =
-  "claude mcp add sapiom -- npx -y @sapiom/mcp";
+  "claude mcp add sapiom-project -- npx -y @sapiom/mcp";
+const SUPPORTED_LOCAL_CODEX_COMMAND =
+  "codex mcp add sapiom-project -- npx -y @sapiom/mcp";
 const SUPPORTED_HOSTED_CLAUDE_COMMAND =
-  'claude mcp add --scope user --transport http sapiom-direct https://api.sapiom.ai/v1/mcp --header "x-api-key: $SAPIOM_API_KEY"';
+  'claude mcp add --scope user --transport http sapiom-cloud https://api.sapiom.ai/v1/mcp --header "x-api-key: $SAPIOM_API_KEY"';
+const SUPPORTED_HOSTED_CODEX_COMMAND =
+  "codex mcp add sapiom-cloud --url https://api.sapiom.ai/v1/mcp --bearer-token-env-var SAPIOM_API_KEY";
 /**
  * Public pages in the approved Docs.sapiom.ai information architecture.
  * Product source may link only to these canonical routes; redirects are for
@@ -162,22 +166,26 @@ export function validateDocsLinkContent(filePath, content) {
 
 export function validateSupportedMcpSetupContent(filePath, content) {
   const errors = [];
-  for (const match of content.matchAll(/claude mcp add[^\n]*/gi)) {
+  for (const match of content.matchAll(/(?:claude|codex) mcp add[^\n]*/gi)) {
     const command = match[0];
     const line = content.slice(0, match.index ?? 0).split("\n").length;
-    if (command.includes("@sapiom/mcp") && /\bsapiom-dev\b/.test(command)) {
+    if (
+      command.includes("@sapiom/mcp") &&
+      !/\bsapiom-project\b/.test(command) &&
+      !/\$\{PROJECT_MCP_ALIAS\}/.test(command)
+    ) {
       errors.push(
-        `${filePath}:${line} registers local @sapiom/mcp with the unsupported sapiom-dev client alias`,
+        `${filePath}:${line} registers local @sapiom/mcp without the supported sapiom-project client alias`,
       );
     }
     if (
       (/--transport\s+http/i.test(command) ||
+        /--url\s+https?:\/\/api\.sapiom\./i.test(command) ||
         /https?:\/\/api\.sapiom\./i.test(command)) &&
-      /\bsapiom\b/.test(command) &&
-      !/\bsapiom-direct\b/.test(command)
+      !/\bsapiom-cloud\b/.test(command)
     ) {
       errors.push(
-        `${filePath}:${line} registers the hosted MCP with the local sapiom client alias`,
+        `${filePath}:${line} registers Sapiom Cloud MCP without the supported sapiom-cloud client alias`,
       );
     }
   }
@@ -219,7 +227,9 @@ export function validateRepository(root = REPOSITORY_ROOT) {
   }
   for (const command of [
     SUPPORTED_LOCAL_CLAUDE_COMMAND,
+    SUPPORTED_LOCAL_CODEX_COMMAND,
     SUPPORTED_HOSTED_CLAUDE_COMMAND,
+    SUPPORTED_HOSTED_CODEX_COMMAND,
   ]) {
     if (!corpus.includes(command)) {
       throw new Error(

@@ -21,7 +21,7 @@ describe("createServerInfo", () => {
     expect(info.version).toBe("9.9.9");
     expect(info.description).toContain("tests agents locally");
     expect(info.description).toContain("authenticated cloud actions");
-    expect(info.description).toContain("hosted direct-capability MCP");
+    expect(info.description).toContain("Sapiom Cloud MCP");
     expect(info.description).not.toContain("unmetered");
     expect(info.description).not.toContain("makes no paid capability calls");
   });
@@ -32,7 +32,7 @@ describe("createServerInfo", () => {
       registryMetadata.description,
     ]) {
       expect(description).toContain("authenticated cloud actions");
-      expect(description).toContain("hosted direct-capability MCP");
+      expect(description).toContain("Sapiom Cloud MCP");
       expect(description).not.toContain("unmetered");
       expect(description).not.toContain("makes no paid capability calls");
     }

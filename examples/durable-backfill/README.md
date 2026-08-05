@@ -38,12 +38,13 @@ Input: `{ "total": 100000, "chunkSize": 5000, "jobId": "users-backfill", "dbHand
 With no `dbHandle` (or `dryRun` set), `process` counts each chunk in-process and
 skips the sandbox / database / file-storage calls.
 
-## Run it with Claude + the Sapiom MCP
+## Run it with your coding agent + Sapiom Project MCP
 
-1. Add the MCP:
+1. Add Project MCP to Claude Code or Codex:
 
    ```bash
-   claude mcp add sapiom -- npx -y @sapiom/mcp
+   claude mcp add sapiom-project -- npx -y @sapiom/mcp
+   codex mcp add sapiom-project -- npx -y @sapiom/mcp
    ```
 
 2. In your client, authenticate: run `sapiom_authenticate`, then confirm with

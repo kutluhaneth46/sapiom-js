@@ -60,8 +60,8 @@ test("rejects client aliases that collapse the two MCP surfaces", () => {
       ].join("\n"),
     ),
     [
-      "README.md:1 registers local @sapiom/mcp with the unsupported sapiom-dev client alias",
-      "README.md:2 registers the hosted MCP with the local sapiom client alias",
+      "README.md:1 registers local @sapiom/mcp without the supported sapiom-project client alias",
+      "README.md:2 registers Sapiom Cloud MCP without the supported sapiom-cloud client alias",
     ],
   );
   assert.deepEqual(
@@ -77,11 +77,20 @@ test("rejects client aliases that collapse the two MCP surfaces", () => {
 
 test("accepts the distinct supported local and hosted aliases", () => {
   const source = [
-    "claude mcp add sapiom -- npx -y @sapiom/mcp",
-    'claude mcp add --scope user --transport http sapiom-direct https://api.sapiom.ai/v1/mcp --header "x-api-key: $SAPIOM_API_KEY"',
+    "claude mcp add sapiom-project -- npx -y @sapiom/mcp",
+    "codex mcp add sapiom-project -- npx -y @sapiom/mcp",
+    'claude mcp add --scope user --transport http sapiom-cloud https://api.sapiom.ai/v1/mcp --header "x-api-key: $SAPIOM_API_KEY"',
+    "codex mcp add sapiom-cloud --url https://api.sapiom.ai/v1/mcp --bearer-token-env-var SAPIOM_API_KEY",
   ].join("\n");
 
   assert.deepEqual(validateSupportedMcpSetupContent("README.md", source), []);
+  assert.deepEqual(
+    validateSupportedMcpSetupContent(
+      "adapter.ts",
+      "`claude mcp add ${PROJECT_MCP_ALIAS} -- npx -y @sapiom/mcp`",
+    ),
+    [],
+  );
 });
 
 test("walks the whole product repository and skips only declared fixtures", () => {
@@ -99,8 +108,10 @@ test("walks the whole product repository and skips only declared fixtures", () =
         "https://docs.sapiom.ai/agents/quick-start",
         "https://docs.sapiom.ai/guides/connect-claude-code-with-mcp",
         "https://docs.sapiom.ai/reference/agent-studio",
-        "claude mcp add sapiom -- npx -y @sapiom/mcp",
-        'claude mcp add --scope user --transport http sapiom-direct https://api.sapiom.ai/v1/mcp --header "x-api-key: $SAPIOM_API_KEY"',
+        "claude mcp add sapiom-project -- npx -y @sapiom/mcp",
+        "codex mcp add sapiom-project -- npx -y @sapiom/mcp",
+        'claude mcp add --scope user --transport http sapiom-cloud https://api.sapiom.ai/v1/mcp --header "x-api-key: $SAPIOM_API_KEY"',
+        "codex mcp add sapiom-cloud --url https://api.sapiom.ai/v1/mcp --bearer-token-env-var SAPIOM_API_KEY",
       ].join("\n"),
     );
     writeFileSync(

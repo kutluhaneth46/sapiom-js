@@ -1,7 +1,7 @@
 {
   "name": "@sapiom/mcp",
   "version": "0.12.1",
-  "description": "Local Sapiom authoring MCP (wire identity sapiom-dev): scaffold and test agents locally, then link, deploy, and operate through authenticated cloud actions. Distinct from the hosted direct-capability MCP.",
+  "description": "Sapiom Project MCP (wire identity sapiom-dev): scaffold and test agents locally, then link, deploy, and operate through authenticated cloud actions. Distinct from Sapiom Cloud MCP.",
   "mcpName": "io.github.sapiom/mcp",
   "keywords": [
     "sapiom",

@@ -603,8 +603,9 @@ jobs:
             **Linux** — make the AppImage executable (`chmod +x Sapiom-Linux-x86_64.AppImage`) and
             run it, or install the `.deb` with `sudo apt install ./Sapiom-Linux-amd64.deb`.
 
-            On first launch Sapiom checks for Claude Code. If it is unavailable, Sapiom tries to
-            install Claude Code and shows manual setup steps if that fails. It reuses a cached
+            On first launch Sapiom checks for Claude Code or Codex. If neither is available,
+            Sapiom tries to install Claude Code and shows both manual setup options if that fails.
+            It reuses a cached
             Sapiom sign-in when present; otherwise it opens your browser to sign in, then prepares
             a workspace folder for you.
 

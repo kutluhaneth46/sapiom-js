@@ -1,56 +1,61 @@
-# The two Sapiom MCP servers
+# Sapiom MCP connections
 
-Sapiom has a local authoring MCP and a hosted direct-capability MCP. They are
-different surfaces. Keep their client aliases distinct:
+Sapiom has two MCP connections. Use **Project MCP** for work rooted in a local
+agent project and **Cloud MCP** for a direct cloud capability.
 
-|                | **Local authoring MCP**                                             | **Hosted capability MCP**                                                              |
-| -------------- | ------------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
-| Client alias   | `sapiom`                                                            | `sapiom-direct`                                                                        |
-| Implementation | `npx -y @sapiom/mcp` over stdio                                     | `https://api.sapiom.ai/v1/mcp` over HTTP                                               |
-| Wire identity  | `sapiom-dev`                                                        | Inspect the current MCP handshake                                                      |
-| Primary tools  | `sapiom_dev_*` authoring lifecycle plus authentication and feedback | Discover the current direct-capability inventory with `tools/list` and `tool_discover` |
-| Use it to…     | Build, check, test, deploy, run, and inspect an agent               | Call a hosted capability directly                                                      |
+|              | **Sapiom Project MCP**                                       | **Sapiom Cloud MCP**                         |
+| ------------ | ------------------------------------------------------------ | -------------------------------------------- |
+| Client alias | `sapiom-project`                                             | `sapiom-cloud`                               |
+| Connection   | `npx -y @sapiom/mcp` over stdio                              | `https://api.sapiom.ai/v1/mcp` over HTTP     |
+| Sign-in      | Browser sign-in begins at the first cloud project action     | API key required when the connection starts  |
+| Use it for   | Create, check, test, deploy, run, and inspect agent projects | Call an advertised cloud capability directly |
 
-The alias is client-local configuration. The local package continues to report
-`sapiom-dev` in its MCP handshake even though the supported registration alias
-is `sapiom`.
+These aliases label client configuration entries. They do not rename tools.
+Some MCP clients merge tools from all connections into one flat list, so do
+not use `sapiom_*` as a cloud-only allowlist: it also matches Project MCP's
+`sapiom_dev_*` lifecycle tools. Allow exact operations when the distinction is
+a security boundary.
 
-## Local authoring MCP
+## Sapiom Project MCP
 
-Register the published package in Claude Code:
-
-```sh
-claude mcp add sapiom -- npx -y @sapiom/mcp
-```
-
-The local server scaffolds agent projects, validates them, and runs them against
-local stubs. `scaffold`, `check`, and `run_local` do not require Sapiom
-authentication. Local Run creates no Sapiom capability request or spend, but it
-executes the agent's ordinary JavaScript, including its file, process, and
-network side effects.
-
-`link`, `deploy`, production `run`, inspection, schedules, and signals are
-authenticated cloud actions. A production run can make metered capability
-calls from the agent's `ctx.sapiom.*` step code.
-
-The server exposes authoring operations rather than duplicating every
-capability. Add capabilities to typed agent code through `@sapiom/tools`;
-use the hosted MCP only when a client needs to call a capability directly.
-
-## Hosted capability MCP
-
-Register the hosted endpoint under `sapiom-direct` so it can coexist with the
-local `sapiom` alias:
+Register the published package in the coding agent you use:
 
 ```sh
-export SAPIOM_API_KEY="your-api-key"
-claude mcp add --scope user --transport http sapiom-direct https://api.sapiom.ai/v1/mcp --header "x-api-key: $SAPIOM_API_KEY"
+claude mcp add sapiom-project -- npx -y @sapiom/mcp
 ```
 
-This configuration stores the expanded header value in the Claude Code MCP
-configuration. Do not share raw MCP server diagnostics. Discover the endpoint's
-current tools at runtime instead of relying on a fixed count.
+```sh
+codex mcp add sapiom-project -- npx -y @sapiom/mcp
+```
+
+Project MCP scaffolds agent projects, validates them, and runs them against
+local stubs. Creating, checking, and running locally do not require Sapiom
+authentication. Local Run creates no Sapiom capability request or spend, but
+it executes ordinary project code, including file, process, and network side
+effects.
+
+Linking, deploying, production runs, inspection, schedules, and signals are
+authenticated cloud actions. Ask the coding agent to connect your Sapiom
+account when you first cross that boundary.
+
+## Sapiom Cloud MCP
+
+Create an API key in Sapiom settings and expose it as `SAPIOM_API_KEY`, then
+register the hosted endpoint:
+
+```sh
+claude mcp add --scope user --transport http sapiom-cloud https://api.sapiom.ai/v1/mcp --header "x-api-key: $SAPIOM_API_KEY"
+```
+
+```sh
+codex mcp add sapiom-cloud --url https://api.sapiom.ai/v1/mcp --bearer-token-env-var SAPIOM_API_KEY
+```
+
+Claude Code stores the expanded header value in its MCP configuration; do not
+share raw diagnostics. Codex stores the environment-variable name, so make the
+variable available to the process that launches Codex. Ask either client for
+the outcome you want and let it discover the current cloud catalog.
 
 For maintained public setup and boundary guidance, read
-[Connect Claude Code with MCP](https://docs.sapiom.ai/guides/connect-claude-code-with-mcp)
-and [Hosted capability MCP](https://docs.sapiom.ai/integration/mcp-servers/remote).
+[Connect your coding agent](https://docs.sapiom.ai/guides/connect-claude-code-with-mcp)
+and [Sapiom Cloud MCP](https://docs.sapiom.ai/integration/mcp-servers/remote).

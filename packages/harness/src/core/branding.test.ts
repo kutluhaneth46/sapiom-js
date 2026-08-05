@@ -47,9 +47,10 @@ describe("Agent Studio public metadata", () => {
       launcherPackage,
     ]) {
       expect(packageMetadata.description).toContain("Sapiom agents");
-      expect(packageMetadata.description).toMatch(/Claude Code|coding agent/);
-      expect(packageMetadata.description).not.toMatch(/Codex/i);
+      expect(packageMetadata.description).toMatch(/coding agent|Claude Code/);
     }
+    expect(harnessPackage.description).toContain("Claude Code or Codex");
+    expect(desktopPackage.description).toContain("Claude Code or Codex");
   });
 
   it("preserves package, binary, desktop, artifact, and updater identities", () => {

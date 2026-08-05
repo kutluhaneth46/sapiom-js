@@ -1,24 +1,25 @@
 # Agent Studio
 
 Agent Studio is a local workspace for building, testing, deploying, and running
-Sapiom agents with Claude Code.
+Sapiom agents with Claude Code or Codex.
 
 ```bash
 npx @sapiom/harness@latest [dir]
 ```
 
 The optional directory defaults to the current working directory. The command
-requires Node.js 20 or newer and Claude Code on `PATH`; it reports environment
-checks, starts a token-protected loopback server, and opens the complete local
-URL in your browser. It does not install Claude Code, require Sapiom sign-in, or
-start a coding-agent session automatically. Sign in before the first cloud
-action, then choose a folder or template when you are ready to start a session.
+requires Node.js 20 or newer and at least one supported coding agent on `PATH`:
+Claude Code or Codex. It reports environment checks, starts a token-protected
+loopback server, and opens the complete local URL in your browser. It does not
+install a coding agent, require Sapiom sign-in, or start a coding-agent session
+automatically. Sign in before the first cloud action, then choose a folder or
+template when you are ready to start a session.
 
 ## What you get
 
-- **Terminal sessions** — Claude Code runs on your machine and subscription.
-  Studio can manage multiple sessions and resume only when the recorded Claude
-  conversation is still available.
+- **Terminal sessions** — Claude Code or Codex runs on your machine and account.
+  Studio can manage multiple sessions and resume only when the coding agent's
+  recorded conversation is still available.
 - **Agents rail** — agent projects (`sapiom.json`) discovered and
   tracked, with direct Local Run, Deploy, production run, and
   open-in-Sapiom actions.
@@ -40,7 +41,7 @@ opt-in. Product interaction analytics are a separate setting. Normalized
 events are written locally whether remote sharing is enabled or not.
 
 Removing `~/.sapiom/harness` removes Harness-owned global state only. It does
-not remove project `.sapiom/` directories, shared credentials, or Claude Code
+not remove project `.sapiom/` directories, shared credentials, or coding-agent
 history. Read [Install Agent Studio](https://docs.sapiom.ai/agent-studio/install),
 [Account and privacy](https://docs.sapiom.ai/agent-studio/account-and-privacy),
 and the [CLI and files reference](https://docs.sapiom.ai/reference/agent-studio)

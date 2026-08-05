@@ -6,6 +6,7 @@
     "sapiom",
     "agent-studio",
     "claude",
+    "codex",
     "agents"
   ],
   "homepage": "https://github.com/sapiom/sapiom-js/tree/main/packages/agent-studio#readme",

@@ -1,15 +1,15 @@
 # @sapiom/mcp
 
 The **local authoring** MCP server for Sapiom. It runs on your machine over
-stdio and should be registered under the supported client alias `sapiom`; its
+stdio and should be registered under the supported client alias `sapiom-project`; its
 MCP handshake reports the internal wire identity `sapiom-dev`. Its
 `sapiom_dev_*` tools let a coding agent scaffold, test, deploy, and inspect
 Sapiom agents.
 
 > **Not the capability surface.** This is _not_ the remote "Sapiom" MCP (the
 > hosted connector with `sapiom_sandbox_*`, scrape, search, … capability tools).
-> Use `sapiom` for this local authoring connection and `sapiom-direct` for the
-> hosted capability connection. The local server exposes no direct capability
+> Use `sapiom-project` for this project connection and `sapiom-cloud` for the
+> hosted cloud connection. The project server exposes no direct capability
 > tools. Check and Local Run use no Sapiom capability spend, but authored code
 > and its ordinary side effects still run. Deploys, cloud builds, production
 > runs, signals, and schedules operate Sapiom cloud state and may be metered. See
@@ -17,14 +17,18 @@ Sapiom agents.
 
 ## Install
 
-No global install is required. In Claude Code:
+No global install is required. Register Project MCP in the coding agent you use:
 
 ```sh
-claude mcp add sapiom -- npx -y @sapiom/mcp
+claude mcp add sapiom-project -- npx -y @sapiom/mcp
 ```
 
-The registration alias is `sapiom`; the package's MCP handshake still reports
-the server identity `sapiom-dev`.
+```sh
+codex mcp add sapiom-project -- npx -y @sapiom/mcp
+```
+
+The registration alias is `sapiom-project`; the package's MCP handshake still
+reports the server identity `sapiom-dev`.
 
 ## Configuration
 
@@ -32,7 +36,7 @@ The server targets the `production` environment by default. Register a
 staging-specific local server with:
 
 ```sh
-claude mcp add sapiom -e SAPIOM_ENVIRONMENT=staging -- npx -y @sapiom/mcp
+claude mcp add sapiom-project -e SAPIOM_ENVIRONMENT=staging -- npx -y @sapiom/mcp
 ```
 
 - `production` (alias `prod`) → `app.sapiom.ai` / `api.sapiom.ai` — the default.
@@ -90,7 +94,7 @@ coding agents, search, storage, content generation — through
 [`@sapiom/tools`](../tools) (`ctx.sapiom.*`). `run_local` resolves those calls
 from stubs; deploy and production run cross into authenticated cloud operations
 and can be metered. This MCP never grows a per-capability tool of its own —
-capabilities live in `@sapiom/tools` and the hosted `sapiom-direct` MCP. See
+capabilities live in `@sapiom/tools` and the hosted `sapiom-cloud` MCP. See
 [the positioning doc](../../docs/mcp-servers.md) for the full policy.
 
 ## Sending feedback
