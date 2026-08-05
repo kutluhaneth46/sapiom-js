@@ -27,8 +27,9 @@ team. Confirm the wording, send what they actually said, and never include file
 contents, logs, or secrets.
 
 **The authoring loop, in order:** scaffold a new agent project → check
-(bundle + manifest + step-graph validation, offline) → run_local (your real
-step code against stub capabilities, no cost) → link (associate the project
+(typecheck + bundle/import + manifest + step-graph validation; no Sapiom account)
+→ run_local (your real step code with ctx.sapiom.* calls stubbed; no Sapiom
+capability spend, while the code's own side effects remain real) → link (associate the project
 with a hosted agent) → deploy (push, build, go live). Read a project's
 AGENTS.md before touching its steps — it documents that project's specifics.
 
