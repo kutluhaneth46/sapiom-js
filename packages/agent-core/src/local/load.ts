@@ -48,6 +48,9 @@ export async function loadDefinition(
       await esbuild.build({
         entryPoints: [entryFile],
         outfile: bundlePath,
+        // Diagnostics stay project-relative regardless of who called us — see
+        // check.ts, where the caller's cwd is a package deep under the app.
+        absWorkingDir: path.resolve(sourceDir),
         bundle: true,
         platform: "node",
         target: "node20",

@@ -4,11 +4,22 @@
  * were never installed) into a one-line "run npm install" instruction, while
  * leaving every other bundle failure's message untouched.
  */
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { describeBundleFailure } from "./bundle-error";
+
+/** Permission bits don't deny root, so the unreadable-directory case can only
+ *  be staged as an unprivileged user (and not on Windows at all). */
+const canDenyReads =
+  process.platform !== "win32" && (process.getuid?.() ?? 0) !== 0;
 
 describe("describeBundleFailure", () => {
   let dir: string;
@@ -63,6 +74,49 @@ describe("describeBundleFailure", () => {
 
     expect(hint).not.toContain("Dependencies are not installed");
     expect(hint).toBe('index.ts:3:5: ERROR: Expected ";" but found "const"');
+  });
+
+  (canDenyReads ? it : it.skip)(
+    "names an unreadable project directory instead of blaming dependencies",
+    () => {
+      // esbuild reports exactly this pair when it can't list the project: the
+      // entry point itself becomes unresolvable. `node_modules` is present, but
+      // unreadable — the shape that made the old probe answer "not installed".
+      mkdirSync(path.join(dir, "node_modules"));
+      const project = path.join(dir, "agent");
+      mkdirSync(project);
+      writeFileSync(path.join(project, "index.ts"), "export {};");
+      chmodSync(project, 0o111); // traversable, not listable
+      const esbuildErr = new Error(
+        "Build failed with 2 errors:\n" +
+          `error: Cannot read directory "../../${path.basename(dir)}/agent": permission denied\n` +
+          `error: Could not resolve "${path.join(project, "index.ts")}"`,
+      );
+
+      try {
+        const hint = describeBundleFailure(project, esbuildErr);
+
+        expect(hint).not.toContain("Dependencies are not installed");
+        expect(hint).toContain(project);
+        expect(hint).toContain("permission denied");
+        // Raw esbuild detail still available for anyone debugging.
+        expect(hint).toContain("Cannot read directory");
+      } finally {
+        chmodSync(project, 0o755);
+      }
+    },
+  );
+
+  it("names a project directory that no longer exists", () => {
+    const gone = path.join(dir, "moved-away");
+
+    const hint = describeBundleFailure(
+      gone,
+      new Error('error: Could not resolve "@sapiom/agent"'),
+    );
+
+    expect(hint).not.toContain("Dependencies are not installed");
+    expect(hint).toContain(`${gone} no longer exists`);
   });
 
   it("stringifies a non-Error thrown value", () => {

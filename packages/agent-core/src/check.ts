@@ -161,6 +161,12 @@ export async function check(opts: CheckOptions): Promise<CheckResult> {
       await esbuild.build({
         entryPoints: [entryFile],
         outfile: bundlePath,
+        // esbuild pretty-prints every path in a diagnostic relative to its
+        // working directory, which is the CALLER's cwd — for the Studio Canvas
+        // that is the harness package root, so a project error arrived as
+        // `../../../../../Users/me/agents/x/index.ts`. Anchor it to the project
+        // instead and the same message reads `index.ts`.
+        absWorkingDir: sourceDir,
         bundle: true,
         platform: "node",
         target: "node20",
