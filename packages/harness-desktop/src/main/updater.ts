@@ -33,7 +33,7 @@ import { BrowserWindow, app, dialog, ipcMain } from "electron";
 // CJS: default-import then read the property. See trap 1 above.
 import electronUpdater from "electron-updater";
 import type { UpdateInfo } from "electron-updater";
-import { UPDATE_CHECK, type UpdateCheckOutcome } from "./ipc.js";
+import { UPDATE_CHECK, UPDATE_STATE, type UpdateCheckOutcome, type UpdateStatePayload } from "./ipc.js";
 // Shared with the folder-picker channel — the "only the SPA at `/` may ask" rule
 // lives in one place rather than being copied per privileged channel.
 import { isTrustedSender } from "./trusted-sender.js";
@@ -121,6 +121,39 @@ let checkInFlight: Promise<UpdateCheckOutcome> | null = null;
  * for Squirrel.Mac's staging step, not a guess at a happy path.
  */
 const HANDOFF_GRACE_MS = 15 * 1_000;
+
+/**
+ * Tell the SPA whether its "Update now" card should exist — the state that
+ * mirrors `pending`. Push-only (see UPDATE_STATE in ipc.ts): the card's click
+ * comes back through the existing UPDATE_CHECK invoke, so this adds no
+ * privileged surface. Called on `update-downloaded`, on a failed apply (to
+ * retract), and on every `did-finish-load` so a reloaded page re-learns what
+ * the main process still knows.
+ */
+function pushUpdateState(): void {
+  const win = host?.mainWindow;
+  if (!win || win.isDestroyed()) return;
+  const payload: UpdateStatePayload = pending
+    ? { kind: "downloaded", version: pending.version }
+    : { kind: "none" };
+  // Rare and load-bearing when a user reports "the card never shows" — same
+  // rationale as every other line this module logs.
+  log(`card state → ${payload.kind === "downloaded" ? payload.version : "none"}`);
+  win.webContents.send(UPDATE_STATE, payload);
+}
+
+/**
+ * Dev-only preview twin of SAPIOM_PREVIEW_UPDATE_WINDOW (see index.ts): fake a
+ * downloaded update so the rail's "Update now" card can be eyeballed without a
+ * real release. Only `version` is ever read off `pending` on this path (the
+ * card push and the on-demand check's `downloaded` answer), so the sparse cast
+ * is honest — and clicking the card in an unpackaged build answers `disabled`,
+ * which is the truth. Never called outside the devMode gate.
+ */
+export function previewDownloadedUpdateCard(version: string): void {
+  pending = { version } as UpdateInfo;
+  pushUpdateState();
+}
 
 /**
  * Hand off to the platform installer, having first closed the harness server.
@@ -258,6 +291,10 @@ async function offerUpdate(info: UpdateInfo, deps: UpdaterDeps): Promise<void> {
         pending = null;
         if (active) active.autoUpdater.autoInstallOnAppQuit = false;
       }
+      // A skip also retracts the rail's "Update now" card — it mirrors
+      // `pending`, and "skip this version" means exactly "stop showing me
+      // ways back to it".
+      pushUpdateState();
       return;
     }
     if (choice !== "restart") {
@@ -273,6 +310,9 @@ async function offerUpdate(info: UpdateInfo, deps: UpdaterDeps): Promise<void> {
       // case, which is exactly what the message needs to tell them. The rare
       // failure stays a native dialog — an OK-only acknowledgement.
       pending = null;
+      // The SPA's card mirrors `pending` — retract it, or it wedges on a
+      // "ready to install" that can never install.
+      pushUpdateState();
       await dialog.showMessageBox(deps.mainWindow, {
         type: "warning",
         buttons: ["OK"],
@@ -306,13 +346,13 @@ export async function checkForUpdatesNow(): Promise<UpdateCheckOutcome> {
   // Asking is undeclining — and it has to happen BEFORE the `pending` shortcut
   // below, or it never happens in the one case that matters: choosing "Later"
   // sets `pending`, so returning early would leave the version declined for the
-  // rest of the run and the native prompt would never come back.
+  // rest of the run and the update prompt would never come back.
   declined.clear();
   // ...and un-skip: an explicit ask is the user reconsidering, so a version they
   // chose "Skip this version" for is offered again too.
   await clearSkippedVersions(updatePrefsFile());
   // Something already downloaded and waiting to be applied: report that instead of
-  // asking GitHub again, and RE-RAISE the native prompt. That prompt is the only
+  // asking GitHub again, and RE-RAISE the update window. That window is the only
   // way to actually apply an update — the SPA has no restart channel, by design —
   // and it already carries the wording that matters ("this ends running agent
   // sessions"). Re-offering here is what `declined.clear()` above exists for: a
@@ -376,6 +416,10 @@ export function initUpdater(deps: UpdaterDeps): void {
   // — so skipping registration for a build with updates disabled would turn a
   // clear "updates are off in this build" into an opaque renderer-side error.
   registerHandlers();
+  // Also regardless of the gate: a reload wipes renderer state but not
+  // `pending`, so every finished load re-learns the current update state (an
+  // honest `none` when updates are off — the card simply never appears).
+  deps.mainWindow.webContents.on("did-finish-load", pushUpdateState);
   try {
     startUpdater(deps);
   } catch (err) {
@@ -462,8 +506,27 @@ function startUpdater(deps: UpdaterDeps): void {
     // on disk and applying it is a restart away — which is what the SPA's button
     // needs to know to say "restart" instead of "up to date".
     pending = info;
-    void offerUpdate(info, deps).catch((err: unknown) => {
-      log(`failed to apply ${info.version}: ${err instanceof Error ? err.message : String(err)}`);
+    void (async () => {
+      // A persisted skip is honored BEFORE anything becomes visible: no rail
+      // card, no prompt (offerUpdate re-checks, but by then the card would
+      // already be up), and no silent install of the very version the user
+      // refused — with the staged artifact left as `pending` under an ON
+      // auto-install toggle, the next ordinary quit would apply it.
+      const prefs = await loadUpdatePrefs(updatePrefsFile());
+      if (prefs.skippedVersions.includes(info.version)) {
+        log(`skipping ${info.version} (user chose Skip this version)`);
+        if (pending?.version === info.version) pending = null;
+        autoUpdater.autoInstallOnAppQuit = false;
+        pushUpdateState();
+        return;
+      }
+      // The rail's "Update now" card appears now and OUTLIVES the prompt
+      // below: a user who chooses "Later" keeps a visible way back to the
+      // restart.
+      pushUpdateState();
+      await offerUpdate(info, deps);
+    })().catch((err: unknown) => {
+      log(`failed to offer ${info.version}: ${err instanceof Error ? err.message : String(err)}`);
     });
   });
   autoUpdater.on("error", (err) => {

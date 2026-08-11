@@ -38,6 +38,12 @@ export interface DeepLinkTemplateTarget {
   slug?: string;
 }
 
+/** Downloaded-update state pushed by the desktop app (mirrors its
+ *  `UpdateStatePayload`). `none` retracts the rail's "Update now" card. */
+export type UpdateStatePayload =
+  | { kind: "none" }
+  | { kind: "downloaded"; version: string };
+
 /** Result of an on-demand update check. Mirrors the desktop app's `UpdateCheckOutcome`. */
 export type UpdateCheckOutcome =
   | { kind: "available"; version: string }
@@ -68,9 +74,18 @@ export interface DesktopBridge {
    * `agent=` load-URL param (see `deep-link.ts`), not this channel.
    */
   onDeepLink?: (callback: (target: DeepLinkTarget) => void) => () => void;
-  // No restart method: applying an update is confirmed by a native dialog in the
-  // desktop app, so page code — which shares an origin with agent-authored files
-  // the harness serves — has no way to end a user's sessions.
+  /**
+   * Subscribe to downloaded-update state (main → renderer push); returns an
+   * unsubscribe fn. Drives the rail's "Update now" card: the desktop preload
+   * buffers the latest push and replays it on subscribe (the load-time re-push
+   * lands before mount effects run), so subscribing at mount is the whole
+   * protocol. Optional for the usual reason — older desktop builds don't
+   * expose it, and a browser has no bridge; the card then never renders.
+   */
+  onUpdateState?: (callback: (state: UpdateStatePayload) => void) => () => void;
+  // No restart method: applying an update is confirmed in the desktop app's own
+  // main-process-owned update window, so page code — which shares an origin with
+  // agent-authored files the harness serves — has no way to end a user's sessions.
 }
 
 declare global {
@@ -112,6 +127,9 @@ export function getDesktopBridge(host: DesktopHost | undefined = defaultHost()):
     // Optional for the same reason: an older desktop build (or a browser) simply
     // never delivers a warm deep link, and cold links still ride the load-URL param.
     onDeepLink: typeof bridge.onDeepLink === "function" ? bridge.onDeepLink : undefined,
+    // Optional again: with no subscription there is no update state, so the
+    // "Update now" card simply never appears on an older desktop build.
+    onUpdateState: typeof bridge.onUpdateState === "function" ? bridge.onUpdateState : undefined,
   };
 }
 
