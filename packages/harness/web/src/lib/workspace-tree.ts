@@ -1,5 +1,7 @@
 import type { HarnessSession, WorkflowInfo } from "@shared/types";
 
+import { basenameOf, isWithinDir } from "./paths";
+
 /**
  * One agent (workflow) node in the rail. The rail is an EXPLORER of what
  * exists on disk: workspace folders and the agents (sapiom.json) inside them.
@@ -68,11 +70,12 @@ export interface WorkspaceTree {
   orphanAgents: AgentNode[];
 }
 
-const basename = (path: string): string => path.split("/").filter(Boolean).pop() ?? path;
+const basename = basenameOf;
 /** Segment-aware containment — a bare prefix check would put /a/scratch-2
- *  under /a/scratch. Exported for the palette's agent-recency derivation. */
-export const isUnder = (childPath: string, cwd: string): boolean =>
-  childPath === cwd || childPath.startsWith(`${cwd}/`);
+ *  under /a/scratch. Separator-insensitive on both sides, so a Windows path
+ *  matches its native spelling. Exported for the palette's agent-recency
+ *  derivation. */
+export const isUnder = (childPath: string, cwd: string): boolean => isWithinDir(cwd, childPath);
 
 // Agent rows have no recency signal (WorkflowInfo carries no timestamp), so
 // "recent" cannot order them — it falls back to a stable path sort. Only the

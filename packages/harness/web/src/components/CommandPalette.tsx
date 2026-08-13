@@ -15,6 +15,7 @@ import type { PaletteAction, PaletteFilter, PaletteItem, PaletteTemplate } from 
 import type { SessionNameOverrides } from "../lib/session-name";
 import { STARTER_TEMPLATES } from "../lib/templates";
 import { useTabIndicator } from "../lib/use-tab-indicator";
+import { looksAbsolutePath } from "../lib/paths";
 import { Icon } from "./Icon";
 
 interface CommandPaletteProps {
@@ -158,7 +159,9 @@ export function CommandPalette({
     };
   }, [listTemplates]);
 
-  const looksLikePath = query.startsWith("/") || query.startsWith("~");
+  // looksAbsolutePath, not a two-prefix check: a Windows user types "C:\\…",
+  // which the SPA must recognize as a path (see lib/paths.ts).
+  const looksLikePath = looksAbsolutePath(query);
 
   useEffect(() => {
     if (!looksLikePath) {

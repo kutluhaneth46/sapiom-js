@@ -25,6 +25,8 @@ import { promisify } from "node:util";
 import { CLAUDE_INSTALL_COMMAND } from "@sapiom/harness";
 import {
   SAPIOM_CLI_PACKAGE,
+  SAPIOM_MCP_PACKAGE,
+  npmInstallEnv,
   shouldInstallSapiomCli,
   type SapiomCliDecision,
 } from "./install-policy.js";
@@ -141,6 +143,17 @@ export function installSapiomCli(
 }
 
 /**
+ * Install the local sapiom-dev MCP server package into the same prefix, so
+ * sessions can launch it via the app binary (Electron-as-Node) instead of
+ * `npx` — see mcp-install.ts for why. Same non-fatal contract as the CLI.
+ */
+export function installSapiomMcp(
+  onLine: (line: string) => void,
+): Promise<InstallResult> {
+  return installNpmGlobal(SAPIOM_MCP_PACKAGE, onLine);
+}
+
+/**
  * Is `sapiom` already on PATH, and where?
  *
  * Shells `which`/`where` — the same mechanism `harness/src/cli/doctor.ts` uses for
@@ -153,7 +166,7 @@ export function installSapiomCli(
 async function whichSapiom(): Promise<string | null> {
   const exec = promisify(execFile);
   try {
-    const { stdout } = await exec(isWindows ? "where" : "which", ["sapiom"]);
+    const { stdout } = await exec(isWindows ? "where" : "which", ["sapiom"], { windowsHide: true });
     return stdout.trim().split("\n")[0]?.trim() || null;
   } catch {
     return null;
@@ -206,12 +219,17 @@ function installNpmGlobal(
     "--loglevel=info",
   ];
 
+  // See npmInstallEnv: ELECTRON_RUN_AS_NODE on, the host's esbuild pin OFF —
+  // the pin inheriting into npm's postinstalls tore @sapiom/mcp installs.
+  const env = npmInstallEnv(process.env);
+
   return new Promise<InstallResult>((resolve) => {
     let child;
     try {
       child = spawn(process.execPath, args, {
-        env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
+        env,
         stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);

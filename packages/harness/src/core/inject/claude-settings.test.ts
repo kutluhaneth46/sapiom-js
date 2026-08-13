@@ -56,7 +56,7 @@ describe("generateClaudeSettings", () => {
     expect(command).not.toBe(`node ${emitScriptPath} SessionStart`);
   });
 
-  it("writes a self-contained CommonJS emit.cjs with no requires", async () => {
+  it("writes a self-contained CommonJS emit.cjs — node builtins only", async () => {
     const { emitScriptPath } = await generateClaudeSettings({
       harnessSessionId: "session-abc",
       generatedRoot: tmpDir,
@@ -64,12 +64,47 @@ describe("generateClaudeSettings", () => {
 
     const source = await fs.readFile(emitScriptPath, "utf8");
     expect(source).toContain('"use strict"');
-    expect(source).not.toMatch(/require\(/);
+    // The real invariant: the script runs from an arbitrary user project with
+    // no node_modules resolvable, so every require must be a `node:` builtin.
+    for (const match of source.matchAll(/require\(([^)]*)\)/g)) {
+      expect(match[1]).toMatch(/^"node:[a-z/]+"$/);
+    }
     expect(source).not.toMatch(/^import /m);
     expect(source).toContain("process.env.SAPIOM_HARNESS_INGEST_URL");
     expect(source).toContain("process.env.SAPIOM_HARNESS_INGEST_TOKEN");
     expect(source).toContain("process.env.SAPIOM_HARNESS_SESSION_ID");
     expect(source).toContain("AbortController");
+  });
+
+  it("budgets the ready-signal POST generously and every other hook tightly", async () => {
+    // 200ms abort / 1s hard-stop raced a cold ConPTY boot and the SessionStart
+    // POST — the only signal that flips a session to "ready" — silently lost,
+    // so the held first prompt was dropped. But the agent BLOCKS on every
+    // hook's exit, so the relaxed budget must NOT apply to the per-tool-call
+    // analytics events (PreToolUse/PostToolUse fire dozens of times a turn).
+    const { emitScriptPath } = await generateClaudeSettings({
+      harnessSessionId: "session-abc",
+      generatedRoot: tmpDir,
+    });
+    const source = await fs.readFile(emitScriptPath, "utf8");
+    const budget = (name: string): { ready: number; other: number } => {
+      const m = new RegExp(`const ${name} = isReadySignal \\? (\\d+) : (\\d+);`).exec(source);
+      return { ready: Number(m?.[1]), other: Number(m?.[2]) };
+    };
+    const hardStop = budget("hardStopMs");
+    const abort = budget("abortMs");
+    const stdinGiveUp = budget("stdinGiveUpMs");
+
+    expect(source).toContain('const isReadySignal = hookEvent === "SessionStart"');
+    expect(abort.ready).toBeGreaterThanOrEqual(2000);
+    expect(abort.other).toBeLessThanOrEqual(200);
+    // Ordering invariant, per branch: stdin give-up + fetch abort must stay
+    // under the hard stop, or the ceiling kills the POST it exists to protect.
+    expect(hardStop.ready).toBeGreaterThan(stdinGiveUp.ready + abort.ready);
+    expect(hardStop.other).toBeGreaterThan(stdinGiveUp.other + abort.other);
+    // Breadcrumb on failure, capped so it can't grow unboundedly.
+    expect(source).toContain("emit-debug.log");
+    expect(source).toContain("65536");
   });
 
   it("omits the theme key by default (Claude keeps its default rendering)", async () => {
@@ -93,6 +128,23 @@ describe("generateClaudeSettings", () => {
     const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
     expect(settings.theme).toBe("light-ansi");
     expect(Object.keys(settings.hooks)).toHaveLength(6);
+  });
+
+  it("invokes a BARE `node` in every hook command — the one spelling all three hook shells resolve", async () => {
+    // Claude Code runs hooks through Git Bash on Windows (PowerShell
+    // fallback), /bin/sh on POSIX. Bare `node` resolves under all of them
+    // (the desktop host ships .cmd AND extensionless sh shims); an absolute
+    // "C:\...\node.exe" would parse as a string EXPRESSION, not an
+    // invocation, under PowerShell's -Command form. Pinned so a future
+    // "improvement" back to an embedded path has to argue with this test.
+    const { settingsPath } = await generateClaudeSettings({
+      harnessSessionId: "session-abc",
+      generatedRoot: tmpDir,
+    });
+    const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+    for (const event of Object.keys(settings.hooks)) {
+      expect(settings.hooks[event][0].hooks[0].command).toMatch(/^node "/);
+    }
   });
 
   it("is safe to regenerate for the same session (overwrites in place)", async () => {

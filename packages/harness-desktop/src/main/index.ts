@@ -12,8 +12,9 @@
 // `spawn ENOTDIR`. See esbuild-binary.ts.
 import "./esbuild-binary.js";
 import { writeFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { app, dialog, Menu } from "electron";
+import { initFileLog } from "./log-file.js";
 import { resolveInstanceLockAction } from "./single-instance.js";
 import { createSetupWindow } from "./windows.js";
 import { boot, type BootResult } from "./boot.js";
@@ -37,6 +38,21 @@ const smokeMode = process.argv.includes("--smoke");
 // left/right panels showed scrollbars in Electron but not in the (overlay-
 // scrollbar) browser. Must be set before app is ready.
 app.commandLine.appendSwitch("enable-features", "OverlayScrollbar");
+
+// Disable HTTP/2 in Chromium's network stack. The auto-updater is the only
+// remote consumer of that stack in this app (electron-updater rides
+// Electron's `net`; the SPA talks to 127.0.0.1 and telemetry goes through
+// Node's fetch), and on a real user machine every update check failed with
+// net::ERR_HTTP2_SERVER_REFUSED_STREAM against GitHub — repeatedly, across
+// hours, while the same machine's browser reached github.com fine. That is
+// the documented Electron/GitHub HTTP/2 failure mode (a refused multiplexed
+// stream surfaces as a hard error instead of retrying on a fresh
+// connection), and falling back to HTTP/1.1 is the accepted workaround. Cost
+// is one extra TCP connection per update check/download. Escape hatch for
+// A/B-testing the theory on an affected machine, not a supported setting.
+if (process.env.SAPIOM_KEEP_HTTP2 !== "1") {
+  app.commandLine.appendSwitch("disable-http2");
+}
 
 let bootResult: BootResult | null = null;
 let quitting = false;
@@ -143,6 +159,12 @@ if (lock.action === "fail") {
   });
 
   app.whenReady().then(async () => {
+    // FIRST, before boot() and before any early --smoke return: tee console
+    // output into a log file. The packaged Windows app is a GUI-subsystem exe
+    // with no console, so without this every console.error — including the
+    // harness server's "[harness] unhandled request error:" lines, which run
+    // in this process — vanishes and nothing is diagnosable in the field.
+    initFileLog(join(app.getPath("logs"), "main.log"), app.getVersion());
     // No application menu — the harness SPA is the whole UI. Removes the
     // File/Edit/View/Window/Help bar on Linux/Windows. (On macOS the top menu
     // bar is OS-level and can't be removed; this leaves a bare default there —

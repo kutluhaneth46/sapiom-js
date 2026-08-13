@@ -26,6 +26,9 @@ import { displayAgentName } from "./agent-name";
 import type { FsDirEntry } from "./api";
 import { DOC_LINKS, DOCS_SITE } from "./docs";
 import { fuzzyMatch } from "./fuzzy";
+// Separator-aware basename: a Windows path ("C:\\a\\b") must yield "b", not the
+// whole string. One implementation, shared with the rest of the SPA.
+import { basenameOf } from "./paths";
 import { sessionDisplayName, type SessionNameOverrides } from "./session-name";
 import { isUnder } from "./workspace-tree";
 
@@ -145,7 +148,6 @@ export function recencyBonus(now: number, recency: number): number {
   return 0;
 }
 
-const basenameOf = (path: string): string => path.split("/").filter(Boolean).pop() ?? path;
 const parseTime = (iso: string): number => {
   const t = Date.parse(iso);
   return Number.isNaN(t) ? 0 : t;

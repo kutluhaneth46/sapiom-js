@@ -3,6 +3,7 @@ import type { JSX, ReactNode } from "react";
 import type { HarnessSession } from "@shared/types";
 
 import { HARNESS_LABELS, formatRelativeTime } from "../lib/history-meta";
+import { basenameOf } from "../lib/paths";
 import type { ToastTone } from "../lib/toast";
 import { AnchoredPopover } from "./AnchoredPopover";
 import { EndSessionConfirm } from "./EndSessionConfirm";
@@ -11,7 +12,7 @@ import { Icon } from "./Icon";
 /** The workspace a session belongs to is its directory's basename — the
  *  same label the rail's workspace group carries. */
 function workspaceLabelOf(path: string): string {
-  return path.split("/").filter(Boolean).pop() ?? path;
+  return basenameOf(path);
 }
 
 interface SessionBarProps {

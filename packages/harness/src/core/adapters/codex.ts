@@ -200,7 +200,7 @@ export class CodexAdapter implements HarnessAdapter {
 
   async doctor(): Promise<DoctorCheck[]> {
     try {
-      const { stdout } = await execFileAsync(this.binary, ["--version"], { timeout: 5_000 });
+      const { stdout } = await execFileAsync(this.binary, ["--version"], { timeout: 5_000, windowsHide: true });
       return [{ name: "codex", ok: true, detail: stdout.trim() || "installed" }];
     } catch {
       return [
@@ -245,6 +245,13 @@ export class CodexAdapter implements HarnessAdapter {
    * injection that needs it — a scrollback check is the only thing that
    * can stand in for it up to that point.
    */
+  /**
+   * See `HarnessAdapter.readyFallback`: `isReadyEnough` may trust a settled,
+   * prompt-free scrollback immediately — Codex's real readiness signal cannot
+   * arrive before the first injection needs it (see detectBlockingPrompt).
+   */
+  readonly readyFallback = "immediate" as const;
+
   detectBlockingPrompt(scrollback: string): boolean {
     return TRUST_PROMPT_PATTERN.test(stripAnsi(scrollback));
   }

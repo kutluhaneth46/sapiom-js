@@ -56,6 +56,12 @@ touching this package, and how to tell whether a change actually works on the OS
 - **Paths contain spaces** (`C:\Program Files`, `/Users/x/My Drive`): prefer argv arrays over shell
   strings, and don't hand-quote.
 - Use `os.homedir()` / `app.getPath("userData")`, never a literal `~` or `%USERPROFILE%`.
+- **Every `child_process` call needs `windowsHide: true`.** The app is a GUI-subsystem process with
+  no console, so any console-subsystem child (`git`, `where`, npm, a `.cmd` chain) otherwise
+  ALLOCATES A VISIBLE CONSOLE WINDOW on the user's screen — and closing that window kills the
+  child's whole tree (this killed live MCP servers mid-session). Node's default is `false`; the
+  flag is a no-op on POSIX. Applies equally to `@sapiom/harness`, `@sapiom/agent-core` and
+  `@sapiom/mcp` code, all of which run inside this console-less process or its children.
 - **A test harness is part of the system under test.** `smoke.sh` exported `HOME`/`USERPROFILE`/
   `APPDATA` from `mktemp -d`, which under git-bash is a POSIX path (`/tmp/…`) with no drive letter.
   Electron uses `APPDATA` to compute `userData`, so it died creating those directories *before logging
@@ -293,7 +299,7 @@ The main window carries a preload (`src/preload/desktop.mts`) — it did not bef
 
 ## What the app installs for the user
 
-Three shims (`runtime-shims.ts`, PATH-prepended) plus two npm installs into
+Three shims (`runtime-shims.ts`, PATH-prepended) plus three npm installs into
 `userData/npm-global` (`agent-install.ts`, on PATH via `agentBinDir()`):
 
 | Provided | Why |
@@ -301,6 +307,8 @@ Three shims (`runtime-shims.ts`, PATH-prepended) plus two npm installs into
 | `node`, `npm`, **`npx`** shims | Electron bundles Node but not npm, and the machine may have neither |
 | Claude Code (if no agent on PATH) | the app is useless without an agent |
 | `@sapiom/cli` (if `sapiom` not on PATH) | macros and templates hand the agent `sapiom agents …` |
+| `@sapiom/mcp` (the sapiom-dev server) | so sessions launch it as `<app binary> <entry.js>` (Electron-as-Node) instead of `npx`. A GUI-subsystem launcher can allocate no console — the npx chain's `cmd.exe` sat on Windows users' screens as a persistent blank window, and closing it killed the MCP server mid-session. Also removes an npm round-trip per session. Refreshed at boot only when the install is older than `REFRESH_AFTER_MS`, and **awaited** — a background refresh would rewrite the tree the running sessions were spawned from (`mcp-install.ts`) |
+| **MinGit** (Windows, if no `git` on PATH) | template cloning and deploy shell out to a real `git`, and Windows ships none; downloaded checksum-pinned from git-for-windows' official releases into `userData/mingit` at first boot (`git-provision.ts`) — never bundled, so no installer bloat and no GPL redistribution. Its `bash.exe` (when the variant has one) is advertised via `CLAUDE_CODE_GIT_BASH_PATH`, which upgrades Claude Code's Windows shell from the PowerShell fallback to Git Bash. A user-installed git always wins (`where git` short-circuits; the provisioned dir is PATH-appended) |
 
 `npx` and the CLI were both missing until they were added together, and both failed
 **silently**: the per-session MCP config launches the sapiom-dev server with
