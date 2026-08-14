@@ -26,16 +26,39 @@ const ATTRIBUTE_PREFIX = "data-ph-capture-attribute-";
 export interface TrackingContext {
   /**
    * The arc of intent. Usually omitted — the current journey rides as a
-   * super-property (see events.ts `registerViewContext`). Set it explicitly only
-   * for UI that outlives its view (a global modal, a command palette) where the
-   * ambient view would misattribute the click.
+   * super-property (see events.ts `registerViewContext`).
+   *
+   * Set it explicitly only for UI that both outlives its view AND belongs to
+   * one journey — a modal that always means "deploy", say. A navigator like the
+   * command palette does NOT qualify: it can take you anywhere, so it has no
+   * journey of its own and the ambient value (which journey you reached for it
+   * FROM) is the more useful fact. That is why `CommandPalette` sets only
+   * `dialog`.
    */
   readonly journey?: Journey;
   /**
    * The specific UI region, in snake_case: `agent_rail`, `run_canvas`,
    * `secrets_panel`. The main dimension for "where did they click?"
+   *
+   * Set this on TOP-LEVEL regions only. Because the outermost element wins a
+   * key conflict (see above), a `surface` on a component nested inside another
+   * surfaced region is silently discarded — which looks identical to working
+   * instrumentation. For a modal hosted inside such a region, use
+   * {@link TrackingContext.dialog} instead.
    */
   readonly surface?: string;
+  /**
+   * The open modal/dialog, in snake_case: `add_agents`, `template_use`,
+   * `command_palette`.
+   *
+   * A separate dimension from `surface` rather than a value of it, because a
+   * dialog is not laid out where it conceptually belongs: `StartDialog` is a
+   * DOM child of the agent rail, so a `surface` on it loses to the rail's and
+   * vanishes. Keeping its own key means both survive — you get "the
+   * add-agents dialog" AND "opened from the rail", which is the pair you
+   * actually want when asking where a flow was entered from.
+   */
+  readonly dialog?: string;
   /** The kind of entity being acted on: `session`, `template`, `secret`, `run`. */
   readonly object?: string;
   /**

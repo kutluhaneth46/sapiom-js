@@ -5,6 +5,7 @@ import type { FsDirEntry, FsListResponse } from "../lib/api";
 import { getDesktopBridge } from "../lib/desktop";
 import { middleTruncatePath, parentOf } from "../lib/paths";
 import { Icon } from "./Icon";
+import { trackingAttrs } from "../lib/analytics/tracking-attrs";
 
 /**
  * The resolved state of the field, handed to `onResolve` so a host can classify
@@ -209,6 +210,10 @@ export function DirectoryPicker({
     }
   };
 
+  // `object` deliberately NOT on the picker root: it would put the Browse and
+  // up-a-level buttons in drop_name and blank their labels, which is the very
+  // problem this PR set out to fix. It belongs on the listing rows, which are
+  // the elements that actually carry a folder name.
   return (
     <div className="dir-picker">
       <div className="dir-picker-inputrow">
@@ -310,6 +315,7 @@ export function DirectoryPicker({
               data-testid={`dir-picker-item-${entry.name}`}
               onMouseEnter={() => setHighlight(index)}
               onClick={() => navigate(entry.path)}
+              {...trackingAttrs({ object: "directory" })}
             >
               <Icon name="Folder" size={13} />
               <span className="dir-picker-item-name">{entry.name}</span>

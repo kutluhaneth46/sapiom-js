@@ -15,6 +15,7 @@ import type { DeployProgress, RunTarget } from "../lib/use-harness-state";
 import { agentUrl } from "../lib/urls";
 import { ArtifactRenderer } from "./ArtifactRenderer";
 import { Icon } from "./Icon";
+import { trackingAttrs } from "../lib/analytics/tracking-attrs";
 
 /**
  * The per-step "stubbed" chip (WB15-2). Rendered for a step that ran in a
@@ -435,6 +436,9 @@ function StepInputContract({ node }: { node: CanvasGraphNode }): JSX.Element | n
             key={f.name}
             className={"canvas-input-field" + (f.required ? " is-required" : "")}
             aria-label={`${f.name}, ${f.type}${f.required ? ", required" : ""}`}
+            // Field names come from the user's own agent code, and the
+            // aria-label interpolates them — so this must not be promoted.
+            {...trackingAttrs({ object: "run" })}
           >
             {f.name}
             {f.required && <span aria-hidden="true">*</span>}
@@ -908,6 +912,7 @@ export function CanvasStepDetail({
                       className={"canvas-input-field" + (f.required ? " is-required" : "")}
                       aria-label={`${f.name}, ${f.type}${f.required ? ", required" : ""}`}
                       data-tooltip={f.required ? "Required field" : "Optional field"}
+                      {...trackingAttrs({ object: "run" })}
                     >
                       {f.name}
                       {f.required && <span aria-hidden="true">*</span>}

@@ -9,6 +9,7 @@ import type {
   HarnessSession,
   HarnessSettings,
   RunMacroRequest,
+  RunTarget,
   SessionRecord,
   SessionSummary,
   WorkflowInfo,
@@ -40,8 +41,12 @@ import { track as trackProduct } from "./analytics/events";
 import {
   agentProvenance,
   deployErrorKind,
+  initialRunFunnelState,
+  localRunOutcomeKind,
   newAgentPaths,
+  runFunnelStep,
   slugFromPath,
+  type RunFunnelEvent,
 } from "./analytics/lifecycle";
 import { renderLocalRun } from "@shared/render-local-run";
 import type { LocalStepTrace, LocalRunOutcome } from "@sapiom/agent-core";
@@ -61,10 +66,17 @@ const BUSY_WINDOW_MS = 3_000;
  *  cli/settings.ts) and its response replaces this guess. */
 const RECENT_DIRS_UI_CAP = 8;
 
-/** Where a run executed — the server announces it on execution.started.
- *  "local" runs are stubbed (capabilities run against fixtures); "prod" runs
- *  are real cloud executions. */
-export type RunTarget = "prod" | "local";
+
+/** Upper bound on {@link announcedRuns}. A Studio left open for days can
+ *  accumulate executionIds without limit otherwise; the set only needs to
+ *  cover the redelivery window, not the whole session. */
+const ANNOUNCED_RUNS_CAP = 500;
+
+/** Re-exported from `@shared/types`, where it now lives so the analytics
+ *  registry can name it without importing this module (which imports the
+ *  registry). Existing `import { RunTarget } from "./use-harness-state"`
+ *  callers keep working. */
+export type { RunTarget };
 
 /** One observed run: the polled RunView plus the facts captured when its
  *  execution.started announcement arrived. */
@@ -374,6 +386,14 @@ export function useHarnessState(): HarnessStateHook {
   const runPollers = useRef<Map<string, ReturnType<typeof setInterval>>>(
     new Map(),
   );
+  // executionIds already counted into the run funnel. `execution.started` is a
+  // bus message, and nothing upstream promises it arrives exactly once — a
+  // reconnect that replays it, or the ExecutionDetector matching the CLI's
+  // "Started execution" line twice, would otherwise book a second
+  // `agent.run_started` for one run and inflate the funnel. Restarting the
+  // poller on a repeat is harmless (the UI just re-reads the same run), so the
+  // guard covers only the analytics.
+  const announcedRuns = useRef<Set<string>>(new Set());
   // One-click preview loop: the server's PortDetector announces a
   // dev server the agent started; the session surfaces a Preview chip.
   const [previewBySession, setPreviewBySession] = useState<
@@ -522,6 +542,11 @@ export function useHarnessState(): HarnessStateHook {
   const startRunPolling = useCallback(
     (sessionId: string, executionId: string, target: RunTarget) => {
       const existing = runPollers.current.get(sessionId);
+      // Superseding a live poller abandons the run it was watching, and that
+      // run gets NO terminal analytics event — deliberately. It is still
+      // executing server-side; we simply stopped looking. Calling it failed
+      // would be a lie, and calling it succeeded worse. This is the one place
+      // `run_started` legitimately outnumbers its terminal events.
       if (existing) clearInterval(existing);
       // Attribution facts are captured NOW, not at read time: the workflow the
       // session is bound to when the run is announced owns the run's cost.
@@ -545,6 +570,55 @@ export function useHarnessState(): HarnessStateHook {
         next.delete(sessionId);
         return next;
       });
+
+      // ---- run funnel -----------------------------------------------------
+      // This is the single door every prod run comes through — the Prod Run
+      // button AND a CLI-launched run the ExecutionDetector announced on the
+      // bus — so instrumenting here counts runs the user caused, not clicks.
+      // Every decision here — dedupe the start, emit at most one terminal,
+      // tolerate N failures, tell `exception` from `unobservable` — lives in
+      // the pure `runFunnelStep` reducer, unit-tested in lifecycle.test.ts.
+      // This block only drives it and sends what it returns; keeping the rules
+      // out of a closure over React refs and timers is what makes them testable
+      // at all (both bugs found in review round 1 were invisible to the suite).
+      const runSlug = workflowPath ? slugFromPath(workflowPath) : undefined;
+      const runBase = { workflow_slug: runSlug, session_id: sessionId, target };
+      let funnel = initialRunFunnelState();
+
+      const advanceFunnel = (event: RunFunnelEvent): void => {
+        const { state: next, emit } = runFunnelStep(funnel, event);
+        funnel = next;
+        if (emit.event === null) return;
+        if (emit.event === "agent.run_started") {
+          trackProduct("agent.run_started", runBase);
+          return;
+        }
+        const duration_ms = Date.now() - observedAt;
+        if (emit.event === "agent.run_succeeded") {
+          trackProduct("agent.run_succeeded", { ...runBase, duration_ms });
+          return;
+        }
+        trackProduct("agent.run_failed", { ...runBase, duration_ms, error_kind: emit.error_kind });
+      };
+
+      const alreadyAnnounced = announcedRuns.current.has(executionId);
+      // Bounded: drop the oldest ids once past the cap. Insertion order is
+      // iteration order for a Set, so the first key is the oldest.
+      if (announcedRuns.current.size >= ANNOUNCED_RUNS_CAP) {
+        const oldest = announcedRuns.current.values().next().value;
+        if (oldest !== undefined) announcedRuns.current.delete(oldest);
+      }
+      announcedRuns.current.add(executionId);
+      // A redelivery re-polls (so the UI still tracks the run) but must not
+      // re-count the start. The terminal event is deliberately NOT suppressed.
+      advanceFunnel({ kind: "announced", duplicate: alreadyAnnounced });
+
+      const stopPolling = (): void => {
+        const timer = runPollers.current.get(sessionId);
+        if (timer) clearInterval(timer);
+        runPollers.current.delete(sessionId);
+      };
+
       const poll = async (): Promise<void> => {
         try {
           const run = await api.getRunState(executionId);
@@ -556,17 +630,15 @@ export function useHarnessState(): HarnessStateHook {
               observedAt,
             }),
           );
-          if (run.status !== "running") {
-            const timer = runPollers.current.get(sessionId);
-            if (timer) clearInterval(timer);
-            runPollers.current.delete(sessionId);
-          }
+          advanceFunnel({ kind: "polled", status: run.status });
+          if (run.status !== "running") stopPolling();
         } catch {
           // Endpoint absent (server predates runtime analytics) or transient
-          // failure: stop polling quietly - the UI simply shows no run state.
-          const timer = runPollers.current.get(sessionId);
-          if (timer) clearInterval(timer);
-          runPollers.current.delete(sessionId);
+          // failure. The reducer decides when enough consecutive failures have
+          // accrued to call it; until then this keeps polling, because a single
+          // 2-second blip is not a failed run.
+          advanceFunnel({ kind: "poll_failed" });
+          if (funnel.settled) stopPolling();
         }
       };
       void poll();
@@ -658,6 +730,17 @@ export function useHarnessState(): HarnessStateHook {
       // run immediately, before the first trace line lands.
       publish();
 
+      // ---- run funnel (local half; the prod half is in startRunPolling) ----
+      const runBase = {
+        workflow_slug: workflowPath ? slugFromPath(workflowPath) : undefined,
+        session_id: sessionId,
+        target: "local" as const,
+      };
+      // True when the stream itself broke, as opposed to the run reporting a
+      // failure — the difference between `exception` and `failed`.
+      let transportBroke = false;
+      trackProduct("agent.run_started", runBase);
+
       const onLine = (line: RunLocalLine): void => {
         if (line.kind === "summary") {
           outcome = line.outcome;
@@ -728,6 +811,9 @@ export function useHarnessState(): HarnessStateHook {
               ? err.message
               : "Local execution failed.";
         outcome = "failed";
+        // The stream broke, as opposed to the run reporting a failure — that
+        // is the difference between `exception` and `failed` in the funnel.
+        transportBroke = true;
         runError = message;
         finishedAt = new Date().toISOString();
         const failedTrace: LocalStepTrace = {
@@ -750,6 +836,20 @@ export function useHarnessState(): HarnessStateHook {
         publish();
         setToast(createToastMessage(message));
       } finally {
+        // Close the run funnel. `pending` means the stream ended without a
+        // terminal outcome — a `paused` run waiting on a signal is still alive,
+        // so it gets no terminal event rather than a fabricated one.
+        const kind = localRunOutcomeKind(outcome);
+        const duration_ms = Date.now() - observedAt;
+        if (kind === "succeeded") {
+          trackProduct("agent.run_succeeded", { ...runBase, duration_ms });
+        } else if (kind === "failed") {
+          trackProduct("agent.run_failed", {
+            ...runBase,
+            duration_ms,
+            error_kind: transportBroke ? "exception" : "failed",
+          });
+        }
         // Signal settle so the SessionStepsBar clears the Local Run button's
         // pending ring — the stream ended (success or failure), the button's
         // "in flight" state is over.

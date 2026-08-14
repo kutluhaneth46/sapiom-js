@@ -9,6 +9,7 @@ import type { RunTarget } from "../lib/use-harness-state";
 import { agentUrl } from "../lib/urls";
 import { ArtifactRenderer } from "./ArtifactRenderer";
 import { Icon } from "./Icon";
+import { trackingAttrs } from "../lib/analytics/tracking-attrs";
 
 export type EvidenceTab =
   | "input"
@@ -322,6 +323,8 @@ function AttemptInspector({
     <section
       className="run-attempt-inspector"
       aria-label={`${step.name} attempt ${step.attempt ?? 1}`}
+      // Step names come from the user's own agent code.
+      {...trackingAttrs({ object: "run" })}
     >
       <header className="run-attempt-head">
         <button

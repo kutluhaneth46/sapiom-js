@@ -17,6 +17,7 @@ import {
   workflowDeploymentState,
 } from "../lib/workflow-deployment";
 import { RunTargetMenu } from "./RunTargetMenu";
+import { trackingAttrs } from "../lib/analytics/tracking-attrs";
 
 interface SessionStepsBarProps {
   workflow: WorkflowInfo;
@@ -144,7 +145,12 @@ export function SessionStepsBar({
   };
 
   return (
-    <div className="session-actions" data-testid="session-steps" aria-label="Agent actions">
+    <div
+      className="session-actions"
+      data-testid="session-steps"
+      aria-label="Agent actions"
+      {...trackingAttrs({ surface: "agent_actions" })}
+    >
       {/* One-click preview loop: the server detected a dev server this session's
           agent started — one click opens it. */}
       {preview && (

@@ -5,6 +5,7 @@ import { HARNESS_LABELS, formatDuration, formatRelativeTime, historyRowMeta } fr
 import { useSessionRecord, type SessionRecordState } from "../lib/use-session-record";
 import { Icon } from "./Icon";
 import { SessionTranscript } from "./SessionTranscript";
+import { trackingAttrs } from "../lib/analytics/tracking-attrs";
 
 interface DeadSessionPaneProps {
   session: HarnessSession;
@@ -92,8 +93,17 @@ export function DeadSessionPane({
   const canContinue = !canResume && record.status === "ready";
 
   return (
-    <div className="dead-session-pane" data-testid="dead-session-pane" data-has-record={showRecord}>
-      <div className="dead-session-summary">
+    <div
+      className="dead-session-pane"
+      data-testid="dead-session-pane"
+      data-has-record={showRecord}
+      // `object` is on the summary block below, NOT here: at pane level it
+      // would blank the labels of Continue / Resume / Close / Start too, which
+      // is the blank-row problem this PR set out to fix. The name-bearing part
+      // is the summary (cwd + session title), so that is what carries it.
+      {...trackingAttrs({ surface: "session_history" })}
+    >
+      <div className="dead-session-summary" {...trackingAttrs({ object: "session" })}>
         <span className="empty-state-icon" aria-hidden="true">
           <Icon name="SquareTerminal" size={18} />
         </span>

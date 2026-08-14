@@ -7,6 +7,7 @@ import type {
 
 import { formatPayload } from "../lib/format-payload";
 import { Icon } from "./Icon";
+import { trackingAttrs } from "../lib/analytics/tracking-attrs";
 
 const COLLECTION_PREVIEW = 8;
 const TEXT_PREVIEW_CHARS = 1_200;
@@ -460,6 +461,9 @@ export function ArtifactRenderer({
       className="artifact-renderer"
       data-testid={testId}
       data-collapsed={!open || undefined}
+      // An artifact's title is produced by the user's agent, and it is rendered
+      // as text and interpolated into the tablist's aria-label.
+      {...trackingAttrs({ object: "run" })}
     >
       <header className="artifact-header">
         <button
