@@ -616,9 +616,7 @@ describe("contentGeneration.video.create()", () => {
             })
           : null,
       (c) =>
-        c.init.method === "GET"
-          ? jsonResponse({ video: { url: "u" } })
-          : null,
+        c.init.method === "GET" ? jsonResponse({ video: { url: "u" } }) : null,
     ]);
 
     await video.create({ prompt: "x", pollIntervalMs: 1 }, transport, BASE);
@@ -1176,41 +1174,229 @@ describe("contentGeneration.images.launch()", () => {
 });
 
 // ---------------------------------------------------------------------------
+// SAP-2576 — per-generation cost envelope surfaced on results + launch handles
+// ---------------------------------------------------------------------------
+
+describe("cost envelope (SAP-2576)", () => {
+  const COST = {
+    estimateUsd: 0.4,
+    currency: "USD",
+    isEstimate: true,
+    source: "quote",
+    reference: "txn_abc123",
+  } as const;
+
+  it("createVideo threads the submit handle's cost + resolvedModel onto the polled result", async () => {
+    const { transport } = makeTransport([
+      (c) =>
+        c.init.method === "POST"
+          ? jsonResponse({
+              requestId: "req-cost",
+              responseUrl: `${BASE}/queue/req-cost`,
+              resolvedModel: "seedance-fast",
+              cost: COST,
+            })
+          : null,
+      (c) =>
+        c.init.method === "GET"
+          ? jsonResponse({ video: { url: "https://media/v.mp4" } })
+          : null,
+    ]);
+
+    const out = await createVideo(
+      { prompt: "a wave", pollIntervalMs: 1 },
+      transport,
+      BASE,
+    );
+
+    // The queue passthrough (the GET poll) carries neither cost nor resolvedModel — both are
+    // threaded from the submit handle, so a reseller can price without a second API call.
+    expect(out.resolvedModel).toBe("seedance-fast");
+    expect(out.cost).toEqual(COST);
+    expect(out.cost?.reference).toBe("txn_abc123");
+    expect(out.video?.url).toBe("https://media/v.mp4");
+  });
+
+  it("createVideo surfaces resolvedModel with no cost when the quote was unavailable", async () => {
+    const { transport } = makeTransport([
+      (c) =>
+        c.init.method === "POST"
+          ? jsonResponse({
+              requestId: "r",
+              responseUrl: `${BASE}/queue/r`,
+              // Contract: the router always echoes resolvedModel, even when the price join is down.
+              resolvedModel: "veo3-fast",
+            })
+          : null,
+      (c) =>
+        c.init.method === "GET"
+          ? jsonResponse({ video: { url: "https://media/v.mp4" } })
+          : null,
+    ]);
+
+    const out = await createVideo(
+      { prompt: "x", pollIntervalMs: 1 },
+      transport,
+      BASE,
+    );
+
+    expect(out.resolvedModel).toBe("veo3-fast");
+    expect(out.cost).toBeUndefined();
+    expect(out.video?.url).toBe("https://media/v.mp4");
+  });
+
+  it("createVideo echoes a legacy raw provider id as resolvedModel", async () => {
+    const { transport } = makeTransport([
+      (c) =>
+        c.init.method === "POST"
+          ? jsonResponse({
+              requestId: "r-raw",
+              responseUrl: `${BASE}/queue/r-raw`,
+              resolvedModel: "fal-ai/veo3/fast",
+            })
+          : null,
+      (c) =>
+        c.init.method === "GET"
+          ? jsonResponse({ video: { url: "https://media/v.mp4" } })
+          : null,
+    ]);
+
+    const out = await createVideo(
+      { prompt: "x", model: "fal-ai/veo3/fast", pollIntervalMs: 1 },
+      transport,
+      BASE,
+    );
+
+    expect(out.resolvedModel).toBe("fal-ai/veo3/fast");
+  });
+
+  it("launchVideo exposes cost + resolvedModel on the handle AND on the wait() result", async () => {
+    const { transport } = makeLaunchTransport(
+      {
+        requestId: "req-lc",
+        responseUrl: `${BASE}/queue/req-lc`,
+        resolvedModel: "veo3-fast",
+        cost: COST,
+      },
+      { video: { url: "https://media/v.mp4" } },
+    );
+
+    const handle = await launchVideo({ prompt: "x" }, transport, BASE);
+    expect(handle.resolvedModel).toBe("veo3-fast");
+    expect(handle.cost).toEqual(COST);
+
+    const result = await handle.wait({ pollMs: 1 });
+    expect(result.cost?.reference).toBe("txn_abc123");
+    expect(result.resolvedModel).toBe("veo3-fast");
+  });
+
+  it("createImage surfaces the response body's cost + resolvedModel", async () => {
+    const { transport } = makeTransport([
+      () =>
+        jsonResponse({
+          images: [{ url: "https://media/x.png" }],
+          resolvedModel: "flux-fast",
+          cost: COST,
+        }),
+    ]);
+
+    const out = await createImage({ prompt: "x" }, transport, BASE);
+    expect(out.resolvedModel).toBe("flux-fast");
+    expect(out.cost).toEqual(COST);
+  });
+
+  it("launchImage exposes cost + resolvedModel on the handle", async () => {
+    const { transport } = makeLaunchTransport(
+      {
+        requestId: "img-c",
+        responseUrl: `${BASE}/queue/img-c`,
+        resolvedModel: "flux-fast",
+        cost: COST,
+      },
+      { images: [{ url: "u" }] },
+    );
+
+    const handle = await launchImage({ prompt: "x" }, transport, BASE);
+    expect(handle.resolvedModel).toBe("flux-fast");
+    expect(handle.cost?.reference).toBe("txn_abc123");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // toVideoResumePayload()
 // ---------------------------------------------------------------------------
 
 describe("toVideoResumePayload()", () => {
+  const M = "veo3-fast";
+
+  // SAP-2576: the durable resume payload MUST carry resolvedModel + cost, so a step that bills
+  // in the resumed step (after generation) can still read cost.reference / resolvedModel.
+  it("carries resolvedModel + cost onto the resume payload (the Polsia rebilling case)", () => {
+    const payload = toVideoResumePayload({
+      video: { url: "https://media/v.mp4", fileId: "f-1" },
+      resolvedModel: M,
+      cost: {
+        estimateUsd: 0.4,
+        currency: "USD",
+        isEstimate: true,
+        source: "quote",
+        reference: "txn_abc123",
+      },
+    });
+    expect(payload.resolvedModel).toBe(M);
+    expect(payload.cost?.reference).toBe("txn_abc123");
+    expect(payload.outputs).toEqual([{ fileId: "f-1" }]);
+  });
+
+  it("carries a reference-only cost envelope (quote unavailable, transaction still created)", () => {
+    const payload = toVideoResumePayload({
+      video: { url: "u" },
+      resolvedModel: M,
+      cost: { reference: "txn_only" },
+    });
+    expect(payload.cost).toEqual({ reference: "txn_only" });
+    expect(payload.resolvedModel).toBe(M);
+  });
+
   it("maps a video with fileId to outputs[0].fileId", () => {
     const payload = toVideoResumePayload({
       video: { url: "https://media/v.mp4", fileId: "f-1" },
+      resolvedModel: M,
     });
-    expect(payload).toEqual({ outputs: [{ fileId: "f-1" }] });
+    expect(payload).toEqual({ resolvedModel: M, outputs: [{ fileId: "f-1" }] });
   });
 
   it("maps a video with storageError to outputs[0].storageError", () => {
     const payload = toVideoResumePayload({
       video: { url: "https://media/v.mp4", storageError: "quota exceeded" },
+      resolvedModel: M,
     });
-    expect(payload).toEqual({ outputs: [{ storageError: "quota exceeded" }] });
+    expect(payload).toEqual({
+      resolvedModel: M,
+      outputs: [{ storageError: "quota exceeded" }],
+    });
   });
 
   it("maps a video with neither fileId nor storageError to an empty-field outputs[0]", () => {
     const payload = toVideoResumePayload({
       video: { url: "https://media/v.mp4" },
+      resolvedModel: M,
     });
-    expect(payload).toEqual({ outputs: [{}] });
+    expect(payload).toEqual({ resolvedModel: M, outputs: [{}] });
   });
 
-  it("returns empty outputs when there is no video", () => {
-    const payload = toVideoResumePayload({});
-    expect(payload).toEqual({ outputs: [] });
+  it("returns empty outputs when there is no video (metadata still present)", () => {
+    const payload = toVideoResumePayload({ resolvedModel: M });
+    expect(payload).toEqual({ resolvedModel: M, outputs: [] });
   });
 
   it("includes both fileId and storageError when both are present", () => {
     const payload = toVideoResumePayload({
       video: { url: "u", fileId: "f-2", storageError: "partial" },
+      resolvedModel: M,
     });
     expect(payload).toEqual({
+      resolvedModel: M,
       outputs: [{ fileId: "f-2", storageError: "partial" }],
     });
   });
@@ -1223,8 +1409,10 @@ describe("toVideoResumePayload()", () => {
         downloadUrl: "https://dl/f-3",
         downloadUrlExpiresAt: "2026-03-03T00:00:00Z",
       },
+      resolvedModel: M,
     });
     expect(payload).toEqual({
+      resolvedModel: M,
       outputs: [
         {
           fileId: "f-3",
@@ -1241,21 +1429,58 @@ describe("toVideoResumePayload()", () => {
 // ---------------------------------------------------------------------------
 
 describe("toImageResumePayload()", () => {
+  const M = "flux-fast";
+
+  it("carries resolvedModel + cost onto the resume payload (the Polsia rebilling case)", () => {
+    const payload = toImageResumePayload({
+      images: [{ url: "u1", fileId: "f-1" }],
+      resolvedModel: M,
+      cost: {
+        estimateUsd: 0.02,
+        currency: "USD",
+        isEstimate: true,
+        source: "quote",
+        reference: "txn_img",
+      },
+    });
+    expect(payload.resolvedModel).toBe(M);
+    expect(payload.cost?.reference).toBe("txn_img");
+    expect(payload.outputs).toEqual([{ fileId: "f-1" }]);
+  });
+
+  it("carries a reference-only cost envelope (quote unavailable, transaction still created)", () => {
+    const payload = toImageResumePayload({
+      images: [{ url: "u" }],
+      resolvedModel: M,
+      cost: { reference: "txn_only" },
+    });
+    expect(payload.cost).toEqual({ reference: "txn_only" });
+    expect(payload.resolvedModel).toBe(M);
+  });
+
   it("maps each image to an outputs[] entry (one per image, order preserved)", () => {
     const payload = toImageResumePayload({
       images: [
         { url: "u1", fileId: "f-1" },
         { url: "u2", fileId: "f-2", storageError: "partial" },
       ],
+      resolvedModel: M,
     });
     expect(payload).toEqual({
+      resolvedModel: M,
       outputs: [{ fileId: "f-1" }, { fileId: "f-2", storageError: "partial" }],
     });
   });
 
-  it("returns empty outputs when there are no images", () => {
-    expect(toImageResumePayload({})).toEqual({ outputs: [] });
-    expect(toImageResumePayload({ images: [] })).toEqual({ outputs: [] });
+  it("returns empty outputs when there are no images (metadata still present)", () => {
+    expect(toImageResumePayload({ resolvedModel: M })).toEqual({
+      resolvedModel: M,
+      outputs: [],
+    });
+    expect(toImageResumePayload({ images: [], resolvedModel: M })).toEqual({
+      resolvedModel: M,
+      outputs: [],
+    });
   });
 
   it("carries the convenience downloadUrl + its expiry alongside fileId", () => {
@@ -1268,8 +1493,10 @@ describe("toImageResumePayload()", () => {
           downloadUrlExpiresAt: "2026-03-03T00:00:00Z",
         },
       ],
+      resolvedModel: M,
     });
     expect(payload).toEqual({
+      resolvedModel: M,
       outputs: [
         {
           fileId: "f-3",
@@ -1281,8 +1508,11 @@ describe("toImageResumePayload()", () => {
   });
 
   it("emits an empty-field entry for an image with no storage annotations", () => {
-    const payload = toImageResumePayload({ images: [{ url: "u" }] });
-    expect(payload).toEqual({ outputs: [{}] });
+    const payload = toImageResumePayload({
+      images: [{ url: "u" }],
+      resolvedModel: M,
+    });
+    expect(payload).toEqual({ resolvedModel: M, outputs: [{}] });
   });
 });
 

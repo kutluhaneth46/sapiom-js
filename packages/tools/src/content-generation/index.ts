@@ -58,6 +58,49 @@ export interface StorageOptions {
   visibility?: "private" | "public";
 }
 
+/**
+ * Per-generation cost visibility (SAP-2576) — the SDK mirror of the backend capability
+ * envelope (`content-generation/content-generation.types.ts`). Two INDEPENDENTLY-available
+ * halves; the envelope ships when at least one resolved, and neither half is ever fabricated
+ * to satisfy the other (omit-don't-fabricate):
+ *
+ *  - the ESTIMATE quartet (`estimateUsd`, `currency`, `isEstimate`, `source`) — present
+ *    together exactly when the price quote resolved;
+ *  - the `reference` — the Sapiom transaction id the charge lands on; present when the gateway
+ *    echoed it. The authoritative SETTLED amount lives out-of-band at
+ *    `GET /v1/transactions/:id/costs` (design D1 option C — estimate inline, settled out-of-band).
+ *
+ * The shape is stable from this epic onward: the E6 metering migration flips `source` (adding
+ * `'metered'`) and nothing else, so a reseller can build credit pricing against it today.
+ */
+export interface MediaCostEnvelope {
+  /**
+   * Estimated cost of THIS generation in `currency`, quoted from the provider's ungated price
+   * route. For an `upto`-priced video model this is the authorized CEILING — the settled amount
+   * can be lower. Absent when the quote didn't resolve (never `0`).
+   */
+  estimateUsd?: number;
+  /** ISO 4217 code of `estimateUsd`; present exactly when it is. Always `"USD"` today. */
+  currency?: string;
+  /**
+   * `true` while `source` is `"quote"`: the authoritative settled number lives out-of-band at
+   * `GET /v1/transactions/:id/costs`, reachable via `reference`. Travels with `estimateUsd`.
+   */
+  isEstimate?: boolean;
+  /**
+   * Provenance of `estimateUsd`: `"quote"` (the ungated gateway price inquiry — today's only
+   * value) or `"authorized"` (the payment-authorized amount). E6 adds `"metered"`.
+   */
+  source?: "quote" | "authorized";
+  /**
+   * The Sapiom transaction id this generation's charge lands on — resolves at
+   * `GET /v1/transactions/:id/costs`. Captured from the gateway's `x-sapiom-transaction-id`
+   * response header (set by the x402 collapsed flow at authorization time, so async submits
+   * carry it too); omitted when the gateway didn't echo one.
+   */
+  reference?: string;
+}
+
 export interface ImageCreateInput {
   /** Text prompt describing the image to generate. */
   prompt: string;
@@ -116,6 +159,14 @@ export interface GeneratedImage {
 export interface ImageGenerationResult {
   /** Generated images. */
   images?: GeneratedImage[];
+  /**
+   * The public semantic model alias that served this generation (SAP-2576) — the grouping
+   * dimension for per-model cost/failure slicing. Always present: a cataloged raw id is
+   * reverse-mapped to its alias, an uncataloged one is echoed verbatim (never omitted).
+   */
+  resolvedModel: string;
+  /** Per-generation cost (SAP-2576); omitted when the price join was unavailable. */
+  cost?: MediaCostEnvelope;
   /** Additional model-specific fields (e.g. `seed`, `timings`), returned as-is. */
   [key: string]: unknown;
 }
@@ -140,6 +191,8 @@ interface RawImage {
 
 interface RawImageResult {
   images?: RawImage[];
+  resolvedModel: string;
+  cost?: MediaCostEnvelope;
   [key: string]: unknown;
 }
 
@@ -163,6 +216,25 @@ function mapResult(raw: RawImageResult): ImageGenerationResult {
   return images === undefined
     ? { ...rest }
     : { ...rest, images: images.map(mapImage) };
+}
+
+/**
+ * Thread a dispatch handle's SAP-2576 `resolvedModel` (always present) + optional `cost`
+ * envelope onto a polled result. For video (and async image) the resolved model, price quote,
+ * and transaction `reference` resolve at SUBMIT, so they ride the dispatch handle — but the
+ * result is polled from the gateway's queue passthrough, which carries none of them. Merge them
+ * here: `resolvedModel` unconditionally (the contract guarantees it), `cost` only when the
+ * quote/reference resolved (omit-don't-fabricate). The `as` narrows the generic object spread.
+ */
+function withDispatchCost<TBody extends Record<string, unknown>>(
+  body: TBody,
+  handle: { cost?: MediaCostEnvelope; resolvedModel: string },
+): TBody & { resolvedModel: string; cost?: MediaCostEnvelope } {
+  return {
+    ...body,
+    resolvedModel: handle.resolvedModel,
+    ...(handle.cost !== undefined && { cost: handle.cost }),
+  } as TBody & { resolvedModel: string; cost?: MediaCostEnvelope };
 }
 
 // ----- Capability operations -----
@@ -254,6 +326,10 @@ interface ImageDispatchResponse {
   requestId: string;
   statusUrl: string;
   responseUrl?: string;
+  /** The semantic model alias this job was submitted to (SAP-2576). Always present. */
+  resolvedModel: string;
+  /** Per-generation cost estimate (SAP-2576), resolved at submit; omitted when the quote was unavailable. */
+  cost?: MediaCostEnvelope;
 }
 
 /**
@@ -280,6 +356,13 @@ function imageResultUrl(handle: ImageDispatchResponse): string | undefined {
 export interface ImageLaunchHandle extends DispatchHandle {
   /** The queue request id for this job (also the correlation id a workflow resumes on). */
   requestId: string;
+  /** The semantic model alias this job was submitted to (SAP-2576), from the submit handle. */
+  resolvedModel: string;
+  /**
+   * Per-generation cost envelope (SAP-2576), resolved at submit — `estimateUsd` inline and the
+   * settled charge out-of-band via `cost.reference`. Also merged onto the {@link wait} result.
+   */
+  cost?: MediaCostEnvelope;
   /** Poll to completion and resolve the full result. */
   wait(opts?: {
     timeoutMs?: number;
@@ -294,7 +377,20 @@ export interface ImageLaunchHandle extends DispatchHandle {
  * the identical shape a resumed video step receives. Annotate a resumed step's input
  * with this type instead of hand-rolling the shape.
  */
-export interface ImageResultPayload {
+/**
+ * The SAP-2576 generation metadata a resumed step needs alongside its `outputs`. Carried on the
+ * durable pause/resume payload so a workflow step that bills AFTER the generation (the Polsia
+ * rebilling case) can still read `cost.reference` / `resolvedModel` — the launch handle is gone
+ * by then (`pauseUntilSignal` reduces it to its signal + `correlationId`).
+ */
+export interface MediaResumeFields {
+  /** The semantic model alias that served this generation (SAP-2576). Always present. */
+  resolvedModel: string;
+  /** Per-generation cost (SAP-2576) — `estimateUsd` inline, settled charge via `cost.reference`. */
+  cost?: MediaCostEnvelope;
+}
+
+export interface ImageResultPayload extends MediaResumeFields {
   outputs: Array<{
     /** Present when the output was persisted to file storage — the durable reference. */
     fileId?: string;
@@ -326,6 +422,10 @@ export function toImageResumePayload(
   result: ImageGenerationResult,
 ): ImageResultPayload {
   return {
+    // SAP-2576: preserve the generation metadata across the durable pause/resume boundary, so a
+    // resumed step (which never sees the launch handle) can still bill against `cost.reference`.
+    resolvedModel: result.resolvedModel,
+    ...(result.cost !== undefined && { cost: result.cost }),
     outputs: (result.images ?? []).map((img) => ({
       ...(img.fileId !== undefined && { fileId: img.fileId }),
       ...(img.downloadUrl !== undefined && { downloadUrl: img.downloadUrl }),
@@ -405,7 +505,9 @@ export async function launchImage(
       const res = await transport.fetch(responseUrl, { method: "GET" });
       if (res.ok) {
         const raw = (await res.json()) as RawImageResult;
-        if (Array.isArray(raw.images)) return mapResult(raw);
+        // Thread the submit handle's SAP-2576 cost + resolvedModel onto the polled result.
+        if (Array.isArray(raw.images))
+          return withDispatchCost(mapResult(raw), handle);
       } else {
         // Still generating, or a transient error. Drain the unread body so the
         // connection can be reused, then keep polling — `timeoutMs` is the backstop.
@@ -424,6 +526,10 @@ export async function launchImage(
 
   return {
     requestId,
+    // SAP-2576: surface the submit handle's resolvedModel + cost envelope on the handle too,
+    // so a caller reading them off `launch()` needn't await `wait()`.
+    resolvedModel: handle.resolvedModel,
+    ...(handle.cost !== undefined && { cost: handle.cost }),
     dispatch: { correlationId: requestId, resultSignal: IMAGE_RESULT_SIGNAL },
     wait,
   };
@@ -532,6 +638,18 @@ export interface GeneratedVideo {
 export interface VideoGenerationResult {
   /** The generated video. */
   video?: GeneratedVideo;
+  /**
+   * The public semantic model alias that served this generation (SAP-2576) — from the submit
+   * handle (the polled queue passthrough doesn't carry it). Always present: cataloged raw ids
+   * reverse-map to their alias, uncataloged ones are echoed verbatim.
+   */
+  resolvedModel: string;
+  /**
+   * Per-generation cost (SAP-2576), threaded from the submit handle: `estimateUsd` inline and
+   * the settled charge out-of-band via `cost.reference`. Omitted when the price join was
+   * unavailable at submit.
+   */
+  cost?: MediaCostEnvelope;
   /** Additional model-specific fields (e.g. `seed`, `timings`), returned as-is. */
   [key: string]: unknown;
 }
@@ -565,6 +683,14 @@ interface VideoDispatchResponse {
   requestId: string;
   statusUrl: string;
   responseUrl?: string;
+  /** The semantic model alias this job was submitted to (SAP-2576). Always present. */
+  resolvedModel: string;
+  /**
+   * Per-generation cost envelope (SAP-2576), resolved at submit. Carries the `estimateUsd`
+   * quote and the transaction `reference` for the settled charge — the poll target (the
+   * gateway's queue passthrough) carries neither, so this is the only place they ride.
+   */
+  cost?: MediaCostEnvelope;
 }
 
 /**
@@ -594,7 +720,12 @@ function mapVideo(raw: RawMedia): GeneratedVideo {
   };
 }
 
-function mapVideoResult(raw: RawVideoResult): VideoGenerationResult {
+// Returns the camelCase video BODY only — the submit-only metadata (`resolvedModel`, `cost`) is
+// threaded on separately by `withDispatchCost`, since the queue passthrough omits it.
+function mapVideoResult(raw: RawVideoResult): {
+  video?: GeneratedVideo;
+  [key: string]: unknown;
+} {
   const { video, ...rest } = raw;
   return video === undefined
     ? { ...rest }
@@ -664,7 +795,9 @@ export async function createVideo(
     const res = await transport.fetch(responseUrl, { method: "GET" });
     if (res.ok) {
       const raw = (await res.json()) as RawVideoResult;
-      if (raw.video?.url) return mapVideoResult(raw);
+      // Thread the submit handle's SAP-2576 cost + resolvedModel onto the polled result —
+      // the queue passthrough (this `raw`) carries neither.
+      if (raw.video?.url) return withDispatchCost(mapVideoResult(raw), handle);
     } else {
       // Still generating, or a transient error. Drain the unread body so the
       // connection can be reused, then keep polling — `timeoutMs` is the backstop
@@ -691,6 +824,13 @@ export async function createVideo(
 export interface VideoLaunchHandle extends DispatchHandle {
   /** The queue request id for this job. */
   requestId: string;
+  /** The semantic model alias this job was submitted to (SAP-2576), from the submit handle. */
+  resolvedModel: string;
+  /**
+   * Per-generation cost envelope (SAP-2576), resolved at submit — `estimateUsd` inline and the
+   * settled charge out-of-band via `cost.reference`. Also merged onto the {@link wait} result.
+   */
+  cost?: MediaCostEnvelope;
   /** Poll to completion and resolve the full result. */
   wait(opts?: {
     timeoutMs?: number;
@@ -708,7 +848,7 @@ export interface VideoLaunchHandle extends DispatchHandle {
  *     async run(result: VideoResultPayload, ctx) { … },
  *   });
  */
-export interface VideoResultPayload {
+export interface VideoResultPayload extends MediaResumeFields {
   outputs: Array<{
     /** Present when the output was persisted to file storage — the durable reference. */
     fileId?: string;
@@ -739,8 +879,15 @@ export interface VideoResultPayload {
 export function toVideoResumePayload(
   result: VideoGenerationResult,
 ): VideoResultPayload {
-  if (!result.video) return { outputs: [] };
+  // SAP-2576: preserve the generation metadata across the durable pause/resume boundary, so a
+  // resumed step (which never sees the launch handle) can still bill against `cost.reference`.
+  const metadata = {
+    resolvedModel: result.resolvedModel,
+    ...(result.cost !== undefined && { cost: result.cost }),
+  };
+  if (!result.video) return { outputs: [], ...metadata };
   return {
+    ...metadata,
     outputs: [
       {
         ...(result.video.fileId !== undefined && {
@@ -831,7 +978,9 @@ export async function launchVideo(
       const res = await transport.fetch(responseUrl, { method: "GET" });
       if (res.ok) {
         const raw = (await res.json()) as RawVideoResult;
-        if (raw.video?.url) return mapVideoResult(raw);
+        // Thread the submit handle's SAP-2576 cost + resolvedModel onto the polled result.
+        if (raw.video?.url)
+          return withDispatchCost(mapVideoResult(raw), handle);
       } else {
         try {
           await res.body?.cancel();
@@ -848,6 +997,10 @@ export async function launchVideo(
 
   return {
     requestId,
+    // SAP-2576: surface the submit handle's resolvedModel + cost envelope on the handle too,
+    // so a caller reading them off `launch()` needn't await `wait()`.
+    resolvedModel: handle.resolvedModel,
+    ...(handle.cost !== undefined && { cost: handle.cost }),
     dispatch: { correlationId: requestId, resultSignal: VIDEO_RESULT_SIGNAL },
     wait,
   };
