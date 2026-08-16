@@ -1,9 +1,17 @@
-import { mkdirSync } from "node:fs";
-import { join } from "node:path";
+import {
+  chmodSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  statSync,
+} from "node:fs";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import {
   MANAGED_AGENT_CONTRACT,
   MANAGED_AGENT_MODEL_ENVIRONMENT_VARIABLES,
+  ManagedAgentConfigurationError,
 } from "./contract.js";
 
 export type ManagedAgentAmbientEnvironment = Readonly<
@@ -11,6 +19,7 @@ export type ManagedAgentAmbientEnvironment = Readonly<
 >;
 
 export interface ManagedAgentIsolatedDirectories {
+  readonly privateRoot: string;
   readonly home: string;
   readonly appData: string;
   readonly localAppData: string;
@@ -46,30 +55,108 @@ const SAFE_AMBIENT_PASSTHROUGH = [
   "CLAUDE_CODE_GIT_BASH_PATH",
 ] as const;
 
+const PRIVATE_RUN_DIRECTORY_PREFIX = "managed-agent-run-";
+
 function validateHeaderValue(value: string, label: string): void {
   if (!value || /[\r\n]/.test(value)) {
     throw new Error(`${label} is not a safe header value`);
   }
 }
 
+function comparisonPath(value: string): string {
+  return process.platform === "win32" ? value.toLowerCase() : value;
+}
+
+function pathWithin(root: string, candidate: string): boolean {
+  const pathRelative = relative(
+    comparisonPath(root),
+    comparisonPath(candidate),
+  );
+  if (pathRelative === "") return true;
+  return (
+    !isAbsolute(pathRelative) &&
+    pathRelative !== ".." &&
+    !pathRelative.startsWith(`..${sep}`)
+  );
+}
+
+function canonicalDirectory(value: string, label: string): string {
+  let canonical: string;
+  try {
+    canonical = realpathSync(resolve(value));
+  } catch {
+    throw new ManagedAgentConfigurationError(`${label} must exist`);
+  }
+  if (!statSync(canonical).isDirectory()) {
+    throw new ManagedAgentConfigurationError(`${label} must be a directory`);
+  }
+  return canonical;
+}
+
+function verifyPrivateDirectory(
+  candidate: string,
+  privateRoot: string,
+  label: string,
+): string {
+  const metadata = lstatSync(candidate);
+  if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+    throw new ManagedAgentConfigurationError(
+      `${label} must be a private directory`,
+    );
+  }
+  chmodSync(candidate, 0o700);
+  const canonical = realpathSync(candidate);
+  if (!pathWithin(privateRoot, canonical)) {
+    throw new ManagedAgentConfigurationError(
+      `${label} must remain inside the private run root`,
+    );
+  }
+  return canonical;
+}
+
+function createPrivateDirectory(
+  parent: string,
+  name: string,
+  privateRoot: string,
+): string {
+  const candidate = join(parent, name);
+  mkdirSync(candidate, { mode: 0o700 });
+  return verifyPrivateDirectory(candidate, privateRoot, name);
+}
+
 export function prepareManagedAgentDirectories(
   configRoot: string,
 ): ManagedAgentIsolatedDirectories {
-  const home = join(configRoot, "home");
+  const canonicalConfigRoot = canonicalDirectory(configRoot, "configRoot");
+  const createdPrivateRoot = mkdtempSync(
+    join(canonicalConfigRoot, PRIVATE_RUN_DIRECTORY_PREFIX),
+  );
+  const privateRoot = verifyPrivateDirectory(
+    createdPrivateRoot,
+    canonicalConfigRoot,
+    "private run root",
+  );
+  const home = createPrivateDirectory(privateRoot, "home", privateRoot);
   const directories = {
+    privateRoot,
     home,
-    appData: join(home, "appdata"),
-    localAppData: join(home, "local-appdata"),
-    xdgConfig: join(home, "xdg-config"),
-    xdgCache: join(home, "xdg-cache"),
-    xdgData: join(home, "xdg-data"),
-    claudeConfig: join(configRoot, "claude-config"),
-    secureStorage: join(configRoot, "secure-storage"),
-    temporary: join(configRoot, "tmp"),
+    appData: createPrivateDirectory(home, "appdata", privateRoot),
+    localAppData: createPrivateDirectory(home, "local-appdata", privateRoot),
+    xdgConfig: createPrivateDirectory(home, "xdg-config", privateRoot),
+    xdgCache: createPrivateDirectory(home, "xdg-cache", privateRoot),
+    xdgData: createPrivateDirectory(home, "xdg-data", privateRoot),
+    claudeConfig: createPrivateDirectory(
+      privateRoot,
+      "claude-config",
+      privateRoot,
+    ),
+    secureStorage: createPrivateDirectory(
+      privateRoot,
+      "secure-storage",
+      privateRoot,
+    ),
+    temporary: createPrivateDirectory(privateRoot, "tmp", privateRoot),
   } satisfies ManagedAgentIsolatedDirectories;
-  for (const directory of Object.values(directories)) {
-    mkdirSync(directory, { recursive: true, mode: 0o700 });
-  }
   return directories;
 }
 

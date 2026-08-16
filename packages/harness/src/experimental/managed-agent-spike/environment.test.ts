@@ -1,6 +1,14 @@
-import { mkdtemp, rm, stat } from "node:fs/promises";
+import {
+  lstat,
+  mkdir,
+  mkdtemp,
+  realpath,
+  rm,
+  stat,
+  symlink,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, isAbsolute, join, relative, sep } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -67,6 +75,64 @@ describe("managed-agent child environment", () => {
       child.TMPDIR,
     ]) {
       expect((await stat(directory)).isDirectory()).toBe(true);
+    }
+  });
+
+  it("uses a fresh canonical private root without following pre-existing child symlinks", async () => {
+    const root = await mkdtemp(join(tmpdir(), "managed-agent-env-"));
+    roots.push(root);
+    const configRoot = join(root, "config");
+    const external = join(root, "external-claude-config");
+    await Promise.all([mkdir(configRoot), mkdir(external)]);
+    await symlink(external, join(configRoot, "claude-config"));
+
+    const first = buildManagedAgentChildEnvironment({
+      ambient: {},
+      configRoot,
+      gatewayOrigin: "https://gateway.example.test",
+      gatewayCredential: "dedicated-eval-key",
+      modelAlias: "claude-sonnet-5-anthropic-anthropic-eval",
+      evalSource: "eval-source",
+      executionId: "execution-id",
+    });
+    const second = buildManagedAgentChildEnvironment({
+      ambient: {},
+      configRoot,
+      gatewayOrigin: "https://gateway.example.test",
+      gatewayCredential: "dedicated-eval-key",
+      modelAlias: "claude-sonnet-5-anthropic-anthropic-eval",
+      evalSource: "eval-source",
+      executionId: "execution-id-2",
+    });
+
+    const privateRoot = dirname(first.CLAUDE_CONFIG_DIR);
+    expect(privateRoot).not.toBe(dirname(second.CLAUDE_CONFIG_DIR));
+    expect(await realpath(first.CLAUDE_CONFIG_DIR)).not.toBe(
+      await realpath(external),
+    );
+    expect(
+      (await lstat(join(configRoot, "claude-config"))).isSymbolicLink(),
+    ).toBe(true);
+    for (const directory of [
+      first.HOME,
+      first.USERPROFILE,
+      first.APPDATA,
+      first.LOCALAPPDATA,
+      first.XDG_CONFIG_HOME,
+      first.XDG_CACHE_HOME,
+      first.XDG_DATA_HOME,
+      first.CLAUDE_CONFIG_DIR,
+      first.CLAUDE_SECURESTORAGE_CONFIG_DIR,
+      first.TMPDIR,
+      first.TMP,
+      first.TEMP,
+    ]) {
+      const canonical = await realpath(directory);
+      const pathRelative = relative(privateRoot, canonical);
+      expect(isAbsolute(pathRelative)).toBe(false);
+      expect(pathRelative).not.toBe("..");
+      expect(pathRelative.startsWith(`..${sep}`)).toBe(false);
+      expect((await lstat(directory)).isSymbolicLink()).toBe(false);
     }
   });
 

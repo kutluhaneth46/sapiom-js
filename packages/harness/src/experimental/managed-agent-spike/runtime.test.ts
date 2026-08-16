@@ -1,3 +1,6 @@
+import { lstat, mkdir, realpath, symlink, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { Options } from "@anthropic-ai/claude-agent-sdk";
@@ -26,6 +29,10 @@ import type {
 } from "./types.js";
 
 const fixtures: ManagedAgentFixture[] = [];
+const SUCCESS_SESSION_ID = "11111111-1111-4111-8111-111111111111";
+const CANCEL_SESSION_ID = "22222222-2222-4222-8222-222222222222";
+const TIMEOUT_SESSION_ID = "33333333-3333-4333-8333-333333333333";
+const CLOSE_SESSION_ID = "44444444-4444-4444-8444-444444444444";
 
 afterEach(async () => {
   await Promise.all(fixtures.splice(0).map((fixture) => fixture.cleanup()));
@@ -156,12 +163,12 @@ describe("runManagedAgentProbe", () => {
               {
                 type: "system",
                 subtype: "init",
-                session_id: "sdk-session-1",
+                session_id: SUCCESS_SESSION_ID,
                 model: resolveManagedAgentModelTarget("sonnet-5").alias,
               },
               {
                 type: "assistant",
-                session_id: "sdk-session-1",
+                session_id: SUCCESS_SESSION_ID,
                 message: {
                   content: [
                     {
@@ -178,7 +185,7 @@ describe("runManagedAgentProbe", () => {
               },
               {
                 type: "user",
-                session_id: "sdk-session-1",
+                session_id: SUCCESS_SESSION_ID,
                 message: {
                   content: [
                     {
@@ -193,7 +200,7 @@ describe("runManagedAgentProbe", () => {
                 type: "result",
                 subtype: "success",
                 is_error: false,
-                session_id: "sdk-session-1",
+                session_id: SUCCESS_SESSION_ID,
                 result: `secret:${fixture.nonce}`,
                 usage: { input_tokens: 9, output_tokens: 4 },
               },
@@ -236,7 +243,7 @@ describe("runManagedAgentProbe", () => {
       );
       expect(capturedOptions?.env).not.toHaveProperty("SAPIOM_API_KEY");
       expect(result.terminal).toBe("success");
-      expect(result.sdkSessionId).toBe("sdk-session-1");
+      expect(result.sdkSessionId).toBe(SUCCESS_SESSION_ID);
       expect(result.queryClosed).toBe(true);
       expect(result.preservation.every(({ preserved }) => preserved)).toBe(
         true,
@@ -254,6 +261,144 @@ describe("runManagedAgentProbe", () => {
     }
   });
 
+  it("does not follow pre-existing config child symlinks and fails invalid roots before query construction", async () => {
+    const { config, fixture } = await probeConfig();
+    const externalConfig = join(fixture.root, "external-config");
+    await mkdir(externalConfig);
+    await symlink(externalConfig, join(fixture.configRoot, "claude-config"));
+    let claudeConfigDirectory: string | undefined;
+    const safeQueryFactory = vi.fn(({ options }: { options: Options }) => {
+      claudeConfigDirectory = options.env?.CLAUDE_CONFIG_DIR;
+      return queryFromEvents([
+        {
+          type: "system",
+          subtype: "init",
+          session_id: SUCCESS_SESSION_ID,
+        },
+        { type: "result", subtype: "success", is_error: false },
+      ]);
+    });
+
+    await runManagedAgentProbe(config, {
+      hermeticGatewayOrigin: config.gatewayOrigin,
+      processObserver: fakeObserver(),
+      queryFactory: safeQueryFactory,
+    });
+
+    expect(safeQueryFactory).toHaveBeenCalledOnce();
+    expect(claudeConfigDirectory).toBeDefined();
+    expect(await realpath(claudeConfigDirectory!)).not.toBe(
+      await realpath(externalConfig),
+    );
+    expect(dirname(dirname(claudeConfigDirectory!))).toBe(fixture.configRoot);
+    expect((await lstat(claudeConfigDirectory!)).isSymbolicLink()).toBe(false);
+
+    const invalidConfigRoot = join(fixture.root, "config-file");
+    await writeFile(invalidConfigRoot, "not a directory");
+    const rejectedQueryFactory = vi.fn(() => queryFromEvents([]));
+    await expect(
+      runManagedAgentProbe(
+        { ...config, configRoot: invalidConfigRoot },
+        {
+          hermeticGatewayOrigin: config.gatewayOrigin,
+          processObserver: fakeObserver(),
+          queryFactory: rejectedQueryFactory,
+        },
+      ),
+    ).rejects.toThrow("configRoot must be a directory");
+    expect(rejectedQueryFactory).not.toHaveBeenCalled();
+  });
+
+  it("redacts malicious SDK and permission identifiers from the complete result", async () => {
+    const { config } = await probeConfig();
+    const sessionSecret = "session-secret-injected-by-sdk";
+    const toolIdSecret = "tool-id-secret-injected-by-sdk";
+    const toolNameSecret = "ReadSecretInjectedBySdk";
+    const permissionIdSecret = "permission-id-secret-injected-by-sdk";
+    const permissionNameSecret = "PermissionSecretInjectedBySdk";
+    const result = await runManagedAgentProbe(config, {
+      hermeticGatewayOrigin: config.gatewayOrigin,
+      processObserver: fakeObserver(),
+      queryFactory: ({ options }) => ({
+        async *[Symbol.asyncIterator]() {
+          await options.canUseTool?.(
+            permissionNameSecret,
+            {},
+            {
+              signal: new AbortController().signal,
+              toolUseID: permissionIdSecret,
+              requestId: "request-id-not-persisted",
+            },
+          );
+          yield {
+            type: "system",
+            subtype: "init",
+            session_id: sessionSecret,
+          };
+          yield {
+            type: "assistant",
+            session_id: sessionSecret,
+            message: {
+              content: [
+                {
+                  type: "tool_use",
+                  id: toolIdSecret,
+                  name: toolNameSecret,
+                  input: { secret: "tool-input-secret" },
+                },
+              ],
+            },
+          };
+          yield {
+            type: "user",
+            session_id: sessionSecret,
+            message: {
+              content: [
+                {
+                  type: "tool_result",
+                  tool_use_id: toolIdSecret,
+                  content: "tool-result-secret",
+                },
+              ],
+            },
+          };
+          yield {
+            type: "result",
+            subtype: "success",
+            is_error: false,
+            session_id: sessionSecret,
+          };
+        },
+        close: vi.fn(),
+      }),
+    });
+
+    expect(result.sdkSessionId).toBeUndefined();
+    expect(result.toolEvidence.slice(0, 2)).toMatchObject([
+      { toolName: "unknown", status: "requested" },
+      { toolName: "unknown", status: "success" },
+    ]);
+    expect(result.toolEvidence[0]?.toolUseId).toBe(
+      result.toolEvidence[1]?.toolUseId,
+    );
+    expect(result.permissionEvidence).toMatchObject([
+      { toolName: "unknown", decision: "deny", reason: "tool_not_allowed" },
+    ]);
+    const serialized = JSON.stringify(result);
+    for (const secret of [
+      sessionSecret,
+      toolIdSecret,
+      toolNameSecret,
+      permissionIdSecret,
+      permissionNameSecret,
+      "request-id-not-persisted",
+      "tool-input-secret",
+      "tool-result-secret",
+    ]) {
+      expect(serialized).not.toContain(secret);
+    }
+  });
+
   it("classifies an explicit active-run abort as cancellation", async () => {
     const { config } = await probeConfig("L2");
     const observer = fakeObserver();
@@ -267,7 +412,7 @@ describe("runManagedAgentProbe", () => {
           yield {
             type: "system",
             subtype: "init",
-            session_id: "cancel-session",
+            session_id: CANCEL_SESSION_ID,
           };
           if (!options.abortController?.signal.aborted) {
             await new Promise<void>((resolveAbort) =>
@@ -307,7 +452,11 @@ describe("runManagedAgentProbe", () => {
       processObserver: observer,
       queryFactory: () =>
         queryFromEvents([
-          { type: "system", subtype: "init", session_id: "session-timeout" },
+          {
+            type: "system",
+            subtype: "init",
+            session_id: TIMEOUT_SESSION_ID,
+          },
           { type: "result", subtype: "success", is_error: false },
         ]),
     });
@@ -332,7 +481,11 @@ describe("runManagedAgentProbe", () => {
         abortSignal = options.abortController?.signal;
         return queryFromEvents(
           [
-            { type: "system", subtype: "init", session_id: "close-session" },
+            {
+              type: "system",
+              subtype: "init",
+              session_id: CLOSE_SESSION_ID,
+            },
             { type: "result", subtype: "success", is_error: false },
           ],
           vi.fn(() => {

@@ -19,6 +19,7 @@ import {
 } from "./runtime.js";
 import type {
   ManagedAgentModelTargetId,
+  ManagedAgentPermissionReason,
   ManagedAgentProbeResult,
   ManagedAgentProbeScenario,
 } from "./types.js";
@@ -144,10 +145,17 @@ export function evaluateManagedAgentProbe(
       (evidence) =>
         evidence.toolName === toolName && evidence.status === status,
     );
-  const pathDenials = result.permissionEvidence.filter(
-    ({ decision, reason }) =>
-      decision === "deny" && reason === "path_outside_workspace",
-  ).length;
+  const permission = (
+    toolName: string,
+    decision: "allow" | "deny",
+    reason: ManagedAgentPermissionReason,
+  ): boolean =>
+    result.permissionEvidence.some(
+      (evidence) =>
+        evidence.toolName === toolName &&
+        evidence.decision === decision &&
+        evidence.reason === reason,
+    );
   const checks: ManagedAgentProbeCheck[] = [
     {
       id: "exact_model_alias",
@@ -202,7 +210,30 @@ export function evaluateManagedAgentProbe(
           invocation(qualifiedManagedAgentMcpToolName("fail_once"), "error") &&
           invocation(qualifiedManagedAgentMcpToolName("fail_once"), "success"),
       },
-      { id: "outside_and_symlink_denied", passed: pathDenials >= 2 },
+      {
+        id: "expected_permissions_allowed",
+        passed:
+          ["Read", "Edit", "Write"].every((toolName) =>
+            permission(toolName, "allow", "fixture_path"),
+          ) &&
+          permission("Bash", "allow", "exact_bash_command") &&
+          permission(
+            qualifiedManagedAgentMcpToolName("echo_nonce"),
+            "allow",
+            "managed_mcp_tool",
+          ) &&
+          permission(
+            qualifiedManagedAgentMcpToolName("fail_once"),
+            "allow",
+            "managed_mcp_tool",
+          ),
+      },
+      {
+        id: "outside_and_symlink_denied",
+        passed:
+          permission("Read", "deny", "path_outside_workspace") &&
+          permission("Read", "deny", "path_symlink_escape"),
+      },
     );
   } else {
     checks.push(

@@ -41,6 +41,7 @@ export type ManagedAgentPermissionReason =
   | "managed_mcp_tool"
   | "invalid_input"
   | "path_outside_workspace"
+  | "path_symlink_escape"
   | "bash_command_not_allowed"
   | "tool_not_allowed";
 

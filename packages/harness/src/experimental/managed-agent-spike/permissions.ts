@@ -10,6 +10,10 @@ import type {
   ManagedAgentPermissionEvidence,
   ManagedAgentPermissionReason,
 } from "./types.js";
+import {
+  normalizeManagedAgentToolUseId,
+  sanitizeManagedAgentToolName,
+} from "./events.js";
 
 export const MANAGED_AGENT_BUILTIN_TOOLS = [
   "Read",
@@ -44,7 +48,10 @@ export const MANAGED_AGENT_DISALLOWED_TOOLS = [
 
 export class ManagedAgentPathError extends Error {
   public constructor(
-    public readonly reason: "invalid_input" | "path_outside_workspace",
+    public readonly reason:
+      | "invalid_input"
+      | "path_outside_workspace"
+      | "path_symlink_escape",
   ) {
     super(reason);
     this.name = "ManagedAgentPathError";
@@ -110,7 +117,7 @@ export async function resolveManagedAgentToolPath(
   const existing = await nearestExistingParent(candidate);
   const canonicalExisting = await realpath(existing);
   if (!isPathWithinRoot(canonicalWorkspaceRoot, canonicalExisting)) {
-    throw new ManagedAgentPathError("path_outside_workspace");
+    throw new ManagedAgentPathError("path_symlink_escape");
   }
   if (existing === candidate) return canonicalExisting;
 
@@ -133,9 +140,14 @@ function permissionResult(
   decision: "allow" | "deny",
   toolUseID: string,
   reason: ManagedAgentPermissionReason,
+  updatedInput?: Record<string, unknown>,
 ): PermissionResult {
   return decision === "allow"
-    ? { behavior: "allow", toolUseID }
+    ? {
+        behavior: "allow",
+        toolUseID,
+        ...(updatedInput ? { updatedInput } : {}),
+      }
     : {
         behavior: "deny",
         message: `Managed-agent permission denied: ${reason}`,
@@ -159,6 +171,7 @@ export function createManagedAgentPermissionHandler(
   return async (toolName, input, permission): Promise<PermissionResult> => {
     let decision: "allow" | "deny" = "deny";
     let reason: ManagedAgentPermissionReason = "tool_not_allowed";
+    let updatedInput: Record<string, unknown> | undefined;
 
     if (allowedMcpTools.has(toolName)) {
       decision = "allow";
@@ -184,12 +197,13 @@ export function createManagedAgentPermissionHandler(
         reason = "invalid_input";
       } else {
         try {
-          await resolveManagedAgentToolPath(
+          const canonicalPath = await resolveManagedAgentToolPath(
             options.canonicalWorkspaceRoot,
             requestedPath,
           );
           decision = "allow";
           reason = "fixture_path";
+          updatedInput = { ...input, file_path: canonicalPath };
         } catch (error) {
           reason =
             error instanceof ManagedAgentPathError
@@ -200,11 +214,16 @@ export function createManagedAgentPermissionHandler(
     }
 
     options.onDecision({
-      toolUseId: permission.toolUseID,
-      toolName,
+      toolUseId: normalizeManagedAgentToolUseId(permission.toolUseID),
+      toolName: sanitizeManagedAgentToolName(toolName),
       decision,
       reason,
     });
-    return permissionResult(decision, permission.toolUseID, reason);
+    return permissionResult(
+      decision,
+      permission.toolUseID,
+      reason,
+      updatedInput,
+    );
   };
 }

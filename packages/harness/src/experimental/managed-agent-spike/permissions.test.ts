@@ -12,7 +12,6 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
-  ManagedAgentPathError,
   createManagedAgentPermissionHandler,
   resolveManagedAgentToolPath,
 } from "./permissions.js";
@@ -50,19 +49,25 @@ describe("symlink-aware managed-agent containment", () => {
     );
   });
 
-  it("denies direct, traversal, sibling-prefix, and symlink escapes", async () => {
+  it("distinguishes lexical outside-root paths from symlink escapes", async () => {
     const outsidePath = join(outside, "secret.txt");
     for (const requested of [
       outsidePath,
       "../outside/secret.txt",
       `${workspace}-evil/file.txt`,
+    ]) {
+      await expect(
+        resolveManagedAgentToolPath(workspace, requested),
+      ).rejects.toMatchObject({ reason: "path_outside_workspace" });
+    }
+    for (const requested of [
       "escape.txt",
       "escape-dir/secret.txt",
       "escape-dir/new.txt",
     ]) {
       await expect(
         resolveManagedAgentToolPath(workspace, requested),
-      ).rejects.toBeInstanceOf(ManagedAgentPathError);
+      ).rejects.toMatchObject({ reason: "path_symlink_escape" });
     }
   });
 });
@@ -89,7 +94,36 @@ describe("managed-agent permission handler", () => {
       handler("Bash", { command: "git status --short " }, permission),
     ).resolves.toMatchObject({ behavior: "deny", interrupt: false });
     await expect(
+      handler(
+        "Read",
+        { file_path: "inside.txt", preserve: "metadata" },
+        permission,
+      ),
+    ).resolves.toMatchObject({
+      behavior: "allow",
+      updatedInput: {
+        file_path: join(workspace, "inside.txt"),
+        preserve: "metadata",
+      },
+    });
+    await expect(
+      handler(
+        "Write",
+        { file_path: "nested/new.txt", content: "safe" },
+        permission,
+      ),
+    ).resolves.toMatchObject({
+      behavior: "allow",
+      updatedInput: {
+        file_path: join(workspace, "nested/new.txt"),
+        content: "safe",
+      },
+    });
+    await expect(
       handler("Read", { file_path: join(outside, "secret.txt") }, permission),
+    ).resolves.toMatchObject({ behavior: "deny", interrupt: false });
+    await expect(
+      handler("Read", { file_path: "escape.txt" }, permission),
     ).resolves.toMatchObject({ behavior: "deny", interrupt: false });
     await expect(
       handler("mcp__probe__echo_nonce", { nonce: "secret" }, permission),
@@ -101,12 +135,16 @@ describe("managed-agent permission handler", () => {
     expect(evidence.map(({ decision, reason }) => [decision, reason])).toEqual([
       ["allow", "exact_bash_command"],
       ["deny", "bash_command_not_allowed"],
+      ["allow", "fixture_path"],
+      ["allow", "fixture_path"],
       ["deny", "path_outside_workspace"],
+      ["deny", "path_symlink_escape"],
       ["allow", "managed_mcp_tool"],
       ["deny", "tool_not_allowed"],
     ]);
     expect(JSON.stringify(evidence)).not.toContain(join(outside, "secret.txt"));
     expect(JSON.stringify(evidence)).not.toContain("secret");
+    expect(JSON.stringify(evidence)).not.toContain("tool-1");
     expect(vi.isMockFunction(handler)).toBe(false);
   });
 });

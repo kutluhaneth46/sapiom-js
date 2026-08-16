@@ -12,6 +12,88 @@ import { FIXTURE_PATHS } from "./fixture.js";
 import { qualifiedManagedAgentMcpToolName } from "./runtime.js";
 import type { ManagedAgentProbeResult } from "./types.js";
 
+function passingL1Result(): ManagedAgentProbeResult {
+  const builtins = ["Read", "Edit", "Write", "Bash"];
+  const echoTool = qualifiedManagedAgentMcpToolName("echo_nonce");
+  const failOnceTool = qualifiedManagedAgentMcpToolName("fail_once");
+  return {
+    contractVersion: 1,
+    runId: "run-1",
+    scenario: "L1",
+    target: "sonnet-5",
+    modelAlias: "claude-sonnet-5-anthropic-anthropic-eval",
+    sdkSessionId: "11111111-1111-4111-8111-111111111111",
+    terminal: "success",
+    events: [],
+    toolEvidence: [
+      ...builtins.flatMap((toolName) => [
+        { toolName, status: "requested" as const },
+        { toolName, status: "success" as const },
+      ]),
+      { toolName: echoTool, status: "success" },
+      { toolName: failOnceTool, status: "error" },
+      { toolName: failOnceTool, status: "success" },
+    ],
+    permissionEvidence: [
+      ...["Read", "Edit", "Write"].map((toolName, index) => ({
+        toolUseId: `tool_${String(index + 1).repeat(64)}`,
+        toolName,
+        decision: "allow" as const,
+        reason: "fixture_path" as const,
+      })),
+      {
+        toolUseId: `tool_${"b".repeat(64)}`,
+        toolName: "Bash",
+        decision: "allow",
+        reason: "exact_bash_command",
+      },
+      {
+        toolUseId: `tool_${"c".repeat(64)}`,
+        toolName: echoTool,
+        decision: "allow",
+        reason: "managed_mcp_tool",
+      },
+      {
+        toolUseId: `tool_${"d".repeat(64)}`,
+        toolName: failOnceTool,
+        decision: "allow",
+        reason: "managed_mcp_tool",
+      },
+      {
+        toolUseId: `tool_${"e".repeat(64)}`,
+        toolName: "Read",
+        decision: "deny",
+        reason: "path_outside_workspace",
+      },
+      {
+        toolUseId: `tool_${"f".repeat(64)}`,
+        toolName: "Read",
+        decision: "deny",
+        reason: "path_symlink_escape",
+      },
+    ],
+    workspaceChanges: [
+      { path: FIXTURE_PATHS.cleanTarget, change: "modified" },
+      { path: FIXTURE_PATHS.createdTarget, change: "created" },
+    ],
+    preservation: [
+      { path: FIXTURE_PATHS.dirtySentinel, preserved: true },
+      { path: FIXTURE_PATHS.untrackedSentinel, preserved: true },
+    ],
+    cancellationRequested: false,
+    queryClosed: true,
+    teardown: {
+      quiescent: true,
+      deadlineMet: true,
+      elapsedMs: 5,
+      observedPids: [],
+      alivePidsAtDeadline: [],
+      emergencyCleanupAttempted: false,
+    },
+    correlation: { executionId: "execution-1", evalSource: "eval-1" },
+  };
+}
+
 describe("managed-agent probe CLI", () => {
   it("is opt-in and never accepts credentials through arguments", () => {
     expect(() =>
@@ -139,71 +221,14 @@ describe("managed-agent probe CLI", () => {
   });
 
   it("requires successful results from every built-in tool for L1", () => {
-    const builtins = ["Read", "Edit", "Write", "Bash"];
+    const passing = passingL1Result();
     const result: ManagedAgentProbeResult = {
-      contractVersion: 1,
-      runId: "run-1",
-      scenario: "L1",
-      target: "sonnet-5",
-      modelAlias: "claude-sonnet-5-anthropic-anthropic-eval",
-      sdkSessionId: "session-1",
-      terminal: "success",
-      events: [],
-      toolEvidence: [
-        ...builtins.flatMap((toolName) => [
-          { toolName, status: "requested" as const },
-          {
-            toolName,
-            status:
-              toolName === "Bash" ? ("error" as const) : ("success" as const),
-          },
-        ]),
-        {
-          toolName: qualifiedManagedAgentMcpToolName("echo_nonce"),
-          status: "success",
-        },
-        {
-          toolName: qualifiedManagedAgentMcpToolName("fail_once"),
-          status: "error",
-        },
-        {
-          toolName: qualifiedManagedAgentMcpToolName("fail_once"),
-          status: "success",
-        },
-      ],
-      permissionEvidence: [
-        {
-          toolUseId: "deny-1",
-          toolName: "Read",
-          decision: "deny",
-          reason: "path_outside_workspace",
-        },
-        {
-          toolUseId: "deny-2",
-          toolName: "Read",
-          decision: "deny",
-          reason: "path_outside_workspace",
-        },
-      ],
-      workspaceChanges: [
-        { path: FIXTURE_PATHS.cleanTarget, change: "modified" },
-        { path: FIXTURE_PATHS.createdTarget, change: "created" },
-      ],
-      preservation: [
-        { path: FIXTURE_PATHS.dirtySentinel, preserved: true },
-        { path: FIXTURE_PATHS.untrackedSentinel, preserved: true },
-      ],
-      cancellationRequested: false,
-      queryClosed: true,
-      teardown: {
-        quiescent: true,
-        deadlineMet: true,
-        elapsedMs: 5,
-        observedPids: [],
-        alivePidsAtDeadline: [],
-        emergencyCleanupAttempted: false,
-      },
-      correlation: { executionId: "execution-1", evalSource: "eval-1" },
+      ...passing,
+      toolEvidence: passing.toolEvidence.map((evidence) =>
+        evidence.toolName === "Bash" && evidence.status === "success"
+          ? { ...evidence, status: "error" }
+          : evidence,
+      ),
     };
 
     expect(
@@ -211,5 +236,37 @@ describe("managed-agent probe CLI", () => {
         ({ id }) => id === "builtin_tools_succeeded",
       ),
     ).toEqual({ id: "builtin_tools_succeeded", passed: false });
+  });
+
+  it("requires positive permission evidence and distinct lexical and symlink denials", () => {
+    const passing = passingL1Result();
+    expect(evaluateManagedAgentProbe(passing).outcome).toBe("pass");
+
+    const falsePass: ManagedAgentProbeResult = {
+      ...passing,
+      permissionEvidence: [
+        {
+          toolUseId: `tool_${"a".repeat(64)}`,
+          toolName: "Read",
+          decision: "deny",
+          reason: "path_outside_workspace",
+        },
+        {
+          toolUseId: `tool_${"b".repeat(64)}`,
+          toolName: "Read",
+          decision: "deny",
+          reason: "path_outside_workspace",
+        },
+      ],
+    };
+    const checks = evaluateManagedAgentProbe(falsePass);
+
+    expect(checks.outcome).toBe("fail");
+    expect(
+      checks.checks.find(({ id }) => id === "expected_permissions_allowed"),
+    ).toEqual({ id: "expected_permissions_allowed", passed: false });
+    expect(
+      checks.checks.find(({ id }) => id === "outside_and_symlink_denied"),
+    ).toEqual({ id: "outside_and_symlink_denied", passed: false });
   });
 });

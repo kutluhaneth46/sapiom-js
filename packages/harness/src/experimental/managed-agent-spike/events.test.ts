@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import { ManagedAgentEventRecorder } from "./events.js";
+import {
+  ManagedAgentEventRecorder,
+  normalizeManagedAgentToolUseId,
+} from "./events.js";
+
+const SESSION_ID = "11111111-1111-4111-8111-111111111111";
 
 describe("ManagedAgentEventRecorder", () => {
   it("retains structural evidence while redacting message and tool content", () => {
@@ -8,12 +13,12 @@ describe("ManagedAgentEventRecorder", () => {
     recorder.observeSdkEvent({
       type: "system",
       subtype: "init",
-      session_id: "session-1",
+      session_id: SESSION_ID,
       model: "model-secret-must-not-be-copied",
     });
     recorder.observeSdkEvent({
       type: "assistant",
-      session_id: "session-1",
+      session_id: SESSION_ID,
       message: {
         id: "message-1",
         content: [
@@ -29,7 +34,7 @@ describe("ManagedAgentEventRecorder", () => {
     });
     recorder.observeSdkEvent({
       type: "user",
-      session_id: "session-1",
+      session_id: SESSION_ID,
       message: {
         content: [
           {
@@ -45,7 +50,7 @@ describe("ManagedAgentEventRecorder", () => {
       type: "result",
       subtype: "success",
       is_error: false,
-      session_id: "session-1",
+      session_id: SESSION_ID,
       result: "private-final-answer",
       usage: {
         input_tokens: 7,
@@ -58,7 +63,7 @@ describe("ManagedAgentEventRecorder", () => {
     expect(recorder.recordTerminal("success")).toBe(true);
     expect(recorder.recordTerminal("query_error")).toBe(false);
 
-    expect(recorder.sessionId).toBe("session-1");
+    expect(recorder.sessionId).toBe(SESSION_ID);
     expect(recorder.usage).toEqual({
       authority: "sdk_non_authoritative",
       inputTokens: 7,
@@ -68,8 +73,16 @@ describe("ManagedAgentEventRecorder", () => {
       estimatedCostUsd: 0.001,
     });
     expect(recorder.toolEvidence).toEqual([
-      { toolUseId: "tool-1", toolName: "Read", status: "requested" },
-      { toolUseId: "tool-1", toolName: "Read", status: "success" },
+      {
+        toolUseId: normalizeManagedAgentToolUseId("tool-1"),
+        toolName: "Read",
+        status: "requested",
+      },
+      {
+        toolUseId: normalizeManagedAgentToolUseId("tool-1"),
+        toolName: "Read",
+        status: "success",
+      },
     ]);
     expect(
       recorder.events.filter(({ type }) => type === "terminal"),
@@ -82,27 +95,88 @@ describe("ManagedAgentEventRecorder", () => {
       "tool-secret",
       "private-file-contents",
       "private-final-answer",
+      "tool-1",
     ]) {
       expect(serialized).not.toContain(secret);
     }
   });
 
-  it("normalizes an attacker-controlled tool name instead of persisting it", () => {
+  it("redacts attacker-controlled session, tool, and permission identifiers from all evidence", () => {
     const recorder = new ManagedAgentEventRecorder("run-2");
+    const sessionSecret = "session-secret-credential";
+    const toolIdSecret = "tool-id-secret-credential";
+    const permissionIdSecret = "permission-id-secret-credential";
+    const toolNameSecret = "ReadSecretCredential";
+    const permissionNameSecret = "WriteSecretCredential";
+    recorder.observeSdkEvent({
+      type: "system",
+      subtype: "init",
+      session_id: sessionSecret,
+    });
     recorder.observeSdkEvent({
       type: "assistant",
+      session_id: sessionSecret,
       message: {
         content: [
           {
             type: "tool_use",
-            id: "tool-2",
-            name: "Read secret=credential.value",
+            id: toolIdSecret,
+            name: toolNameSecret,
             input: {},
           },
         ],
       },
     });
+    recorder.observeSdkEvent({
+      type: "user",
+      session_id: sessionSecret,
+      message: {
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: toolIdSecret,
+            content: "private-result",
+          },
+        ],
+      },
+    });
+    recorder.recordPermission({
+      toolUseId: permissionIdSecret,
+      toolName: permissionNameSecret,
+      decision: "deny",
+      reason: "tool_not_allowed",
+    });
+    recorder.recordTerminal("success");
+
+    expect(recorder.sessionId).toBeUndefined();
     expect(recorder.toolEvidence[0]?.toolName).toBe("unknown");
-    expect(JSON.stringify(recorder.events)).not.toContain("credential.value");
+    expect(recorder.toolEvidence.map(({ toolUseId }) => toolUseId)).toEqual([
+      normalizeManagedAgentToolUseId(toolIdSecret),
+      normalizeManagedAgentToolUseId(toolIdSecret),
+    ]);
+    expect(recorder.permissionEvidence).toEqual([
+      {
+        toolUseId: normalizeManagedAgentToolUseId(permissionIdSecret),
+        toolName: "unknown",
+        decision: "deny",
+        reason: "tool_not_allowed",
+      },
+    ]);
+    const serialized = JSON.stringify({
+      sdkSessionId: recorder.sessionId,
+      events: recorder.events,
+      toolEvidence: recorder.toolEvidence,
+      permissionEvidence: recorder.permissionEvidence,
+    });
+    for (const secret of [
+      sessionSecret,
+      toolIdSecret,
+      permissionIdSecret,
+      toolNameSecret,
+      permissionNameSecret,
+      "private-result",
+    ]) {
+      expect(serialized).not.toContain(secret);
+    }
   });
 });

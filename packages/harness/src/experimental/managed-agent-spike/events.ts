@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import type {
   ManagedAgentPermissionEvidence,
   ManagedAgentProbeEvent,
@@ -29,11 +31,39 @@ function safeSubtype(value: unknown): string | undefined {
   return subtype && /^[a-z0-9_-]{1,80}$/i.test(subtype) ? subtype : undefined;
 }
 
-function safeToolName(value: unknown): string {
+const SAFE_TOOL_NAMES = new Set([
+  "Read",
+  "Edit",
+  "Write",
+  "Bash",
+  "mcp__sapiom-managed-agent-spike__echo_nonce",
+  "mcp__sapiom-managed-agent-spike__fail_once",
+]);
+const NORMALIZED_TOOL_USE_ID_PATTERN = /^tool_[0-9a-f]{64}$/;
+const SDK_SESSION_ID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+export function sanitizeManagedAgentToolName(value: unknown): string {
   const toolName = optionalString(value);
-  return toolName && /^[a-z0-9_-]{1,128}$/i.test(toolName)
-    ? toolName
-    : "unknown";
+  return toolName && SAFE_TOOL_NAMES.has(toolName) ? toolName : "unknown";
+}
+
+export function normalizeManagedAgentToolUseId(value: unknown): string {
+  if (typeof value === "string" && NORMALIZED_TOOL_USE_ID_PATTERN.test(value)) {
+    return value;
+  }
+  const raw = typeof value === "string" ? value : "invalid-tool-use-id";
+  return `tool_${createHash("sha256")
+    .update("sapiom-managed-agent-tool-use-id\0")
+    .update(raw)
+    .digest("hex")}`;
+}
+
+function safeSdkSessionId(value: unknown): string | undefined {
+  const sessionId = optionalString(value);
+  return sessionId && SDK_SESSION_ID_PATTERN.test(sessionId)
+    ? sessionId
+    : undefined;
 }
 
 function contentBlocks(message: JsonRecord | undefined): readonly JsonRecord[] {
@@ -119,13 +149,18 @@ export class ManagedAgentEventRecorder {
   }
 
   public recordPermission(evidence: ManagedAgentPermissionEvidence): void {
-    this.#permissionEvidence.push(evidence);
+    const normalizedEvidence = {
+      ...evidence,
+      toolUseId: normalizeManagedAgentToolUseId(evidence.toolUseId),
+      toolName: sanitizeManagedAgentToolName(evidence.toolName),
+    } satisfies ManagedAgentPermissionEvidence;
+    this.#permissionEvidence.push(normalizedEvidence);
     this.#append({
       type: "permission",
-      toolUseId: evidence.toolUseId,
-      toolName: safeToolName(evidence.toolName),
-      permissionDecision: evidence.decision,
-      permissionReason: evidence.reason,
+      toolUseId: normalizedEvidence.toolUseId,
+      toolName: normalizedEvidence.toolName,
+      permissionDecision: normalizedEvidence.decision,
+      permissionReason: normalizedEvidence.reason,
     });
   }
 
@@ -134,8 +169,8 @@ export class ManagedAgentEventRecorder {
     const type = optionalString(event?.type);
     if (!event || !type) return;
     const subtype = safeSubtype(event.subtype);
-    const sessionId = optionalString(event.session_id);
-    if (sessionId) this.#sessionId = sessionId;
+    const sessionId = safeSdkSessionId(event.session_id);
+    if (sessionId && !this.#sessionId) this.#sessionId = sessionId;
 
     if (type === "system" && subtype === "init") {
       this.#append({ type: "lifecycle", subtype: "sdk_init", sessionId });
@@ -150,8 +185,8 @@ export class ManagedAgentEventRecorder {
     if (type === "assistant") {
       for (const block of blocks) {
         if (block.type !== "tool_use") continue;
-        const toolUseId = optionalString(block.id);
-        const toolName = safeToolName(block.name);
+        const toolUseId = normalizeManagedAgentToolUseId(block.id);
+        const toolName = sanitizeManagedAgentToolName(block.name);
         this.#toolEvidence.push({ toolUseId, toolName, status: "requested" });
         this.#append({
           type: "tool_requested",
@@ -164,7 +199,7 @@ export class ManagedAgentEventRecorder {
     if (type === "user") {
       for (const block of blocks) {
         if (block.type !== "tool_result") continue;
-        const toolUseId = optionalString(block.tool_use_id);
+        const toolUseId = normalizeManagedAgentToolUseId(block.tool_use_id);
         const isError = block.is_error === true;
         const matchingTool = [...this.#toolEvidence]
           .reverse()
