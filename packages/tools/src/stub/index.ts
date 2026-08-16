@@ -1042,6 +1042,9 @@ export function createStubClient(opts: StubClientOptions = {}): Sapiom {
       images: {
         create: (input) =>
           Promise.resolve(
+            // SAP-2576: the routed backend always echoes a resolvedModel (a required field), so the
+            // stub does too. Set it INSIDE the fallback factory — not by post-mutating the resolved
+            // result — so a caller-supplied override wins and a frozen override is never mutated.
             r("contentGeneration.images.create", [input], () => ({
               images: [
                 {
@@ -1059,6 +1062,7 @@ export function createStubClient(opts: StubClientOptions = {}): Sapiom {
                     : {}),
                 },
               ],
+              resolvedModel: input.model ?? "stub-model",
             })) as ImageGenerationResult,
           ),
         launch: (input) => {
@@ -1107,6 +1111,9 @@ export function createStubClient(opts: StubClientOptions = {}): Sapiom {
       video: {
         create: (input) =>
           Promise.resolve(
+            // SAP-2576: set resolvedModel INSIDE the fallback factory (not by post-mutating the
+            // resolved result) so a caller-supplied override wins and a frozen override is never
+            // mutated. The real routed backend always echoes it; the required type expects it.
             r("contentGeneration.video.create", [input], () => ({
               video: {
                 url: "https://content.local/stub-video.mp4",
@@ -1120,6 +1127,7 @@ export function createStubClient(opts: StubClientOptions = {}): Sapiom {
                     }
                   : {}),
               },
+              resolvedModel: input.model ?? "stub-model",
             })) as VideoGenerationResult,
           ),
         launch: (input) => {
