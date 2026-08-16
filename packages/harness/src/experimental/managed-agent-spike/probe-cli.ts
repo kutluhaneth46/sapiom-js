@@ -184,7 +184,7 @@ export function evaluateManagedAgentProbe(
         ),
       },
       {
-        id: "builtin_tools_observed",
+        id: "builtin_tools_succeeded",
         passed: ["Read", "Edit", "Write", "Bash"].every(
           (name) => requestedTools.has(name) && invocation(name, "success"),
         ),

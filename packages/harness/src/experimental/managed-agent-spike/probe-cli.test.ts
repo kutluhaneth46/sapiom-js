@@ -3,10 +3,14 @@ import { describe, expect, it } from "vitest";
 import {
   ManagedAgentProbeCliError,
   assertManagedAgentCertificationNodeVersion,
+  evaluateManagedAgentProbe,
   executeManagedAgentProbeCli,
   managedAgentProbeUsage,
   parseManagedAgentProbeCliArgs,
 } from "./probe-cli.js";
+import { FIXTURE_PATHS } from "./fixture.js";
+import { qualifiedManagedAgentMcpToolName } from "./runtime.js";
+import type { ManagedAgentProbeResult } from "./types.js";
 
 describe("managed-agent probe CLI", () => {
   it("is opt-in and never accepts credentials through arguments", () => {
@@ -132,5 +136,80 @@ describe("managed-agent probe CLI", () => {
     expect(() => assertManagedAgentCertificationNodeVersion("22.23.1")).toThrow(
       ManagedAgentProbeCliError,
     );
+  });
+
+  it("requires successful results from every built-in tool for L1", () => {
+    const builtins = ["Read", "Edit", "Write", "Bash"];
+    const result: ManagedAgentProbeResult = {
+      contractVersion: 1,
+      runId: "run-1",
+      scenario: "L1",
+      target: "sonnet-5",
+      modelAlias: "claude-sonnet-5-anthropic-anthropic-eval",
+      sdkSessionId: "session-1",
+      terminal: "success",
+      events: [],
+      toolEvidence: [
+        ...builtins.flatMap((toolName) => [
+          { toolName, status: "requested" as const },
+          {
+            toolName,
+            status:
+              toolName === "Bash" ? ("error" as const) : ("success" as const),
+          },
+        ]),
+        {
+          toolName: qualifiedManagedAgentMcpToolName("echo_nonce"),
+          status: "success",
+        },
+        {
+          toolName: qualifiedManagedAgentMcpToolName("fail_once"),
+          status: "error",
+        },
+        {
+          toolName: qualifiedManagedAgentMcpToolName("fail_once"),
+          status: "success",
+        },
+      ],
+      permissionEvidence: [
+        {
+          toolUseId: "deny-1",
+          toolName: "Read",
+          decision: "deny",
+          reason: "path_outside_workspace",
+        },
+        {
+          toolUseId: "deny-2",
+          toolName: "Read",
+          decision: "deny",
+          reason: "path_outside_workspace",
+        },
+      ],
+      workspaceChanges: [
+        { path: FIXTURE_PATHS.cleanTarget, change: "modified" },
+        { path: FIXTURE_PATHS.createdTarget, change: "created" },
+      ],
+      preservation: [
+        { path: FIXTURE_PATHS.dirtySentinel, preserved: true },
+        { path: FIXTURE_PATHS.untrackedSentinel, preserved: true },
+      ],
+      cancellationRequested: false,
+      queryClosed: true,
+      teardown: {
+        quiescent: true,
+        deadlineMet: true,
+        elapsedMs: 5,
+        observedPids: [],
+        alivePidsAtDeadline: [],
+        emergencyCleanupAttempted: false,
+      },
+      correlation: { executionId: "execution-1", evalSource: "eval-1" },
+    };
+
+    expect(
+      evaluateManagedAgentProbe(result).checks.find(
+        ({ id }) => id === "builtin_tools_succeeded",
+      ),
+    ).toEqual({ id: "builtin_tools_succeeded", passed: false });
   });
 });
