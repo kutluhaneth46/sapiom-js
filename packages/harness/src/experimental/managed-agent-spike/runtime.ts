@@ -20,9 +20,13 @@ import {
 import {
   MANAGED_AGENT_BUILTIN_TOOLS,
   MANAGED_AGENT_DISALLOWED_TOOLS,
-  createManagedAgentPermissionHandler,
+  createManagedAgentPolicyBoundary,
 } from "./permissions.js";
 import { createLocalManagedAgentProcessObserver } from "./process-observer.js";
+import {
+  assertManagedAgentHooksEnabled,
+  buildManagedAgentSettingsGuardEnvironment,
+} from "./settings-guard.js";
 import type {
   ManagedAgentProbeConfig,
   ManagedAgentProbeDependencies,
@@ -35,6 +39,8 @@ import type {
 
 export const MANAGED_AGENT_MCP_SERVER_NAME = "sapiom-managed-agent-spike";
 export const MANAGED_AGENT_TEARDOWN_TIMEOUT_MS = 5_000;
+export const MANAGED_AGENT_CORRELATION_MARKER_VERSION =
+  "SAPIOM_CERTIFICATION_CORRELATION_V1";
 const QUERY_CLOSE_TIMEOUT_MS = 2_000;
 
 type McpToolName = "echo_nonce" | "fail_once";
@@ -148,6 +154,8 @@ function defaultQueryFactory(input: {
   readonly prompt: string;
   readonly options: Options;
 }): ManagedAgentQuery {
+  // The narrow return type intentionally withholds control-channel methods,
+  // especially Query.mcpCall(), because those calls bypass permission checks.
   return agentSdkQuery(input);
 }
 
@@ -160,6 +168,48 @@ function safeEvalSource(
     .toLowerCase()
     .replace(/[^a-z0-9-]+/g, "-")
     .replace(/^-|-$/g, "");
+}
+
+export function buildManagedAgentCorrelationPrompt(input: {
+  readonly prompt: string;
+  readonly evalSource: string;
+  readonly executionId: string;
+}): string {
+  const marker = [
+    MANAGED_AGENT_CORRELATION_MARKER_VERSION,
+    `eval_source=${input.evalSource}`,
+    `execution_id=${input.executionId}`,
+  ].join(";");
+  return [
+    marker,
+    "This is a non-secret certification marker. Do not repeat it.",
+    input.prompt,
+  ].join("\n");
+}
+
+function hasUniversalPolicyHookCoverage(
+  toolEvidence: readonly ManagedAgentToolEvidence[],
+  permissionEvidence: ManagedAgentProbeResult["permissionEvidence"],
+): boolean {
+  const requested = toolEvidence.filter(({ status }) => status === "requested");
+  const requestedIds = requested.flatMap(({ toolUseId }) =>
+    toolUseId ? [toolUseId] : [],
+  );
+  if (
+    requestedIds.length !== requested.length ||
+    new Set(requestedIds).size !== requestedIds.length
+  ) {
+    return false;
+  }
+  return requestedIds.every((toolUseId) => {
+    return (
+      permissionEvidence.filter(
+        (evidence) =>
+          evidence.toolUseId === toolUseId &&
+          evidence.source === "pre_tool_use",
+      ).length === 1
+    );
+  });
 }
 
 async function closeQueryBounded(query: ManagedAgentQuery): Promise<boolean> {
@@ -241,6 +291,7 @@ export async function runManagedAgentProbe(
   let queryFailed = false;
   let queryClosed = false;
   let cancellationTriggerFailed = false;
+  let policyPreflightFailed = false;
 
   const childEnvironment = buildManagedAgentChildEnvironment({
     ambient: process.env,
@@ -251,7 +302,7 @@ export async function runManagedAgentProbe(
     evalSource,
     executionId,
   });
-  const permissionHandler = createManagedAgentPermissionHandler({
+  const policyBoundary = createManagedAgentPolicyBoundary({
     canonicalWorkspaceRoot: validated.canonicalWorkspaceRoot,
     allowedBashCommands: config.allowedBashCommands,
     allowedMcpTools: mcpRuntime.qualifiedToolNames,
@@ -262,11 +313,22 @@ export async function runManagedAgentProbe(
 
   const options: Options = {
     abortController,
-    canUseTool: permissionHandler,
+    // PreToolUse is the universal boundary. canUseTool only handles an
+    // unresolved SDK permission as defense in depth; the shared evaluator
+    // deduplicates its evidence by tool-use ID.
+    canUseTool: policyBoundary.canUseToolFallback,
     cwd: validated.canonicalWorkspaceRoot,
     disallowedTools: [...MANAGED_AGENT_DISALLOWED_TOOLS],
     env: childEnvironment,
     includePartialMessages: false,
+    hooks: {
+      PreToolUse: [
+        {
+          hooks: [policyBoundary.preToolUseHook],
+          timeout: 5,
+        },
+      ],
+    },
     maxBudgetUsd: config.maxBudgetUsd,
     maxTurns: config.maxTurns,
     mcpServers: { [MANAGED_AGENT_MCP_SERVER_NAME]: mcpRuntime.server },
@@ -289,40 +351,62 @@ export async function runManagedAgentProbe(
 
   let teardown!: ManagedAgentTeardownObservation;
   let terminal!: ManagedAgentTerminalClassification;
+  let policyHookCoverage = false;
   try {
     recorder.recordLifecycle("starting");
-    const cancellationTask = dependencies.waitForCancellationSignal
-      ? dependencies
-          .waitForCancellationSignal(triggerController.signal)
-          .then(() => {
-            if (triggerController.signal.aborted) return;
-            cancellationRequested = true;
-            cancellationRequestedAt = (dependencies.now ?? Date.now)();
-            recorder.recordLifecycle("cancellation_requested");
-            abortController.abort();
-          })
-          .catch(() => {
-            if (!triggerController.signal.aborted) {
-              cancellationTriggerFailed = true;
-              abortController.abort();
-            }
-          })
-      : undefined;
-
     try {
-      query = (dependencies.queryFactory ?? defaultQueryFactory)({
-        prompt: config.prompt,
-        options,
+      await (
+        dependencies.policySettingsGuard ?? assertManagedAgentHooksEnabled
+      )({
+        cwd: validated.canonicalWorkspaceRoot,
+        environment:
+          buildManagedAgentSettingsGuardEnvironment(childEnvironment),
       });
-      for await (const event of query) recorder.observeSdkEvent(event);
     } catch {
-      if (!abortController.signal.aborted) queryFailed = true;
-    } finally {
+      policyPreflightFailed = true;
+      recorder.recordLifecycle("policy_preflight_failed");
       triggerController.abort();
-      if (cancellationTask) await cancellationTask;
-      queryFailed ||= cancellationTriggerFailed;
-      if (query) queryClosed = await closeQueryBounded(query);
-      if ((query && !queryClosed) || queryFailed) abortController.abort();
+      abortController.abort();
+    }
+    const cancellationTask =
+      !policyPreflightFailed && dependencies.waitForCancellationSignal
+        ? dependencies
+            .waitForCancellationSignal(triggerController.signal)
+            .then(() => {
+              if (triggerController.signal.aborted) return;
+              cancellationRequested = true;
+              cancellationRequestedAt = (dependencies.now ?? Date.now)();
+              recorder.recordLifecycle("cancellation_requested");
+              abortController.abort();
+            })
+            .catch(() => {
+              if (!triggerController.signal.aborted) {
+                cancellationTriggerFailed = true;
+                abortController.abort();
+              }
+            })
+        : undefined;
+
+    if (!policyPreflightFailed) {
+      try {
+        query = (dependencies.queryFactory ?? defaultQueryFactory)({
+          prompt: buildManagedAgentCorrelationPrompt({
+            prompt: config.prompt,
+            evalSource,
+            executionId,
+          }),
+          options,
+        });
+        for await (const event of query) recorder.observeSdkEvent(event);
+      } catch {
+        if (!abortController.signal.aborted) queryFailed = true;
+      } finally {
+        triggerController.abort();
+        if (cancellationTask) await cancellationTask;
+        queryFailed ||= cancellationTriggerFailed;
+        if (query) queryClosed = await closeQueryBounded(query);
+        if ((query && !queryClosed) || queryFailed) abortController.abort();
+      }
     }
 
     const now = dependencies.now ?? Date.now;
@@ -353,6 +437,26 @@ export async function runManagedAgentProbe(
       queryFailed,
       sdkResult: recorder.result,
     });
+    if (
+      policyPreflightFailed &&
+      terminal !== "teardown_timeout" &&
+      terminal !== "close_timeout"
+    ) {
+      terminal = "policy_violation";
+    }
+    policyHookCoverage =
+      !policyPreflightFailed &&
+      hasUniversalPolicyHookCoverage(
+        recorder.toolEvidence,
+        recorder.permissionEvidence,
+      );
+    if (
+      !policyHookCoverage &&
+      terminal !== "teardown_timeout" &&
+      terminal !== "close_timeout"
+    ) {
+      terminal = "policy_violation";
+    }
     recorder.recordTerminal(terminal);
 
     if (!teardown.quiescent) {
@@ -374,6 +478,11 @@ export async function runManagedAgentProbe(
     target: config.target,
     modelAlias: validated.model.alias,
     ...(recorder.sessionId ? { sdkSessionId: recorder.sessionId } : {}),
+    inferenceTurns: recorder.inferenceTurns,
+    ...(recorder.sdkNumTurns === undefined
+      ? {}
+      : { sdkNumTurns: recorder.sdkNumTurns }),
+    policyHookCoverage,
     terminal,
     events: [...recorder.events],
     toolEvidence: [...recorder.toolEvidence, ...mcpRuntime.invocations],
@@ -387,7 +496,7 @@ export async function runManagedAgentProbe(
     cancellationRequested,
     queryClosed,
     teardown,
-    correlation: { executionId, evalSource },
+    correlation: { executionId, evalSource, promptEmbedded: true },
     ...(recorder.usage ? { sdkUsage: recorder.usage } : {}),
   };
 }

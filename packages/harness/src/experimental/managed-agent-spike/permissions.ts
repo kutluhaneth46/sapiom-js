@@ -3,12 +3,14 @@ import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 
 import type {
   CanUseTool,
+  HookCallback,
   PermissionResult,
 } from "@anthropic-ai/claude-agent-sdk";
 
 import type {
   ManagedAgentPermissionEvidence,
   ManagedAgentPermissionReason,
+  ManagedAgentPermissionSource,
 } from "./types.js";
 import {
   normalizeManagedAgentToolUseId,
@@ -129,28 +131,47 @@ export async function resolveManagedAgentToolPath(
   return resolvedCandidate;
 }
 
-export interface ManagedAgentPermissionHandlerOptions {
+export interface ManagedAgentPolicyBoundaryOptions {
   readonly canonicalWorkspaceRoot: string;
   readonly allowedBashCommands: readonly string[];
   readonly allowedMcpTools: readonly string[];
   readonly onDecision: (evidence: ManagedAgentPermissionEvidence) => void;
+  /** Test seam for proving cancellation after asynchronous path validation. */
+  readonly resolveToolPath?: typeof resolveManagedAgentToolPath;
+}
+
+export interface ManagedAgentPolicyBoundary {
+  /** Primary boundary: the SDK runs this before its own permission evaluation. */
+  readonly preToolUseHook: HookCallback;
+  /** Defense in depth when the SDK still surfaces an unresolved permission. */
+  readonly canUseToolFallback: CanUseTool;
+}
+
+interface ManagedAgentPolicyDecision {
+  readonly decision: "allow" | "deny";
+  readonly reason: ManagedAgentPermissionReason;
+  readonly updatedInput?: Record<string, unknown>;
+}
+
+interface ManagedAgentRecordedPolicyDecision extends ManagedAgentPolicyDecision {
+  readonly source: ManagedAgentPermissionSource;
 }
 
 function permissionResult(
-  decision: "allow" | "deny",
+  policy: ManagedAgentPolicyDecision,
   toolUseID: string,
-  reason: ManagedAgentPermissionReason,
-  updatedInput?: Record<string, unknown>,
 ): PermissionResult {
-  return decision === "allow"
+  return policy.decision === "allow"
     ? {
         behavior: "allow",
         toolUseID,
-        ...(updatedInput ? { updatedInput } : {}),
+        ...(policy.updatedInput
+          ? { updatedInput: { ...policy.updatedInput } }
+          : {}),
       }
     : {
         behavior: "deny",
-        message: `Managed-agent permission denied: ${reason}`,
+        message: `Managed-agent permission denied: ${policy.reason}`,
         interrupt: false,
         toolUseID,
       };
@@ -162,68 +183,178 @@ function filePathFromInput(input: Record<string, unknown>): string | undefined {
     : undefined;
 }
 
-export function createManagedAgentPermissionHandler(
-  options: ManagedAgentPermissionHandlerOptions,
-): CanUseTool {
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function denied(
+  reason: ManagedAgentPermissionReason,
+): ManagedAgentPolicyDecision {
+  return { decision: "deny", reason };
+}
+
+async function evaluateManagedAgentPolicy(
+  options: ManagedAgentPolicyBoundaryOptions,
+  allowedCommands: ReadonlySet<string>,
+  allowedMcpTools: ReadonlySet<string>,
+  toolName: string,
+  rawInput: unknown,
+  signal: AbortSignal,
+): Promise<ManagedAgentPolicyDecision> {
+  if (signal.aborted) return denied("policy_aborted");
+  const input = asRecord(rawInput);
+  if (!input) return denied("invalid_input");
+
+  if (allowedMcpTools.has(toolName)) {
+    return signal.aborted
+      ? denied("policy_aborted")
+      : {
+          decision: "allow",
+          reason: "managed_mcp_tool",
+          updatedInput: { ...input },
+        };
+  }
+  if (toolName === "Bash") {
+    const command =
+      typeof input.command === "string" ? input.command : undefined;
+    if (!command) return denied("invalid_input");
+    if (!allowedCommands.has(command)) {
+      return denied("bash_command_not_allowed");
+    }
+    return signal.aborted
+      ? denied("policy_aborted")
+      : {
+          decision: "allow",
+          reason: "exact_bash_command",
+          updatedInput: { ...input },
+        };
+  }
+  if (toolName === "Read" || toolName === "Edit" || toolName === "Write") {
+    const requestedPath = filePathFromInput(input);
+    if (!requestedPath) return denied("invalid_input");
+    try {
+      const canonicalPath = await (
+        options.resolveToolPath ?? resolveManagedAgentToolPath
+      )(options.canonicalWorkspaceRoot, requestedPath);
+      if (signal.aborted) return denied("policy_aborted");
+      return {
+        decision: "allow",
+        reason: "fixture_path",
+        updatedInput: { ...input, file_path: canonicalPath },
+      };
+    } catch (error) {
+      if (signal.aborted) return denied("policy_aborted");
+      return denied(
+        error instanceof ManagedAgentPathError ? error.reason : "invalid_input",
+      );
+    }
+  }
+  return denied("tool_not_allowed");
+}
+
+/**
+ * Build one universal host policy shared by the primary PreToolUse hook and a
+ * canUseTool fallback. Decisions are deduplicated by raw tool-use ID so one
+ * attempted tool produces exactly one normalized evidence record.
+ */
+export function createManagedAgentPolicyBoundary(
+  options: ManagedAgentPolicyBoundaryOptions,
+): ManagedAgentPolicyBoundary {
   const allowedCommands = new Set(options.allowedBashCommands);
   const allowedMcpTools = new Set(options.allowedMcpTools);
-
-  return async (toolName, input, permission): Promise<PermissionResult> => {
-    let decision: "allow" | "deny" = "deny";
-    let reason: ManagedAgentPermissionReason = "tool_not_allowed";
-    let updatedInput: Record<string, unknown> | undefined;
-
-    if (allowedMcpTools.has(toolName)) {
-      decision = "allow";
-      reason = "managed_mcp_tool";
-    } else if (toolName === "Bash") {
-      const command =
-        typeof input.command === "string" ? input.command : undefined;
-      if (!command) {
-        reason = "invalid_input";
-      } else if (allowedCommands.has(command)) {
-        decision = "allow";
-        reason = "exact_bash_command";
-      } else {
-        reason = "bash_command_not_allowed";
-      }
-    } else if (
-      toolName === "Read" ||
-      toolName === "Edit" ||
-      toolName === "Write"
-    ) {
-      const requestedPath = filePathFromInput(input);
-      if (!requestedPath) {
-        reason = "invalid_input";
-      } else {
-        try {
-          const canonicalPath = await resolveManagedAgentToolPath(
-            options.canonicalWorkspaceRoot,
-            requestedPath,
-          );
-          decision = "allow";
-          reason = "fixture_path";
-          updatedInput = { ...input, file_path: canonicalPath };
-        } catch (error) {
-          reason =
-            error instanceof ManagedAgentPathError
-              ? error.reason
-              : "invalid_input";
-        }
-      }
+  const decisions = new Map<
+    string,
+    {
+      readonly source: ManagedAgentPermissionSource;
+      readonly pending: Promise<ManagedAgentRecordedPolicyDecision>;
     }
+  >();
 
-    options.onDecision({
-      toolUseId: normalizeManagedAgentToolUseId(permission.toolUseID),
-      toolName: sanitizeManagedAgentToolName(toolName),
-      decision,
-      reason,
+  const decide = async (
+    toolUseID: string,
+    toolName: string,
+    input: unknown,
+    signal: AbortSignal,
+    source: ManagedAgentPermissionSource,
+  ): Promise<ManagedAgentRecordedPolicyDecision> => {
+    const existing = decisions.get(toolUseID);
+    if (existing) {
+      if (signal.aborted) {
+        return { ...denied("policy_aborted"), source };
+      }
+      // The only valid duplicate is the SDK consulting canUseTool after the
+      // primary hook. A repeated primary ID or fallback-first sequence is
+      // ambiguous and must never inherit an earlier allow decision.
+      return source === "can_use_tool_fallback" &&
+        existing.source === "pre_tool_use"
+        ? existing.pending
+        : { ...denied("invalid_input"), source };
+    }
+    const pending = evaluateManagedAgentPolicy(
+      options,
+      allowedCommands,
+      allowedMcpTools,
+      toolName,
+      input,
+      signal,
+    ).then((policy) => {
+      const recorded = { ...policy, source };
+      options.onDecision({
+        toolUseId: normalizeManagedAgentToolUseId(toolUseID),
+        toolName: sanitizeManagedAgentToolName(toolName),
+        decision: recorded.decision,
+        reason: recorded.reason,
+        source,
+      });
+      return recorded;
     });
-    return permissionResult(
-      decision,
-      permission.toolUseID,
-      reason,
-      updatedInput,
-    );
+    decisions.set(toolUseID, { source, pending });
+    return pending;
   };
+
+  const preToolUseHook: HookCallback = async (
+    input,
+    callbackToolUseID,
+    { signal },
+  ) => {
+    const isPreToolUse = input.hook_event_name === "PreToolUse";
+    const inputToolUseID = isPreToolUse ? input.tool_use_id : undefined;
+    const identifiersMatch =
+      !callbackToolUseID || callbackToolUseID === inputToolUseID;
+    const toolUseID =
+      callbackToolUseID ?? inputToolUseID ?? "invalid-tool-use-id";
+    const policy = await decide(
+      toolUseID,
+      isPreToolUse ? input.tool_name : "unknown",
+      isPreToolUse && identifiersMatch ? input.tool_input : undefined,
+      signal,
+      "pre_tool_use",
+    );
+    return {
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: policy.decision,
+        permissionDecisionReason: `Managed-agent policy: ${policy.reason}`,
+        ...(policy.decision === "allow" && policy.updatedInput
+          ? { updatedInput: { ...policy.updatedInput } }
+          : {}),
+      },
+    };
+  };
+
+  const canUseToolFallback: CanUseTool = async (toolName, input, permission) =>
+    permissionResult(
+      await decide(
+        permission.toolUseID,
+        toolName,
+        input,
+        permission.signal,
+        "can_use_tool_fallback",
+      ),
+      permission.toolUseID,
+    );
+
+  return { preToolUseHook, canUseToolFallback };
 }

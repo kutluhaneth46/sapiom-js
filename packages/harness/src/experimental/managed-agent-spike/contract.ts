@@ -19,6 +19,7 @@ export const MANAGED_AGENT_CONTRACT = {
   suiteVersion: "0.1.0",
   directGatewayOrigin: "https://litellm.services.sapiom.ai",
   maxBudgetUsd: 1,
+  maxTurns: 20,
 } as const;
 
 export const MANAGED_AGENT_MODEL_TARGETS: Readonly<
@@ -209,10 +210,10 @@ export function validateManagedAgentProbeConfig(
   if (
     !Number.isInteger(config.maxTurns) ||
     config.maxTurns < 1 ||
-    config.maxTurns > 20
+    config.maxTurns > MANAGED_AGENT_CONTRACT.maxTurns
   ) {
     throw new ManagedAgentConfigurationError(
-      "maxTurns must be an integer between 1 and 20",
+      `maxTurns must be an integer between 1 and ${MANAGED_AGENT_CONTRACT.maxTurns}`,
     );
   }
   if (

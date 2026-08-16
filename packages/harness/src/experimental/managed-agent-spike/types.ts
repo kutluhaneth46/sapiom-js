@@ -39,11 +39,16 @@ export type ManagedAgentPermissionReason =
   | "fixture_path"
   | "exact_bash_command"
   | "managed_mcp_tool"
+  | "policy_aborted"
   | "invalid_input"
   | "path_outside_workspace"
   | "path_symlink_escape"
   | "bash_command_not_allowed"
   | "tool_not_allowed";
+
+export type ManagedAgentPermissionSource =
+  | "pre_tool_use"
+  | "can_use_tool_fallback";
 
 export type ManagedAgentProbeEventType =
   | "lifecycle"
@@ -68,6 +73,7 @@ export interface ManagedAgentProbeEvent {
   readonly toolName?: string;
   readonly permissionDecision?: ManagedAgentPermissionDecision;
   readonly permissionReason?: ManagedAgentPermissionReason;
+  readonly permissionSource?: ManagedAgentPermissionSource;
   readonly isError?: boolean;
   readonly terminal?: ManagedAgentTerminalClassification;
 }
@@ -102,6 +108,7 @@ export interface ManagedAgentPermissionEvidence {
   readonly toolName: string;
   readonly decision: ManagedAgentPermissionDecision;
   readonly reason: ManagedAgentPermissionReason;
+  readonly source: ManagedAgentPermissionSource;
 }
 
 export interface ManagedAgentTeardownObservation {
@@ -118,6 +125,7 @@ export type ManagedAgentTerminalClassification =
   | "cancelled"
   | "sdk_result_error"
   | "query_error"
+  | "policy_violation"
   | "incomplete"
   | "close_timeout"
   | "teardown_timeout";
@@ -129,6 +137,12 @@ export interface ManagedAgentProbeResult {
   readonly target: ManagedAgentModelTargetId;
   readonly modelAlias: string;
   readonly sdkSessionId?: string;
+  /** Distinct, hashed assistant message IDs; authoritative for BQ call count. */
+  readonly inferenceTurns: number;
+  /** SDK result.num_turns; informational and not a gateway reconciliation key. */
+  readonly sdkNumTurns?: number;
+  /** False if any requested tool lacked exactly one primary PreToolUse decision. */
+  readonly policyHookCoverage: boolean;
   readonly terminal: ManagedAgentTerminalClassification;
   readonly events: readonly ManagedAgentProbeEvent[];
   readonly toolEvidence: readonly ManagedAgentToolEvidence[];
@@ -141,10 +155,15 @@ export interface ManagedAgentProbeResult {
   readonly correlation: {
     readonly executionId: string;
     readonly evalSource: string;
+    readonly promptEmbedded: true;
   };
   readonly sdkUsage?: ManagedAgentSdkUsageEstimate;
 }
 
+/**
+ * Deliberately excludes Agent SDK control-channel methods. In particular,
+ * Query.mcpCall bypasses permission checks and is outside this host boundary.
+ */
 export interface ManagedAgentQuery extends AsyncIterable<unknown> {
   close(): void;
 }
@@ -175,4 +194,9 @@ export interface ManagedAgentProbeDependencies {
   readonly uuid?: () => string;
   readonly now?: () => number;
   readonly waitForCancellationSignal?: (signal: AbortSignal) => Promise<void>;
+  readonly policySettingsGuard?: (input: {
+    readonly cwd: string;
+    readonly environment: Readonly<Record<string, string>>;
+    readonly nodeExecutable?: string;
+  }) => Promise<void>;
 }

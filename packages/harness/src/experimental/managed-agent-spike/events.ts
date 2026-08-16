@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 
+import { MANAGED_AGENT_CONTRACT } from "./contract.js";
 import type {
   ManagedAgentPermissionEvidence,
   ManagedAgentProbeEvent,
@@ -42,6 +43,14 @@ const SAFE_TOOL_NAMES = new Set([
 const NORMALIZED_TOOL_USE_ID_PATTERN = /^tool_[0-9a-f]{64}$/;
 const SDK_SESSION_ID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const MAX_ASSISTANT_MESSAGE_ID_LENGTH = 512;
+
+export class ManagedAgentEventError extends Error {
+  public constructor(message: string) {
+    super(message);
+    this.name = "ManagedAgentEventError";
+  }
+}
 
 export function sanitizeManagedAgentToolName(value: unknown): string {
   const toolName = optionalString(value);
@@ -64,6 +73,33 @@ function safeSdkSessionId(value: unknown): string | undefined {
   return sessionId && SDK_SESSION_ID_PATTERN.test(sessionId)
     ? sessionId
     : undefined;
+}
+
+function normalizeAssistantMessageId(value: unknown): string {
+  const messageId = optionalString(value);
+  if (!messageId || messageId.length > MAX_ASSISTANT_MESSAGE_ID_LENGTH) {
+    throw new ManagedAgentEventError(
+      "Assistant event has no bounded string message id",
+    );
+  }
+  return createHash("sha256")
+    .update("sapiom-managed-agent-assistant-message-id\0")
+    .update(messageId)
+    .digest("hex");
+}
+
+function boundedSdkNumTurns(value: unknown): number | undefined {
+  if (value === undefined) return undefined;
+  if (
+    !Number.isInteger(value) ||
+    Number(value) < 0 ||
+    Number(value) > MANAGED_AGENT_CONTRACT.maxTurns
+  ) {
+    throw new ManagedAgentEventError(
+      `SDK num_turns must be an integer between 0 and ${MANAGED_AGENT_CONTRACT.maxTurns}`,
+    );
+  }
+  return Number(value);
 }
 
 function contentBlocks(message: JsonRecord | undefined): readonly JsonRecord[] {
@@ -95,10 +131,12 @@ export class ManagedAgentEventRecorder {
   readonly #events: ManagedAgentProbeEvent[] = [];
   readonly #toolEvidence: ManagedAgentToolEvidence[] = [];
   readonly #permissionEvidence: ManagedAgentPermissionEvidence[] = [];
+  readonly #inferenceMessageIds = new Set<string>();
   readonly #runId: string;
   #terminalRecorded = false;
   #sessionId: string | undefined;
   #usage: ManagedAgentSdkUsageEstimate | undefined;
+  #sdkNumTurns: number | undefined;
   #sdkResult:
     | { readonly isError: boolean; readonly subtype?: string }
     | undefined;
@@ -125,6 +163,14 @@ export class ManagedAgentEventRecorder {
 
   public get usage(): ManagedAgentSdkUsageEstimate | undefined {
     return this.#usage;
+  }
+
+  public get inferenceTurns(): number {
+    return this.#inferenceMessageIds.size;
+  }
+
+  public get sdkNumTurns(): number | undefined {
+    return this.#sdkNumTurns;
   }
 
   public get result():
@@ -161,6 +207,7 @@ export class ManagedAgentEventRecorder {
       toolName: normalizedEvidence.toolName,
       permissionDecision: normalizedEvidence.decision,
       permissionReason: normalizedEvidence.reason,
+      permissionSource: normalizedEvidence.source,
     });
   }
 
@@ -179,6 +226,14 @@ export class ManagedAgentEventRecorder {
 
     const message = asRecord(event.message);
     const blocks = contentBlocks(message);
+    if (type === "assistant") {
+      this.#inferenceMessageIds.add(normalizeAssistantMessageId(message?.id));
+      if (this.#inferenceMessageIds.size > MANAGED_AGENT_CONTRACT.maxTurns) {
+        throw new ManagedAgentEventError(
+          `Distinct assistant message ids exceed ${MANAGED_AGENT_CONTRACT.maxTurns}`,
+        );
+      }
+    }
     if (type === "assistant" || type === "user") {
       this.#append({ type: "message", subtype: type, sessionId });
     }
@@ -220,6 +275,7 @@ export class ManagedAgentEventRecorder {
       }
     }
     if (type === "result") {
+      this.#sdkNumTurns = boundedSdkNumTurns(event.num_turns);
       const isError = event.is_error === true || subtype !== "success";
       this.#sdkResult = { isError, ...(subtype ? { subtype } : {}) };
       this.#usage = sdkUsage(event);

@@ -79,6 +79,34 @@ function queryFromEvents(
   };
 }
 
+async function invokePreToolUse(
+  options: Options,
+  input: {
+    readonly toolName: string;
+    readonly toolInput: unknown;
+    readonly toolUseId: string;
+  },
+  signal = new AbortController().signal,
+): Promise<void> {
+  const matcher = options.hooks?.PreToolUse?.[0];
+  const hook = matcher?.hooks[0];
+  if (!hook)
+    throw new Error("PreToolUse hook missing from managed-agent probe");
+  await hook(
+    {
+      hook_event_name: "PreToolUse",
+      session_id: SUCCESS_SESSION_ID,
+      transcript_path: "not-persisted",
+      cwd: String(options.cwd),
+      tool_name: input.toolName,
+      tool_input: input.toolInput,
+      tool_use_id: input.toolUseId,
+    },
+    input.toolUseId,
+    { signal },
+  );
+}
+
 async function probeConfig(scenario: "L1" | "L2" = "L1") {
   const fixture = await createManagedAgentFixture(() => "runtime-test-secret");
   fixtures.push(fixture);
@@ -145,6 +173,7 @@ describe("runManagedAgentProbe", () => {
     const observer = fakeObserver();
     const close = vi.fn();
     let capturedOptions: Options | undefined;
+    let capturedPrompt: string | undefined;
     const previousOAuth = process.env.CLAUDE_CODE_OAUTH_TOKEN;
     process.env.CLAUDE_CODE_OAUTH_TOKEN = "ambient-user-login";
     try {
@@ -156,34 +185,44 @@ describe("runManagedAgentProbe", () => {
           return () =>
             `00000000-0000-4000-8000-${String(++counter).padStart(12, "0")}`;
         })(),
-        queryFactory: ({ options }) => {
+        queryFactory: ({ prompt, options }) => {
           capturedOptions = options;
-          return queryFromEvents(
-            [
-              {
+          capturedPrompt = prompt;
+          return {
+            async *[Symbol.asyncIterator]() {
+              yield {
                 type: "system",
                 subtype: "init",
                 session_id: SUCCESS_SESSION_ID,
                 model: resolveManagedAgentModelTarget("sonnet-5").alias,
-              },
-              {
+              };
+              yield {
                 type: "assistant",
                 session_id: SUCCESS_SESSION_ID,
                 message: {
+                  id: "message-runtime-1",
                   content: [
                     {
                       type: "tool_use",
                       id: "tool-1",
                       name: "Read",
                       input: {
-                        file_path: fixture.outsideSentinel,
+                        file_path: FIXTURE_PATHS.cleanTarget,
                         secret: fixture.nonce,
                       },
                     },
                   ],
                 },
-              },
-              {
+              };
+              await invokePreToolUse(options, {
+                toolName: "Read",
+                toolInput: {
+                  file_path: FIXTURE_PATHS.cleanTarget,
+                  secret: fixture.nonce,
+                },
+                toolUseId: "tool-1",
+              });
+              yield {
                 type: "user",
                 session_id: SUCCESS_SESSION_ID,
                 message: {
@@ -195,18 +234,19 @@ describe("runManagedAgentProbe", () => {
                     },
                   ],
                 },
-              },
-              {
+              };
+              yield {
                 type: "result",
                 subtype: "success",
                 is_error: false,
                 session_id: SUCCESS_SESSION_ID,
                 result: `secret:${fixture.nonce}`,
+                num_turns: 1,
                 usage: { input_tokens: 9, output_tokens: 4 },
-              },
-            ],
+              };
+            },
             close,
-          );
+          };
         },
       });
 
@@ -222,6 +262,14 @@ describe("runManagedAgentProbe", () => {
       expect(capturedOptions?.settingSources).toEqual([]);
       expect(capturedOptions?.strictMcpConfig).toBe(true);
       expect(capturedOptions?.canUseTool).toBeTypeOf("function");
+      expect(capturedOptions?.hooks?.PreToolUse).toHaveLength(1);
+      expect(capturedOptions?.hooks?.PreToolUse?.[0]?.hooks).toHaveLength(1);
+      expect(
+        Object.prototype.hasOwnProperty.call(
+          capturedOptions?.hooks?.PreToolUse?.[0] ?? {},
+          "matcher",
+        ),
+      ).toBe(false);
       expect(capturedOptions?.spawnClaudeCodeProcess).toBeTypeOf("function");
       expect(
         Object.prototype.hasOwnProperty.call(capturedOptions, "allowedTools"),
@@ -243,6 +291,14 @@ describe("runManagedAgentProbe", () => {
       );
       expect(capturedOptions?.env).not.toHaveProperty("SAPIOM_API_KEY");
       expect(result.terminal).toBe("success");
+      expect(result.policyHookCoverage).toBe(true);
+      expect(result.inferenceTurns).toBe(1);
+      expect(result.sdkNumTurns).toBe(1);
+      expect(result.correlation.promptEmbedded).toBe(true);
+      expect(capturedPrompt).toContain(
+        "SAPIOM_CERTIFICATION_CORRELATION_V1;eval_source=studio-managed-agent-e0-l1-sonnet-5-00000000-0000-4000-8000-000000000002;execution_id=00000000-0000-4000-8000-000000000002",
+      );
+      expect(capturedPrompt).toContain("Do not repeat it");
       expect(result.sdkSessionId).toBe(SUCCESS_SESSION_ID);
       expect(result.queryClosed).toBe(true);
       expect(result.preservation.every(({ preserved }) => preserved)).toBe(
@@ -309,6 +365,158 @@ describe("runManagedAgentProbe", () => {
     expect(rejectedQueryFactory).not.toHaveBeenCalled();
   });
 
+  it("fails before query creation when isolated managed settings disable hooks", async () => {
+    const { config } = await probeConfig();
+    const queryFactory = vi.fn(() => queryFromEvents([]));
+    const result = await runManagedAgentProbe(config, {
+      hermeticGatewayOrigin: config.gatewayOrigin,
+      processObserver: fakeObserver(),
+      queryFactory,
+      policySettingsGuard: async ({ environment }) => {
+        expect(environment).not.toHaveProperty("ANTHROPIC_API_KEY");
+        expect(environment).not.toHaveProperty("ANTHROPIC_BASE_URL");
+        expect(environment).not.toHaveProperty("ANTHROPIC_CUSTOM_HEADERS");
+        expect(environment).toHaveProperty("CLAUDE_CONFIG_DIR");
+        throw new Error("disableAllHooks");
+      },
+    });
+
+    expect(queryFactory).not.toHaveBeenCalled();
+    expect(result.terminal).toBe("policy_violation");
+    expect(result.policyHookCoverage).toBe(false);
+    expect(result.queryClosed).toBe(false);
+    expect(result.workspaceChanges).toEqual([]);
+    expect(
+      result.events.filter(({ type }) => type === "terminal"),
+    ).toHaveLength(1);
+  });
+
+  it("preserves teardown failure priority when policy preflight fails", async () => {
+    const { config } = await probeConfig();
+    const observer = fakeObserver({
+      quiescent: false,
+      deadlineMet: false,
+      elapsedMs: 5_001,
+      observedPids: [8001],
+      alivePidsAtDeadline: [8001],
+      emergencyCleanupAttempted: false,
+    });
+    const result = await runManagedAgentProbe(config, {
+      hermeticGatewayOrigin: config.gatewayOrigin,
+      processObserver: observer,
+      queryFactory: vi.fn(() => queryFromEvents([])),
+      policySettingsGuard: async () => {
+        throw new Error("disableAllHooks");
+      },
+    });
+
+    expect(result.terminal).toBe("teardown_timeout");
+    expect(result.events.at(-1)).toMatchObject({
+      type: "terminal",
+      terminal: "teardown_timeout",
+    });
+    expect(observer.emergencyCleanup).toHaveBeenCalledWith([8001]);
+  });
+
+  it("rejects a successful stream when a requested tool has no primary hook decision", async () => {
+    const { config } = await probeConfig();
+    const result = await runManagedAgentProbe(config, {
+      hermeticGatewayOrigin: config.gatewayOrigin,
+      processObserver: fakeObserver(),
+      policySettingsGuard: async () => undefined,
+      queryFactory: () =>
+        queryFromEvents([
+          {
+            type: "assistant",
+            message: {
+              id: "message-with-disabled-hook",
+              content: [
+                {
+                  type: "tool_use",
+                  id: "tool-with-disabled-hook",
+                  name: "Read",
+                  input: { file_path: FIXTURE_PATHS.cleanTarget },
+                },
+              ],
+            },
+          },
+          {
+            type: "result",
+            subtype: "success",
+            is_error: false,
+            num_turns: 1,
+          },
+        ]),
+    });
+
+    expect(result.policyHookCoverage).toBe(false);
+    expect(result.terminal).toBe("policy_violation");
+    expect(result.permissionEvidence).toEqual([]);
+  });
+
+  it("rejects duplicate requested tool ids instead of reusing one policy decision", async () => {
+    const { config } = await probeConfig();
+    const duplicateToolUseId = "duplicate-tool-use-id";
+    const result = await runManagedAgentProbe(config, {
+      hermeticGatewayOrigin: config.gatewayOrigin,
+      processObserver: fakeObserver(),
+      policySettingsGuard: async () => undefined,
+      queryFactory: ({ options }) => ({
+        async *[Symbol.asyncIterator]() {
+          yield {
+            type: "assistant",
+            message: {
+              id: "duplicate-tool-message-1",
+              content: [
+                {
+                  type: "tool_use",
+                  id: duplicateToolUseId,
+                  name: "Read",
+                  input: { file_path: FIXTURE_PATHS.cleanTarget },
+                },
+              ],
+            },
+          };
+          await invokePreToolUse(options, {
+            toolName: "Read",
+            toolInput: { file_path: FIXTURE_PATHS.cleanTarget },
+            toolUseId: duplicateToolUseId,
+          });
+          yield {
+            type: "assistant",
+            message: {
+              id: "duplicate-tool-message-2",
+              content: [
+                {
+                  type: "tool_use",
+                  id: duplicateToolUseId,
+                  name: "Bash",
+                  input: { command: "touch must-not-inherit-allow" },
+                },
+              ],
+            },
+          };
+          await invokePreToolUse(options, {
+            toolName: "Bash",
+            toolInput: { command: "touch must-not-inherit-allow" },
+            toolUseId: duplicateToolUseId,
+          });
+          yield {
+            type: "result",
+            subtype: "success",
+            is_error: false,
+            num_turns: 2,
+          };
+        },
+        close: vi.fn(),
+      }),
+    });
+
+    expect(result.permissionEvidence).toHaveLength(1);
+    expect(result.policyHookCoverage).toBe(false);
+    expect(result.terminal).toBe("policy_violation");
+  });
+
   it("redacts malicious SDK and permission identifiers from the complete result", async () => {
     const { config } = await probeConfig();
     const sessionSecret = "session-secret-injected-by-sdk";
@@ -321,15 +529,6 @@ describe("runManagedAgentProbe", () => {
       processObserver: fakeObserver(),
       queryFactory: ({ options }) => ({
         async *[Symbol.asyncIterator]() {
-          await options.canUseTool?.(
-            permissionNameSecret,
-            {},
-            {
-              signal: new AbortController().signal,
-              toolUseID: permissionIdSecret,
-              requestId: "request-id-not-persisted",
-            },
-          );
           yield {
             type: "system",
             subtype: "init",
@@ -339,6 +538,7 @@ describe("runManagedAgentProbe", () => {
             type: "assistant",
             session_id: sessionSecret,
             message: {
+              id: permissionIdSecret,
               content: [
                 {
                   type: "tool_use",
@@ -349,6 +549,11 @@ describe("runManagedAgentProbe", () => {
               ],
             },
           };
+          await invokePreToolUse(options, {
+            toolName: permissionNameSecret,
+            toolInput: { secret: "tool-input-secret" },
+            toolUseId: toolIdSecret,
+          });
           yield {
             type: "user",
             session_id: sessionSecret,
@@ -367,6 +572,7 @@ describe("runManagedAgentProbe", () => {
             subtype: "success",
             is_error: false,
             session_id: sessionSecret,
+            num_turns: 1,
           };
         },
         close: vi.fn(),
@@ -382,7 +588,12 @@ describe("runManagedAgentProbe", () => {
       result.toolEvidence[1]?.toolUseId,
     );
     expect(result.permissionEvidence).toMatchObject([
-      { toolName: "unknown", decision: "deny", reason: "tool_not_allowed" },
+      {
+        toolName: "unknown",
+        decision: "deny",
+        reason: "tool_not_allowed",
+        source: "pre_tool_use",
+      },
     ]);
     const serialized = JSON.stringify(result);
     for (const secret of [
@@ -391,7 +602,6 @@ describe("runManagedAgentProbe", () => {
       toolNameSecret,
       permissionIdSecret,
       permissionNameSecret,
-      "request-id-not-persisted",
       "tool-input-secret",
       "tool-result-secret",
     ]) {

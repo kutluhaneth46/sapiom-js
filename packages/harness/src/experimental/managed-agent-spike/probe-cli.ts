@@ -154,7 +154,24 @@ export function evaluateManagedAgentProbe(
       (evidence) =>
         evidence.toolName === toolName &&
         evidence.decision === decision &&
-        evidence.reason === reason,
+        evidence.reason === reason &&
+        evidence.source === "pre_tool_use",
+    );
+  const requestedToolIds = result.toolEvidence.flatMap((evidence) =>
+    evidence.status === "requested" && evidence.toolUseId
+      ? [evidence.toolUseId]
+      : [],
+  );
+  const universalHookCoverage =
+    requestedToolIds.length > 0 &&
+    new Set(requestedToolIds).size === requestedToolIds.length &&
+    requestedToolIds.every(
+      (toolUseId) =>
+        result.permissionEvidence.filter(
+          (evidence) =>
+            evidence.toolUseId === toolUseId &&
+            evidence.source === "pre_tool_use",
+        ).length === 1,
     );
   const checks: ManagedAgentProbeCheck[] = [
     {
@@ -166,6 +183,21 @@ export function evaluateManagedAgentProbe(
     { id: "sdk_session_observed", passed: Boolean(result.sdkSessionId) },
     { id: "query_closed", passed: result.queryClosed },
     { id: "process_tree_quiescent", passed: result.teardown.quiescent },
+    {
+      id: "universal_policy_hook_coverage",
+      passed: result.policyHookCoverage && universalHookCoverage,
+    },
+    {
+      id: "bounded_inference_turn_evidence",
+      passed:
+        Number.isInteger(result.inferenceTurns) &&
+        result.inferenceTurns > 0 &&
+        result.inferenceTurns <= MANAGED_AGENT_CONTRACT.maxTurns &&
+        (result.sdkNumTurns === undefined ||
+          (Number.isInteger(result.sdkNumTurns) &&
+            result.sdkNumTurns >= 0 &&
+            result.sdkNumTurns <= MANAGED_AGENT_CONTRACT.maxTurns)),
+    },
     {
       id: "dirty_and_untracked_preserved",
       passed:

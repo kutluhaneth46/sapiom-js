@@ -18,7 +18,7 @@ export {
   type ManagedAgentChildEnvironmentInput,
   type ManagedAgentIsolatedDirectories,
 } from "./environment.js";
-export { ManagedAgentEventRecorder } from "./events.js";
+export { ManagedAgentEventError, ManagedAgentEventRecorder } from "./events.js";
 export {
   FIXTURE_PATHS,
   captureManagedAgentWorkspaceSnapshot,
@@ -36,18 +36,28 @@ export {
   MANAGED_AGENT_BUILTIN_TOOLS,
   MANAGED_AGENT_DISALLOWED_TOOLS,
   ManagedAgentPathError,
-  createManagedAgentPermissionHandler,
+  createManagedAgentPolicyBoundary,
   isPathWithinRoot,
   resolveManagedAgentToolPath,
-  type ManagedAgentPermissionHandlerOptions,
+  type ManagedAgentPolicyBoundary,
+  type ManagedAgentPolicyBoundaryOptions,
 } from "./permissions.js";
 export {
   LocalManagedAgentProcessObserver,
   createLocalManagedAgentProcessObserver,
 } from "./process-observer.js";
 export {
+  ManagedAgentSettingsGuardError,
+  assertManagedAgentHooksEnabled,
+  buildManagedAgentSettingsGuardEnvironment,
+  type ManagedAgentSettingsGuardDependencies,
+  type ManagedAgentSettingsGuardInput,
+} from "./settings-guard.js";
+export {
   MANAGED_AGENT_MCP_SERVER_NAME,
+  MANAGED_AGENT_CORRELATION_MARKER_VERSION,
   MANAGED_AGENT_TEARDOWN_TIMEOUT_MS,
+  buildManagedAgentCorrelationPrompt,
   createManagedAgentMcpRuntime,
   qualifiedManagedAgentMcpToolName,
   runManagedAgentProbe,
@@ -59,6 +69,7 @@ export type {
   ManagedAgentPermissionDecision,
   ManagedAgentPermissionEvidence,
   ManagedAgentPermissionReason,
+  ManagedAgentPermissionSource,
   ManagedAgentPreservationObservation,
   ManagedAgentProbeConfig,
   ManagedAgentProbeDependencies,

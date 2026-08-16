@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  ManagedAgentEventError,
   ManagedAgentEventRecorder,
   normalizeManagedAgentToolUseId,
 } from "./events.js";
@@ -59,6 +60,7 @@ describe("ManagedAgentEventRecorder", () => {
         cache_read_input_tokens: 1,
       },
       total_cost_usd: 0.001,
+      num_turns: 7,
     });
     expect(recorder.recordTerminal("success")).toBe(true);
     expect(recorder.recordTerminal("query_error")).toBe(false);
@@ -72,6 +74,8 @@ describe("ManagedAgentEventRecorder", () => {
       cacheReadInputTokens: 1,
       estimatedCostUsd: 0.001,
     });
+    expect(recorder.inferenceTurns).toBe(1);
+    expect(recorder.sdkNumTurns).toBe(7);
     expect(recorder.toolEvidence).toEqual([
       {
         toolUseId: normalizeManagedAgentToolUseId("tool-1"),
@@ -108,6 +112,7 @@ describe("ManagedAgentEventRecorder", () => {
     const permissionIdSecret = "permission-id-secret-credential";
     const toolNameSecret = "ReadSecretCredential";
     const permissionNameSecret = "WriteSecretCredential";
+    const messageIdSecret = "message-id-secret-credential";
     recorder.observeSdkEvent({
       type: "system",
       subtype: "init",
@@ -117,6 +122,7 @@ describe("ManagedAgentEventRecorder", () => {
       type: "assistant",
       session_id: sessionSecret,
       message: {
+        id: messageIdSecret,
         content: [
           {
             type: "tool_use",
@@ -145,6 +151,7 @@ describe("ManagedAgentEventRecorder", () => {
       toolName: permissionNameSecret,
       decision: "deny",
       reason: "tool_not_allowed",
+      source: "pre_tool_use",
     });
     recorder.recordTerminal("success");
 
@@ -160,6 +167,7 @@ describe("ManagedAgentEventRecorder", () => {
         toolName: "unknown",
         decision: "deny",
         reason: "tool_not_allowed",
+        source: "pre_tool_use",
       },
     ]);
     const serialized = JSON.stringify({
@@ -174,9 +182,54 @@ describe("ManagedAgentEventRecorder", () => {
       permissionIdSecret,
       toolNameSecret,
       permissionNameSecret,
+      messageIdSecret,
       "private-result",
     ]) {
       expect(serialized).not.toContain(secret);
     }
+  });
+
+  it("counts distinct hashed assistant ids and keeps bounded SDK turns separate", () => {
+    const recorder = new ManagedAgentEventRecorder("run-3");
+    for (const messageId of [
+      "private-message-a",
+      "private-message-a",
+      "private-message-b",
+    ]) {
+      recorder.observeSdkEvent({
+        type: "assistant",
+        message: { id: messageId, content: [{ type: "text", text: "secret" }] },
+      });
+    }
+    recorder.observeSdkEvent({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      num_turns: 9,
+    });
+
+    expect(recorder.inferenceTurns).toBe(2);
+    expect(recorder.sdkNumTurns).toBe(9);
+    const serialized = JSON.stringify({
+      events: recorder.events,
+      inferenceTurns: recorder.inferenceTurns,
+      sdkNumTurns: recorder.sdkNumTurns,
+    });
+    expect(serialized).not.toContain("private-message-a");
+    expect(serialized).not.toContain("private-message-b");
+
+    expect(() =>
+      recorder.observeSdkEvent({
+        type: "result",
+        subtype: "success",
+        num_turns: 21,
+      }),
+    ).toThrow(ManagedAgentEventError);
+    expect(() =>
+      recorder.observeSdkEvent({
+        type: "assistant",
+        message: { content: [] },
+      }),
+    ).toThrow(ManagedAgentEventError);
   });
 });

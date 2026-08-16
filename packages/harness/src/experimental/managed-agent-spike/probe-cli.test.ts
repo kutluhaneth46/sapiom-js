@@ -14,6 +14,12 @@ import type { ManagedAgentProbeResult } from "./types.js";
 
 function passingL1Result(): ManagedAgentProbeResult {
   const builtins = ["Read", "Edit", "Write", "Bash"];
+  const builtinIds = [
+    `tool_${"1".repeat(64)}`,
+    `tool_${"2".repeat(64)}`,
+    `tool_${"3".repeat(64)}`,
+    `tool_${"b".repeat(64)}`,
+  ];
   const echoTool = qualifiedManagedAgentMcpToolName("echo_nonce");
   const failOnceTool = qualifiedManagedAgentMcpToolName("fail_once");
   return {
@@ -23,12 +29,23 @@ function passingL1Result(): ManagedAgentProbeResult {
     target: "sonnet-5",
     modelAlias: "claude-sonnet-5-anthropic-anthropic-eval",
     sdkSessionId: "11111111-1111-4111-8111-111111111111",
+    inferenceTurns: 8,
+    sdkNumTurns: 8,
+    policyHookCoverage: true,
     terminal: "success",
     events: [],
     toolEvidence: [
-      ...builtins.flatMap((toolName) => [
-        { toolName, status: "requested" as const },
-        { toolName, status: "success" as const },
+      ...builtins.flatMap((toolName, index) => [
+        {
+          toolUseId: builtinIds[index],
+          toolName,
+          status: "requested" as const,
+        },
+        {
+          toolUseId: builtinIds[index],
+          toolName,
+          status: "success" as const,
+        },
       ]),
       { toolName: echoTool, status: "success" },
       { toolName: failOnceTool, status: "error" },
@@ -40,36 +57,42 @@ function passingL1Result(): ManagedAgentProbeResult {
         toolName,
         decision: "allow" as const,
         reason: "fixture_path" as const,
+        source: "pre_tool_use" as const,
       })),
       {
         toolUseId: `tool_${"b".repeat(64)}`,
         toolName: "Bash",
         decision: "allow",
         reason: "exact_bash_command",
+        source: "pre_tool_use",
       },
       {
         toolUseId: `tool_${"c".repeat(64)}`,
         toolName: echoTool,
         decision: "allow",
         reason: "managed_mcp_tool",
+        source: "pre_tool_use",
       },
       {
         toolUseId: `tool_${"d".repeat(64)}`,
         toolName: failOnceTool,
         decision: "allow",
         reason: "managed_mcp_tool",
+        source: "pre_tool_use",
       },
       {
         toolUseId: `tool_${"e".repeat(64)}`,
         toolName: "Read",
         decision: "deny",
         reason: "path_outside_workspace",
+        source: "pre_tool_use",
       },
       {
         toolUseId: `tool_${"f".repeat(64)}`,
         toolName: "Read",
         decision: "deny",
         reason: "path_symlink_escape",
+        source: "pre_tool_use",
       },
     ],
     workspaceChanges: [
@@ -90,7 +113,11 @@ function passingL1Result(): ManagedAgentProbeResult {
       alivePidsAtDeadline: [],
       emergencyCleanupAttempted: false,
     },
-    correlation: { executionId: "execution-1", evalSource: "eval-1" },
+    correlation: {
+      executionId: "execution-1",
+      evalSource: "eval-1",
+      promptEmbedded: true,
+    },
   };
 }
 
@@ -250,12 +277,14 @@ describe("managed-agent probe CLI", () => {
           toolName: "Read",
           decision: "deny",
           reason: "path_outside_workspace",
+          source: "pre_tool_use",
         },
         {
           toolUseId: `tool_${"b".repeat(64)}`,
           toolName: "Read",
           decision: "deny",
           reason: "path_outside_workspace",
+          source: "pre_tool_use",
         },
       ],
     };
