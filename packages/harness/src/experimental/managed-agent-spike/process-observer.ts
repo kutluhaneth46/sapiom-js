@@ -227,6 +227,8 @@ if (inner) {
 export interface ManagedAgentKernelProcessRecord {
   readonly parentPid: number;
   readonly processGroupId?: number;
+  /** POSIX process state used only to confirm an issued group stop. */
+  readonly state?: string;
   /** Kernel-reported creation time used for evidence, never POSIX authority. */
   readonly startedAt: string;
 }
@@ -263,26 +265,22 @@ export interface LocalManagedAgentProcessObserverOptions {
 interface OwnedRoot {
   readonly pid: number;
   readonly child: ChildProcessWithoutNullStreams;
+  identity?: ManagedAgentKernelProcessRecord;
   containmentSupported: boolean;
   ownershipProven: boolean;
   stopIssued: boolean;
   forceKillIssued: boolean;
 }
 
-interface PendingToolRegistration {
+type ToolProcessRole = "parent" | "child";
+
+interface ToolProcessRegistration {
+  readonly role: ToolProcessRole;
   readonly pid: number;
   readonly socket: NetSocket;
-}
-
-interface OwnedToolGroup {
-  readonly registeredPid: number;
-  readonly registeredIdentity: ManagedAgentKernelProcessRecord;
-  readonly processGroupId: number;
-  readonly groupLeaderIdentity?: ManagedAgentKernelProcessRecord;
-  containmentSupported: boolean;
-  ownershipProven: boolean;
-  stopIssued: boolean;
-  forceKillIssued: boolean;
+  accepted: boolean;
+  closed: boolean;
+  identity?: ManagedAgentKernelProcessRecord;
 }
 
 interface ObservedIdentity {
@@ -361,7 +359,7 @@ async function windowsProcessTable(): Promise<ManagedAgentKernelProcessTable> {
 async function posixProcessTable(): Promise<ManagedAgentKernelProcessTable> {
   const { stdout } = await execFileAsync(
     "/bin/ps",
-    ["-axo", "pid=,ppid=,pgid=,lstart="],
+    ["-axo", "pid=,ppid=,pgid=,stat=,lstart="],
     {
       encoding: "utf8",
       windowsHide: true,
@@ -372,14 +370,15 @@ async function posixProcessTable(): Promise<ManagedAgentKernelProcessTable> {
   );
   const entries: Array<readonly [number, ManagedAgentKernelProcessRecord]> = [];
   for (const line of stdout.split("\n")) {
-    const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(.+?)\s*$/.exec(line);
+    const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(.+?)\s*$/.exec(line);
     if (!match) continue;
     entries.push([
       Number(match[1]),
       {
         parentPid: Number(match[2]),
         processGroupId: Number(match[3]),
-        startedAt: match[4]!,
+        state: match[4]!,
+        startedAt: match[5]!,
       },
     ]);
   }
@@ -457,18 +456,20 @@ function descendantsOf(
 /**
  * E0.4 deliberately certifies one narrow containment model. The SDK command
  * runs in an observer-owned POSIX process group. The exact host-created L2
- * fixture additionally authenticates over a private one-shot Unix socket
- * outside the workspace and keeps that connection open. A random capability,
- * a primary exact-Bash policy latch, and a fresh kernel table jointly grant
- * fallback signal authority for the fixture's distinct PGID. The capability
- * remains sufficient if SDK cleanup has already reparented the live fixture;
- * this exception is safe only because L2 permits one immutable trusted command.
+ * fixture parent and child additionally authenticate over separate private
+ * Unix-socket connections outside the workspace and keep those connections
+ * open for their complete lifetimes. A random capability, a primary exact-Bash
+ * policy latch, stable role identities, and fresh kernel ancestry prove that
+ * every member of their detached group remains below the active owned root.
+ * A tool-reported or cached PID/PGID never grants signal authority by itself.
  *
  * This is not universal built-in Bash containment or a process-tree killer.
- * Windows, an unavailable process table, an unauthenticated tool process, or
- * identity drift fail certification closed. POSIX `lstart` remains evidence,
- * not authority. Workspace PID-file contents never enter this class and can
- * never become signal authority.
+ * Windows, an unavailable process table, missing lifetime channels, or
+ * identity/ancestry drift fail certification closed. The fallback stops the
+ * owned root first, revalidates all authority, then stops and revalidates the
+ * exact fixture group before killing it. POSIX `lstart` remains one component
+ * of fresh identity evidence, not standalone authority. Workspace PID-file
+ * contents never enter this class.
  */
 export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObserver {
   readonly #platform: NodeJS.Platform;
@@ -495,8 +496,16 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
   #toolControlAvailable = false;
   #toolControlFailed = false;
   #toolProcessContainmentArmed = false;
-  #pendingToolRegistration: PendingToolRegistration | undefined;
-  #ownedToolGroup: OwnedToolGroup | undefined;
+  readonly #toolProcessRegistrations = new Map<
+    ToolProcessRole,
+    ToolProcessRegistration
+  >();
+  #toolProcessGroupId: number | undefined;
+  #toolProcessRootPid: number | undefined;
+  #toolProcessObservationComplete = false;
+  #toolProcessObservationInvalid = false;
+  #toolProcessStopIssued = false;
+  #toolProcessForceKillIssued = false;
   #fallbackCleanupRequested = false;
   #lastTable: ManagedAgentKernelProcessTable | undefined;
   #processTableAvailable = false;
@@ -554,7 +563,22 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
   #receiveToolRegistration(socket: NetSocket): void {
     this.#toolControlSockets.add(socket);
     socket.on("error", () => undefined);
-    socket.once("close", () => this.#toolControlSockets.delete(socket));
+    let registration: ToolProcessRegistration | undefined;
+    socket.once("close", () => {
+      this.#toolControlSockets.delete(socket);
+      if (!registration) return;
+      const current = this.#toolProcessRegistrations.get(registration.role);
+      if (current !== registration) return;
+      if (this.#toolProcessObservationComplete) {
+        registration.closed = true;
+      } else {
+        // A connection that disappears before readiness cannot reserve its
+        // role. Clearing it transactionally permits the trusted process to
+        // retry instead of leaving an unfinishable stale pending state.
+        this.#toolProcessRegistrations.delete(registration.role);
+      }
+      void this.observeProcessTree();
+    });
     let body = "";
     let handled = false;
     const reject = (): void => {
@@ -571,7 +595,11 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
       const newline = body.indexOf("\n");
       if (newline < 0) return;
       handled = true;
-      let payload: { capability?: unknown; pid?: unknown };
+      let payload: {
+        capability?: unknown;
+        pid?: unknown;
+        role?: unknown;
+      };
       try {
         payload = JSON.parse(body.slice(0, newline)) as typeof payload;
       } catch {
@@ -580,10 +608,11 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
       }
       if (
         !this.#toolProcessContainmentArmed ||
-        this.#pendingToolRegistration ||
-        this.#ownedToolGroup ||
+        this.#toolProcessObservationComplete ||
         typeof payload.capability !== "string" ||
         !sameCapability(payload.capability, this.#toolControlCapability) ||
+        (payload.role !== "parent" && payload.role !== "child") ||
+        this.#toolProcessRegistrations.has(payload.role) ||
         typeof payload.pid !== "number" ||
         !Number.isSafeInteger(payload.pid) ||
         payload.pid <= 1
@@ -591,7 +620,14 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
         socket.destroy();
         return;
       }
-      this.#pendingToolRegistration = { pid: payload.pid, socket };
+      registration = {
+        role: payload.role,
+        pid: payload.pid,
+        socket,
+        accepted: false,
+        closed: false,
+      };
+      this.#toolProcessRegistrations.set(payload.role, registration);
       void this.observeProcessTree();
     });
   }
@@ -602,14 +638,12 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
     signal.addEventListener(
       "abort",
       () => {
-        this.#fallbackCleanupRequested = true;
-        this.#forceStopKillSynchronously();
+        this.#requestFallbackCleanupSynchronously();
       },
       { once: true },
     );
     if (signal.aborted) {
-      this.#fallbackCleanupRequested = true;
-      this.#forceStopKillSynchronously();
+      this.#requestFallbackCleanupSynchronously();
     }
   }
 
@@ -740,71 +774,153 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
   }
 
   #observeToolProcessContainment(table: ManagedAgentKernelProcessTable): void {
-    const pending = this.#pendingToolRegistration;
-    if (pending && !pending.socket.destroyed && !this.#ownedToolGroup) {
-      const registeredIdentity = table.get(pending.pid);
-      const processGroupId = registeredIdentity?.processGroupId;
+    if (!this.#toolProcessContainmentArmed) return;
+    const parent = this.#toolProcessRegistrations.get("parent");
+    const child = this.#toolProcessRegistrations.get("child");
+    if (
+      !this.#toolProcessObservationComplete &&
+      parent &&
+      child &&
+      !parent.socket.destroyed &&
+      !child.socket.destroyed
+    ) {
+      const parentIdentity = table.get(parent.pid);
+      const childIdentity = table.get(child.pid);
+      const processGroupId = parentIdentity?.processGroupId;
       const hostProcessGroupId = table.get(process.pid)?.processGroupId;
+      const groupLeaderIdentity =
+        typeof processGroupId === "number"
+          ? table.get(processGroupId)
+          : undefined;
+      const root =
+        this.#roots.size === 1 ? [...this.#roots.values()][0] : undefined;
+      const rootDescendants = root
+        ? descendantsOf(new Set([root.pid]), table)
+        : new Set<number>();
+      const groupMemberPids =
+        typeof processGroupId === "number"
+          ? [...table.entries()].flatMap(([pid, record]) =>
+              record.processGroupId === processGroupId ? [pid] : [],
+            )
+          : [];
       if (
-        registeredIdentity &&
+        root &&
+        childActive(root.child) &&
+        table.get(root.pid)?.processGroupId === root.pid &&
+        parentIdentity &&
+        childIdentity &&
         typeof processGroupId === "number" &&
         typeof hostProcessGroupId === "number" &&
         processGroupId > 1 &&
         processGroupId !== hostProcessGroupId &&
-        !this.#roots.has(processGroupId)
+        !this.#roots.has(processGroupId) &&
+        parent.pid !== child.pid &&
+        childIdentity.parentPid === parent.pid &&
+        childIdentity.processGroupId === processGroupId &&
+        groupLeaderIdentity?.processGroupId === processGroupId &&
+        groupMemberPids.length > 0 &&
+        groupMemberPids.every((pid) => rootDescendants.has(pid))
       ) {
-        const groupLeaderIdentity = table.get(processGroupId);
-        if (
-          !groupLeaderIdentity ||
-          groupLeaderIdentity.processGroupId === processGroupId
-        ) {
-          this.#ownedToolGroup = {
-            registeredPid: pending.pid,
-            registeredIdentity,
-            processGroupId,
-            ...(groupLeaderIdentity ? { groupLeaderIdentity } : {}),
-            containmentSupported: true,
-            ownershipProven: true,
-            stopIssued: false,
-            forceKillIssued: false,
-          };
-          this.#pendingToolRegistration = undefined;
-          pending.socket.write('{"registered":true}\n');
+        parent.identity = parentIdentity;
+        child.identity = childIdentity;
+        this.#toolProcessGroupId = processGroupId;
+        this.#toolProcessRootPid = root.pid;
+        for (const registration of [parent, child]) {
+          if (registration.accepted) continue;
+          registration.accepted = true;
+          registration.socket.write('{"registered":true}\n');
         }
       }
     }
 
-    const owned = this.#ownedToolGroup;
-    if (!owned) return;
-    const currentRegistered = table.get(owned.registeredPid);
-    if (
-      currentRegistered &&
-      (!sameProcess(owned.registeredIdentity, currentRegistered) ||
-        currentRegistered.processGroupId !== owned.processGroupId)
-    ) {
-      owned.containmentSupported = false;
+    const processGroupId = this.#toolProcessGroupId;
+    if (typeof processGroupId === "number") {
+      for (const [pid, record] of table) {
+        if (record.processGroupId === processGroupId) {
+          this.#observedPids.add(pid);
+        }
+      }
     }
-    if (owned.groupLeaderIdentity) {
-      const currentLeader = table.get(owned.processGroupId);
+    if (!this.#toolProcessObservationComplete) return;
+    for (const registration of this.#toolProcessRegistrations.values()) {
+      const current = table.get(registration.pid);
       if (
-        currentLeader &&
-        !sameProcess(owned.groupLeaderIdentity, currentLeader)
+        !registration.closed &&
+        current &&
+        (!sameProcess(registration.identity, current) ||
+          current.processGroupId !== processGroupId)
       ) {
-        owned.containmentSupported = false;
+        this.#toolProcessObservationInvalid = true;
       }
     }
-    for (const [pid, record] of table) {
-      if (record.processGroupId === owned.processGroupId) {
-        this.#observedPids.add(pid);
-      }
+  }
+
+  #hasFreshToolAuthority(
+    table: ManagedAgentKernelProcessTable,
+    options: {
+      readonly requireRootStopped: boolean;
+      readonly requireToolStopped: boolean;
+    },
+  ): boolean {
+    const rootPid = this.#toolProcessRootPid;
+    const processGroupId = this.#toolProcessGroupId;
+    const root =
+      typeof rootPid === "number" ? this.#roots.get(rootPid) : undefined;
+    const parent = this.#toolProcessRegistrations.get("parent");
+    const child = this.#toolProcessRegistrations.get("child");
+    if (
+      !root ||
+      !childActive(root.child) ||
+      this.#toolProcessObservationInvalid ||
+      typeof processGroupId !== "number" ||
+      !parent?.accepted ||
+      !parent.identity ||
+      !child?.accepted ||
+      !child.identity ||
+      ![parent, child].some(
+        ({ closed, socket }) => !closed && !socket.destroyed,
+      )
+    ) {
+      return false;
     }
-    if (this.#fallbackCleanupRequested) this.#forceStopKillSynchronously();
+
+    const currentRoot = table.get(root.pid);
+    const currentParent = table.get(parent.pid);
+    const currentChild = table.get(child.pid);
+    if (
+      !currentRoot ||
+      !currentParent ||
+      !currentChild ||
+      currentRoot.processGroupId !== root.pid ||
+      (root.identity && !sameProcess(root.identity, currentRoot)) ||
+      (options.requireRootStopped && !currentRoot.state?.includes("T")) ||
+      !sameProcess(parent.identity, currentParent) ||
+      currentParent.processGroupId !== processGroupId ||
+      !sameProcess(child.identity, currentChild) ||
+      currentChild.parentPid !== parent.pid ||
+      currentChild.processGroupId !== processGroupId
+    ) {
+      return false;
+    }
+
+    const rootDescendants = descendantsOf(new Set([root.pid]), table);
+    const groupMembers = [...table.entries()].filter(
+      ([, record]) => record.processGroupId === processGroupId,
+    );
+    return (
+      groupMembers.length > 0 &&
+      groupMembers.every(
+        ([pid, record]) =>
+          rootDescendants.has(pid) &&
+          (!options.requireToolStopped || record.state?.includes("T")),
+      )
+    );
   }
 
   public async observeProcessTree(
     timeoutMs = MANAGED_AGENT_PROCESS_HELPER_TIMEOUT_MS,
   ): Promise<boolean> {
-    if (this.#roots.size === 0) {
+    if (this.#roots.size === 0 && !this.#toolProcessContainmentArmed) {
       this.#lastTable = new Map();
       this.#processTableAvailable = true;
       return true;
@@ -924,7 +1040,8 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
           ({ containmentSupported }) => containmentSupported,
         ) &&
         (!this.#toolProcessContainmentArmed ||
-          Boolean(this.#ownedToolGroup?.containmentSupported)),
+          (this.#toolProcessRegistrations.size === 2 &&
+            !this.#toolProcessObservationInvalid)),
       ownershipProven: false,
       observedPids: observedPids(),
     });
@@ -940,29 +1057,45 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
     }
     if (this.#roots.size !== 1) return unsupported("root_count_invalid");
     const root = [...this.#roots.values()][0]!;
-    if (!childActive(root.child)) {
-      root.containmentSupported = false;
-      return unsupported("root_not_active");
-    }
     if (!root.containmentSupported) {
       return unsupported("containment_escaped");
+    }
+    if (!childActive(root.child)) {
+      return unsupported("root_not_active");
     }
     const currentRoot = this.#lastTable!.get(root.pid);
     if (!currentRoot || currentRoot.processGroupId !== root.pid) {
       root.containmentSupported = false;
       return unsupported("root_not_group_leader");
     }
+    root.identity = currentRoot;
     if (this.#toolProcessContainmentArmed) {
+      const parent = this.#toolProcessRegistrations.get("parent");
+      const child = this.#toolProcessRegistrations.get("child");
       if (
         !this.#toolControlAvailable ||
-        !this.#ownedToolGroup ||
-        !this.#ownedToolGroup.ownershipProven
+        !parent?.accepted ||
+        parent.closed ||
+        parent.socket.destroyed ||
+        !child?.accepted ||
+        child.closed ||
+        child.socket.destroyed ||
+        typeof this.#toolProcessGroupId !== "number"
       ) {
         return unsupported("tool_process_not_registered");
       }
-      if (!this.#ownedToolGroup.containmentSupported) {
+      if (this.#toolProcessObservationInvalid) {
         return unsupported("tool_process_identity_invalid");
       }
+      if (
+        !this.#hasFreshToolAuthority(this.#lastTable!, {
+          requireRootStopped: false,
+          requireToolStopped: false,
+        })
+      ) {
+        return unsupported("tool_process_identity_invalid");
+      }
+      this.#toolProcessObservationComplete = true;
     }
 
     root.ownershipProven = true;
@@ -976,9 +1109,8 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
     };
   }
 
-  #forceStopKillSynchronously(): void {
+  #stopOwnedRootsSynchronously(): void {
     if (this.#platform !== "darwin" && this.#platform !== "linux") return;
-    this.#fallbackCleanupRequested = true;
     for (const root of this.#roots.values()) {
       if (root.forceKillIssued || !childActive(root.child)) continue;
       if (!root.stopIssued) {
@@ -989,41 +1121,75 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
         }
       }
     }
-    const toolGroup = this.#ownedToolGroup;
-    if (
-      toolGroup &&
-      toolGroup.containmentSupported &&
-      !toolGroup.forceKillIssued &&
-      !toolGroup.stopIssued
-    ) {
-      const stopOutcome = this.#signalProcessGroup(
-        toolGroup.processGroupId,
-        "SIGSTOP",
-      );
-      toolGroup.stopIssued = stopOutcome === "sent";
-      if (stopOutcome === "failure") {
-        toolGroup.containmentSupported = false;
-      }
-    }
-    if (
-      toolGroup &&
-      toolGroup.containmentSupported &&
-      !toolGroup.forceKillIssued
-    ) {
-      const killOutcome = this.#signalProcessGroup(
-        toolGroup.processGroupId,
-        "SIGKILL",
-      );
-      toolGroup.forceKillIssued = killOutcome === "sent";
-      if (killOutcome === "failure") {
-        toolGroup.containmentSupported = false;
-      }
-    }
+  }
+
+  #killOwnedRootsSynchronously(): void {
+    if (this.#platform !== "darwin" && this.#platform !== "linux") return;
     for (const root of this.#roots.values()) {
       if (root.forceKillIssued || !childActive(root.child)) continue;
       const killOutcome = this.#signalProcessGroup(root.pid, "SIGKILL");
       root.forceKillIssued = killOutcome === "sent";
       if (killOutcome === "failure") root.containmentSupported = false;
+    }
+  }
+
+  #requestFallbackCleanupSynchronously(): void {
+    this.#fallbackCleanupRequested = true;
+    this.#stopOwnedRootsSynchronously();
+    if (
+      !this.#toolProcessContainmentArmed ||
+      !this.#toolProcessObservationComplete
+    ) {
+      this.#killOwnedRootsSynchronously();
+    }
+  }
+
+  #advanceFallbackCleanup(): void {
+    if (
+      !this.#fallbackCleanupRequested ||
+      this.#platform === "win32" ||
+      !this.#processTableAvailable
+    ) {
+      return;
+    }
+    if (
+      !this.#toolProcessContainmentArmed ||
+      !this.#toolProcessObservationComplete
+    ) {
+      this.#killOwnedRootsSynchronously();
+      return;
+    }
+
+    const processGroupId = this.#toolProcessGroupId;
+    if (typeof processGroupId !== "number") return;
+    const groupLiveness = this.#processGroupLiveness(processGroupId);
+    if (groupLiveness === "gone") {
+      this.#killOwnedRootsSynchronously();
+      return;
+    }
+    if (groupLiveness !== "alive") return;
+
+    const table = this.#lastTable!;
+    if (
+      !this.#hasFreshToolAuthority(table, {
+        requireRootStopped: true,
+        requireToolStopped: this.#toolProcessStopIssued,
+      })
+    ) {
+      return;
+    }
+    if (!this.#toolProcessStopIssued) {
+      const stopOutcome = this.#signalProcessGroup(processGroupId, "SIGSTOP");
+      this.#toolProcessStopIssued = stopOutcome === "sent";
+      if (stopOutcome === "gone") this.#killOwnedRootsSynchronously();
+      return;
+    }
+    if (!this.#toolProcessForceKillIssued) {
+      const killOutcome = this.#signalProcessGroup(processGroupId, "SIGKILL");
+      this.#toolProcessForceKillIssued = killOutcome === "sent";
+      if (killOutcome === "sent" || killOutcome === "gone") {
+        this.#killOwnedRootsSynchronously();
+      }
     }
   }
 
@@ -1057,48 +1223,64 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
         }
       }
     }
-    const toolGroup = this.#ownedToolGroup;
+    const toolRegistrations = [...this.#toolProcessRegistrations.values()];
+    const toolProcessGroupId = this.#toolProcessGroupId;
+    for (const registration of toolRegistrations) {
+      if (!registration.closed && !registration.socket.destroyed) {
+        alive.add(registration.pid);
+      }
+    }
     if (this.#processTableAvailable) {
       const table = this.#lastTable!;
-      if (toolGroup) {
+      if (typeof toolProcessGroupId === "number") {
         for (const [pid, record] of table) {
-          if (record.processGroupId === toolGroup.processGroupId)
+          if (record.processGroupId === toolProcessGroupId) {
             alive.add(pid);
+          }
         }
-        const groupLiveness = this.#processGroupLiveness(
-          toolGroup.processGroupId,
-        );
-        if (groupLiveness === "alive") alive.add(toolGroup.processGroupId);
+        const groupLiveness = this.#processGroupLiveness(toolProcessGroupId);
+        if (groupLiveness === "alive") alive.add(toolProcessGroupId);
         if (groupLiveness === "unknown") {
-          toolGroup.containmentSupported = false;
+          this.#toolProcessObservationInvalid = true;
         }
-      } else if (this.#pendingToolRegistration) {
-        if (table.has(this.#pendingToolRegistration.pid)) {
-          alive.add(this.#pendingToolRegistration.pid);
+      }
+      for (const registration of toolRegistrations) {
+        if (table.has(registration.pid)) {
+          alive.add(registration.pid);
         }
       }
     }
 
     const processTableAvailable =
       roots.length === 0 || this.#processTableAvailable;
+    const toolProcessObservationComplete =
+      !this.#toolProcessContainmentArmed ||
+      this.#toolProcessObservationComplete;
+    const toolProcessChannelsClosed =
+      !this.#toolProcessContainmentArmed ||
+      (this.#toolProcessObservationComplete &&
+        toolRegistrations.length === 2 &&
+        toolRegistrations.every(
+          ({ closed, socket }) => closed || socket.destroyed,
+        ));
     const containmentSupported =
       roots.every(({ containmentSupported: supported }) => supported) &&
       (!this.#toolProcessContainmentArmed ||
         (this.#toolControlAvailable &&
-          Boolean(toolGroup?.containmentSupported)));
+          this.#toolProcessObservationComplete &&
+          !this.#toolProcessObservationInvalid));
     const ownershipProven =
       roots.length > 0 &&
       roots.every(({ ownershipProven }) => ownershipProven) &&
-      (!this.#toolProcessContainmentArmed ||
-        Boolean(toolGroup?.ownershipProven));
+      toolProcessObservationComplete;
     const forceKillIssued =
-      roots.length > 0 &&
-      roots.every(({ forceKillIssued }) => forceKillIssued) &&
-      (!this.#toolProcessContainmentArmed ||
-        Boolean(toolGroup?.forceKillIssued));
+      roots.length > 0 && roots.every(({ forceKillIssued }) => forceKillIssued);
     const elapsedMs = Math.max(0, this.#now() - startedAt);
     const quiescent =
-      processTableAvailable && containmentSupported && alive.size === 0;
+      processTableAvailable &&
+      containmentSupported &&
+      toolProcessChannelsClosed &&
+      alive.size === 0;
     return {
       quiescent,
       deadlineMet: quiescent,
@@ -1106,6 +1288,8 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
       containmentSupported,
       ownershipProven,
       forceKillIssued,
+      toolProcessObservationComplete,
+      toolProcessChannelsClosed,
       elapsedMs,
       observedPids: [...this.#observedPids].sort((left, right) => left - right),
       alivePidsAtDeadline: [...alive].sort((left, right) => left - right),
@@ -1123,6 +1307,7 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
       await this.observeProcessTree(
         Math.max(0, boundedTimeoutMs - elapsedBeforeSample),
       );
+      this.#advanceFallbackCleanup();
       const observation = await this.#currentObservation(startedAt, false);
       if (observation.quiescent) {
         return {
@@ -1144,11 +1329,16 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
   ): Promise<ManagedAgentTeardownObservation> {
     const startedAt = this.#now();
     const boundedTimeoutMs = Math.max(0, timeoutMs);
-    this.#forceStopKillSynchronously();
+    this.#requestFallbackCleanupSynchronously();
     const confirmation = await this.waitForQuiescence(boundedTimeoutMs);
+    if (!confirmation.quiescent) this.#killOwnedRootsSynchronously();
     const elapsedMs = Math.max(0, this.#now() - startedAt);
+    const roots = [...this.#roots.values()];
+    const forceKillIssued =
+      roots.length > 0 && roots.every((root) => root.forceKillIssued);
     return {
       ...confirmation,
+      forceKillIssued,
       elapsedMs,
       deadlineMet: confirmation.quiescent && elapsedMs <= boundedTimeoutMs,
       emergencyCleanupAttempted: true,

@@ -88,21 +88,59 @@ const pidFile = resolve(process.argv[2]);
 const requireControlRegistration = process.argv[3] === "--register-control";
 const controlSocket = process.env[${JSON.stringify(MANAGED_AGENT_TOOL_CONTROL_SOCKET_ENV)}];
 const controlCapability = process.env[${JSON.stringify(MANAGED_AGENT_TOOL_CONTROL_CAPABILITY_ENV)}];
-delete process.env[${JSON.stringify(MANAGED_AGENT_TOOL_CONTROL_SOCKET_ENV)}];
-delete process.env[${JSON.stringify(MANAGED_AGENT_TOOL_CONTROL_CAPABILITY_ENV)}];
 if (requireControlRegistration && (!controlSocket || !controlCapability)) {
   throw new Error("managed-agent tool control capability missing");
 }
 process.on("SIGTERM", () => {});
 const childProgram = [
+  'const { createConnection } = require("node:net");',
+  'const requireControlRegistration = ' + JSON.stringify(requireControlRegistration) + ';',
+  'const controlSocket = process.env["${MANAGED_AGENT_TOOL_CONTROL_SOCKET_ENV}"];',
+  'const controlCapability = process.env["${MANAGED_AGENT_TOOL_CONTROL_CAPABILITY_ENV}"];',
+  'delete process.env["${MANAGED_AGENT_TOOL_CONTROL_SOCKET_ENV}"];',
+  'delete process.env["${MANAGED_AGENT_TOOL_CONTROL_CAPABILITY_ENV}"];',
   'process.on("SIGTERM", () => {});',
-  'if (process.send) process.send("ready");',
+  'const publishReady = () => { if (process.send) process.send("ready"); };',
+  'const connectControl = () => {',
+  '  if (!controlSocket || !controlCapability) { publishReady(); return; }',
+  '  const socket = createConnection(controlSocket);',
+  '  socket.unref();',
+  '  socket.setEncoding("utf8");',
+  '  let response = "";',
+  '  let registered = false;',
+  '  let retryScheduled = false;',
+  '  const retry = () => {',
+  '    if (registered || retryScheduled) return;',
+  '    retryScheduled = true;',
+  '    setTimeout(connectControl, 10);',
+  '  };',
+  '  socket.once("connect", () => {',
+  '    socket.write(JSON.stringify({ capability: controlCapability, role: "child", pid: process.pid }) + "\\\\n");',
+  '  });',
+  '  socket.on("data", (chunk) => {',
+  '    response += chunk;',
+  '    if (!response.includes("\\\\n")) return;',
+  '    if (!response.includes(' + JSON.stringify('"registered":true') + ')) { socket.destroy(); return; }',
+  '    registered = true;',
+  '    publishReady();',
+  '  });',
+  '  socket.once("error", retry);',
+  '  socket.once("close", retry);',
+  '};',
+  'if (requireControlRegistration) connectControl(); else publishReady();',
   'setInterval(() => {}, 1000);',
 ].join("");
 const child = spawn(process.execPath, ["-e", childProgram], {
   stdio: ["ignore", "ignore", "ignore", "ipc"],
+  env: {
+    ...process.env,
+    ...(requireControlRegistration && controlSocket ? { [${JSON.stringify(MANAGED_AGENT_TOOL_CONTROL_SOCKET_ENV)}]: controlSocket } : {}),
+    ...(requireControlRegistration && controlCapability ? { [${JSON.stringify(MANAGED_AGENT_TOOL_CONTROL_CAPABILITY_ENV)}]: controlCapability } : {}),
+  },
   windowsHide: true,
 });
+delete process.env[${JSON.stringify(MANAGED_AGENT_TOOL_CONTROL_SOCKET_ENV)}];
+delete process.env[${JSON.stringify(MANAGED_AGENT_TOOL_CONTROL_CAPABILITY_ENV)}];
 let childReady = false;
 let controlReady = !requireControlRegistration;
 const publishReadiness = () => {
@@ -119,8 +157,15 @@ const connectControl = () => {
   socket.unref();
   socket.setEncoding("utf8");
   let response = "";
+  let registered = false;
+  let retryScheduled = false;
+  const retry = () => {
+    if (registered || retryScheduled) return;
+    retryScheduled = true;
+    setTimeout(connectControl, 10);
+  };
   socket.once("connect", () => {
-    socket.write(JSON.stringify({ capability: controlCapability, pid: process.pid }) + "\\n");
+    socket.write(JSON.stringify({ capability: controlCapability, role: "parent", pid: process.pid }) + "\\n");
   });
   socket.on("data", (chunk) => {
     response += chunk;
@@ -128,12 +173,12 @@ const connectControl = () => {
     if (!response.includes('"registered":true')) {
       throw new Error("managed-agent tool registration rejected");
     }
+    registered = true;
     controlReady = true;
     publishReadiness();
   });
-  socket.once("error", () => {
-    if (!controlReady) setTimeout(connectControl, 10);
-  });
+  socket.once("error", retry);
+  socket.once("close", retry);
 };
 if (requireControlRegistration) connectControl();
 setInterval(() => {}, 1000);

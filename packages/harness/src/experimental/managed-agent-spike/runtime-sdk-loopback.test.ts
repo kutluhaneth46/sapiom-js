@@ -561,6 +561,8 @@ it.skipIf(
         containmentSupported: true,
         ownershipProven: true,
         forceKillIssued: true,
+        toolProcessObservationComplete: true,
+        toolProcessChannelsClosed: true,
         alivePidsAtDeadline: [],
       });
       expect(fixturePids).toHaveLength(2);
@@ -581,6 +583,7 @@ it.skipIf(
       }
       await fixture.cleanup();
     }
+    expect(fixturePids.every((pid) => !processExists(pid))).toBe(true);
   },
   20_000,
 );
@@ -589,7 +592,7 @@ it.skipIf(
   process.platform === "win32" ||
     process.versions.node !== MANAGED_AGENT_CONTRACT.certificationNodeVersion,
 )(
-  "contains the real SDK L2 Bash group when readiness fails before cancellation",
+  "records a teardown timeout when readiness failure leaves the Bash fixture alive",
   async () => {
     const fixture = await createManagedAgentFixture(
       () => "loopback-l2-early-error",
@@ -624,6 +627,7 @@ it.skipIf(
       server.once("error", reject);
       server.listen(0, "127.0.0.1", resolve);
     });
+    let recordedTerminal: string | undefined;
     try {
       const address = server.address() as AddressInfo;
       const ids = [RUN_ID, EXECUTION_ID];
@@ -668,24 +672,31 @@ it.skipIf(
       );
 
       expect(inferenceTurn).toBe(1);
-      expect(result.terminal).toBe("query_error");
+      recordedTerminal = result.terminal;
+      expect(result.terminal).toBe("teardown_timeout");
       expect(result.cancellationRequested).toBe(false);
       expect(result.terminationEvidence).toEqual({
-        beforePolicyOverride: "query_error",
+        beforePolicyOverride: "teardown_timeout",
         queryExecution: "iteration_aborted",
         sdkResult: "not_observed",
       });
       expect(result.queryClosed).toBe(true);
       expect(result.teardown).toMatchObject({
-        quiescent: true,
-        deadlineMet: true,
-        processTableAvailable: true,
-        containmentSupported: true,
+        quiescent: false,
+        deadlineMet: false,
+        containmentSupported: false,
+        ownershipProven: false,
         forceKillIssued: true,
-        alivePidsAtDeadline: [],
+        toolProcessObservationComplete: false,
+        toolProcessChannelsClosed: false,
       });
       expect(fixturePids).toHaveLength(2);
-      expect(fixturePids.every((pid) => !processExists(pid))).toBe(true);
+      expect(
+        fixturePids.every((pid) =>
+          result.teardown.alivePidsAtDeadline.includes(pid),
+        ),
+      ).toBe(true);
+      expect(fixturePids.every((pid) => processExists(pid))).toBe(true);
     } finally {
       await observer.emergencyCleanup(1_000);
       observer.dispose();
@@ -697,6 +708,8 @@ it.skipIf(
       }
       await fixture.cleanup();
     }
+    expect(recordedTerminal).toBe("teardown_timeout");
+    expect(fixturePids.every((pid) => !processExists(pid))).toBe(true);
   },
   20_000,
 );

@@ -308,6 +308,24 @@ async function closeQueryBounded(
   }
 }
 
+async function waitForTaskBounded(
+  task: Promise<void>,
+  timeoutMs: number,
+): Promise<boolean> {
+  if (timeoutMs <= 0) return false;
+  let timeout: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      task.then(() => true),
+      new Promise<false>((resolveTimeout) => {
+        timeout = setTimeout(() => resolveTimeout(false), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
 type ManagedAgentIteratorStep =
   | { readonly kind: "next"; readonly value: IteratorResult<unknown> }
   | { readonly kind: "aborted" };
@@ -396,6 +414,9 @@ export async function runManagedAgentProbe(
   let queryFailed = false;
   let queryClosed = false;
   let cancellationTriggerFailed = false;
+  let cancellationSignalReady = false;
+  let queryIterationSettled = false;
+  let toolProcessContainmentArmed = false;
   let policyPreflightFailed = false;
   let promptEmbedded = false;
   let eventNormalizationFailure: ManagedAgentProbeResult["terminationEvidence"]["eventNormalizationFailure"];
@@ -433,6 +454,7 @@ export async function runManagedAgentProbe(
         evidence.decision === "allow" &&
         evidence.reason === "exact_bash_command"
       ) {
+        toolProcessContainmentArmed = true;
         processObserver.armToolProcessContainment();
       }
     },
@@ -514,6 +536,8 @@ export async function runManagedAgentProbe(
             .waitForCancellationSignal(triggerController.signal)
             .then(() => {
               if (triggerController.signal.aborted) return;
+              cancellationSignalReady = true;
+              if (queryIterationSettled) return;
               cancellationRequested = true;
               cancellationRequestedAt = (dependencies.now ?? Date.now)();
               abortStartedAt = cancellationRequestedAt;
@@ -523,8 +547,10 @@ export async function runManagedAgentProbe(
             .catch(() => {
               if (!triggerController.signal.aborted) {
                 cancellationTriggerFailed = true;
-                abortStartedAt = (dependencies.now ?? Date.now)();
-                abortController.abort();
+                if (!queryIterationSettled) {
+                  abortStartedAt = (dependencies.now ?? Date.now)();
+                  abortController.abort();
+                }
               }
             })
         : undefined;
@@ -582,18 +608,40 @@ export async function runManagedAgentProbe(
         }
         if (!abortController.signal.aborted) queryFailed = true;
       } finally {
+        queryIterationSettled = true;
+        const now = dependencies.now ?? Date.now;
+        const armedEarlyQueryTeardown =
+          queryFailed &&
+          toolProcessContainmentArmed &&
+          Boolean(cancellationTask) &&
+          !abortController.signal.aborted;
+        if (armedEarlyQueryTeardown) {
+          abortStartedAt ??= now();
+          const readinessBudget = Math.max(
+            0,
+            MANAGED_AGENT_TEARDOWN_TIMEOUT_MS - (now() - abortStartedAt),
+          );
+          const taskSettled = await waitForTaskBounded(
+            cancellationTask!,
+            readinessBudget,
+          );
+          if (!taskSettled || !cancellationSignalReady) {
+            cancellationTriggerFailed = true;
+          }
+        }
         triggerController.abort();
-        if (cancellationTask) await cancellationTask;
+        if (cancellationTask && !armedEarlyQueryTeardown) {
+          await cancellationTask;
+        }
         queryFailed ||= cancellationTriggerFailed;
         // Give the SDK its documented graceful-shutdown path before host
         // fallback containment. The observer binds only SpawnOptions.signal,
         // which the SDK forwards after stdin EOF and its bounded grace period.
         if (queryFailed && !abortController.signal.aborted) {
-          abortStartedAt = (dependencies.now ?? Date.now)();
+          abortStartedAt ??= (dependencies.now ?? Date.now)();
           abortController.abort();
         }
         if (query) {
-          const now = dependencies.now ?? Date.now;
           const closeBudgetMs =
             abortStartedAt === undefined
               ? QUERY_CLOSE_TIMEOUT_MS

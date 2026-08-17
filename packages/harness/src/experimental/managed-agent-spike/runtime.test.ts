@@ -49,6 +49,8 @@ function quiescentTeardown(): ManagedAgentTeardownObservation {
     containmentSupported: true,
     ownershipProven: true,
     forceKillIssued: true,
+    toolProcessObservationComplete: true,
+    toolProcessChannelsClosed: true,
     elapsedMs: 12,
     observedPids: [],
     alivePidsAtDeadline: [],
@@ -524,6 +526,8 @@ describe("runManagedAgentProbe", () => {
       containmentSupported: true,
       ownershipProven: false,
       forceKillIssued: false,
+      toolProcessObservationComplete: true,
+      toolProcessChannelsClosed: true,
       elapsedMs: 5_001,
       observedPids: [8001],
       alivePidsAtDeadline: [8001],
@@ -907,10 +911,70 @@ describe("runManagedAgentProbe", () => {
     ).toHaveLength(1);
   });
 
+  it("keeps armed L2 readiness alive after an early query failure before aborting the SDK", async () => {
+    const { config } = await probeConfig("L2");
+    const observer = fakeObserver();
+    let now = 1_000;
+    let readinessCompleted = false;
+    let readinessWasAborted = false;
+    const result = await runManagedAgentProbe(config, {
+      hermeticGatewayOrigin: config.gatewayOrigin,
+      processObserver: observer,
+      now: () => now,
+      waitForCancellationSignal: (signal) =>
+        new Promise<void>((resolveReadiness, rejectReadiness) => {
+          const timer = setTimeout(() => {
+            now = 3_250;
+            readinessCompleted = true;
+            resolveReadiness();
+          }, 25);
+          signal.addEventListener(
+            "abort",
+            () => {
+              if (!readinessCompleted) readinessWasAborted = true;
+              clearTimeout(timer);
+              rejectReadiness(
+                new Error("readiness aborted before registration"),
+              );
+            },
+            { once: true },
+          );
+        }),
+      queryFactory: ({ options }) => ({
+        async *[Symbol.asyncIterator]() {
+          yield {
+            type: "system",
+            subtype: "init",
+            session_id: CANCEL_SESSION_ID,
+          };
+          await invokePreToolUse(options, {
+            toolName: "Bash",
+            toolInput: { command: config.allowedBashCommands[0] },
+            toolUseId: "toolu_early_query_failure",
+          });
+          throw new Error("synthetic early query failure");
+        },
+        close: vi.fn(),
+      }),
+    });
+
+    expect(readinessCompleted).toBe(true);
+    expect(readinessWasAborted).toBe(false);
+    expect(observer.armToolProcessContainment).toHaveBeenCalledOnce();
+    expect(observer.emergencyCleanup).toHaveBeenCalledWith(2_750);
+    expect(result.teardown.elapsedMs).toBe(2_250);
+    expect(result.cancellationRequested).toBe(false);
+    expect(result.terminationEvidence.beforePolicyOverride).toBe("query_error");
+  }, 10_000);
+
   it("abandons a never-resolving iterator next immediately after raw cancellation", async () => {
     const { config } = await probeConfig("L2");
     const observer = fakeObserver();
     const close = vi.fn();
+    let markNextStarted: (() => void) | undefined;
+    const nextStarted = new Promise<void>((resolveStarted) => {
+      markNextStarted = resolveStarted;
+    });
     const resultPromise = runManagedAgentProbe(config, {
       hermeticGatewayOrigin: config.gatewayOrigin,
       processObserver: observer,
@@ -918,19 +982,23 @@ describe("runManagedAgentProbe", () => {
       queryFactory: () => ({
         [Symbol.asyncIterator]() {
           return {
-            next: () => new Promise<IteratorResult<unknown>>(() => undefined),
+            next: () => {
+              markNextStarted?.();
+              return new Promise<IteratorResult<unknown>>(() => undefined);
+            },
           };
         },
         close,
       }),
     });
 
+    await nextStarted;
     const result = await Promise.race([
       resultPromise,
       new Promise<never>((_, reject) =>
         setTimeout(
           () => reject(new Error("probe stayed blocked on iterator.next()")),
-          500,
+          2_000,
         ),
       ),
     ]);
@@ -956,6 +1024,8 @@ const teardown = {
   containmentSupported: true,
   ownershipProven: true,
   forceKillIssued: true,
+  toolProcessObservationComplete: true,
+  toolProcessChannelsClosed: true,
   elapsedMs: 0,
   observedPids: [],
   alivePidsAtDeadline: [],
@@ -1069,6 +1139,8 @@ process.stdout.write(JSON.stringify({
       containmentSupported: true,
       ownershipProven: false,
       forceKillIssued: false,
+      toolProcessObservationComplete: true,
+      toolProcessChannelsClosed: true,
       elapsedMs: 5_001,
       observedPids: [9001],
       alivePidsAtDeadline: [9001],

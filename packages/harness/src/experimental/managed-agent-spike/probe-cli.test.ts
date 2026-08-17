@@ -162,6 +162,8 @@ function passingL1Result(): ManagedAgentProbeResult {
       containmentSupported: true,
       ownershipProven: false,
       forceKillIssued: false,
+      toolProcessObservationComplete: true,
+      toolProcessChannelsClosed: true,
       elapsedMs: 5,
       observedPids: [],
       alivePidsAtDeadline: [],
@@ -1104,6 +1106,32 @@ describe("managed-agent probe CLI", () => {
       id: "exact_l2_bash_only_trace",
       passed: false,
     });
+  });
+
+  it("requires observed closed tool lifetimes but not an unnecessary host force-kill", () => {
+    const passing = passingL2Result();
+    const graceful = {
+      ...passing,
+      teardown: { ...passing.teardown, forceKillIssued: false },
+    };
+    expect(evaluateManagedAgentProbe(graceful, [12_345, 12_346]).outcome).toBe(
+      "pass",
+    );
+
+    for (const [field, checkId] of [
+      ["toolProcessObservationComplete", "l2_containment_prepared"],
+      ["toolProcessChannelsClosed", "sdk_closed_tool_lifetime_channels"],
+    ] as const) {
+      expect(
+        evaluateManagedAgentProbe(
+          {
+            ...passing,
+            teardown: { ...passing.teardown, [field]: false },
+          },
+          [12_345, 12_346],
+        ).checks,
+      ).toContainEqual({ id: checkId, passed: false });
+    }
   });
 
   it.each([

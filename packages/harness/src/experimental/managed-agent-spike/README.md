@@ -114,37 +114,61 @@ recorded as a content-free nonce-verification boolean.
 ## L2 cancellation containment boundary
 
 E0.4 certifies one deliberately narrow host model: the exact non-cooperative
-fixture command running under an observer-owned supervisor in a detached macOS
-or Linux process group. The supervisor is the persistent group leader and stays
-alive when the inner Agent SDK root exits while a same-group descendant
-survives. Before cancellation may fire, a bounded host `ps` sample must prove
-that the trusted supervisor `ChildProcess` is still active and is the group
-leader, and both PIDs read from the fixture file must already be present in the
-independently host-observed group. The file is comparison evidence only; its
-contents are never passed into the observer or used as signal targets.
+fixture command running below an observer-owned Agent SDK supervisor on macOS or
+Linux. The exact fixture parent and child each authenticate over a separate
+private Unix-socket connection and keep that connection open for their complete
+lifetime. Before cancellation may fire, a fresh bounded `ps` sample must observe
+an active SDK supervisor root with stable identity, both role-tagged PIDs, their
+parent-child relationship, their shared process group, and every current group
+member as a descendant of that owned root. The group must be distinct from both
+the host and SDK supervisor groups. The random capability and role-tagged
+lifetime channels are necessary evidence, but a claimed or cached PID/PGID never
+grants signal authority by itself. The model-writable fixture PID file is used
+only by the test driver and never enters the observer.
 
-The runtime binds the observer directly to the per-run `Options.abortController`
-signal. On abort it synchronously and idempotently sends `SIGSTOP` followed by
-`SIGKILL` to the supervisor-owned group while the trusted anchor handle remains
-active. The returned SDK process also maps direct kills to that group, and a
-parent IPC disconnect kills the group. The fixture parent and child
-intentionally ignore `SIGTERM`, making the forced path load-bearing. The
-supervisor's bounded `ps` helper remains inside the owned group and only its
-known PID plus the anchor PID are excluded from its membership decision.
-Iterator abandonment, query close, bounded process enumeration, and
-group-death confirmation share one absolute five-second process-termination
-deadline. Workspace snapshots and result assembly occur afterward. The
+The runtime gives the Agent SDK its documented abort and bounded query-close
+path first. It does not bind the raw per-run `Options.abortController` to host
+signals. Only the SDK-forwarded post-grace `SpawnOptions.signal` can trigger the
+fallback. The fallback first stops the observer-created SDK supervisor group.
+A new process-table sample must then revalidate the active root identity, both
+role identities, their relationship and shared group, every current tool-group
+member's ancestry, and at least one open lifetime channel. Only that fresh proof
+authorizes `SIGSTOP` to the detached fixture group. A second fresh sample must
+show both the root and every tool-group member stopped before `SIGKILL` is sent
+to the fixture group and then the SDK supervisor group. Failed tool stop/kill
+attempts remain retryable, but every retry requires another fresh proof. The
+five-second absolute deadline bounds the entire sequence.
+
+If the root exits, an identity changes or disappears, a foreign member appears,
+ancestry is lost, both channels close prematurely, or a process-table read is
+unavailable, the observer never signals the detached group. It may still stop
+or kill its own live SDK supervisor group, but the run remains a fail-closed
+`teardown_timeout` while any tool process or lifetime channel remains. This also
+prevents numeric PID/PGID reuse from converting cached evidence into authority.
+`forceKillIssued` describes only owned SDK supervisor roots and is not required
+when SDK graceful shutdown succeeds.
+
+If an exact Bash launch is armed and the query ends early, its registration task
+is not discarded. Readiness, SDK abort/close, owned-root fallback, and death
+confirmation share one absolute five-second clock. Safe L2 completion requires
+that both authenticated lifetime channels were observed, both closed, and a
+fresh table/liveness sample found no member of the observed fixture group. A
+missing channel, an open channel, or a live observed group produces
+`teardown_timeout`; later test/campaign-owned cleanup cannot turn that result
+into a pass. Workspace snapshots and result assembly occur afterward. The
 close-deadline timer remains referenced so a CLI host cannot exit before
 cleanup and result reporting finish.
 
 An unavailable or timed-out process table is explicit unknown evidence, never
-an empty process table. The active detached supervisor still authorizes safe
-cleanup of its owned group, but the run fails certification. An invalid or
-inactive supervisor, an observed `setsid`/group escape, unknown group liveness,
-failed signals, and Windows all fail closed. Windows live L2 is rejected before
-the query or credential is opened. Universal containment, POSIX group escape,
-Windows Job Objects, and production recovery belong to later epics; this probe
-does not claim those guarantees.
+an empty process table. Closed pending registrations release their role so the
+trusted fixture may retry; duplicate live roles fail closed. A capability holder
+can at worst deny certification—it cannot make the host signal an unrelated
+group. Invalid observation, unknown group liveness, exhausted signal retries,
+and Windows all fail closed. Windows live L2 is rejected before the query or
+credential is opened. The detached-group path is limited to this exact fixture;
+universal Bash containment, other command shapes, Windows Job Objects, and
+production recovery belong to later epics, and this probe does not claim those
+guarantees.
 
 ## Pre-v2 live evidence
 

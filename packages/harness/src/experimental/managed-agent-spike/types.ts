@@ -220,10 +220,14 @@ export interface ManagedAgentTeardownObservation {
   readonly processTableAvailable: boolean;
   /** False means the owned E0 containment model was escaped or unproven. */
   readonly containmentSupported: boolean;
-  /** True only after the active POSIX supervisor is observed as PGID leader. */
+  /** True after SDK-root authority and any required L2 observations are proven. */
   readonly ownershipProven: boolean;
-  /** True only when the bound raw abort synchronously issued SIGSTOP+SIGKILL. */
+  /** True only when SIGKILL was issued to every owned SDK supervisor root. */
   readonly forceKillIssued: boolean;
+  /** True after both exact L2 fixture lifetime channels pass fresh observation. */
+  readonly toolProcessObservationComplete: boolean;
+  /** True only when both observed L2 lifetime channels have closed. */
+  readonly toolProcessChannelsClosed: boolean;
   readonly elapsedMs: number;
   readonly observedPids: readonly number[];
   readonly alivePidsAtDeadline: readonly number[];
@@ -300,19 +304,19 @@ export interface ManagedAgentProcessObserver {
   /** Bind only the SDK-forwarded post-grace SpawnOptions signal. */
   bindAbortSignal(signal: AbortSignal): void;
   /**
-   * Arm the one-shot, host-authenticated process registration used only by
-   * the exact E0.4 L2 fixture. Unregistered built-in Bash processes are not
-   * granted signal authority by this experimental observer.
+   * Arm the two host-authenticated lifetime observations used only by the
+   * exact E0.4 L2 fixture. Tool-reported identities never grant authority by
+   * themselves; the observer also requires fresh owned-root ancestry.
    */
   armToolProcessContainment(): void;
-  /** Prove the narrow POSIX ownership model before allowing L2 to cancel. */
+  /** Prove the narrow POSIX observation model before allowing L2 to cancel. */
   prepareCancellation(): Promise<ManagedAgentCancellationReadiness>;
   /** Sample only members owned by the host-observed process anchors. */
   observeProcessTree(timeoutMs?: number): Promise<boolean>;
   waitForQuiescence(
     timeoutMs: number,
   ): Promise<ManagedAgentTeardownObservation>;
-  /** Idempotently force an anchored owned group and confirm within this budget. */
+  /** Idempotently run the anchored fallback and confirm within this budget. */
   emergencyCleanup(timeoutMs: number): Promise<ManagedAgentTeardownObservation>;
   dispose(): void;
 }

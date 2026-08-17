@@ -822,7 +822,11 @@ export function evaluateManagedAgentProbe(
           result.teardown.processTableAvailable &&
           result.teardown.containmentSupported &&
           result.teardown.ownershipProven &&
-          result.teardown.forceKillIssued,
+          result.teardown.toolProcessObservationComplete,
+      },
+      {
+        id: "sdk_closed_tool_lifetime_channels",
+        passed: result.teardown.toolProcessChannelsClosed,
       },
       {
         id: "fixture_processes_observed",

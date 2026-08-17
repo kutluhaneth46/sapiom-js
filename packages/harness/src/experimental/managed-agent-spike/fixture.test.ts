@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -21,6 +22,19 @@ afterEach(async () => {
 });
 
 describe("managed-agent disposable git fixture", () => {
+  it("emits a syntactically valid long-running fixture program", async () => {
+    const fixture = await createManagedAgentFixture(() => "syntax-check");
+    fixtures.push(fixture);
+
+    expect(() =>
+      execFileSync(
+        process.execPath,
+        ["--check", join(fixture.workspaceRoot, FIXTURE_PATHS.processScript)],
+        { stdio: "pipe", windowsHide: true },
+      ),
+    ).not.toThrow();
+  });
+
   it("starts with a clean target plus dirty tracked and untracked sentinels", async () => {
     const fixture = await createManagedAgentFixture(
       () => "11111111-2222-3333-4444-555555555555",
