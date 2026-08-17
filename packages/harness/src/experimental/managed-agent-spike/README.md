@@ -199,10 +199,13 @@ The fixture also fails closed if its host disappears outside that orderly
 sequence. After authentication, either lifetime channel closing makes the
 receiving fixture process terminate its own current group. Before
 authentication, connection failures retry only until a five-second monotonic
-deadline and then terminate that same receiver-owned group. This receiver-side
-behavior lets an outer process-bound supervisor close its own IPC channel and
-cascade termination through nested detached fixture processes without sending
-a host-side signal to a cached numeric PID or PGID.
+deadline and then terminate that same receiver-owned group. An unconditional
+timer enforces the same deadline when a controller accepts a connection but
+never authenticates it, and every connect attempt and registration ACK rechecks
+the deadline. This receiver-side behavior lets an outer process-bound
+supervisor close its own IPC channel and cascade termination through nested
+detached fixture processes without sending a host-side signal to a cached
+numeric PID or PGID.
 
 Deadline expiry or a successful quiescence observation seals all evidence,
 closes the spawn gate, and permanently revokes numeric signal authority.

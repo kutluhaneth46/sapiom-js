@@ -1,8 +1,10 @@
 import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createServer, type Socket as NetSocket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { performance } from "node:perf_hooks";
 
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -16,6 +18,10 @@ import {
   verifyManagedAgentFixtureBytes,
   type ManagedAgentFixture,
 } from "./fixture.js";
+import {
+  MANAGED_AGENT_TOOL_CONTROL_CAPABILITY_ENV,
+  MANAGED_AGENT_TOOL_CONTROL_SOCKET_ENV,
+} from "./process-observer.js";
 
 const fixtures: ManagedAgentFixture[] = [];
 
@@ -156,6 +162,78 @@ describe("managed-agent disposable git fixture", () => {
       } finally {
         await rm(externalLeaseRoot, { recursive: true, force: true });
         await waitForProcessExit(descendantPid);
+      }
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "self-terminates its detached group when a controller accepts but never authenticates",
+    { timeout: 12_000 },
+    async () => {
+      const fixture = await createManagedAgentFixture(
+        () => "silent-control-registration",
+      );
+      fixtures.push(fixture);
+      const controlRoot = await mkdtemp(
+        join(tmpdir(), "managed-agent-silent-control-"),
+      );
+      const controlSocket = join(controlRoot, "control.sock");
+      const acceptedSockets: NetSocket[] = [];
+      const server = createServer((socket) => {
+        acceptedSockets.push(socket);
+        socket.on("error", () => undefined);
+        socket.resume();
+      });
+      server.listen(controlSocket);
+      await once(server, "listening");
+      const parent = spawn(
+        process.execPath,
+        [
+          join(fixture.workspaceRoot, FIXTURE_PATHS.processScript),
+          join(fixture.workspaceRoot, FIXTURE_PATHS.processPidFile),
+          "--register-control",
+        ],
+        {
+          detached: true,
+          env: {
+            ...process.env,
+            [MANAGED_AGENT_TOOL_CONTROL_SOCKET_ENV]: controlSocket,
+            [MANAGED_AGENT_TOOL_CONTROL_CAPABILITY_ENV]:
+              "silent-control-capability",
+          },
+          stdio: "ignore",
+          windowsHide: true,
+        },
+      );
+      await once(parent, "spawn");
+      const spawnedAt = performance.now();
+      let childPid: number | undefined;
+
+      try {
+        childPid = await waitForDirectChildPid(parent.pid!);
+        const connectionDeadline = Date.now() + 2_000;
+        while (acceptedSockets.length < 2 && Date.now() < connectionDeadline) {
+          await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
+        }
+        expect(acceptedSockets).toHaveLength(2);
+        expect(processExists(parent.pid!)).toBe(true);
+        expect(processExists(childPid)).toBe(true);
+
+        const [exitCode, signal] = await once(parent, "exit");
+        expect(exitCode).toBeNull();
+        expect(signal).toBe("SIGKILL");
+        expect(performance.now() - spawnedAt).toBeLessThan(6_000);
+        await waitForProcessExit(childPid);
+      } finally {
+        for (const socket of acceptedSockets) socket.destroy();
+        await new Promise<void>((resolveClose, rejectClose) =>
+          server.close((error) =>
+            error ? rejectClose(error) : resolveClose(),
+          ),
+        );
+        await waitForProcessExit(parent.pid!, 7_000);
+        if (childPid !== undefined) await waitForProcessExit(childPid, 7_000);
+        await rm(controlRoot, { recursive: true, force: true });
       }
     },
   );

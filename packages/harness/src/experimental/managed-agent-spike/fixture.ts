@@ -83,6 +83,8 @@ function shellQuote(value: string): string {
   return `'${value.split("'").join(`'"'"'`)}'`;
 }
 
+const TOOL_CONTROL_REGISTRATION_TIMEOUT_MS = 5_000;
+
 const LONG_RUNNING_SCRIPT = `
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
@@ -106,7 +108,8 @@ const readinessDelayMs = Number.isSafeInteger(parsedReadinessDelay) &&
   : 0;
 const controlSocket = process.env[${JSON.stringify(MANAGED_AGENT_TOOL_CONTROL_SOCKET_ENV)}];
 const controlCapability = process.env[${JSON.stringify(MANAGED_AGENT_TOOL_CONTROL_CAPABILITY_ENV)}];
-const controlRegistrationDeadlineAt = performance.now() + 5_000;
+const controlRegistrationTimeoutMs = ${TOOL_CONTROL_REGISTRATION_TIMEOUT_MS};
+const controlRegistrationDeadlineAt = performance.now() + controlRegistrationTimeoutMs;
 if (requireControlRegistration && (!controlSocket || !controlCapability)) {
   throw new Error("managed-agent tool control capability missing");
 }
@@ -117,7 +120,8 @@ const childProgram = [
   'const requireControlRegistration = ' + JSON.stringify(requireControlRegistration) + ';',
   'const controlSocket = process.env["${MANAGED_AGENT_TOOL_CONTROL_SOCKET_ENV}"];',
   'const controlCapability = process.env["${MANAGED_AGENT_TOOL_CONTROL_CAPABILITY_ENV}"];',
-  'const controlRegistrationDeadlineAt = performance.now() + 5_000;',
+  'const controlRegistrationTimeoutMs = ' + JSON.stringify(controlRegistrationTimeoutMs) + ';',
+  'const controlRegistrationDeadlineAt = performance.now() + controlRegistrationTimeoutMs;',
   'delete process.env["${MANAGED_AGENT_TOOL_CONTROL_SOCKET_ENV}"];',
   'delete process.env["${MANAGED_AGENT_TOOL_CONTROL_CAPABILITY_ENV}"];',
   'const readinessDelayMs = ' + JSON.stringify(readinessDelayMs) + ';',
@@ -128,6 +132,10 @@ const childProgram = [
   'const terminateOwnedGroup = () => {',
   '  try { process.kill(0, "SIGKILL"); } catch { process.exit(1); }',
   '};',
+  'const controlRegistrationTimer = requireControlRegistration',
+  '  ? setTimeout(terminateOwnedGroup, Math.max(0, controlRegistrationDeadlineAt - performance.now()))',
+  '  : undefined;',
+  'controlRegistrationTimer?.unref();',
   'const publishReady = () => {',
   '  if (readyPublished) return;',
   '  readyPublished = true;',
@@ -136,6 +144,7 @@ const childProgram = [
   '};',
   'const connectControl = () => {',
   '  if (!controlSocket || !controlCapability) { publishReady(); return; }',
+  '  if (performance.now() >= controlRegistrationDeadlineAt) { terminateOwnedGroup(); return; }',
   '  const socket = createConnection(controlSocket);',
   '  socket.unref();',
   '  socket.setEncoding("utf8");',
@@ -166,7 +175,9 @@ const childProgram = [
   '    }',
   '    if (!response.includes("\\\\n")) return;',
   '    if (!response.includes(' + JSON.stringify('"registered":true') + ')) { socket.destroy(); return; }',
+  '    if (performance.now() >= controlRegistrationDeadlineAt) { terminateOwnedGroup(); return; }',
   '    registered = true;',
+  '    if (controlRegistrationTimer) clearTimeout(controlRegistrationTimer);',
   '    publishReady();',
   '  });',
   '  socket.once("error", retry);',
@@ -191,6 +202,13 @@ let controlReady = !requireControlRegistration;
 const terminateOwnedGroup = () => {
   try { process.kill(0, "SIGKILL"); } catch { process.exit(1); }
 };
+const controlRegistrationTimer = requireControlRegistration
+  ? setTimeout(
+      terminateOwnedGroup,
+      Math.max(0, controlRegistrationDeadlineAt - performance.now()),
+    )
+  : undefined;
+controlRegistrationTimer?.unref();
 const publishReadiness = () => {
   if (!childReady || !controlReady) return;
   try {
@@ -207,6 +225,10 @@ child.once("message", () => {
 });
 const connectControl = () => {
   if (!controlSocket || !controlCapability) return;
+  if (performance.now() >= controlRegistrationDeadlineAt) {
+    terminateOwnedGroup();
+    return;
+  }
   const socket = createConnection(controlSocket);
   socket.unref();
   socket.setEncoding("utf8");
@@ -241,7 +263,12 @@ const connectControl = () => {
     if (!response.includes('"registered":true')) {
       throw new Error("managed-agent tool registration rejected");
     }
+    if (performance.now() >= controlRegistrationDeadlineAt) {
+      terminateOwnedGroup();
+      return;
+    }
     registered = true;
+    if (controlRegistrationTimer) clearTimeout(controlRegistrationTimer);
     controlReady = true;
     publishReadiness();
   });
