@@ -96,6 +96,9 @@ function killOwnedGroup() {
 }
 
 process.on("disconnect", killOwnedGroup);
+// The host can close IPC after spawn() succeeds but before this module starts.
+// Register first, then close the already-disconnected bootstrap window.
+if (!process.connected) killOwnedGroup();
 
 function readOtherGroupMembers() {
   return new Promise((resolveMembers) => {
@@ -290,6 +293,10 @@ export interface LocalManagedAgentProcessObserverOptions {
   readonly testOnlyBeforeTerminationRequest?: (
     request: ManagedAgentTerminationRequest,
   ) => ManagedAgentTerminationRequestOutcome | undefined;
+  /** Simulate one role's channel write; undefined uses the real retained socket. */
+  readonly testOnlyWriteToolTermination?: (
+    role: ToolProcessRole,
+  ) => Exclude<ManagedAgentTerminationRequestOutcome, "gone"> | undefined;
   /** Read-only test telemetry emitted after a channel request is attempted. */
   readonly onTerminationRequest?: (
     request: ManagedAgentTerminationRequest,
@@ -556,6 +563,11 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
         request: ManagedAgentTerminationRequest,
       ) => ManagedAgentTerminationRequestOutcome | undefined)
     | undefined;
+  readonly #testOnlyWriteToolTermination:
+    | ((
+        role: ToolProcessRole,
+      ) => Exclude<ManagedAgentTerminationRequestOutcome, "gone"> | undefined)
+    | undefined;
   readonly #onTerminationRequest:
     | ((
         request: ManagedAgentTerminationRequest,
@@ -617,6 +629,7 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
     this.#testOnlyRequestTermination = options.testOnlyRequestTermination;
     this.#testOnlyBeforeTerminationRequest =
       options.testOnlyBeforeTerminationRequest;
+    this.#testOnlyWriteToolTermination = options.testOnlyWriteToolTermination;
     this.#onTerminationRequest = options.onTerminationRequest;
     this.#monotonicNow = options.monotonicNow ?? (() => performance.now());
     this.#delay = options.delay ?? defaultDelay;
@@ -1741,28 +1754,42 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
         ),
       );
     }
-    const registration = (["parent", "child"] as const)
+    const registrations = (["parent", "child"] as const)
       .map((role) => this.#toolProcessRegistrations.get(role))
-      .find(
-        (candidate) =>
-          candidate?.accepted &&
+      .filter(
+        (candidate): candidate is ToolProcessRegistration =>
+          candidate !== undefined &&
+          candidate.accepted &&
           !candidate.closed &&
           !candidate.socket.destroyed &&
           candidate.socket.writable,
       );
-    if (!registration) {
+    if (registrations.length === 0) {
       return this.#recordTerminationRequest(request, "failure");
     }
-    try {
-      // This retained socket is bound to the authenticated process instance,
-      // not its numeric PID. The receiver calls kill(0, SIGKILL), so the
-      // still-running member terminates its own current group without a host
-      // snapshot-to-signal PGID reuse window.
-      registration.socket.write('{"forceKill":true}\n');
-      return this.#recordTerminationRequest(request, "sent");
-    } catch {
-      return this.#recordTerminationRequest(request, "failure");
+    let sent = false;
+    for (const registration of registrations) {
+      const simulatedOutcome = this.#testOnlyWriteToolTermination?.(
+        registration.role,
+      );
+      if (simulatedOutcome) {
+        sent ||= simulatedOutcome === "sent";
+        continue;
+      }
+      try {
+        // This retained socket is bound to the authenticated process instance,
+        // not its numeric PID. The receiver calls kill(0, SIGKILL), so the
+        // still-running member terminates its own current group without a host
+        // snapshot-to-signal PGID reuse window. Broadcast to every live role:
+        // a stale peer cannot prevent its surviving group-mate from receiving
+        // the same idempotent self-group termination request.
+        registration.socket.write('{"forceKill":true}\n');
+        sent = true;
+      } catch {
+        // Try every independently authenticated channel before failing closed.
+      }
     }
+    return this.#recordTerminationRequest(request, sent ? "sent" : "failure");
   }
 
   #requestRootGroupTermination(

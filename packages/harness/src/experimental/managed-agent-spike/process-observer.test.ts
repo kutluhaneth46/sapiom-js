@@ -961,6 +961,47 @@ describe("LocalManagedAgentProcessObserver", () => {
   );
 
   it.skipIf(process.platform === "win32")(
+    "self-terminates when IPC disconnects before the supervisor installs its listener",
+    async () => {
+      const fixture = await createManagedAgentFixture(
+        () => "supervisor-bootstrap-disconnect",
+      );
+      fixtures.push(fixture);
+      const disconnectPreload = join(
+        fixture.workspaceRoot,
+        "disconnect-supervisor-ipc.cjs",
+      );
+      await writeFile(
+        disconnectPreload,
+        "if (process.connected) process.disconnect();\n",
+      );
+      const observer = new LocalManagedAgentProcessObserver();
+      const controller = new AbortController();
+      const anchor = asChildProcess(
+        observer.spawn({
+          command: "/usr/bin/true",
+          args: [],
+          cwd: fixture.workspaceRoot,
+          env: {
+            ...process.env,
+            NODE_OPTIONS: `--require=${disconnectPreload}`,
+          },
+          signal: controller.signal,
+        }),
+      );
+      try {
+        const [exitCode, signalCode] = await once(anchor, "exit");
+        expect(exitCode).toBeNull();
+        expect(signalCode).toBe("SIGKILL");
+      } finally {
+        controller.abort();
+        await observer.dispose();
+      }
+    },
+    5_000,
+  );
+
+  it.skipIf(process.platform === "win32")(
     "never signals a cached supervisor group through SDK kill after observed exit",
     async () => {
       const observer = new LocalManagedAgentProcessObserver();
@@ -1391,6 +1432,43 @@ describe("LocalManagedAgentProcessObserver", () => {
         hostKillSpy.mockRestore();
         await cleanupRegisteredDescendantToolRun(run);
         observer.dispose();
+      }
+    },
+    15_000,
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "broadcasts tool termination when the parent channel write is unusable",
+    async () => {
+      const attemptedRoles: Array<"parent" | "child"> = [];
+      const observer = new LocalManagedAgentProcessObserver({
+        testOnlyWriteToolTermination: (role) => {
+          attemptedRoles.push(role);
+          return role === "parent" ? "failure" : undefined;
+        },
+      });
+      let run: RegisteredDescendantToolRun | undefined;
+      try {
+        run = await startRegisteredDescendantToolRun(
+          observer,
+          "child-channel-termination-fallback",
+        );
+
+        const teardown = await observer.emergencyCleanup(deadlineAfter(3_000));
+
+        expect(attemptedRoles).toEqual(["parent", "child"]);
+        expect(teardown).toMatchObject({
+          quiescent: true,
+          deadlineMet: true,
+          containmentSupported: true,
+          forceKillIssued: true,
+          toolProcessChannelsClosed: true,
+          alivePidsAtDeadline: [],
+        });
+        expect(run.toolPids.every((pid) => !processExists(pid))).toBe(true);
+      } finally {
+        await cleanupRegisteredDescendantToolRun(run);
+        await observer.dispose();
       }
     },
     15_000,
