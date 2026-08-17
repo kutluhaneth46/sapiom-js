@@ -1,10 +1,11 @@
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { once } from "node:events";
 import { readFile } from "node:fs/promises";
 import { createServer, type ServerResponse } from "node:http";
 import { createRequire } from "node:module";
 import type { AddressInfo } from "node:net";
 import { dirname, join } from "node:path";
+import { promisify } from "node:util";
 
 import { query as agentSdkQuery } from "@anthropic-ai/claude-agent-sdk";
 import { expect, it } from "vitest";
@@ -16,11 +17,18 @@ import {
   waitForManagedAgentFixturePids,
 } from "./fixture.js";
 import { MANAGED_AGENT_CONTRACT } from "./contract.js";
-import { LocalManagedAgentProcessObserver } from "./process-observer.js";
+import {
+  LocalManagedAgentProcessObserver,
+  managedAgentPosixSessionColumn,
+  parseManagedAgentPosixProcessTable,
+  type ManagedAgentKernelProcessTable,
+  type ManagedAgentProcessTableObservation,
+} from "./process-observer.js";
 import {
   qualifiedManagedAgentMcpToolName,
   runManagedAgentProbe,
 } from "./runtime.js";
+import type { ManagedAgentProcessObserver } from "./types.js";
 
 const RUN_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const EXECUTION_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
@@ -32,6 +40,24 @@ const ALLOWED_BASH_COMMAND = "git status --short";
 const DENIED_BASH_COMMAND = "touch denied-side-effect.txt";
 const ECHO_NONCE_TOOL = qualifiedManagedAgentMcpToolName("echo_nonce");
 const require = createRequire(import.meta.url);
+const execFileAsync = promisify(execFile);
+
+async function readLoopbackProcessTable(): Promise<ManagedAgentProcessTableObservation> {
+  try {
+    const sessionColumn = managedAgentPosixSessionColumn(process.platform);
+    const { stdout } = await execFileAsync(
+      "/bin/ps",
+      ["-axo", `pid=,ppid=,pgid=,${sessionColumn}=,stat=,lstart=`],
+      { encoding: "utf8", maxBuffer: 4 * 1024 * 1024, timeout: 1_000 },
+    );
+    return {
+      available: true,
+      processes: parseManagedAgentPosixProcessTable(stdout),
+    };
+  } catch {
+    return { available: false };
+  }
+}
 
 function processExists(pid: number): boolean {
   try {
@@ -245,6 +271,92 @@ function writeFinalResponse(response: ServerResponse, turn: number): void {
 
 it("enforces real-SDK built-in and in-process MCP calls with exact loopback correlation", async () => {
   const fixture = await createManagedAgentFixture(() => "loopback-nonce");
+  const startedAt = Date.now();
+  const stateSamples: Array<{
+    readonly elapsedMs: number;
+    readonly processes?: ManagedAgentKernelProcessTable;
+  }> = [];
+  const groupSignals: Array<{
+    readonly elapsedMs: number;
+    readonly groupId: number;
+    readonly signal: "SIGSTOP" | "SIGKILL";
+    readonly outcome: "sent" | "gone" | "failure";
+  }> = [];
+  const lifecycle: Array<{
+    readonly elapsedMs: number;
+    readonly event: string;
+  }> = [];
+  const observer = new LocalManagedAgentProcessObserver({
+    readProcessTable: async () => {
+      const observation = await readLoopbackProcessTable();
+      stateSamples.push({
+        elapsedMs: Date.now() - startedAt,
+        ...(observation.available ? { processes: observation.processes } : {}),
+      });
+      return observation;
+    },
+    signalProcessGroup: (groupId, signal) => {
+      let outcome: "sent" | "gone" | "failure";
+      try {
+        process.kill(-groupId, signal);
+        outcome = "sent";
+      } catch (error) {
+        outcome =
+          (error as NodeJS.ErrnoException).code === "ESRCH"
+            ? "gone"
+            : "failure";
+      }
+      groupSignals.push({
+        elapsedMs: Date.now() - startedAt,
+        groupId,
+        signal,
+        outcome,
+      });
+      return outcome;
+    },
+  });
+  let supervisorPid: number | undefined;
+  const observedObserver: ManagedAgentProcessObserver = {
+    spawn: (options) => {
+      const child = observer.spawn(options);
+      const pid = Reflect.get(child, "pid");
+      supervisorPid = typeof pid === "number" ? pid : undefined;
+      lifecycle.push({
+        elapsedMs: Date.now() - startedAt,
+        event: "observer_spawned",
+      });
+      return child;
+    },
+    bindAbortSignal: (signal) => observer.bindAbortSignal(signal),
+    armToolProcessContainment: () => observer.armToolProcessContainment(),
+    prepareCancellation: () => observer.prepareCancellation(),
+    observeProcessTree: (timeoutMs) => observer.observeProcessTree(timeoutMs),
+    waitForQuiescence: async (timeoutMs) => {
+      lifecycle.push({
+        elapsedMs: Date.now() - startedAt,
+        event: "wait_for_quiescence_started",
+      });
+      const result = await observer.waitForQuiescence(timeoutMs);
+      lifecycle.push({
+        elapsedMs: Date.now() - startedAt,
+        event: `wait_for_quiescence_settled:${result.quiescent}:${result.containmentSupported}`,
+      });
+      return result;
+    },
+    emergencyCleanup: async (timeoutMs) => {
+      lifecycle.push({
+        elapsedMs: Date.now() - startedAt,
+        event: "host_emergency_cleanup_started",
+      });
+      const result = await observer.emergencyCleanup(timeoutMs);
+      lifecycle.push({
+        elapsedMs: Date.now() - startedAt,
+        event: `host_emergency_cleanup_settled:${result.quiescent}:${result.containmentSupported}`,
+      });
+      return result;
+    },
+    dispose: () => observer.dispose(),
+  };
   const observations: LoopbackObservation[] = [];
   let helloCount = 0;
   let inferenceTurn = 0;
@@ -339,8 +451,32 @@ it("enforces real-SDK built-in and in-process MCP calls with exact loopback corr
       },
       {
         hermeticGatewayOrigin: `http://127.0.0.1:${address.port}`,
-        queryFactory: ({ prompt, options }) =>
-          agentSdkQuery({ prompt, options }),
+        processObserver: observedObserver,
+        queryFactory: ({ prompt, options }) => {
+          const sdkQuery = agentSdkQuery({ prompt, options });
+          return {
+            [Symbol.asyncIterator]: () => sdkQuery[Symbol.asyncIterator](),
+            close: () => {
+              lifecycle.push({
+                elapsedMs: Date.now() - startedAt,
+                event: "sdk_close_called",
+              });
+              sdkQuery.close();
+            },
+            return: async () => {
+              lifecycle.push({
+                elapsedMs: Date.now() - startedAt,
+                event: "sdk_return_started",
+              });
+              const returned = await sdkQuery.return(undefined);
+              lifecycle.push({
+                elapsedMs: Date.now() - startedAt,
+                event: "sdk_return_settled",
+              });
+              return returned;
+            },
+          };
+        },
         uuid: () => {
           const id = ids.shift();
           if (!id) throw new Error("unexpected UUID request");
@@ -366,7 +502,38 @@ it("enforces real-SDK built-in and in-process MCP calls with exact loopback corr
     expect(
       observations.map(({ mcpResultMatches }) => mcpResultMatches),
     ).toEqual([false, false, false, false, true]);
-    expect(result.terminal).toBe("success");
+    const stateTransitions = stateSamples.reduce<
+      Array<{
+        readonly elapsedMs: number;
+        readonly records: unknown;
+      }>
+    >((transitions, { elapsedMs, processes }) => {
+      const records = processes
+        ? [...processes.entries()]
+            .filter(
+              ([pid]) =>
+                pid === supervisorPid ||
+                result.teardown.observedPids.includes(pid),
+            )
+            .map(([pid, record]) => ({ pid, ...record }))
+        : "unavailable";
+      const previous = transitions.at(-1)?.records;
+      if (JSON.stringify(previous) !== JSON.stringify(records)) {
+        transitions.push({ elapsedMs, records });
+      }
+      return transitions;
+    }, []);
+    expect(
+      result.terminal,
+      JSON.stringify({
+        groupSignals,
+        lifecycle,
+        processTableSampleCount: stateSamples.length,
+        stateTransitions,
+        teardown: result.teardown,
+        terminationEvidence: result.terminationEvidence,
+      }),
+    ).toBe("success");
 
     const requested = result.toolEvidence.filter(
       ({ status }) => status === "requested",
@@ -447,6 +614,8 @@ it("enforces real-SDK built-in and in-process MCP calls with exact loopback corr
     expect(result.queryClosed).toBe(true);
     expect(result.teardown.quiescent).toBe(true);
   } finally {
+    await observer.emergencyCleanup(1_000);
+    observer.dispose();
     server.closeAllConnections();
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await fixture.cleanup();
@@ -462,7 +631,73 @@ it.skipIf(
     const fixture = await createManagedAgentFixture(
       () => "loopback-l2-cancellation",
     );
-    const observer = new LocalManagedAgentProcessObserver();
+    const startedAt = Date.now();
+    const stateSamples: Array<{
+      readonly elapsedMs: number;
+      readonly processes?: ManagedAgentKernelProcessTable;
+    }> = [];
+    const groupSignals: Array<{
+      readonly elapsedMs: number;
+      readonly groupId: number;
+      readonly signal: "SIGSTOP" | "SIGKILL";
+      readonly outcome: "sent" | "gone" | "failure";
+    }> = [];
+    const observer = new LocalManagedAgentProcessObserver({
+      readProcessTable: async () => {
+        const observation = await readLoopbackProcessTable();
+        stateSamples.push({
+          elapsedMs: Date.now() - startedAt,
+          ...(observation.available
+            ? { processes: observation.processes }
+            : {}),
+        });
+        return observation;
+      },
+      signalProcessGroup: (groupId, signal) => {
+        let outcome: "sent" | "gone" | "failure";
+        try {
+          process.kill(-groupId, signal);
+          outcome = "sent";
+        } catch (error) {
+          outcome =
+            (error as NodeJS.ErrnoException).code === "ESRCH"
+              ? "gone"
+              : "failure";
+        }
+        groupSignals.push({
+          elapsedMs: Date.now() - startedAt,
+          groupId,
+          signal,
+          outcome,
+        });
+        return outcome;
+      },
+    });
+    const cleanupOrder: string[] = [];
+    let supervisorPid: number | undefined;
+    const observedObserver: ManagedAgentProcessObserver = {
+      spawn: (options) => {
+        options.signal.addEventListener(
+          "abort",
+          () => cleanupOrder.push("sdk_forwarded_signal"),
+          { once: true },
+        );
+        const child = observer.spawn(options);
+        const pid = Reflect.get(child, "pid");
+        supervisorPid = typeof pid === "number" ? pid : undefined;
+        return child;
+      },
+      bindAbortSignal: (signal) => observer.bindAbortSignal(signal),
+      armToolProcessContainment: () => observer.armToolProcessContainment(),
+      prepareCancellation: () => observer.prepareCancellation(),
+      observeProcessTree: (timeoutMs) => observer.observeProcessTree(timeoutMs),
+      waitForQuiescence: (timeoutMs) => observer.waitForQuiescence(timeoutMs),
+      emergencyCleanup: (timeoutMs) => {
+        cleanupOrder.push("host_emergency_cleanup");
+        return observer.emergencyCleanup(timeoutMs);
+      },
+      dispose: () => observer.dispose(),
+    };
     const unrelated = spawn(
       process.execPath,
       ["-e", "setInterval(() => {}, 1000)"],
@@ -470,6 +705,8 @@ it.skipIf(
     );
     await once(unrelated, "spawn");
     let fixturePids: readonly number[] = [];
+    let fixtureToolProcessGroupId: number | undefined;
+    let cancellationStartedAt: number | undefined;
     let inferenceTurn = 0;
     const server = createServer((request, response) => {
       if (request.method === "HEAD" && request.url === "/api/hello") {
@@ -522,9 +759,23 @@ it.skipIf(
         },
         {
           hermeticGatewayOrigin: `http://127.0.0.1:${address.port}`,
-          processObserver: observer,
-          queryFactory: ({ prompt, options }) =>
-            agentSdkQuery({ prompt, options }),
+          processObserver: observedObserver,
+          queryFactory: ({ prompt, options }) => {
+            const sdkQuery = agentSdkQuery({ prompt, options });
+            return {
+              [Symbol.asyncIterator]: () => sdkQuery[Symbol.asyncIterator](),
+              close: () => {
+                cleanupOrder.push("sdk_close_called");
+                sdkQuery.close();
+              },
+              return: async () => {
+                cleanupOrder.push("sdk_return_started");
+                const returned = await sdkQuery.return(undefined);
+                cleanupOrder.push("sdk_return_settled");
+                return returned;
+              },
+            };
+          },
           waitForCancellationSignal: async (signal) => {
             fixturePids = await waitForManagedAgentFixturePids(
               fixture,
@@ -541,6 +792,27 @@ it.skipIf(
             expect(
               fixturePids.every((pid) => readiness.observedPids.includes(pid)),
             ).toBe(true);
+            let readinessProcessTable:
+              | ManagedAgentKernelProcessTable
+              | undefined;
+            for (let index = stateSamples.length - 1; index >= 0; index -= 1) {
+              const processes = stateSamples[index]?.processes;
+              if (!processes?.has(fixturePids[0]!)) continue;
+              readinessProcessTable = processes;
+              break;
+            }
+            fixtureToolProcessGroupId = readinessProcessTable?.get(
+              fixturePids[0]!,
+            )?.processGroupId;
+            expect(fixtureToolProcessGroupId).toBeTypeOf("number");
+            expect(
+              fixturePids.every(
+                (pid) =>
+                  readinessProcessTable?.get(pid)?.processGroupId ===
+                  fixtureToolProcessGroupId,
+              ),
+            ).toBe(true);
+            cancellationStartedAt = Date.now();
           },
           uuid: () => {
             const id = ids.shift();
@@ -549,9 +821,45 @@ it.skipIf(
           },
         },
       );
+      const cancellationElapsedMs =
+        Date.now() - (cancellationStartedAt ?? startedAt);
+      const stateTransitions = stateSamples.reduce<
+        Array<{
+          readonly elapsedMs: number;
+          readonly records: unknown;
+        }>
+      >((transitions, { elapsedMs, processes }) => {
+        const records = processes
+          ? [...processes.entries()]
+              .filter(
+                ([pid]) =>
+                  pid === supervisorPid ||
+                  fixturePids.includes(pid) ||
+                  result.teardown.observedPids.includes(pid),
+              )
+              .map(([pid, record]) => ({ pid, ...record }))
+          : "unavailable";
+        const previous = transitions.at(-1)?.records;
+        if (JSON.stringify(previous) !== JSON.stringify(records)) {
+          transitions.push({ elapsedMs, records });
+        }
+        return transitions;
+      }, []);
 
       expect(inferenceTurn).toBe(1);
-      expect(result.terminal).toBe("cancelled");
+      expect(
+        result.terminal,
+        JSON.stringify({
+          cleanupOrder,
+          elapsedMs: cancellationElapsedMs,
+          groupSignals,
+          queryClosed: result.queryClosed,
+          stateTransitions,
+          teardown: result.teardown,
+          terminationEvidence: result.terminationEvidence,
+        }),
+      ).toBe("cancelled");
+      expect(cancellationElapsedMs).toBeLessThan(5_000);
       expect(result.cancellationRequested).toBe(true);
       expect(result.queryClosed).toBe(true);
       expect(result.teardown).toMatchObject({
@@ -568,6 +876,226 @@ it.skipIf(
       expect(fixturePids).toHaveLength(2);
       expect(fixturePids.every((pid) => !processExists(pid))).toBe(true);
       expect(processExists(unrelated.pid!)).toBe(true);
+      expect(
+        groupSignals.map(({ groupId, signal }) => [groupId, signal]),
+      ).toEqual([
+        [supervisorPid, "SIGSTOP"],
+        [fixtureToolProcessGroupId, "SIGSTOP"],
+        [fixtureToolProcessGroupId, "SIGKILL"],
+        [supervisorPid, "SIGKILL"],
+      ]);
+      expect(cleanupOrder).toEqual(
+        expect.arrayContaining([
+          "sdk_close_called",
+          "sdk_return_started",
+          "sdk_return_settled",
+          "host_emergency_cleanup",
+        ]),
+      );
+      expect(cleanupOrder.indexOf("sdk_close_called")).toBeLessThan(
+        cleanupOrder.indexOf("sdk_return_started"),
+      );
+      expect(cleanupOrder.indexOf("sdk_return_started")).toBeLessThan(
+        cleanupOrder.indexOf("sdk_return_settled"),
+      );
+      expect(cleanupOrder.indexOf("sdk_return_settled")).toBeLessThan(
+        cleanupOrder.indexOf("host_emergency_cleanup"),
+      );
+      const forwardedSignalIndex = cleanupOrder.indexOf("sdk_forwarded_signal");
+      expect(forwardedSignalIndex).toBeGreaterThanOrEqual(0);
+      expect(forwardedSignalIndex).toBeLessThan(
+        cleanupOrder.indexOf("host_emergency_cleanup"),
+      );
+    } finally {
+      await observer.emergencyCleanup(1_000);
+      observer.dispose();
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      for (const pid of fixturePids) {
+        if (!processExists(pid)) continue;
+        await forceKillTestProcess(pid);
+      }
+      if (typeof unrelated.pid === "number" && processExists(unrelated.pid)) {
+        unrelated.kill("SIGKILL");
+        await waitForProcessDeath(unrelated.pid);
+      }
+      await fixture.cleanup();
+    }
+    expect(fixturePids.every((pid) => !processExists(pid))).toBe(true);
+  },
+  20_000,
+);
+
+it.skipIf(
+  process.platform === "win32" ||
+    process.versions.node !== MANAGED_AGENT_CONTRACT.certificationNodeVersion,
+)(
+  "fails closed through the runtime timeout fallback when the SDK signal is not forwarded",
+  async () => {
+    const fixture = await createManagedAgentFixture(
+      () => "loopback-l2-missing-forwarded-signal",
+    );
+    const observer = new LocalManagedAgentProcessObserver();
+    const neverForwardedController = new AbortController();
+    const cleanupOrder: string[] = [];
+    const observedObserver: ManagedAgentProcessObserver = {
+      spawn: (options) => {
+        options.signal.addEventListener(
+          "abort",
+          () => cleanupOrder.push("sdk_forwarded_signal_unobserved"),
+          { once: true },
+        );
+        return observer.spawn({
+          ...options,
+          signal: neverForwardedController.signal,
+        });
+      },
+      bindAbortSignal: (signal) => observer.bindAbortSignal(signal),
+      armToolProcessContainment: () => observer.armToolProcessContainment(),
+      prepareCancellation: () => observer.prepareCancellation(),
+      observeProcessTree: (timeoutMs) => observer.observeProcessTree(timeoutMs),
+      waitForQuiescence: (timeoutMs) => observer.waitForQuiescence(timeoutMs),
+      emergencyCleanup: (timeoutMs) => {
+        cleanupOrder.push("host_timeout_fallback");
+        return observer.emergencyCleanup(timeoutMs);
+      },
+      dispose: () => observer.dispose(),
+    };
+    const unrelated = spawn(
+      process.execPath,
+      ["-e", "setInterval(() => {}, 1000)"],
+      { stdio: "ignore", windowsHide: true },
+    );
+    await once(unrelated, "spawn");
+    let fixturePids: readonly number[] = [];
+    let cancellationStartedAt: number | undefined;
+    let inferenceTurn = 0;
+    const server = createServer((request, response) => {
+      if (request.method === "HEAD" && request.url === "/api/hello") {
+        response.writeHead(200).end();
+        return;
+      }
+      if (
+        request.method !== "POST" ||
+        request.url?.split("?")[0] !== "/v1/messages"
+      ) {
+        response.writeHead(404).end();
+        return;
+      }
+      request.resume();
+      request.once("end", () => {
+        inferenceTurn += 1;
+        writeToolUseResponse(response, inferenceTurn, {
+          id: "toolu_loopback_l2_missing_forwarded_signal",
+          name: "Bash",
+          input: { command: fixture.l2BashCommand },
+        });
+      });
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    try {
+      const address = server.address() as AddressInfo;
+      const ids = [RUN_ID, EXECUTION_ID];
+      const result = await runManagedAgentProbe(
+        {
+          scenario: "L2",
+          workspaceRoot: fixture.workspaceRoot,
+          configRoot: fixture.configRoot,
+          target: "sonnet-5",
+          gatewayOrigin: `http://127.0.0.1:${address.port}`,
+          gatewayCredential: "sk-ant-api03-local-loopback-only",
+          prompt: fixture.prompt("L2"),
+          maxTurns: 4,
+          maxBudgetUsd: 0.25,
+          allowedBashCommands: [fixture.l2BashCommand],
+          pathRoleBindings: [],
+          expectedL1FinalBytes: [],
+          preservePaths: [
+            FIXTURE_PATHS.dirtySentinel,
+            FIXTURE_PATHS.untrackedSentinel,
+          ],
+        },
+        {
+          hermeticGatewayOrigin: `http://127.0.0.1:${address.port}`,
+          processObserver: observedObserver,
+          queryFactory: ({ prompt, options }) => {
+            const sdkQuery = agentSdkQuery({ prompt, options });
+            return {
+              [Symbol.asyncIterator]: () => sdkQuery[Symbol.asyncIterator](),
+              close: () => {
+                cleanupOrder.push("sdk_close_called");
+                sdkQuery.close();
+              },
+              return: async () => {
+                cleanupOrder.push("sdk_return_started");
+                await sdkQuery.return(undefined);
+                cleanupOrder.push("sdk_return_underlying_settled");
+                return new Promise<IteratorResult<unknown>>(() => undefined);
+              },
+            };
+          },
+          waitForCancellationSignal: async (signal) => {
+            fixturePids = await waitForManagedAgentFixturePids(
+              fixture,
+              10_000,
+              signal,
+            );
+            await expect(observer.prepareCancellation()).resolves.toMatchObject(
+              {
+                supported: true,
+                reason: "ready",
+                containmentSupported: true,
+                ownershipProven: true,
+              },
+            );
+            cancellationStartedAt = Date.now();
+          },
+          uuid: () => {
+            const id = ids.shift();
+            if (!id) throw new Error("unexpected UUID request");
+            return id;
+          },
+        },
+      );
+      const cancellationElapsedMs =
+        Date.now() - (cancellationStartedAt ?? Date.now());
+
+      expect(inferenceTurn).toBe(1);
+      expect(result.terminal).toBe("close_timeout");
+      expect(result.cancellationRequested).toBe(true);
+      expect(result.queryClosed).toBe(false);
+      expect(result.teardown).toMatchObject({
+        quiescent: true,
+        deadlineMet: true,
+        processTableAvailable: true,
+        containmentSupported: true,
+        ownershipProven: true,
+        forceKillIssued: true,
+        toolProcessObservationComplete: true,
+        toolProcessChannelsClosed: true,
+        alivePidsAtDeadline: [],
+      });
+      expect(result.teardown.elapsedMs).toBeLessThanOrEqual(5_000);
+      expect(cancellationElapsedMs).toBeLessThanOrEqual(5_000);
+      expect(fixturePids).toHaveLength(2);
+      expect(fixturePids.every((pid) => !processExists(pid))).toBe(true);
+      expect(processExists(unrelated.pid!)).toBe(true);
+      expect(cleanupOrder).toEqual(
+        expect.arrayContaining([
+          "sdk_close_called",
+          "sdk_return_started",
+          "sdk_return_underlying_settled",
+          "sdk_forwarded_signal_unobserved",
+          "host_timeout_fallback",
+        ]),
+      );
+      expect(
+        cleanupOrder.indexOf("sdk_forwarded_signal_unobserved"),
+      ).toBeLessThan(cleanupOrder.indexOf("host_timeout_fallback"));
     } finally {
       await observer.emergencyCleanup(1_000);
       observer.dispose();

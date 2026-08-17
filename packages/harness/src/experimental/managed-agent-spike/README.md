@@ -121,36 +121,69 @@ lifetime. Before cancellation may fire, a fresh bounded `ps` sample must observe
 an active SDK supervisor root with stable identity, both role-tagged PIDs, their
 parent-child relationship, their shared process group, and every current group
 member as a descendant of that owned root. The group must be distinct from both
-the host and SDK supervisor groups. The random capability and role-tagged
-lifetime channels are necessary evidence, but a claimed or cached PID/PGID never
-grants signal authority by itself. The model-writable fixture PID file is used
-only by the test driver and never enters the observer.
+the host and SDK supervisor groups. Every observed root/tool descendant retains
+an immutable creation-time, parent, process-group, and session baseline. Once L2
+tool containment is armed, every current root descendant must remain in the
+supervisor group or authenticated tool group; reparenting or PGID/session
+migration fails closed. The random capability and role-tagged lifetime channels
+are necessary evidence, but a claimed or cached PID/PGID never grants signal
+authority by itself. The model-writable fixture PID file is used only by the
+test driver and never enters the observer.
+
+Outside that L2 gate, an unarmed L1 run can briefly create an SDK-owned
+subprocess group while the process is still a descendant of the supervisor.
+That subgroup is never signal authority. The observer remembers each exact
+identity and treats it as pending:
+readiness and quiescence remain false, and fallback cannot kill the supervisor
+root, while any pending identity is live. A later complete process-table sample
+may clear it only by proving that exact identity is absent or a zombie. Any
+parent, group, session, or ancestry change before that positive death evidence
+permanently fails containment closed. Once L2 tool containment is armed, only
+the authenticated supervisor and fixture groups are permitted; an additional
+descendant group rejects readiness.
 
 The runtime gives the Agent SDK its documented abort and bounded query-close
 path first. It does not bind the raw per-run `Options.abortController` to host
 signals. Only the SDK-forwarded post-grace `SpawnOptions.signal` can trigger the
-fallback. The fallback first stops the observer-created SDK supervisor group.
-A new process-table sample must then revalidate the active root identity, both
-role identities, their relationship and shared group, every current tool-group
-member's ancestry, and at least one open lifetime channel. Only that fresh proof
-authorizes `SIGSTOP` to the detached fixture group. A second fresh sample must
-show both the root and every tool-group member stopped before `SIGKILL` is sent
-to the fixture group and then the SDK supervisor group. Failed tool stop/kill
-attempts remain retryable, but every retry requires another fresh proof. The
-five-second absolute deadline bounds the entire sequence.
+fallback. In SDK 0.3.228, `Query.close()` starts cleanup but returns `void`, so
+the runtime immediately follows it with and awaits `Query.return()` under the
+same deadline. `queryClosed` means that awaitable cleanup settled; invoking
+`close()` alone is never completion evidence. Host emergency cleanup starts
+only after that cleanup settles, the forwarded signal has already requested the
+fallback, or the bounded SDK-grace budget expires. The returned handle accepts
+the first SDK `child.kill()` logically by setting `child.killed = true`, but it
+intentionally sends no native signal. The SDK-forwarded abort signal requests
+the sampled host fallback; only freshly validated host group cleanup sends
+signals. The fallback first stops the observer-created SDK supervisor group. A
+new process-table sample must then revalidate the active root identity, both
+role identities, their relationship and shared group, every
+current root/tool descendant's parent, group, session, and ancestry, and at
+least one open lifetime channel. Only that fresh proof authorizes `SIGSTOP` to
+the detached fixture group. A second fresh sample must show both the root and
+every tool-group member stopped before `SIGKILL` is sent to the fixture group
+and then the SDK supervisor group. Failed tool stop/kill attempts remain
+retryable, but every retry requires another fresh proof. The five-second
+absolute deadline bounds the entire sequence.
 
-If the root exits, an identity changes or disappears, a foreign member appears,
-ancestry is lost, both channels close prematurely, or a process-table read is
-unavailable, the observer never signals the detached group. It may still stop
-or kill its own live SDK supervisor group, but the run remains a fail-closed
+If the root exits, a stable identity changes parent/group/session, a foreign
+member appears, ancestry is lost, both channels close prematurely, or a
+process-table read is unavailable, the observer never signals the detached
+group. This includes an inner SDK command exit that reparents a surviving
+descendant: an unchanged old PGID does not retain authority after ancestry is
+lost. A successful complete table that no longer contains the stable identity
+is positive exit evidence; otherwise an escaped same-identity PID and its new
+group remain in final liveness accounting. The observer may still stop or kill
+its own live SDK supervisor group, but the run remains a fail-closed
 `teardown_timeout` while any tool process or lifetime channel remains. This also
 prevents numeric PID/PGID reuse from converting cached evidence into authority.
 `forceKillIssued` describes only owned SDK supervisor roots and is not required
 when SDK graceful shutdown succeeds.
 
-If an exact Bash launch is armed and the query ends early, its registration task
-is not discarded. Readiness, SDK abort/close, owned-root fallback, and death
-confirmation share one absolute five-second clock. Safe L2 completion requires
+If an exact Bash launch is armed and the query settles before readiness—by
+throwing, clean iterator completion, or an SDK error result—its registration
+task is not discarded. Readiness, SDK abort/close/return, owned-root fallback,
+and death confirmation share one absolute five-second clock. Such an early
+settlement never fabricates `cancellationRequested`. Safe L2 completion requires
 that both authenticated lifetime channels were observed, both closed, and a
 fresh table/liveness sample found no member of the observed fixture group. A
 missing channel, an open channel, or a live observed group produces

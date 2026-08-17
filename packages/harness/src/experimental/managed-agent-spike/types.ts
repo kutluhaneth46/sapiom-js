@@ -292,6 +292,8 @@ export interface ManagedAgentProbeResult {
  */
 export interface ManagedAgentQuery extends AsyncIterable<unknown> {
   close(): void | Promise<void>;
+  /** Pinned SDK Query.return() awaits its fire-and-forget close cleanup. */
+  return?(value?: void): Promise<IteratorResult<unknown, void>>;
 }
 
 export type ManagedAgentQueryFactory = (input: {

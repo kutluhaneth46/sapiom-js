@@ -227,6 +227,8 @@ if (inner) {
 export interface ManagedAgentKernelProcessRecord {
   readonly parentPid: number;
   readonly processGroupId?: number;
+  /** POSIX session id, when the process table exposes it. */
+  readonly sessionId?: number;
   /** POSIX process state used only to confirm an issued group stop. */
   readonly state?: string;
   /** Kernel-reported creation time used for evidence, never POSIX authority. */
@@ -299,6 +301,12 @@ function sameProcess(
   return Boolean(left && right && left.startedAt === right.startedAt);
 }
 
+function processIsZombie(
+  record: ManagedAgentKernelProcessRecord | undefined,
+): boolean {
+  return record?.state?.startsWith("Z") ?? false;
+}
+
 function sameCapability(left: string, right: string): boolean {
   const leftBytes = Buffer.from(left, "utf8");
   const rightBytes = Buffer.from(right, "utf8");
@@ -356,10 +364,42 @@ async function windowsProcessTable(): Promise<ManagedAgentKernelProcessTable> {
   );
 }
 
-async function posixProcessTable(): Promise<ManagedAgentKernelProcessTable> {
+export function managedAgentPosixSessionColumn(
+  platform: NodeJS.Platform,
+): "sess" | "sid" {
+  return platform === "darwin" ? "sess" : "sid";
+}
+
+export function parseManagedAgentPosixProcessTable(
+  stdout: string,
+): ManagedAgentKernelProcessTable {
+  const entries: Array<readonly [number, ManagedAgentKernelProcessRecord]> = [];
+  for (const line of stdout.split("\n")) {
+    const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(.+?)\s*$/.exec(
+      line,
+    );
+    if (!match) continue;
+    entries.push([
+      Number(match[1]),
+      {
+        parentPid: Number(match[2]),
+        processGroupId: Number(match[3]),
+        sessionId: Number(match[4]),
+        state: match[5]!,
+        startedAt: match[6]!,
+      },
+    ]);
+  }
+  return new Map(entries);
+}
+
+async function posixProcessTable(
+  platform: NodeJS.Platform,
+): Promise<ManagedAgentKernelProcessTable> {
+  const sessionColumn = managedAgentPosixSessionColumn(platform);
   const { stdout } = await execFileAsync(
     "/bin/ps",
-    ["-axo", "pid=,ppid=,pgid=,stat=,lstart="],
+    ["-axo", `pid=,ppid=,pgid=,${sessionColumn}=,stat=,lstart=`],
     {
       encoding: "utf8",
       windowsHide: true,
@@ -368,21 +408,7 @@ async function posixProcessTable(): Promise<ManagedAgentKernelProcessTable> {
       killSignal: "SIGKILL",
     },
   );
-  const entries: Array<readonly [number, ManagedAgentKernelProcessRecord]> = [];
-  for (const line of stdout.split("\n")) {
-    const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(.+?)\s*$/.exec(line);
-    if (!match) continue;
-    entries.push([
-      Number(match[1]),
-      {
-        parentPid: Number(match[2]),
-        processGroupId: Number(match[3]),
-        state: match[4]!,
-        startedAt: match[5]!,
-      },
-    ]);
-  }
-  return new Map(entries);
+  return parseManagedAgentPosixProcessTable(stdout);
 }
 
 async function defaultReadProcessTable(
@@ -394,7 +420,7 @@ async function defaultReadProcessTable(
       processes:
         platform === "win32"
           ? await windowsProcessTable()
-          : await posixProcessTable(),
+          : await posixProcessTable(platform),
     };
   } catch {
     return { available: false };
@@ -485,6 +511,14 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
   readonly #delay: (milliseconds: number) => Promise<void>;
   readonly #roots = new Map<number, OwnedRoot>();
   readonly #observedIdentities = new Map<number, ObservedIdentity>();
+  // An unarmed SDK may create a short-lived subgroup that is still below the
+  // owned root. Its stable identities block readiness, quiescence, and root
+  // kill but never grant subgroup signal authority. Only positive death clears
+  // them; topology drift is handled as a permanent escape below.
+  readonly #pendingUnauthenticatedDescendants = new Map<
+    number,
+    ObservedIdentity
+  >();
   readonly #observedPids = new Set<number>();
   readonly #sampler: NodeJS.Timeout;
   readonly #boundSignals = new WeakSet<AbortSignal>();
@@ -509,6 +543,7 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
   #fallbackCleanupRequested = false;
   #lastTable: ManagedAgentKernelProcessTable | undefined;
   #processTableAvailable = false;
+  #processTableNeedsRefresh = false;
   #sampleTask: Promise<boolean> | undefined;
 
   public constructor(options: LocalManagedAgentProcessObserverOptions = {}) {
@@ -652,9 +687,44 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
     this.#toolProcessContainmentArmed = true;
     if (this.#toolControlFailed) {
       for (const root of this.#roots.values()) {
-        root.containmentSupported = false;
+        this.#invalidateRootContainment(root);
       }
     }
+  }
+
+  #invalidateRootContainment(root: OwnedRoot): void {
+    root.containmentSupported = false;
+  }
+
+  #invalidateToolContainment(): void {
+    this.#toolProcessObservationInvalid = true;
+  }
+
+  #hasPendingUnauthenticatedDescendants(rootPid: number): boolean {
+    return [...this.#pendingUnauthenticatedDescendants.values()].some(
+      (identity) => identity.rootPid === rootPid,
+    );
+  }
+
+  #expectedAfterAuthorizedGroupKill(
+    root: OwnedRoot,
+    observed: ManagedAgentKernelProcessRecord | undefined,
+    current: ManagedAgentKernelProcessRecord | undefined,
+    toolProcessGroupId: number | undefined,
+  ): boolean {
+    if (!sameProcess(observed, current)) return false;
+    if (
+      observed?.processGroupId === root.pid &&
+      current?.processGroupId === root.pid
+    ) {
+      return root.forceKillIssued;
+    }
+    return (
+      typeof toolProcessGroupId === "number" &&
+      observed?.processGroupId === toolProcessGroupId &&
+      current?.processGroupId === toolProcessGroupId &&
+      this.#toolProcessForceKillIssued
+    );
   }
 
   public spawn(options: SpawnOptions): SpawnedProcess {
@@ -710,23 +780,15 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
     if (typeof child.pid === "number") {
       const pid = child.pid;
       if (usePosixSupervisor) {
-        let groupKillRequested = false;
-        Object.defineProperty(child, "killed", {
-          configurable: true,
-          enumerable: true,
-          get: () => groupKillRequested,
-        });
-        child.kill = ((signal: NodeJS.Signals = "SIGTERM") => {
-          try {
-            process.kill(-pid, signal);
-            groupKillRequested = true;
-            return true;
-          } catch (error) {
-            if ((error as NodeJS.ErrnoException).code === "ESRCH") {
-              return false;
-            }
-            throw error;
-          }
+        child.kill = ((_signal: NodeJS.Signals = "SIGTERM") => {
+          // ProcessTransport calls kill() immediately before it forwards its
+          // private AbortSignal. Treat that first call as logical acceptance so
+          // the SDK will not retry through a cached PID, but preserve the live
+          // supervisor as the ancestry anchor. Only the subsequently forwarded
+          // signal may start sampled, identity-checked group cleanup.
+          if (!childActive(child) || child.killed) return false;
+          Reflect.set(child, "killed", true);
+          return true;
         }) as typeof child.kill;
       }
       this.#roots.set(pid, {
@@ -800,15 +862,21 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
       const groupMemberPids =
         typeof processGroupId === "number"
           ? [...table.entries()].flatMap(([pid, record]) =>
-              record.processGroupId === processGroupId ? [pid] : [],
+              record.processGroupId === processGroupId &&
+              !processIsZombie(record)
+                ? [pid]
+                : [],
             )
           : [];
       if (
         root &&
         childActive(root.child) &&
         table.get(root.pid)?.processGroupId === root.pid &&
+        !processIsZombie(table.get(root.pid)) &&
         parentIdentity &&
+        !processIsZombie(parentIdentity) &&
         childIdentity &&
+        !processIsZombie(childIdentity) &&
         typeof processGroupId === "number" &&
         typeof hostProcessGroupId === "number" &&
         processGroupId > 1 &&
@@ -818,6 +886,7 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
         childIdentity.parentPid === parent.pid &&
         childIdentity.processGroupId === processGroupId &&
         groupLeaderIdentity?.processGroupId === processGroupId &&
+        !processIsZombie(groupLeaderIdentity) &&
         groupMemberPids.length > 0 &&
         groupMemberPids.every((pid) => rootDescendants.has(pid))
       ) {
@@ -847,10 +916,12 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
       if (
         !registration.closed &&
         current &&
+        !processIsZombie(current) &&
+        !this.#toolProcessForceKillIssued &&
         (!sameProcess(registration.identity, current) ||
           current.processGroupId !== processGroupId)
       ) {
-        this.#toolProcessObservationInvalid = true;
+        this.#invalidateToolContainment();
       }
     }
   }
@@ -871,6 +942,8 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
     if (
       !root ||
       !childActive(root.child) ||
+      !root.containmentSupported ||
+      this.#processTableNeedsRefresh ||
       this.#toolProcessObservationInvalid ||
       typeof processGroupId !== "number" ||
       !parent?.accepted ||
@@ -889,23 +962,39 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
     const currentChild = table.get(child.pid);
     if (
       !currentRoot ||
+      processIsZombie(currentRoot) ||
       !currentParent ||
+      processIsZombie(currentParent) ||
       !currentChild ||
+      processIsZombie(currentChild) ||
       currentRoot.processGroupId !== root.pid ||
       (root.identity && !sameProcess(root.identity, currentRoot)) ||
+      (root.identity && root.identity.sessionId !== currentRoot.sessionId) ||
       (options.requireRootStopped && !currentRoot.state?.includes("T")) ||
       !sameProcess(parent.identity, currentParent) ||
       currentParent.processGroupId !== processGroupId ||
+      parent.identity.sessionId !== currentParent.sessionId ||
       !sameProcess(child.identity, currentChild) ||
       currentChild.parentPid !== parent.pid ||
-      currentChild.processGroupId !== processGroupId
+      currentChild.processGroupId !== processGroupId ||
+      child.identity.sessionId !== currentChild.sessionId
     ) {
       return false;
     }
 
     const rootDescendants = descendantsOf(new Set([root.pid]), table);
+    const allowedGroups = new Set([root.pid, processGroupId]);
+    if (
+      [...rootDescendants].some((pid) => {
+        const record = table.get(pid);
+        return !record || !allowedGroups.has(record.processGroupId ?? -1);
+      })
+    ) {
+      return false;
+    }
     const groupMembers = [...table.entries()].filter(
-      ([, record]) => record.processGroupId === processGroupId,
+      ([, record]) =>
+        record.processGroupId === processGroupId && !processIsZombie(record),
     );
     return (
       groupMembers.length > 0 &&
@@ -915,6 +1004,158 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
           (!options.requireToolStopped || record.state?.includes("T")),
       )
     );
+  }
+
+  #observePosixOwnedProcesses(table: ManagedAgentKernelProcessTable): void {
+    for (const root of this.#roots.values()) {
+      const descendants = descendantsOf(new Set([root.pid]), table);
+      const toolProcessGroupId =
+        this.#toolProcessRootPid === root.pid
+          ? this.#toolProcessGroupId
+          : undefined;
+      const allowedGroups = new Set<number>([root.pid]);
+      if (typeof toolProcessGroupId === "number") {
+        allowedGroups.add(toolProcessGroupId);
+      }
+      const validateAllowedGroups =
+        !this.#toolProcessContainmentArmed ||
+        typeof toolProcessGroupId === "number";
+      const currentlyOwned = new Set<number>([root.pid, ...descendants]);
+
+      for (const [pid, pending] of this.#pendingUnauthenticatedDescendants) {
+        if (pending.rootPid !== root.pid) continue;
+        const current = table.get(pid);
+        if (!sameProcess(pending.record, current) || processIsZombie(current)) {
+          this.#pendingUnauthenticatedDescendants.delete(pid);
+        }
+      }
+
+      for (const [pid, record] of table) {
+        if (processIsZombie(record)) continue;
+        if (
+          record.processGroupId !== root.pid &&
+          record.processGroupId !== toolProcessGroupId
+        ) {
+          continue;
+        }
+        currentlyOwned.add(pid);
+        if (pid !== root.pid && !descendants.has(pid)) {
+          const observed = this.#observedIdentities.get(pid);
+          const expectedAfterAuthorizedKill =
+            this.#expectedAfterAuthorizedGroupKill(
+              root,
+              observed?.record,
+              record,
+              toolProcessGroupId,
+            );
+          if (expectedAfterAuthorizedKill) continue;
+          if (record.processGroupId === toolProcessGroupId) {
+            this.#invalidateToolContainment();
+          } else {
+            this.#invalidateRootContainment(root);
+          }
+        }
+      }
+
+      for (const [pid, observed] of this.#observedIdentities) {
+        if (observed.rootPid !== root.pid) continue;
+        const current = table.get(pid);
+        // A successful complete process-table sample with no matching stable
+        // identity is positive evidence that the old process has exited. A
+        // recycled numeric PID never inherits the old observation.
+        // A kernel zombie is already dead and cannot execute, migrate, or
+        // authorize a signal. Its transient reparenting during reap is not a
+        // live containment escape.
+        if (
+          !sameProcess(observed.record, current) ||
+          processIsZombie(current)
+        ) {
+          continue;
+        }
+        this.#observedPids.add(pid);
+        if (
+          current!.parentPid !== observed.record.parentPid ||
+          current!.processGroupId !== observed.record.processGroupId ||
+          current!.sessionId !== observed.record.sessionId ||
+          (pid !== root.pid && !currentlyOwned.has(pid))
+        ) {
+          const belongsToToolGroup =
+            typeof toolProcessGroupId === "number" &&
+            (observed.record.processGroupId === toolProcessGroupId ||
+              current!.processGroupId === toolProcessGroupId);
+          const expectedAfterAuthorizedKill =
+            this.#expectedAfterAuthorizedGroupKill(
+              root,
+              observed.record,
+              current,
+              toolProcessGroupId,
+            );
+          if (expectedAfterAuthorizedKill) {
+            continue;
+          }
+          if (belongsToToolGroup) {
+            this.#invalidateToolContainment();
+          } else {
+            this.#invalidateRootContainment(root);
+          }
+        }
+      }
+
+      for (const pid of currentlyOwned) {
+        const current = table.get(pid);
+        if (!current || processIsZombie(current)) continue;
+        const isDescendant = descendants.has(pid);
+        const escapedOwnedAncestry = pid !== root.pid && !isDescendant;
+        const unauthenticatedDescendant =
+          validateAllowedGroups &&
+          isDescendant &&
+          !allowedGroups.has(current.processGroupId ?? -1);
+        if (escapedOwnedAncestry || unauthenticatedDescendant) {
+          const observed = this.#observedIdentities.get(pid);
+          const belongsToToolGroup =
+            typeof toolProcessGroupId === "number" &&
+            (current.processGroupId === toolProcessGroupId ||
+              observed?.record.processGroupId === toolProcessGroupId);
+          const pending = this.#pendingUnauthenticatedDescendants.get(pid);
+          if (
+            unauthenticatedDescendant &&
+            !this.#toolProcessContainmentArmed &&
+            (!observed ||
+              (pending?.rootPid === root.pid &&
+                sameProcess(pending.record, current)))
+          ) {
+            if (!pending) {
+              this.#pendingUnauthenticatedDescendants.set(pid, {
+                rootPid: root.pid,
+                record: current,
+              });
+            }
+          } else {
+            const expectedAfterAuthorizedKill =
+              this.#expectedAfterAuthorizedGroupKill(
+                root,
+                observed?.record,
+                current,
+                toolProcessGroupId,
+              );
+            if (expectedAfterAuthorizedKill) continue;
+            if (belongsToToolGroup) {
+              this.#invalidateToolContainment();
+            } else {
+              this.#invalidateRootContainment(root);
+            }
+          }
+        }
+        const observed = this.#observedIdentities.get(pid);
+        if (!observed || !sameProcess(observed.record, current)) {
+          this.#observedIdentities.set(pid, {
+            rootPid: root.pid,
+            record: current,
+          });
+        }
+        this.#observedPids.add(pid);
+      }
+    }
   }
 
   public async observeProcessTree(
@@ -934,41 +1175,32 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
         const observation =
           await this.#boundedProcessTableRead(boundedTimeoutMs);
         if (!observation.available) {
-          this.#lastTable = undefined;
-          this.#processTableAvailable = false;
+          if (
+            boundedTimeoutMs > 0 ||
+            this.#processTableNeedsRefresh ||
+            !this.#processTableAvailable
+          ) {
+            this.#lastTable = undefined;
+            this.#processTableAvailable = false;
+          }
           return false;
         }
 
         const table = observation.processes;
         this.#lastTable = table;
         this.#processTableAvailable = true;
+        this.#processTableNeedsRefresh = false;
         for (const root of this.#roots.values()) {
           if (this.#platform !== "win32") {
-            for (const [pid, observed] of this.#observedIdentities) {
-              if (observed.rootPid !== root.pid) continue;
-              const current = table.get(pid);
-              if (
-                sameProcess(observed.record, current) &&
-                current?.processGroupId !== root.pid
-              ) {
-                root.containmentSupported = false;
-              }
-            }
             const currentRoot = table.get(root.pid);
             if (
               currentRoot &&
+              !processIsZombie(currentRoot) &&
               childActive(root.child) &&
+              !root.forceKillIssued &&
               currentRoot.processGroupId !== root.pid
             ) {
-              root.containmentSupported = false;
-            }
-            for (const [pid, record] of table) {
-              if (record.processGroupId !== root.pid) continue;
-              this.#observedIdentities.set(pid, {
-                rootPid: root.pid,
-                record,
-              });
-              this.#observedPids.add(pid);
+              this.#invalidateRootContainment(root);
             }
             continue;
           }
@@ -1002,6 +1234,14 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
           }
         }
         this.#observeToolProcessContainment(table);
+        if (this.#platform !== "win32") {
+          this.#observePosixOwnedProcesses(table);
+        }
+        // Query.return() can remain pending while the SDK performs its own
+        // shutdown. Advance a requested fallback from each authoritative
+        // sample so the detached tool group is stopped/killed before the
+        // supervisor anchor is killed last, all within the same deadline.
+        this.#advanceFallbackCleanup();
         return true;
       })().finally(() => {
         this.#sampleTask = undefined;
@@ -1020,8 +1260,16 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
     if (!available) {
       // A caller with a shorter absolute deadline must not reuse a stale table
       // while a longer background sample is still pending.
-      this.#lastTable = undefined;
-      this.#processTableAvailable = false;
+      if (
+        boundedTimeoutMs > 0 ||
+        this.#processTableNeedsRefresh ||
+        !this.#processTableAvailable
+      ) {
+        this.#lastTable = undefined;
+        this.#processTableAvailable = false;
+      } else {
+        return true;
+      }
     }
     return available;
   }
@@ -1037,7 +1285,9 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
       processTableAvailable: this.#processTableAvailable,
       containmentSupported:
         [...this.#roots.values()].every(
-          ({ containmentSupported }) => containmentSupported,
+          ({ pid, containmentSupported }) =>
+            containmentSupported &&
+            !this.#hasPendingUnauthenticatedDescendants(pid),
         ) &&
         (!this.#toolProcessContainmentArmed ||
           (this.#toolProcessRegistrations.size === 2 &&
@@ -1048,7 +1298,7 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
 
     if (this.#platform !== "darwin" && this.#platform !== "linux") {
       for (const root of this.#roots.values()) {
-        root.containmentSupported = false;
+        this.#invalidateRootContainment(root);
       }
       return unsupported("platform_unsupported");
     }
@@ -1060,13 +1310,19 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
     if (!root.containmentSupported) {
       return unsupported("containment_escaped");
     }
+    if (this.#hasPendingUnauthenticatedDescendants(root.pid)) {
+      return unsupported("containment_escaped");
+    }
     if (!childActive(root.child)) {
       return unsupported("root_not_active");
     }
     const currentRoot = this.#lastTable!.get(root.pid);
     if (!currentRoot || currentRoot.processGroupId !== root.pid) {
-      root.containmentSupported = false;
+      this.#invalidateRootContainment(root);
       return unsupported("root_not_group_leader");
+    }
+    if (processIsZombie(currentRoot)) {
+      return unsupported("root_not_active");
     }
     root.identity = currentRoot;
     if (this.#toolProcessContainmentArmed) {
@@ -1109,16 +1365,56 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
     };
   }
 
+  #hasFreshRootGroupAuthority(root: OwnedRoot): boolean {
+    if (!root.containmentSupported || this.#processTableNeedsRefresh) {
+      return false;
+    }
+    // The observer-created supervisor group remains the bounded fallback when
+    // a helper read is unavailable. Once a complete table exists, however, it
+    // must not turn a dead/zombie or replaced numeric root into authority.
+    if (!this.#processTableAvailable) return true;
+    const current = this.#lastTable?.get(root.pid);
+    const baseline =
+      root.identity ?? this.#observedIdentities.get(root.pid)?.record;
+    if (
+      !current ||
+      processIsZombie(current) ||
+      current.processGroupId !== root.pid
+    ) {
+      return false;
+    }
+    return baseline
+      ? sameProcess(baseline, current) &&
+          current.parentPid === baseline.parentPid &&
+          current.sessionId === baseline.sessionId
+      : true;
+  }
+
+  #signalValidatedProcessGroup(
+    processGroupId: number,
+    signal: "SIGSTOP" | "SIGKILL",
+  ): ManagedAgentProcessSignalOutcome {
+    const outcome = this.#signalProcessGroup(processGroupId, signal);
+    if (outcome === "sent") this.#processTableNeedsRefresh = true;
+    return outcome;
+  }
+
   #stopOwnedRootsSynchronously(): void {
     if (this.#platform !== "darwin" && this.#platform !== "linux") return;
     for (const root of this.#roots.values()) {
-      if (root.forceKillIssued || !childActive(root.child)) continue;
+      if (
+        root.forceKillIssued ||
+        !childActive(root.child) ||
+        !this.#hasFreshRootGroupAuthority(root)
+      ) {
+        continue;
+      }
       if (!root.stopIssued) {
-        const stopOutcome = this.#signalProcessGroup(root.pid, "SIGSTOP");
+        const stopOutcome = this.#signalValidatedProcessGroup(
+          root.pid,
+          "SIGSTOP",
+        );
         root.stopIssued = stopOutcome === "sent";
-        if (stopOutcome === "failure") {
-          root.containmentSupported = false;
-        }
       }
     }
   }
@@ -1126,10 +1422,19 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
   #killOwnedRootsSynchronously(): void {
     if (this.#platform !== "darwin" && this.#platform !== "linux") return;
     for (const root of this.#roots.values()) {
-      if (root.forceKillIssued || !childActive(root.child)) continue;
-      const killOutcome = this.#signalProcessGroup(root.pid, "SIGKILL");
+      if (
+        root.forceKillIssued ||
+        !childActive(root.child) ||
+        this.#hasPendingUnauthenticatedDescendants(root.pid) ||
+        !this.#hasFreshRootGroupAuthority(root)
+      ) {
+        continue;
+      }
+      const killOutcome = this.#signalValidatedProcessGroup(
+        root.pid,
+        "SIGKILL",
+      );
       root.forceKillIssued = killOutcome === "sent";
-      if (killOutcome === "failure") root.containmentSupported = false;
     }
   }
 
@@ -1162,6 +1467,15 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
 
     const processGroupId = this.#toolProcessGroupId;
     if (typeof processGroupId !== "number") return;
+    const table = this.#lastTable!;
+    const liveToolGroupMembers = [...table.values()].some(
+      (record) =>
+        record.processGroupId === processGroupId && !processIsZombie(record),
+    );
+    if (this.#toolProcessForceKillIssued && !liveToolGroupMembers) {
+      this.#killOwnedRootsSynchronously();
+      return;
+    }
     const groupLiveness = this.#processGroupLiveness(processGroupId);
     if (groupLiveness === "gone") {
       this.#killOwnedRootsSynchronously();
@@ -1169,7 +1483,6 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
     }
     if (groupLiveness !== "alive") return;
 
-    const table = this.#lastTable!;
     if (
       !this.#hasFreshToolAuthority(table, {
         requireRootStopped: true,
@@ -1179,38 +1492,58 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
       return;
     }
     if (!this.#toolProcessStopIssued) {
-      const stopOutcome = this.#signalProcessGroup(processGroupId, "SIGSTOP");
+      const stopOutcome = this.#signalValidatedProcessGroup(
+        processGroupId,
+        "SIGSTOP",
+      );
       this.#toolProcessStopIssued = stopOutcome === "sent";
       if (stopOutcome === "gone") this.#killOwnedRootsSynchronously();
       return;
     }
     if (!this.#toolProcessForceKillIssued) {
-      const killOutcome = this.#signalProcessGroup(processGroupId, "SIGKILL");
+      const killOutcome = this.#signalValidatedProcessGroup(
+        processGroupId,
+        "SIGKILL",
+      );
       this.#toolProcessForceKillIssued = killOutcome === "sent";
-      if (killOutcome === "sent" || killOutcome === "gone") {
+      if (killOutcome === "gone") {
         this.#killOwnedRootsSynchronously();
       }
     }
   }
 
-  async #currentObservation(
+  #currentObservation(
     startedAt: number,
     emergencyCleanupAttempted: boolean,
-  ): Promise<ManagedAgentTeardownObservation> {
+  ): ManagedAgentTeardownObservation {
     const roots = [...this.#roots.values()];
     const alive = new Set<number>();
     for (const root of roots) {
-      if (childActive(root.child)) alive.add(root.pid);
+      const sampledRoot = this.#lastTable?.get(root.pid);
+      if (
+        childActive(root.child) &&
+        (!this.#processTableAvailable ||
+          (sampledRoot && !processIsZombie(sampledRoot)))
+      ) {
+        alive.add(root.pid);
+      }
       if (!this.#processTableAvailable) continue;
       const table = this.#lastTable!;
       if (this.#platform !== "win32") {
-        for (const [pid, record] of table) {
-          if (record.processGroupId === root.pid) alive.add(pid);
-        }
-        const groupLiveness = this.#processGroupLiveness(root.pid);
+        const liveRootGroupPids = [...table.entries()].flatMap(
+          ([pid, record]) =>
+            record.processGroupId === root.pid && !processIsZombie(record)
+              ? [pid]
+              : [],
+        );
+        for (const pid of liveRootGroupPids) alive.add(pid);
+        const groupLiveness =
+          liveRootGroupPids.length > 0
+            ? this.#processGroupLiveness(root.pid)
+            : "gone";
         if (groupLiveness === "alive") alive.add(root.pid);
         if (groupLiveness === "unknown") {
-          root.containmentSupported = false;
+          this.#invalidateRootContainment(root);
         }
       } else {
         for (const [pid, observed] of this.#observedIdentities) {
@@ -1232,20 +1565,47 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
     }
     if (this.#processTableAvailable) {
       const table = this.#lastTable!;
-      if (typeof toolProcessGroupId === "number") {
-        for (const [pid, record] of table) {
-          if (record.processGroupId === toolProcessGroupId) {
-            alive.add(pid);
+      if (this.#platform !== "win32") {
+        for (const [pid, observed] of this.#observedIdentities) {
+          const current = table.get(pid);
+          if (
+            !sameProcess(observed.record, current) ||
+            processIsZombie(current)
+          ) {
+            continue;
+          }
+          alive.add(pid);
+          if (
+            typeof current!.processGroupId === "number" &&
+            (current!.parentPid !== observed.record.parentPid ||
+              current!.processGroupId !== observed.record.processGroupId ||
+              current!.sessionId !== observed.record.sessionId)
+          ) {
+            alive.add(current!.processGroupId);
           }
         }
-        const groupLiveness = this.#processGroupLiveness(toolProcessGroupId);
+      }
+      if (typeof toolProcessGroupId === "number") {
+        const liveToolGroupPids = [...table.entries()].flatMap(
+          ([pid, record]) =>
+            record.processGroupId === toolProcessGroupId &&
+            !processIsZombie(record)
+              ? [pid]
+              : [],
+        );
+        for (const pid of liveToolGroupPids) alive.add(pid);
+        const groupLiveness =
+          liveToolGroupPids.length > 0
+            ? this.#processGroupLiveness(toolProcessGroupId)
+            : "gone";
         if (groupLiveness === "alive") alive.add(toolProcessGroupId);
         if (groupLiveness === "unknown") {
-          this.#toolProcessObservationInvalid = true;
+          this.#invalidateToolContainment();
         }
       }
       for (const registration of toolRegistrations) {
-        if (table.has(registration.pid)) {
+        const current = table.get(registration.pid);
+        if (current && !processIsZombie(current)) {
           alive.add(registration.pid);
         }
       }
@@ -1265,6 +1625,9 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
         ));
     const containmentSupported =
       roots.every(({ containmentSupported: supported }) => supported) &&
+      roots.every(
+        ({ pid }) => !this.#hasPendingUnauthenticatedDescendants(pid),
+      ) &&
       (!this.#toolProcessContainmentArmed ||
         (this.#toolControlAvailable &&
           this.#toolProcessObservationComplete &&
@@ -1302,13 +1665,30 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
   ): Promise<ManagedAgentTeardownObservation> {
     const startedAt = this.#now();
     const boundedTimeoutMs = Math.max(0, timeoutMs);
+    if (
+      boundedTimeoutMs === 0 &&
+      this.#processTableAvailable &&
+      !this.#processTableNeedsRefresh &&
+      !this.#sampleTask
+    ) {
+      const cachedObservation = this.#currentObservation(startedAt, false);
+      if (cachedObservation.quiescent) {
+        // The fresh cached table already proved quiescence at call entry. Its
+        // evidence elapsed is therefore zero even if returning the Promise
+        // crosses a wall-clock millisecond boundary.
+        return {
+          ...cachedObservation,
+          deadlineMet: true,
+          elapsedMs: 0,
+        };
+      }
+    }
     for (;;) {
       const elapsedBeforeSample = Math.max(0, this.#now() - startedAt);
       await this.observeProcessTree(
         Math.max(0, boundedTimeoutMs - elapsedBeforeSample),
       );
-      this.#advanceFallbackCleanup();
-      const observation = await this.#currentObservation(startedAt, false);
+      const observation = this.#currentObservation(startedAt, false);
       if (observation.quiescent) {
         return {
           ...observation,

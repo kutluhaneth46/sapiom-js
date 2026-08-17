@@ -967,6 +967,178 @@ describe("runManagedAgentProbe", () => {
     expect(result.terminationEvidence.beforePolicyOverride).toBe("query_error");
   }, 10_000);
 
+  it("awaits async-generator cleanup after void close before host fallback", async () => {
+    const { config } = await probeConfig("L2");
+    const observer = fakeObserver();
+    let resolveCancellation!: () => void;
+    const cancellation = new Promise<void>((resolve) => {
+      resolveCancellation = resolve;
+    });
+    let resolveReturn!: () => void;
+    const returned = new Promise<void>((resolve) => {
+      resolveReturn = resolve;
+    });
+    let markToolArmed!: () => void;
+    const toolArmed = new Promise<void>((resolve) => {
+      markToolArmed = resolve;
+    });
+    let markCloseCalled!: () => void;
+    const closeCalled = new Promise<void>((resolve) => {
+      markCloseCalled = resolve;
+    });
+    const returnCleanup = vi.fn(async () => {
+      await returned;
+      return { done: true as const, value: undefined };
+    });
+    const close = vi.fn(() => markCloseCalled());
+    let nextCall = 0;
+
+    const resultPromise = runManagedAgentProbe(config, {
+      hermeticGatewayOrigin: config.gatewayOrigin,
+      processObserver: observer,
+      waitForCancellationSignal: async () => cancellation,
+      queryFactory: ({ options }) => ({
+        [Symbol.asyncIterator]() {
+          return {
+            next: async (): Promise<IteratorResult<unknown>> => {
+              nextCall += 1;
+              if (nextCall === 1) {
+                return {
+                  done: false,
+                  value: {
+                    type: "assistant",
+                    message: {
+                      id: "assistant_cleanup_order",
+                      content: [
+                        {
+                          type: "tool_use",
+                          id: "toolu_cleanup_order",
+                          name: "Bash",
+                          input: { command: config.allowedBashCommands[0] },
+                        },
+                      ],
+                    },
+                  },
+                };
+              }
+              await invokePreToolUse(options, {
+                toolName: "Bash",
+                toolInput: { command: config.allowedBashCommands[0] },
+                toolUseId: "toolu_cleanup_order",
+              });
+              markToolArmed();
+              return new Promise<IteratorResult<unknown>>(() => undefined);
+            },
+            return: returnCleanup,
+          };
+        },
+        close,
+        return: returnCleanup,
+      }),
+    });
+
+    await toolArmed;
+    resolveCancellation();
+    await closeCalled;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const returnStartedBeforeRelease = returnCleanup.mock.calls.length === 1;
+    const fallbackStartedBeforeRelease =
+      observer.emergencyCleanup.mock.calls.length > 0;
+    resolveReturn();
+    const result = await resultPromise;
+
+    expect(close).toHaveBeenCalledOnce();
+    expect(returnStartedBeforeRelease).toBe(true);
+    expect(fallbackStartedBeforeRelease).toBe(false);
+    expect(observer.emergencyCleanup).toHaveBeenCalledOnce();
+    expect(result.queryClosed).toBe(true);
+    expect(result.terminal).toBe("cancelled");
+    expect(result.cancellationRequested).toBe(true);
+  }, 10_000);
+
+  it.each([
+    ["clean completion", false, "incomplete"],
+    ["SDK error-result completion", true, "sdk_result_error"],
+  ] as const)(
+    "retains armed L2 readiness and one deadline after %s",
+    async (_description, emitErrorResult, expectedTerminal) => {
+      const { config } = await probeConfig("L2");
+      const observer = fakeObserver();
+      let now = 1_000;
+      let readinessCompleted = false;
+      let readinessWasAborted = false;
+      let capturedOptions: Options | undefined;
+
+      const result = await runManagedAgentProbe(config, {
+        hermeticGatewayOrigin: config.gatewayOrigin,
+        processObserver: observer,
+        now: () => now,
+        waitForCancellationSignal: (signal) =>
+          new Promise<void>((resolveReadiness, rejectReadiness) => {
+            const timer = setTimeout(() => {
+              now = 3_250;
+              readinessCompleted = true;
+              resolveReadiness();
+            }, 25);
+            signal.addEventListener(
+              "abort",
+              () => {
+                if (!readinessCompleted) readinessWasAborted = true;
+                clearTimeout(timer);
+                rejectReadiness(
+                  new Error("readiness aborted after early completion"),
+                );
+              },
+              { once: true },
+            );
+          }),
+        queryFactory: ({ options }) => ({
+          async *[Symbol.asyncIterator]() {
+            capturedOptions = options;
+            yield {
+              type: "assistant",
+              message: {
+                id: "assistant_early_settlement",
+                content: [
+                  {
+                    type: "tool_use",
+                    id: "toolu_early_settlement",
+                    name: "Bash",
+                    input: { command: config.allowedBashCommands[0] },
+                  },
+                ],
+              },
+            };
+            await invokePreToolUse(options, {
+              toolName: "Bash",
+              toolInput: { command: config.allowedBashCommands[0] },
+              toolUseId: "toolu_early_settlement",
+            });
+            if (emitErrorResult) {
+              yield {
+                type: "result",
+                subtype: "error_max_turns",
+                is_error: true,
+                num_turns: 1,
+              };
+            }
+          },
+          close: vi.fn(),
+        }),
+      });
+
+      expect(readinessCompleted).toBe(true);
+      expect(readinessWasAborted).toBe(false);
+      expect(capturedOptions?.abortController?.signal.aborted).toBe(true);
+      expect(observer.emergencyCleanup).toHaveBeenCalledWith(2_750);
+      expect(result.teardown.elapsedMs).toBe(2_250);
+      expect(result.queryClosed).toBe(true);
+      expect(result.cancellationRequested).toBe(false);
+      expect(result.terminal).toBe(expectedTerminal);
+    },
+    10_000,
+  );
+
   it("abandons a never-resolving iterator next immediately after raw cancellation", async () => {
     const { config } = await probeConfig("L2");
     const observer = fakeObserver();
@@ -986,6 +1158,7 @@ describe("runManagedAgentProbe", () => {
               markNextStarted?.();
               return new Promise<IteratorResult<unknown>>(() => undefined);
             },
+            return: async () => ({ done: true, value: undefined }),
           };
         },
         close,
@@ -1007,6 +1180,29 @@ describe("runManagedAgentProbe", () => {
     expect(result.terminationEvidence.queryExecution).toBe("iteration_aborted");
     expect(close).toHaveBeenCalledOnce();
     expect(observer.bindAbortSignal).not.toHaveBeenCalled();
+  });
+
+  it("accepts an awaited close promise when no iterator return exists", async () => {
+    const { config } = await probeConfig();
+    const close = vi.fn(async () => undefined);
+    const result = await runManagedAgentProbe(config, {
+      hermeticGatewayOrigin: config.gatewayOrigin,
+      processObserver: fakeObserver(),
+      queryFactory: () => ({
+        [Symbol.asyncIterator]() {
+          return {
+            next: async () => ({ done: true as const, value: undefined }),
+          };
+        },
+        close,
+      }),
+    });
+
+    expect(close).toHaveBeenCalledOnce();
+    expect(result.queryClosed).toBe(true);
+    expect(result.terminationEvidence.queryExecution).toBe(
+      "iteration_completed",
+    );
   });
 
   it("keeps a CLI-shaped process alive until bounded close and cleanup complete", async () => {

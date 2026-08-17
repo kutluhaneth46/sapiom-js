@@ -1134,6 +1134,20 @@ describe("managed-agent probe CLI", () => {
     }
   });
 
+  it("never certifies a cancelled terminal without a requested cancellation", () => {
+    const passing = passingL2Result();
+    const report = evaluateManagedAgentProbe(
+      { ...passing, cancellationRequested: false },
+      [12_345, 12_346],
+    );
+
+    expect(report.outcome).toBe("fail");
+    expect(report.checks).toContainEqual({
+      id: "cancellation_requested",
+      passed: false,
+    });
+  });
+
   it.each([
     [
       "omitted",

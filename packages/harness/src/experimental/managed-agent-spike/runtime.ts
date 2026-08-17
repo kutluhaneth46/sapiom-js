@@ -278,15 +278,45 @@ function buildManagedAgentPolicyDiagnostics(
 
 async function closeQueryBounded(
   query: ManagedAgentQuery,
+  iterator: AsyncIterator<unknown> | undefined,
   timeoutMs = QUERY_CLOSE_TIMEOUT_MS,
 ): Promise<boolean> {
   let timeout: NodeJS.Timeout | undefined;
-  const close = Promise.resolve()
-    .then(() => query.close())
-    .then(
-      () => true,
-      () => false,
-    );
+  let closeResult: void | Promise<void>;
+  try {
+    closeResult = query.close();
+  } catch {
+    return false;
+  }
+  const closeWasAwaitable =
+    closeResult !== undefined &&
+    closeResult !== null &&
+    typeof (closeResult as PromiseLike<void>).then === "function";
+  const closeSettled = Promise.resolve(closeResult).then(
+    () => true,
+    () => false,
+  );
+  const cleanupSettled =
+    typeof query.return === "function"
+      ? Promise.resolve()
+          .then(() => query.return!())
+          .then(
+            () => true,
+            () => false,
+          )
+      : typeof iterator?.return === "function"
+        ? Promise.resolve()
+            .then(() => iterator.return!())
+            .then(
+              () => true,
+              () => false,
+            )
+        : closeWasAwaitable
+          ? closeSettled
+          : new Promise<boolean>(() => undefined);
+  const close = Promise.all([closeSettled, cleanupSettled]).then((settled) =>
+    settled.every(Boolean),
+  );
   if (timeoutMs <= 0) {
     void close;
     return false;
@@ -411,6 +441,7 @@ export async function runManagedAgentProbe(
   let cancellationRequestedAt: number | undefined;
   let abortStartedAt: number | undefined;
   let query: ManagedAgentQuery | undefined;
+  let iterator: AsyncIterator<unknown> | undefined;
   let queryFailed = false;
   let queryClosed = false;
   let cancellationTriggerFailed = false;
@@ -572,7 +603,7 @@ export async function runManagedAgentProbe(
           queryExecution = "construction_failed";
           throw error;
         }
-        const iterator = query[Symbol.asyncIterator]();
+        iterator = query[Symbol.asyncIterator]();
         for (;;) {
           const step = await nextManagedAgentEvent(
             iterator,
@@ -610,12 +641,12 @@ export async function runManagedAgentProbe(
       } finally {
         queryIterationSettled = true;
         const now = dependencies.now ?? Date.now;
-        const armedEarlyQueryTeardown =
-          queryFailed &&
+        const armedEarlyQuerySettlement =
           toolProcessContainmentArmed &&
           Boolean(cancellationTask) &&
-          !abortController.signal.aborted;
-        if (armedEarlyQueryTeardown) {
+          !abortController.signal.aborted &&
+          !cancellationSignalReady;
+        if (armedEarlyQuerySettlement) {
           abortStartedAt ??= now();
           const readinessBudget = Math.max(
             0,
@@ -630,14 +661,17 @@ export async function runManagedAgentProbe(
           }
         }
         triggerController.abort();
-        if (cancellationTask && !armedEarlyQueryTeardown) {
+        if (cancellationTask && !armedEarlyQuerySettlement) {
           await cancellationTask;
         }
         queryFailed ||= cancellationTriggerFailed;
         // Give the SDK its documented graceful-shutdown path before host
         // fallback containment. The observer binds only SpawnOptions.signal,
         // which the SDK forwards after stdin EOF and its bounded grace period.
-        if (queryFailed && !abortController.signal.aborted) {
+        if (
+          (queryFailed || armedEarlyQuerySettlement) &&
+          !abortController.signal.aborted
+        ) {
           abortStartedAt ??= (dependencies.now ?? Date.now)();
           abortController.abort();
         }
@@ -651,7 +685,7 @@ export async function runManagedAgentProbe(
                     (now() - abortStartedAt) -
                     FORCE_CLEANUP_CONFIRMATION_RESERVE_MS,
                 );
-          queryClosed = await closeQueryBounded(query, closeBudgetMs);
+          queryClosed = await closeQueryBounded(query, iterator, closeBudgetMs);
         }
         if ((query && !queryClosed) || queryFailed) abortController.abort();
       }
