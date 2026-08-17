@@ -195,6 +195,15 @@ deadline bounds the entire sequence. A PID or PGID can disappear and be reused
 between any sample and request without redirecting termination, because neither
 channel is addressed by that number.
 
+The fixture also fails closed if its host disappears outside that orderly
+sequence. After authentication, either lifetime channel closing makes the
+receiving fixture process terminate its own current group. Before
+authentication, connection failures retry only until a five-second monotonic
+deadline and then terminate that same receiver-owned group. This receiver-side
+behavior lets an outer process-bound supervisor close its own IPC channel and
+cascade termination through nested detached fixture processes without sending
+a host-side signal to a cached numeric PID or PGID.
+
 Deadline expiry or a successful quiescence observation seals all evidence,
 closes the spawn gate, and permanently revokes numeric signal authority.
 Disposal never signals a cached PID or PGID, even if child exit delivery lags
@@ -245,9 +254,10 @@ The disposable fixture uses a host-owned lifetime lease outside the writable
 workspace. The lease exists before launch; `shutdown` contents or a missing
 lease both make the fixture parent stop its child and exit. Cleanup can therefore
 remove the temporary root without turning a startup race into a permanently
-The child also exits on IPC disconnect, and a failed readiness-file publication
-shuts it down before the parent exits; a hermetic regression removes the real
-fixture root during delayed readiness and verifies that neither process remains.
+running process. The child also exits on IPC disconnect, and a failed
+readiness-file publication shuts it down before the parent exits; a hermetic
+regression removes the real fixture root during delayed readiness and verifies
+that neither process remains.
 
 ## Pre-v2 live evidence
 

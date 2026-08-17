@@ -88,6 +88,7 @@ import { spawn } from "node:child_process";
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { createConnection } from "node:net";
 import { resolve } from "node:path";
+import { performance } from "node:perf_hooks";
 
 const pidFile = resolve(process.argv[2]);
 const requireControlRegistration = process.argv[3] === "--register-control";
@@ -105,15 +106,18 @@ const readinessDelayMs = Number.isSafeInteger(parsedReadinessDelay) &&
   : 0;
 const controlSocket = process.env[${JSON.stringify(MANAGED_AGENT_TOOL_CONTROL_SOCKET_ENV)}];
 const controlCapability = process.env[${JSON.stringify(MANAGED_AGENT_TOOL_CONTROL_CAPABILITY_ENV)}];
+const controlRegistrationDeadlineAt = performance.now() + 5_000;
 if (requireControlRegistration && (!controlSocket || !controlCapability)) {
   throw new Error("managed-agent tool control capability missing");
 }
 process.on("SIGTERM", () => {});
 const childProgram = [
   'const { createConnection } = require("node:net");',
+  'const { performance } = require("node:perf_hooks");',
   'const requireControlRegistration = ' + JSON.stringify(requireControlRegistration) + ';',
   'const controlSocket = process.env["${MANAGED_AGENT_TOOL_CONTROL_SOCKET_ENV}"];',
   'const controlCapability = process.env["${MANAGED_AGENT_TOOL_CONTROL_CAPABILITY_ENV}"];',
+  'const controlRegistrationDeadlineAt = performance.now() + 5_000;',
   'delete process.env["${MANAGED_AGENT_TOOL_CONTROL_SOCKET_ENV}"];',
   'delete process.env["${MANAGED_AGENT_TOOL_CONTROL_CAPABILITY_ENV}"];',
   'const readinessDelayMs = ' + JSON.stringify(readinessDelayMs) + ';',
@@ -121,6 +125,9 @@ const childProgram = [
   'process.on("message", (message) => { if (message === "host-shutdown") process.exit(0); });',
   'process.on("disconnect", () => process.exit(0));',
   'let readyPublished = false;',
+  'const terminateOwnedGroup = () => {',
+  '  try { process.kill(0, "SIGKILL"); } catch { process.exit(1); }',
+  '};',
   'const publishReady = () => {',
   '  if (readyPublished) return;',
   '  readyPublished = true;',
@@ -136,7 +143,11 @@ const childProgram = [
   '  let registered = false;',
   '  let retryScheduled = false;',
   '  const retry = () => {',
-  '    if (registered || retryScheduled) return;',
+  '    if (registered || performance.now() >= controlRegistrationDeadlineAt) {',
+  '      terminateOwnedGroup();',
+  '      return;',
+  '    }',
+  '    if (retryScheduled) return;',
   '    retryScheduled = true;',
   '    setTimeout(connectControl, 10);',
   '  };',
@@ -146,7 +157,7 @@ const childProgram = [
   '  socket.on("data", (chunk) => {',
   '    response += chunk;',
   '    if (response.includes(' + JSON.stringify('"forceKill":true') + ')) {',
-  '      try { process.kill(0, "SIGKILL"); } catch { process.exit(1); }',
+  '      terminateOwnedGroup();',
   '      return;',
   '    }',
   '    if (response.includes(' + JSON.stringify('"shutdown":true') + ')) {',
@@ -177,6 +188,9 @@ delete process.env[${JSON.stringify(MANAGED_AGENT_TOOL_CONTROL_SOCKET_ENV)}];
 delete process.env[${JSON.stringify(MANAGED_AGENT_TOOL_CONTROL_CAPABILITY_ENV)}];
 let childReady = false;
 let controlReady = !requireControlRegistration;
+const terminateOwnedGroup = () => {
+  try { process.kill(0, "SIGKILL"); } catch { process.exit(1); }
+};
 const publishReadiness = () => {
   if (!childReady || !controlReady) return;
   try {
@@ -200,7 +214,11 @@ const connectControl = () => {
   let registered = false;
   let retryScheduled = false;
   const retry = () => {
-    if (registered || retryScheduled) return;
+    if (registered || performance.now() >= controlRegistrationDeadlineAt) {
+      terminateOwnedGroup();
+      return;
+    }
+    if (retryScheduled) return;
     retryScheduled = true;
     setTimeout(connectControl, 10);
   };
@@ -210,7 +228,7 @@ const connectControl = () => {
   socket.on("data", (chunk) => {
     response += chunk;
     if (response.includes('"forceKill":true')) {
-      try { process.kill(0, "SIGKILL"); } catch { process.exit(1); }
+      terminateOwnedGroup();
       return;
     }
     if (response.includes('"shutdown":true')) {

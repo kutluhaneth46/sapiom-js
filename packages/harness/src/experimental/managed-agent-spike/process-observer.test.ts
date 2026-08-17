@@ -1475,6 +1475,38 @@ describe("LocalManagedAgentProcessObserver", () => {
   );
 
   it.skipIf(process.platform === "win32")(
+    "self-terminates the detached tool group when authenticated lifetime channels disappear",
+    async () => {
+      const hostKillSpy = vi.spyOn(process, "kill");
+      const observer = new LocalManagedAgentProcessObserver();
+      const unrelated = spawnCooperativeTestProcess();
+      await once(unrelated, "spawn");
+      let run: RegisteredDescendantToolRun | undefined;
+      try {
+        run = await startRegisteredDescendantToolRun(
+          observer,
+          "lost-tool-lifetime-channels",
+        );
+
+        observer.testOnlyDropToolLifetimeChannels();
+
+        await waitForExactTestProcessIdentitiesToExit(run.toolIdentities);
+        expect(run.toolPids.every((pid) => !processExists(pid))).toBe(true);
+        expect(processExists(unrelated.pid!)).toBe(true);
+        expect(
+          hostKillSpy.mock.calls.some(([, signal]) => signal === "SIGKILL"),
+        ).toBe(false);
+      } finally {
+        hostKillSpy.mockRestore();
+        await cleanupRegisteredDescendantToolRun(run);
+        await observer.dispose();
+        await stopExactTestProcess(unrelated);
+      }
+    },
+    15_000,
+  );
+
+  it.skipIf(process.platform === "win32")(
     "cleans exact fixture and anchor groups when setup fails after PID publication",
     async () => {
       const observer = new LocalManagedAgentProcessObserver();

@@ -846,6 +846,15 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
     }
   }
 
+  /**
+   * Simulates abrupt host loss without terminating the Vitest process. The
+   * exact fixture must treat authenticated lifetime-channel loss as a
+   * fail-closed instruction to terminate its own process group.
+   */
+  public testOnlyDropToolLifetimeChannels(): void {
+    for (const socket of this.#toolControlSockets) socket.destroy();
+  }
+
   #invalidateRootContainment(root: OwnedRoot): void {
     root.containmentSupported = false;
   }
