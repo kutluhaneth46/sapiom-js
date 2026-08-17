@@ -260,6 +260,19 @@ function writeFinalResponse(response: ServerResponse, turn: number): void {
   response.end();
 }
 
+function writeHangingStream(response: ServerResponse, turn: number): void {
+  response.writeHead(200, {
+    "cache-control": "no-cache",
+    "content-type": "text/event-stream",
+    "request-id": `req_loopback_${turn}`,
+  });
+  // The first fake-model turn launches Bash. Claude Code may immediately
+  // request another turn after its Bash implementation backgrounds a long
+  // command. Keep that synthetic continuation open until cancellation instead
+  // of manufacturing duplicate tool calls that a real model never requested.
+  response.write(": awaiting managed-agent cancellation\n\n");
+}
+
 it("enforces real-SDK built-in and in-process MCP calls with exact loopback correlation", async () => {
   const fixture = await createManagedAgentFixture(() => "loopback-nonce");
   const startedAt = Date.now();
@@ -726,11 +739,15 @@ it.skipIf(
       request.resume();
       request.once("end", () => {
         inferenceTurn += 1;
-        writeToolUseResponse(response, inferenceTurn, {
-          id: "toolu_loopback_l2_bash",
-          name: "Bash",
-          input: { command: fixture.l2BashCommand },
-        });
+        if (inferenceTurn === 1) {
+          writeToolUseResponse(response, inferenceTurn, {
+            id: "toolu_loopback_l2_bash",
+            name: "Bash",
+            input: { command: fixture.l2BashCommand },
+          });
+        } else {
+          writeHangingStream(response, inferenceTurn);
+        }
       });
     });
 
@@ -849,7 +866,9 @@ it.skipIf(
         return transitions;
       }, []);
 
-      expect(inferenceTurn).toBe(1);
+      expect(inferenceTurn).toBeGreaterThanOrEqual(1);
+      expect(inferenceTurn).toBeLessThanOrEqual(2);
+      expect(result.inferenceTurns).toBe(1);
       expect(
         result.terminal,
         JSON.stringify({
@@ -882,8 +901,6 @@ it.skipIf(
       expect(
         groupSignals.map(({ groupId, signal }) => [groupId, signal]),
       ).toEqual([
-        [supervisorPid, "SIGSTOP"],
-        [fixtureToolProcessGroupId, "SIGSTOP"],
         [fixtureToolProcessGroupId, "SIGKILL"],
         [supervisorPid, "SIGKILL"],
       ]);
@@ -999,11 +1016,15 @@ it.skipIf(
       request.resume();
       request.once("end", () => {
         inferenceTurn += 1;
-        writeToolUseResponse(response, inferenceTurn, {
-          id: "toolu_loopback_l2_missing_forwarded_signal",
-          name: "Bash",
-          input: { command: fixture.l2BashCommand },
-        });
+        if (inferenceTurn === 1) {
+          writeToolUseResponse(response, inferenceTurn, {
+            id: "toolu_loopback_l2_missing_forwarded_signal",
+            name: "Bash",
+            input: { command: fixture.l2BashCommand },
+          });
+        } else {
+          writeHangingStream(response, inferenceTurn);
+        }
       });
     });
 
@@ -1078,7 +1099,9 @@ it.skipIf(
       const cancellationElapsedMs =
         Date.now() - (cancellationStartedAt ?? Date.now());
 
-      expect(inferenceTurn).toBe(1);
+      expect(inferenceTurn).toBeGreaterThanOrEqual(1);
+      expect(inferenceTurn).toBeLessThanOrEqual(2);
+      expect(result.inferenceTurns).toBe(1);
       expect(result.terminal).toBe("close_timeout");
       expect(result.cancellationRequested).toBe(true);
       expect(result.queryClosed).toBe(false);
@@ -1224,7 +1247,7 @@ it.skipIf(
         deadlineMet: false,
         containmentSupported: false,
         ownershipProven: false,
-        forceKillIssued: true,
+        forceKillIssued: false,
         toolProcessObservationComplete: false,
         toolProcessChannelsClosed: false,
       });

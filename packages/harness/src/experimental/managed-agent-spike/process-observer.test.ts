@@ -1183,7 +1183,7 @@ describe("LocalManagedAgentProcessObserver", () => {
   );
 
   it.skipIf(process.platform === "win32")(
-    "force-stops and kills the exact non-cooperative fixture group, then confirms death inside one deadline",
+    "kills the exact non-cooperative fixture group and confirms death inside one deadline",
     async () => {
       const fixture = await createManagedAgentFixture(() => "process-observer");
       fixtures.push(fixture);
@@ -1411,7 +1411,7 @@ describe("LocalManagedAgentProcessObserver", () => {
   );
 
   it.skipIf(process.platform === "win32")(
-    "stops and kills a freshly revalidated detached tool group wholly descended from the owned root",
+    "kills a freshly revalidated detached tool group wholly descended from the owned root",
     async () => {
       const fixture = await createManagedAgentFixture(
         () => "anchored-descendant-tool",
@@ -1517,8 +1517,6 @@ describe("LocalManagedAgentProcessObserver", () => {
         }
 
         expect(signals).toEqual([
-          [rootProcessGroupId, "SIGSTOP"],
-          [toolProcessGroupId, "SIGSTOP"],
           [toolProcessGroupId, "SIGKILL"],
           [rootProcessGroupId, "SIGKILL"],
         ]);
@@ -1707,11 +1705,10 @@ describe("LocalManagedAgentProcessObserver", () => {
   );
 
   it.skipIf(process.platform === "win32")(
-    "retries detached tool stop and kill failures only after fresh authority checks",
+    "retries detached tool kill failures only after fresh authority checks",
     async () => {
       let processTableReads = 0;
       let toolProcessGroupId: number | undefined;
-      let stopAttempts = 0;
       let killAttempts = 0;
       const toolSignals: Array<{
         readonly signal: "SIGSTOP" | "SIGKILL";
@@ -1727,7 +1724,6 @@ describe("LocalManagedAgentProcessObserver", () => {
             return signalRealProcessGroup(groupId, signal);
           }
           toolSignals.push({ signal, processTableReads });
-          if (signal === "SIGSTOP" && stopAttempts++ === 0) return "failure";
           if (signal === "SIGKILL" && killAttempts++ === 0) return "failure";
           return signalRealProcessGroup(groupId, signal);
         },
@@ -1749,8 +1745,6 @@ describe("LocalManagedAgentProcessObserver", () => {
           alivePidsAtDeadline: [],
         });
         expect(toolSignals.map(({ signal }) => signal)).toEqual([
-          "SIGSTOP",
-          "SIGSTOP",
           "SIGKILL",
           "SIGKILL",
         ]);
@@ -2120,30 +2114,77 @@ describe("LocalManagedAgentProcessObserver", () => {
       expect(signals).toEqual([]);
 
       observer.beginTeardown(deadlineAfter(100));
-      expect(signals).toEqual([[rootPid, "SIGSTOP"]]);
+      await vi.waitFor(() => expect(signals).toEqual([[rootPid, "SIGKILL"]]));
     } finally {
       await forceKillRetainedTestGroup(child);
       await observer.dispose();
     }
   });
 
+  it("closes the spawn gate as soon as teardown adopts its immutable deadline", async () => {
+    const observer = new LocalManagedAgentProcessObserver({
+      platform: "darwin",
+      readProcessTable: async () => available([]),
+    });
+    try {
+      observer.beginTeardown(deadlineAfter(1_000));
+      expect(() =>
+        observer.spawn({
+          ...activeNodeCommand(),
+          cwd: process.cwd(),
+          env: { ...process.env },
+          signal: new AbortController().signal,
+        }),
+      ).toThrow("managed-agent process observer is closed");
+    } finally {
+      await observer.dispose();
+    }
+  });
+
+  it("seals a successful quiescence observation against delayed SDK spawns", async () => {
+    const observer = new LocalManagedAgentProcessObserver({
+      platform: "darwin",
+      readProcessTable: async () => available([]),
+    });
+    try {
+      await expect(
+        observer.waitForQuiescence(deadlineAfter(1_000)),
+      ).resolves.toMatchObject({ quiescent: true, deadlineMet: true });
+      expect(() =>
+        observer.spawn({
+          ...activeNodeCommand(),
+          cwd: process.cwd(),
+          env: { ...process.env },
+          signal: new AbortController().signal,
+        }),
+      ).toThrow("managed-agent process observer is closed");
+    } finally {
+      await observer.dispose();
+    }
+  });
+
   it.skipIf(process.platform === "win32")(
-    "kills a stopped owned group during disposal when post-stop observation misses the deadline",
+    "never signals a cached group during disposal after a post-kill observation misses the deadline",
     async () => {
-      let hangAfterStop = false;
-      const signals: Array<readonly [number, "SIGSTOP" | "SIGKILL"]> = [];
+      let hangAfterKill = false;
+      let cachedNumericIdentityUnsafe = false;
+      const signals: Array<readonly [number, "SIGKILL"]> = [];
       const observer = new LocalManagedAgentProcessObserver({
         readProcessTable: () =>
-          hangAfterStop
+          hangAfterKill
             ? new Promise<ManagedAgentProcessTableObservation>(() => undefined)
             : readRealPosixProcessTable(),
         signalProcessGroup: (groupId, signal) => {
-          signals.push([groupId, signal]);
-          const outcome = signalRealProcessGroup(groupId, signal);
-          if (signal === "SIGSTOP" && outcome === "sent") {
-            hangAfterStop = true;
+          if (cachedNumericIdentityUnsafe) {
+            throw new Error("attempted to signal a potentially reused PGID");
           }
-          return outcome;
+          signals.push([groupId, signal]);
+          // Once the kernel accepted SIGKILL, the original group can be reaped
+          // and its number reused before Node delivers ChildProcess close.
+          // Simulate that uncertainty by making every later numeric use fatal.
+          hangAfterKill = true;
+          cachedNumericIdentityUnsafe = true;
+          return "sent";
         },
       });
       const controller = new AbortController();
@@ -2167,16 +2208,14 @@ describe("LocalManagedAgentProcessObserver", () => {
         expect(teardown).toMatchObject({
           quiescent: false,
           deadlineMet: false,
-          forceKillIssued: false,
+          forceKillIssued: true,
         });
-        expect(signals.map(([, signal]) => signal)).toEqual(["SIGSTOP"]);
+        expect(cachedNumericIdentityUnsafe).toBe(true);
+        expect(signals).toEqual([[anchor.pid!, "SIGKILL"]]);
 
         await observer.dispose();
         await waitForChildExitBounded(anchor);
-        expect(signals.map(([, signal]) => signal)).toEqual([
-          "SIGSTOP",
-          "SIGKILL",
-        ]);
+        expect(signals).toEqual([[anchor.pid!, "SIGKILL"]]);
         expect(processGroupExists(anchor.pid!)).toBe(false);
       } finally {
         await forceKillRetainedTestGroup(anchor);
@@ -2488,10 +2527,7 @@ describe("LocalManagedAgentProcessObserver", () => {
       observer.beginTeardown(teardownDeadline);
       controller.abort();
       await observer.observeProcessTree();
-      expect(signals).toEqual([
-        [rootPid, "SIGSTOP"],
-        [rootPid, "SIGKILL"],
-      ]);
+      expect(signals).toEqual([[rootPid, "SIGKILL"]]);
 
       stage = "exiting";
       await observer.observeProcessTree();
@@ -2956,12 +2992,8 @@ describe("LocalManagedAgentProcessObserver", () => {
       const teardownDeadline = deadlineAfter(100);
       observer.beginTeardown(teardownDeadline);
       controller.abort();
-      expect(signals).toEqual([[rootPid, "SIGSTOP"]]);
       await observer.observeProcessTree();
-      expect(signals).toEqual([
-        [rootPid, "SIGSTOP"],
-        [rootPid, "SIGKILL"],
-      ]);
+      expect(signals).toEqual([[rootPid, "SIGKILL"]]);
       await observer.observeProcessTree();
       subgroupState = "gone";
       await observer.observeProcessTree();
@@ -3226,24 +3258,19 @@ describe("LocalManagedAgentProcessObserver", () => {
       observer.beginTeardown(deadlineAfter(100));
       forwardedController.abort();
       forwardedController.abort();
-      expect(signals).toEqual([[rootPid, "SIGSTOP"]]);
       await observer.observeProcessTree();
-      expect(signals).toEqual([
-        [rootPid, "SIGSTOP"],
-        [rootPid, "SIGKILL"],
-      ]);
+      expect(signals).toEqual([[rootPid, "SIGKILL"]]);
       await observer.observeProcessTree();
-      expect(signals).toHaveLength(2);
+      expect(signals).toHaveLength(1);
     } finally {
       await forceKillRetainedTestGroup(child);
       observer.dispose();
     }
   });
 
-  it("retries transient root stop and kill failures only after fresh authority samples", async () => {
+  it("retries transient root kill failures only after fresh authority samples", async () => {
     let rootPid = 0;
     let processTableReads = 0;
-    let stopAttempts = 0;
     let killAttempts = 0;
     const signals: Array<readonly [number, string]> = [];
     const signalReadCounts: number[] = [];
@@ -3268,7 +3295,6 @@ describe("LocalManagedAgentProcessObserver", () => {
       signalProcessGroup: (groupId, signal) => {
         signals.push([groupId, signal]);
         signalReadCounts.push(processTableReads);
-        if (signal === "SIGSTOP" && stopAttempts++ === 0) return "failure";
         if (signal === "SIGKILL" && killAttempts++ === 0) return "failure";
         return "sent";
       },
@@ -3289,8 +3315,6 @@ describe("LocalManagedAgentProcessObserver", () => {
       await observer.emergencyCleanup(teardownDeadline);
 
       expect(signals).toEqual([
-        [rootPid, "SIGSTOP"],
-        [rootPid, "SIGSTOP"],
         [rootPid, "SIGKILL"],
         [rootPid, "SIGKILL"],
       ]);
@@ -3545,20 +3569,22 @@ describe("LocalManagedAgentProcessObserver", () => {
       await vi.waitFor(() => expect(reads).toHaveLength(1));
       observer.beginTeardown(deadlineAfter(1_000));
       forwardedController.abort();
-      expect(signals).toEqual([[rootPid, "SIGSTOP"]]);
+      await vi.waitFor(() => expect(reads).toHaveLength(2));
+      expect(signals).toEqual([]);
 
+      // Completing the read that started before teardown cannot install its
+      // evidence or authorize a signal in the new lifecycle generation.
       reads.shift()!(rootTable());
       await preSignalSample;
-      expect(signals).toEqual([[rootPid, "SIGSTOP"]]);
+      expect(signals).toEqual([]);
 
+      // Only the complete read that started after teardown can authorize the
+      // one direct group kill.
       const postSignalSample = observer.observeProcessTree();
       await vi.waitFor(() => expect(reads).toHaveLength(1));
       reads.shift()!(rootTable());
       await postSignalSample;
-      expect(signals).toEqual([
-        [rootPid, "SIGSTOP"],
-        [rootPid, "SIGKILL"],
-      ]);
+      expect(signals).toEqual([[rootPid, "SIGKILL"]]);
     } finally {
       await forceKillRetainedTestGroup(anchor);
       forwardedController.abort();

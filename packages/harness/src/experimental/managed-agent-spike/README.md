@@ -9,8 +9,10 @@ Codex flows.
 Every model-requested Read, Edit, Write, Bash, and in-process MCP call is gated
 by one programmatic `PreToolUse` hook registered without a matcher. The hook
 runs before the SDK's permission evaluation, applies canonical-path containment,
-exact Bash equality, and an MCP allowlist, and returns a complete fresh input
-object only when allowing the call. Unknown tools fail closed.
+exact Bash equality, an exact Bash input shape of `{ command: string }`, and an
+MCP allowlist, and returns a complete fresh input object only when allowing the
+call. Extra SDK fields such as background execution or timeout controls fail
+closed even when the command string itself matches. Unknown tools fail closed.
 
 The hook also requires a non-empty, bounded `tool_use_id` from the event. When
 the SDK supplies the optional callback ID, it must be independently bounded and
@@ -31,11 +33,13 @@ probe's isolated HOME and `CLAUDE_CONFIG_DIR` calls SDK `resolveSettings()`.
 query. Policy helpers fail closed because SDK 0.3.228 does not execute them in
 `resolveSettings()` and therefore cannot prove parity with query startup.
 
-The subprocess requires a Node executable. E0.4 uses the current Node host;
-Electron-as-Node and packaged executable resolution are deliberately deferred
-to E0.7. The runtime also exposes only a narrow async-iterator/close query
-interface. It does not expose or call SDK `Query.mcpCall()`, whose trusted
-control channel bypasses permission checks.
+The subprocess requires a Node executable. Every direct gateway invocation,
+including calls through the exported programmatic runtime, requires exact Node
+22.23.2. Hermetic tests may use another Node only through the explicit injected
+gateway/query seam. Electron-as-Node and packaged executable resolution are
+deliberately deferred to E0.7. The runtime also exposes only a narrow
+async-iterator/close query interface. It does not expose or call SDK
+`Query.mcpCall()`, whose trusted control channel bypasses permission checks.
 
 ## Correlation and turn evidence
 
@@ -66,6 +70,10 @@ result event, so it requires the matching init model and then relies on gateway
 reconciliation. These checks prove what the SDK reported, not what the gateway
 served: BigQuery provider/model, fallback, token, and cost rows remain the
 authoritative exact-deployment evidence for every live inference turn.
+Accordingly, the local report uses `outcome: "local_pass"`, labels the check
+`sdk_model_alias_observed`, and always emits
+`deploymentProvenance: "requires_gateway_reconciliation"`. It never calls a
+locally passing run deployment-certified.
 
 The hermetic pinned-SDK loopback exercises Read, allowed and denied Bash, and a
 real in-process `echo_nonce` MCP turn. It requires one primary `PreToolUse`
@@ -170,26 +178,25 @@ sequence sentinel for 0.3.228's exact close/return behavior: one logical kill,
 the SDK-forwarded abort, a second rejected logical kill, return settlement,
 then host fallback. An SDK upgrade must remove or recertify the shim before the
 pin changes. The forwarded abort signal requests the sampled host fallback;
-only freshly validated host group cleanup sends signals. The fallback first
-stops the observer-created SDK supervisor group. A new process-table sample
-must then revalidate the active root identity, both role identities, their
-relationship and shared group, every current root/tool descendant's parent,
-group, session, and ancestry, and at least one open lifetime channel. Only that
-fresh proof authorizes `SIGSTOP` to the detached fixture group. A second fresh
-sample must show both the root and every tool-group member stopped before
-`SIGKILL` is sent to the fixture group. A third fresh sample must prove the
-fixture group absent before the supervisor group receives `SIGKILL`, and a
-fourth must prove that root group absent. Failed stop/kill attempts remain
-retryable, but every attempt—including an ESRCH or helper failure—advances the
-sample generation and requires another fresh proof. The five-second absolute
-deadline bounds the entire sequence.
+only freshly validated host group cleanup sends signals. The request invalidates
+every sample started before teardown. A complete post-request sample must
+revalidate the active root identity, both role identities, their relationship
+and shared group, every current root/tool descendant's parent, group, session,
+and ancestry, and at least one open lifetime channel. Only that fresh proof
+authorizes one direct `SIGKILL` to the detached fixture group. The signal
+invalidates its authorizing sample. A second complete sample must prove the
+fixture group absent before a freshly revalidated supervisor group receives
+`SIGKILL`, and a third must prove that root group absent. Failed kill attempts
+remain retryable, but every attempt—including an ESRCH or helper failure—moves
+to a new sample generation and requires another fresh proof. The five-second
+absolute deadline bounds the entire sequence.
 
-Deadline expiry seals all evidence collection and ordinary fallback authority.
-Disposal has one narrower leak-prevention rule: if this observer successfully
-stopped an owned group before sealing, that stopped kernel group cannot execute,
-fork, exit, or have its PGID recycled, so disposal may issue its final `SIGKILL`
-without a new sample. This never changes a failed deadline result and never
-applies to a group that was not stopped while authority was fresh.
+Deadline expiry or a successful quiescence observation seals all evidence,
+closes the spawn gate, and permanently revokes numeric signal authority.
+Disposal never signals a cached PID or PGID, even if child exit delivery lags
+or the number is reused. It instead asks authenticated fixture sockets to shut
+down and disconnects the retained, observer-created supervisor IPC handle; the
+still-running supervisor can kill only its own exact process group.
 
 If the root exits, a stable identity changes parent/group/session, a foreign
 member appears, ancestry is lost, both channels close prematurely, or a
@@ -198,8 +205,8 @@ group. This includes an inner SDK command exit that reparents a surviving
 descendant: an unchanged old PGID does not retain authority after ancestry is
 lost. A successful complete table that no longer contains the stable identity
 is positive exit evidence; otherwise an escaped same-identity PID and its new
-group remain in final liveness accounting. The observer may still stop or kill
-its own live SDK supervisor group, but the run remains a fail-closed
+group remain in final liveness accounting. The observer may still kill its own
+freshly revalidated live SDK supervisor group, but the run remains a fail-closed
 `teardown_timeout` while any tool process or lifetime channel remains. This also
 prevents numeric PID/PGID reuse from converting cached evidence into authority.
 `forceKillIssued` describes only owned SDK supervisor roots and is not required
@@ -233,7 +240,9 @@ The disposable fixture uses a host-owned lifetime lease outside the writable
 workspace. The lease exists before launch; `shutdown` contents or a missing
 lease both make the fixture parent stop its child and exit. Cleanup can therefore
 remove the temporary root without turning a startup race into a permanently
-running process.
+The child also exits on IPC disconnect, and a failed readiness-file publication
+shuts it down before the parent exits; a hermetic regression removes the real
+fixture root during delayed readiness and verifies that neither process remains.
 
 ## Pre-v2 live evidence
 

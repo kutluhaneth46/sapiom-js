@@ -652,7 +652,7 @@ describe("managed-agent probe CLI", () => {
     });
 
     expect(report.checks).toContainEqual({
-      id: "exact_model_alias",
+      id: "sdk_model_alias_observed",
       passed: false,
     });
     expect(report.outcome).toBe("fail");
@@ -674,7 +674,10 @@ describe("managed-agent probe CLI", () => {
       );
       const report = evaluateManagedAgentProbe(result);
 
-      expect(report.outcome).toBe("pass");
+      expect(report.outcome).toBe("local_pass");
+      expect(report.deploymentProvenance).toBe(
+        "requires_gateway_reconciliation",
+      );
       expect(report).toMatchObject({
         l1Certification: {
           contractVersion: 2,
@@ -689,7 +692,7 @@ describe("managed-agent probe CLI", () => {
 
   it("records zero optional Reads as nonblocking efficiency evidence", () => {
     expect(evaluateManagedAgentProbe(passingL1Result())).toMatchObject({
-      outcome: "pass",
+      outcome: "local_pass",
       l1Certification: {
         evaluatorVersion: "managed-agent-l1-evaluator-v2",
         optionalReadCount: 0,
@@ -711,7 +714,7 @@ describe("managed-agent probe CLI", () => {
       expect(
         evaluateManagedAgentProbe(maximallyBatchedL1Result(optionalRole)),
       ).toMatchObject({
-        outcome: "pass",
+        outcome: "local_pass",
         checks: expect.arrayContaining([
           { id: "exact_l1_tool_trace", passed: true },
         ]),
@@ -873,10 +876,10 @@ describe("managed-agent probe CLI", () => {
       withPermissionsBeforeOwnRequests(passingL1Result());
 
     expect(evaluateManagedAgentProbe(requestBeforePermission).outcome).toBe(
-      "pass",
+      "local_pass",
     );
     expect(evaluateManagedAgentProbe(permissionBeforeRequest).outcome).toBe(
-      "pass",
+      "local_pass",
     );
   });
 
@@ -1068,7 +1071,7 @@ describe("managed-agent probe CLI", () => {
       workspaceChanges: [...passing.workspaceChanges].reverse(),
     });
 
-    expect(report.outcome).toBe("pass");
+    expect(report.outcome).toBe("local_pass");
     expect(report.checks).toContainEqual({
       id: "exact_workspace_delta",
       passed: true,
@@ -1093,7 +1096,7 @@ describe("managed-agent probe CLI", () => {
   it("accepts exactly one permitted Bash request for L2 and rejects any extra tool call", () => {
     const passing = passingL2Result();
     expect(evaluateManagedAgentProbe(passing, [12_345, 12_346])).toMatchObject({
-      outcome: "pass",
+      outcome: "local_pass",
       checks: expect.arrayContaining([
         { id: "exact_l2_bash_only_trace", passed: true },
         { id: "l2_containment_prepared", passed: true },
@@ -1141,7 +1144,7 @@ describe("managed-agent probe CLI", () => {
       teardown: { ...passing.teardown, forceKillIssued: false },
     };
     expect(evaluateManagedAgentProbe(graceful, [12_345, 12_346]).outcome).toBe(
-      "pass",
+      "local_pass",
     );
 
     for (const [field, checkId] of [
@@ -1614,7 +1617,7 @@ describe("managed-agent probe CLI", () => {
 
   it("requires positive permission evidence and distinct lexical and symlink denials", () => {
     const passing = passingL1Result();
-    expect(evaluateManagedAgentProbe(passing).outcome).toBe("pass");
+    expect(evaluateManagedAgentProbe(passing).outcome).toBe("local_pass");
 
     const falsePass: ManagedAgentProbeResult = {
       ...passing,

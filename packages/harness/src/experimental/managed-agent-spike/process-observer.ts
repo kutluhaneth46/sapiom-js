@@ -246,7 +246,7 @@ export interface ManagedAgentKernelProcessRecord {
   readonly processGroupId?: number;
   /** POSIX session id, when the process table exposes it. */
   readonly sessionId?: number;
-  /** POSIX process state used only to confirm an issued group stop. */
+  /** POSIX process state used to treat zombies as already dead. */
   readonly state?: string;
   /** Kernel-reported creation time used for evidence, never POSIX authority. */
   readonly startedAt: string;
@@ -275,7 +275,7 @@ export interface LocalManagedAgentProcessObserverOptions {
   ) => ManagedAgentProcessGroupLiveness;
   readonly signalProcessGroup?: (
     processGroupId: number,
-    signal: "SIGSTOP" | "SIGKILL",
+    signal: "SIGKILL",
   ) => ManagedAgentProcessSignalOutcome;
   readonly monotonicNow?: () => number;
   readonly delay?: (milliseconds: number) => Promise<void>;
@@ -287,7 +287,6 @@ interface OwnedRoot {
   identity?: ManagedAgentKernelProcessRecord;
   containmentSupported: boolean;
   ownershipProven: boolean;
-  stopIssued: boolean;
   forceKillIssued: boolean;
 }
 
@@ -479,7 +478,7 @@ function defaultProcessGroupLiveness(
 
 function defaultSignalProcessGroup(
   processGroupId: number,
-  signal: "SIGSTOP" | "SIGKILL",
+  signal: "SIGKILL",
 ): ManagedAgentProcessSignalOutcome {
   try {
     process.kill(-processGroupId, signal);
@@ -527,11 +526,11 @@ function descendantsOf(
  *
  * This is not universal built-in Bash containment or a process-tree killer.
  * Windows, an unavailable process table, missing lifetime channels, or
- * identity/ancestry drift fail certification closed. The fallback stops the
- * owned root first, revalidates all authority, then stops and revalidates the
- * exact fixture group before killing it. POSIX `lstart` remains one component
- * of fresh identity evidence, not standalone authority. Workspace PID-file
- * contents never enter this class.
+ * identity/ancestry drift fail certification closed. The fallback freshly
+ * validates and kills the exact fixture group, proves it absent with a new
+ * sample, then freshly validates and kills the owned supervisor root. POSIX
+ * `lstart` remains one component of fresh identity evidence, not standalone
+ * authority. Workspace PID-file contents never enter this class.
  */
 export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObserver {
   readonly #platform: NodeJS.Platform;
@@ -541,7 +540,7 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
   ) => ManagedAgentProcessGroupLiveness;
   readonly #signalProcessGroup: (
     processGroupId: number,
-    signal: "SIGSTOP" | "SIGKILL",
+    signal: "SIGKILL",
   ) => ManagedAgentProcessSignalOutcome;
   readonly #monotonicNow: () => number;
   readonly #delay: (milliseconds: number) => Promise<void>;
@@ -574,7 +573,6 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
   #toolProcessRootPid: number | undefined;
   #toolProcessObservationComplete = false;
   #toolProcessObservationInvalid = false;
-  #toolProcessStopIssued = false;
   #toolProcessForceKillIssued = false;
   #fallbackCleanupRequested = false;
   #lastTable: ManagedAgentKernelProcessTable | undefined;
@@ -882,7 +880,12 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
   }
 
   public spawn(options: SpawnOptions): SpawnedProcess {
-    if (this.#sealed || this.#hostDisposing || this.#deadlineExpiredAndSeal()) {
+    if (
+      this.#sealed ||
+      this.#hostDisposing ||
+      this.#teardownDeadline ||
+      this.#deadlineExpiredAndSeal()
+    ) {
       throw new Error("managed-agent process observer is closed");
     }
     const usePosixSupervisor =
@@ -964,7 +967,6 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
         child,
         containmentSupported: true,
         ownershipProven: false,
-        stopIssued: false,
         forceKillIssued: false,
       });
       this.#observedPids.add(pid);
@@ -1094,13 +1096,7 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
     }
   }
 
-  #hasFreshToolAuthority(
-    table: ManagedAgentKernelProcessTable,
-    options: {
-      readonly requireRootStopped: boolean;
-      readonly requireToolStopped: boolean;
-    },
-  ): boolean {
+  #hasFreshToolAuthority(table: ManagedAgentKernelProcessTable): boolean {
     const rootPid = this.#toolProcessRootPid;
     const processGroupId = this.#toolProcessGroupId;
     const root =
@@ -1138,7 +1134,6 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
       currentRoot.processGroupId !== root.pid ||
       (root.identity && !sameProcess(root.identity, currentRoot)) ||
       (root.identity && root.identity.sessionId !== currentRoot.sessionId) ||
-      (options.requireRootStopped && !currentRoot.state?.includes("T")) ||
       !sameProcess(parent.identity, currentParent) ||
       currentParent.processGroupId !== processGroupId ||
       parent.identity.sessionId !== currentParent.sessionId ||
@@ -1166,11 +1161,7 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
     );
     return (
       groupMembers.length > 0 &&
-      groupMembers.every(
-        ([pid, record]) =>
-          rootDescendants.has(pid) &&
-          (!options.requireToolStopped || record.state?.includes("T")),
-      )
+      groupMembers.every(([pid]) => rootDescendants.has(pid))
     );
   }
 
@@ -1567,8 +1558,9 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
         }
         // Query.return() can remain pending while the SDK performs its own
         // shutdown. Advance a requested fallback from each authoritative
-        // sample so the detached tool group is stopped/killed before the
-        // supervisor anchor is killed last, all within the same deadline.
+        // sample so the detached tool group is killed and then confirmed gone
+        // before the supervisor anchor is killed last, all within the same
+        // deadline.
         this.#advanceFallbackCleanup();
         return true;
       })().finally(() => {
@@ -1680,12 +1672,7 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
       if (this.#toolProcessObservationInvalid) {
         return unsupported("tool_process_identity_invalid");
       }
-      if (
-        !this.#hasFreshToolAuthority(this.#lastTable!, {
-          requireRootStopped: false,
-          requireToolStopped: false,
-        })
-      ) {
+      if (!this.#hasFreshToolAuthority(this.#lastTable!)) {
         return unsupported("tool_process_identity_invalid");
       }
       this.#toolProcessObservationComplete = true;
@@ -1702,10 +1689,7 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
     };
   }
 
-  #hasFreshRootGroupAuthority(
-    root: OwnedRoot,
-    requireStopped = false,
-  ): boolean {
+  #hasFreshRootGroupAuthority(root: OwnedRoot): boolean {
     if (!root.containmentSupported || this.#processTableNeedsRefresh) {
       return false;
     }
@@ -1720,8 +1704,7 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
     if (
       !current ||
       processIsZombie(current) ||
-      current.processGroupId !== root.pid ||
-      (requireStopped && !current.state?.includes("T"))
+      current.processGroupId !== root.pid
     ) {
       return false;
     }
@@ -1734,7 +1717,7 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
 
   #signalValidatedProcessGroup(
     processGroupId: number,
-    signal: "SIGSTOP" | "SIGKILL",
+    signal: "SIGKILL",
   ): ManagedAgentProcessSignalOutcome {
     if (this.#sealed || this.#deadlineExpiredAndSeal()) return "failure";
     const outcome = this.#signalProcessGroup(processGroupId, signal);
@@ -1746,27 +1729,6 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
     return outcome;
   }
 
-  #stopOwnedRootsSynchronously(): void {
-    if (this.#sealed) return;
-    if (this.#platform !== "darwin" && this.#platform !== "linux") return;
-    for (const root of this.#roots.values()) {
-      if (
-        root.forceKillIssued ||
-        !childActive(root.child) ||
-        !this.#hasFreshRootGroupAuthority(root)
-      ) {
-        continue;
-      }
-      if (!root.stopIssued) {
-        const stopOutcome = this.#signalValidatedProcessGroup(
-          root.pid,
-          "SIGSTOP",
-        );
-        root.stopIssued = stopOutcome === "sent";
-      }
-    }
-  }
-
   #killOwnedRootsSynchronously(): void {
     if (this.#sealed) return;
     if (this.#platform !== "darwin" && this.#platform !== "linux") return;
@@ -1775,8 +1737,7 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
         root.forceKillIssued ||
         !childActive(root.child) ||
         this.#hasPendingUnauthenticatedDescendants(root.pid) ||
-        !root.stopIssued ||
-        !this.#hasFreshRootGroupAuthority(root, true)
+        !this.#hasFreshRootGroupAuthority(root)
       ) {
         continue;
       }
@@ -1790,38 +1751,15 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
 
   #requestFallbackCleanupSynchronously(): void {
     if (this.#sealed || this.#deadlineExpiredAndSeal()) return;
-    this.#fallbackCleanupRequested = true;
-    this.#stopOwnedRootsSynchronously();
-  }
-
-  /**
-   * Disposal may run after the evidence deadline has irreversibly sealed the
-   * observer. A group for which this observer successfully issued SIGSTOP
-   * cannot execute, exit, fork, or have its PGID recycled while stopped, so
-   * that frozen kernel anchor remains safe for one final SIGKILL without a
-   * new process-table sample. This is leak prevention only: it never changes
-   * the already-finalized teardown evidence or grants authority for a group
-   * that was not stopped before sealing.
-   */
-  #forceKillStoppedGroupsForDisposalSynchronously(): void {
-    if (this.#platform !== "darwin" && this.#platform !== "linux") return;
-
-    const toolProcessGroupId = this.#toolProcessGroupId;
-    if (
-      this.#toolProcessStopIssued &&
-      !this.#toolProcessForceKillIssued &&
-      typeof toolProcessGroupId === "number"
-    ) {
-      const outcome = this.#signalProcessGroup(toolProcessGroupId, "SIGKILL");
-      this.#toolProcessForceKillIssued = outcome === "sent";
+    if (!this.#fallbackCleanupRequested) {
+      this.#fallbackCleanupRequested = true;
+      // The cleanup request itself is a lifecycle boundary. Discard any
+      // earlier sample so the first numeric signal can only be authorized by
+      // a complete process-table read that began after teardown started.
+      this.#sampleGeneration += 1;
+      this.#processTableNeedsRefresh = true;
     }
-
-    for (const root of this.#roots.values()) {
-      if (root.stopIssued && !root.forceKillIssued && childActive(root.child)) {
-        const outcome = this.#signalProcessGroup(root.pid, "SIGKILL");
-        root.forceKillIssued = outcome === "sent";
-      }
-    }
+    void this.observeProcessTree(this.#teardownDeadline);
   }
 
   #advanceFallbackCleanup(): void {
@@ -1834,17 +1772,14 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
     ) {
       return;
     }
-    // A failed root STOP attempt invalidates its authorizing sample just like
-    // every other signal outcome. Retry it only here, after a new complete
-    // generation has restored fresh root authority.
-    this.#stopOwnedRootsSynchronously();
-    if (
-      !this.#toolProcessContainmentArmed ||
-      !this.#toolProcessObservationComplete
-    ) {
+    if (!this.#toolProcessContainmentArmed) {
       this.#killOwnedRootsSynchronously();
       return;
     }
+    // Once tool containment is armed, fail closed until the authenticated
+    // parent/child identities and their separate group are complete. Killing
+    // only the supervisor group could otherwise strand an unknown tool group.
+    if (!this.#toolProcessObservationComplete) return;
 
     const processGroupId = this.#toolProcessGroupId;
     if (typeof processGroupId !== "number") return;
@@ -1853,10 +1788,7 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
       (record) =>
         record.processGroupId === processGroupId && !processIsZombie(record),
     );
-    if (this.#toolProcessForceKillIssued && !liveToolGroupMembers) {
-      this.#killOwnedRootsSynchronously();
-      return;
-    }
+    if (liveToolGroupMembers && this.#toolProcessForceKillIssued) return;
     const groupLiveness = this.#processGroupLiveness(processGroupId);
     if (groupLiveness === "gone") {
       this.#killOwnedRootsSynchronously();
@@ -1864,21 +1796,7 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
     }
     if (groupLiveness !== "alive") return;
 
-    if (
-      !this.#hasFreshToolAuthority(table, {
-        requireRootStopped: true,
-        requireToolStopped: this.#toolProcessStopIssued,
-      })
-    ) {
-      return;
-    }
-    if (!this.#toolProcessStopIssued) {
-      const stopOutcome = this.#signalValidatedProcessGroup(
-        processGroupId,
-        "SIGSTOP",
-      );
-      this.#toolProcessStopIssued = stopOutcome === "sent";
-      if (stopOutcome === "gone") this.#killOwnedRootsSynchronously();
+    if (!this.#hasFreshToolAuthority(table)) {
       return;
     }
     if (!this.#toolProcessForceKillIssued) {
@@ -2061,7 +1979,9 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
       if (observation.quiescent) {
         const deadlineMet =
           this.#monotonicNow() <= adoptedDeadline.deadlineAtMs;
-        if (!deadlineMet) this.#seal();
+        // Seal atomically with the successful observation so no delayed SDK
+        // spawn can appear after quiescence has been certified.
+        this.#seal();
         return {
           ...observation,
           deadlineMet,
@@ -2087,7 +2007,6 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
     const startedAt = adoptedDeadline.startedAtMs;
     this.#requestFallbackCleanupSynchronously();
     const confirmation = await this.waitForQuiescence(adoptedDeadline);
-    if (!confirmation.quiescent) this.#killOwnedRootsSynchronously();
     const elapsedMs = Math.max(0, this.#monotonicNow() - startedAt);
     const roots = [...this.#roots.values()];
     const forceKillIssued =
@@ -2111,7 +2030,6 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
   async #disposeInternal(): Promise<void> {
     this.#hostDisposing = true;
     this.#seal();
-    this.#forceKillStoppedGroupsForDisposalSynchronously();
 
     // The two exact fixture processes authenticated these retained channels
     // with an observer-created capability that was never written into the

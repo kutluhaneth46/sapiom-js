@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Options } from "@anthropic-ai/claude-agent-sdk";
 
 import {
+  MANAGED_AGENT_CONTRACT,
   MANAGED_AGENT_MODEL_ENVIRONMENT_VARIABLES,
   resolveManagedAgentModelTarget,
 } from "./contract.js";
@@ -1552,6 +1553,28 @@ process.stdout.write(JSON.stringify({
     ).rejects.toThrow("pinned direct Sapiom gateway origin");
     expect(queryFactory).not.toHaveBeenCalled();
   });
+
+  it.skipIf(
+    process.versions.node === MANAGED_AGENT_CONTRACT.certificationNodeVersion,
+  )(
+    "enforces the exact Node pin inside the exported direct-gateway runtime",
+    async () => {
+      const { config } = await probeConfig();
+      const queryFactory = vi.fn(() => queryFromEvents([]));
+      await expect(
+        runManagedAgentProbe(
+          {
+            ...config,
+            gatewayOrigin: MANAGED_AGENT_CONTRACT.directGatewayOrigin,
+          },
+          { processObserver: fakeObserver(), queryFactory },
+        ),
+      ).rejects.toThrow(
+        `Direct managed-agent probes require Node ${MANAGED_AGENT_CONTRACT.certificationNodeVersion}`,
+      );
+      expect(queryFactory).not.toHaveBeenCalled();
+    },
+  );
 
   it("rejects the hermetic origin seam without an injected query factory", async () => {
     const { config } = await probeConfig();

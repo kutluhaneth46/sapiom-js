@@ -42,7 +42,9 @@ export interface ManagedAgentProbeCheck {
 }
 
 export interface ManagedAgentProbeReport {
-  readonly outcome: "pass" | "fail";
+  /** Local protocol/host result; never authoritative deployment certification. */
+  readonly outcome: "local_pass" | "fail";
+  readonly deploymentProvenance: "requires_gateway_reconciliation";
   readonly checks: readonly ManagedAgentProbeCheck[];
   readonly result: ManagedAgentProbeResult;
   readonly l1Certification?: {
@@ -684,7 +686,7 @@ export function evaluateManagedAgentProbe(
     );
   const checks: ManagedAgentProbeCheck[] = [
     {
-      id: "exact_model_alias",
+      id: "sdk_model_alias_observed",
       passed:
         result.modelAlias ===
           resolveManagedAgentModelTarget(result.target).alias &&
@@ -854,7 +856,8 @@ export function evaluateManagedAgentProbe(
   }
 
   const report: ManagedAgentProbeReport = {
-    outcome: checks.every(({ passed }) => passed) ? "pass" : "fail",
+    outcome: checks.every(({ passed }) => passed) ? "local_pass" : "fail",
+    deploymentProvenance: "requires_gateway_reconciliation",
     checks,
     result,
   };
@@ -979,7 +982,7 @@ async function main(): Promise<void> {
       return;
     }
     process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
-    if (report.outcome !== "pass") process.exitCode = 1;
+    if (report.outcome === "fail") process.exitCode = 1;
   } catch (error) {
     const message =
       error instanceof Error ? error.message : "Unknown probe failure";

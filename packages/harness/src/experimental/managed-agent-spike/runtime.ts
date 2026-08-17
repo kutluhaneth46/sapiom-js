@@ -11,6 +11,7 @@ import {
 import { z } from "zod";
 
 import {
+  MANAGED_AGENT_CONTRACT,
   MANAGED_AGENT_L1_CERTIFICATION_CONTRACT,
   validateManagedAgentProbeConfig,
 } from "./contract.js";
@@ -440,6 +441,14 @@ export async function runManagedAgentProbe(
       ? { hermeticGatewayOrigin: dependencies.hermeticGatewayOrigin }
       : {}),
   });
+  if (
+    !dependencies.hermeticGatewayOrigin &&
+    process.versions.node !== MANAGED_AGENT_CONTRACT.certificationNodeVersion
+  ) {
+    throw new Error(
+      `Direct managed-agent probes require Node ${MANAGED_AGENT_CONTRACT.certificationNodeVersion}; current runtime is ${process.versions.node}`,
+    );
+  }
   if (config.scenario === "L2" && !dependencies.waitForCancellationSignal) {
     throw new Error("L2 requires an explicit cancellation signal dependency");
   }

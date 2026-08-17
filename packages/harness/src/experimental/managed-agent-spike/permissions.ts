@@ -232,6 +232,19 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
+function hasExactKeys(
+  value: Record<string, unknown>,
+  expectedKeys: readonly string[],
+): boolean {
+  const actualKeys = Object.keys(value);
+  return (
+    actualKeys.length === expectedKeys.length &&
+    expectedKeys.every((key) =>
+      Object.prototype.hasOwnProperty.call(value, key),
+    )
+  );
+}
+
 function denied(
   reason: ManagedAgentPermissionReason,
   operationId: ManagedAgentOperationId = "unknown",
@@ -263,6 +276,7 @@ function classifyManagedAgentOperation(
   const input = asRecord(rawInput);
   if (toolName === "Bash") {
     return input &&
+      hasExactKeys(input, ["command"]) &&
       typeof input.command === "string" &&
       allowedCommands.has(input.command)
       ? "bash:exact_command"
@@ -318,6 +332,9 @@ async function evaluateManagedAgentPolicy(
         };
   }
   if (toolName === "Bash") {
+    if (!hasExactKeys(input, ["command"])) {
+      return denied("invalid_input", operationId);
+    }
     const command =
       typeof input.command === "string" ? input.command : undefined;
     if (!command) return denied("invalid_input", operationId);

@@ -1,6 +1,7 @@
 import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
-import { rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
@@ -17,6 +18,31 @@ import {
 } from "./fixture.js";
 
 const fixtures: ManagedAgentFixture[] = [];
+
+function processExists(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+async function waitForDirectChildPid(parentPid: number): Promise<number> {
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline) {
+    const output = execFileSync("/bin/ps", ["-axo", "pid=,ppid="], {
+      encoding: "utf8",
+      windowsHide: true,
+    });
+    for (const line of output.split("\n")) {
+      const match = /^\s*(\d+)\s+(\d+)\s*$/.exec(line);
+      if (match && Number(match[2]) === parentPid) return Number(match[1]);
+    }
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
+  }
+  throw new Error("fixture child did not start");
+}
 
 afterEach(async () => {
   await Promise.all(fixtures.splice(0).map((fixture) => fixture.cleanup()));
@@ -80,6 +106,49 @@ describe("managed-agent disposable git fixture", () => {
     const [exitCode] = await once(child, "exit");
     expect(exitCode).toBe(0);
   });
+
+  it.skipIf(process.platform === "win32")(
+    "does not orphan the child when the fixture root disappears before delayed readiness",
+    async () => {
+      const fixture = await createManagedAgentFixture(
+        () => "deleted-root-readiness",
+      );
+      fixtures.push(fixture);
+      const externalLeaseRoot = await mkdtemp(
+        join(tmpdir(), "managed-agent-fixture-lease-"),
+      );
+      const externalLease = join(externalLeaseRoot, "lease");
+      await writeFile(externalLease, "run\n", { mode: 0o600 });
+      const child = spawn(
+        process.execPath,
+        [
+          join(fixture.workspaceRoot, FIXTURE_PATHS.processScript),
+          join(fixture.workspaceRoot, FIXTURE_PATHS.processPidFile),
+          "--host-cleanup-marker",
+          externalLease,
+          "--host-readiness-delay-ms",
+          "500",
+        ],
+        { stdio: "ignore", windowsHide: true },
+      );
+      await once(child, "spawn");
+      const descendantPid = await waitForDirectChildPid(child.pid!);
+
+      try {
+        const exitTask = once(child, "exit");
+        await rm(fixture.root, { recursive: true, force: true });
+        const [exitCode] = await exitTask;
+        expect(exitCode).toBe(1);
+        await new Promise((resolveDelay) => setTimeout(resolveDelay, 25));
+        expect(processExists(descendantPid)).toBe(false);
+      } finally {
+        if (processExists(descendantPid)) {
+          process.kill(descendantPid, "SIGKILL");
+        }
+        await rm(externalLeaseRoot, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("renders L1 as eleven exact ordered calls without resolving the escape link", async () => {
     const fixture = await createManagedAgentFixture(() => "prompt-contract");

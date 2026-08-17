@@ -304,6 +304,25 @@ describe("managed-agent universal policy boundary", () => {
     ).resolves.toMatchObject({
       hookSpecificOutput: { permissionDecision: "deny" },
     });
+    await expect(
+      invoke("Bash", {
+        command: "git status --short",
+        run_in_background: true,
+      }),
+    ).resolves.toMatchObject({
+      hookSpecificOutput: {
+        permissionDecision: "deny",
+        permissionDecisionReason: expect.stringContaining("invalid_input"),
+      },
+    });
+    await expect(
+      invoke("Bash", { command: "git status --short", timeout: 10 }),
+    ).resolves.toMatchObject({
+      hookSpecificOutput: {
+        permissionDecision: "deny",
+        permissionDecisionReason: expect.stringContaining("invalid_input"),
+      },
+    });
     const readInput = { file_path: "inside.txt", preserve: "metadata" };
     await expect(invoke("Read", readInput)).resolves.toMatchObject({
       hookSpecificOutput: {
@@ -354,6 +373,8 @@ describe("managed-agent universal policy boundary", () => {
     ).toEqual([
       ["allow", "exact_bash_command", "pre_tool_use", "bash:exact_command"],
       ["deny", "bash_command_not_allowed", "pre_tool_use", "bash:unregistered"],
+      ["deny", "invalid_input", "pre_tool_use", "bash:unregistered"],
+      ["deny", "invalid_input", "pre_tool_use", "bash:unregistered"],
       ["allow", "fixture_path", "pre_tool_use", "read:clean_target"],
       ["allow", "fixture_path", "pre_tool_use", "write:managed_output"],
       [
@@ -611,6 +632,17 @@ describe("managed-agent universal policy boundary", () => {
     ).resolves.toMatchObject({ behavior: "allow" });
     expect(evidence).toHaveLength(2);
     expect(evidence[1]?.source).toBe("can_use_tool_fallback");
+
+    await expect(
+      boundary.canUseToolFallback(
+        "Bash",
+        { command: "git status --short", run_in_background: true },
+        { signal, toolUseID: "fallback-extra", requestId: "request-3" },
+      ),
+    ).resolves.toMatchObject({
+      behavior: "deny",
+      message: expect.stringContaining("invalid_input"),
+    });
   });
 
   it("fails closed when aborted before or during asynchronous path validation", async () => {

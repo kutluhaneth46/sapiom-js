@@ -95,6 +95,14 @@ const cleanupMarkerIndex = process.argv.indexOf("--host-cleanup-marker");
 const cleanupMarker = cleanupMarkerIndex >= 0
   ? resolve(process.argv[cleanupMarkerIndex + 1])
   : undefined;
+const readinessDelayIndex = process.argv.indexOf("--host-readiness-delay-ms");
+const parsedReadinessDelay = readinessDelayIndex >= 0
+  ? Number(process.argv[readinessDelayIndex + 1])
+  : 0;
+const readinessDelayMs = Number.isSafeInteger(parsedReadinessDelay) &&
+  parsedReadinessDelay >= 0 && parsedReadinessDelay <= 5_000
+  ? parsedReadinessDelay
+  : 0;
 const controlSocket = process.env[${JSON.stringify(MANAGED_AGENT_TOOL_CONTROL_SOCKET_ENV)}];
 const controlCapability = process.env[${JSON.stringify(MANAGED_AGENT_TOOL_CONTROL_CAPABILITY_ENV)}];
 if (requireControlRegistration && (!controlSocket || !controlCapability)) {
@@ -108,9 +116,17 @@ const childProgram = [
   'const controlCapability = process.env["${MANAGED_AGENT_TOOL_CONTROL_CAPABILITY_ENV}"];',
   'delete process.env["${MANAGED_AGENT_TOOL_CONTROL_SOCKET_ENV}"];',
   'delete process.env["${MANAGED_AGENT_TOOL_CONTROL_CAPABILITY_ENV}"];',
+  'const readinessDelayMs = ' + JSON.stringify(readinessDelayMs) + ';',
   'process.on("SIGTERM", () => {});',
   'process.on("message", (message) => { if (message === "host-shutdown") process.exit(0); });',
-  'const publishReady = () => { if (process.send) process.send("ready"); };',
+  'process.on("disconnect", () => process.exit(0));',
+  'let readyPublished = false;',
+  'const publishReady = () => {',
+  '  if (readyPublished) return;',
+  '  readyPublished = true;',
+  '  const sendReady = () => { if (process.send) process.send("ready"); };',
+  '  if (readinessDelayMs > 0) setTimeout(sendReady, readinessDelayMs); else sendReady();',
+  '};',
   'const connectControl = () => {',
   '  if (!controlSocket || !controlCapability) { publishReady(); return; }',
   '  const socket = createConnection(controlSocket);',
@@ -159,7 +175,13 @@ let childReady = false;
 let controlReady = !requireControlRegistration;
 const publishReadiness = () => {
   if (!childReady || !controlReady) return;
-  writeFileSync(pidFile, JSON.stringify({ parentPid: process.pid, childPid: child.pid }));
+  try {
+    writeFileSync(pidFile, JSON.stringify({ parentPid: process.pid, childPid: child.pid }));
+  } catch {
+    child.once("exit", () => process.exit(1));
+    if (child.connected) child.send("host-shutdown");
+    else child.kill("SIGKILL");
+  }
 };
 child.once("message", () => {
   childReady = true;
