@@ -15,8 +15,70 @@ import type {
   ManagedAgentOperationId,
   ManagedAgentPermissionDecision,
   ManagedAgentPermissionReason,
+  ManagedAgentProbeEvent,
   ManagedAgentProbeResult,
 } from "./types.js";
+
+function withProjectedL1Events(
+  result: ManagedAgentProbeResult,
+): ManagedAgentProbeResult {
+  const events: ManagedAgentProbeEvent[] = [];
+  const append = (
+    event: Omit<ManagedAgentProbeEvent, "sequence" | "runId">,
+  ): void => {
+    events.push({
+      sequence: events.length + 1,
+      runId: result.runId,
+      ...event,
+    });
+  };
+  for (const evidence of result.toolEvidence) {
+    if (evidence.status === "requested") {
+      append({
+        type: "tool_requested",
+        toolUseId: evidence.toolUseId,
+        toolName: evidence.toolName,
+      });
+      for (const decision of result.permissionEvidence.filter(
+        ({ toolUseId }) => toolUseId === evidence.toolUseId,
+      )) {
+        append({
+          type: "permission",
+          toolUseId: decision.toolUseId,
+          toolName: decision.toolName,
+          permissionDecision: decision.decision,
+          permissionReason: decision.reason,
+          permissionSource: decision.source,
+          operationId: decision.operationId,
+        });
+      }
+      continue;
+    }
+    append({
+      type: "tool_completed",
+      toolUseId: evidence.toolUseId,
+      toolName: evidence.toolName,
+      isError: evidence.status === "error",
+    });
+  }
+  append({ type: "sdk_result", subtype: "success", isError: false });
+  append({ type: "terminal", terminal: "success" });
+  return { ...result, events };
+}
+
+function withResequencedEvents(
+  result: ManagedAgentProbeResult,
+  events: readonly ManagedAgentProbeEvent[],
+): ManagedAgentProbeResult {
+  return {
+    ...result,
+    events: events.map((event, index) => ({
+      ...event,
+      sequence: index + 1,
+      runId: result.runId,
+    })),
+  };
+}
 
 function passingL1Result(): ManagedAgentProbeResult {
   const echoTool = qualifiedManagedAgentMcpToolName("echo_nonce");
@@ -43,7 +105,7 @@ function passingL1Result(): ManagedAgentProbeResult {
   const ids = steps.map(
     (_, index) => `tool_${(index + 1).toString(16).padStart(64, "0")}`,
   );
-  return {
+  return withProjectedL1Events({
     contractVersion: 1,
     runId: "run-1",
     scenario: "L1",
@@ -119,7 +181,7 @@ function passingL1Result(): ManagedAgentProbeResult {
       { role: "managed_output", matched: true },
     ],
     nonceVerified: true,
-  } as ManagedAgentProbeResult;
+  } as ManagedAgentProbeResult);
 }
 
 function passingL2Result(): ManagedAgentProbeResult {
@@ -131,6 +193,7 @@ function passingL2Result(): ManagedAgentProbeResult {
     inferenceTurns: 1,
     sdkNumTurns: 1,
     terminal: "cancelled",
+    events: [],
     toolEvidence: [{ toolUseId, toolName: "Bash", status: "requested" }],
     permissionEvidence: [
       {
@@ -204,7 +267,11 @@ function insertL1ToolStep(
     source: "pre_tool_use",
     operationId: step.operationId,
   });
-  return { ...result, toolEvidence, permissionEvidence };
+  return withProjectedL1Events({
+    ...result,
+    toolEvidence,
+    permissionEvidence,
+  });
 }
 
 function optionalReadStep(
@@ -235,6 +302,104 @@ function expectProbeCheckFailure(
   const report = evaluateManagedAgentProbe(result);
   expect(report.outcome).toBe("fail");
   expect(report.checks).toContainEqual({ id: checkId, passed: false });
+}
+
+function maximallyBatchedL1Result(
+  optionalRole?: "clean_target" | "dirty_sentinel" | "untracked_sentinel",
+): ManagedAgentProbeResult {
+  const withOptional = optionalRole
+    ? insertL1ToolStep(
+        passingL1Result(),
+        5,
+        optionalReadStep(`read:${optionalRole}`),
+        optionalRole === "clean_target"
+          ? "e"
+          : optionalRole === "dirty_sentinel"
+            ? "f"
+            : "a",
+      )
+    : passingL1Result();
+  const requested = withOptional.toolEvidence.filter(
+    ({ status }) => status === "requested",
+  );
+  const completionFor = (
+    request: (typeof requested)[number],
+  ): (typeof withOptional.toolEvidence)[number] =>
+    withOptional.toolEvidence.find(
+      (evidence) =>
+        evidence.toolUseId === request.toolUseId &&
+        evidence.status !== "requested",
+    )!;
+  const optionalOffset = optionalRole ? 1 : 0;
+  const phaseA = requested.slice(0, 5);
+  const optional = optionalRole ? requested[5] : undefined;
+  const phaseB = requested.slice(5 + optionalOffset, 9 + optionalOffset);
+  const call10 = requested[9 + optionalOffset]!;
+  const call11 = requested[10 + optionalOffset]!;
+  const toolEvidence = [
+    ...phaseA,
+    ...[phaseA[2]!, phaseA[4]!, phaseA[0]!, phaseA[3]!, phaseA[1]!].map(
+      completionFor,
+    ),
+    ...(optional ? [optional, completionFor(optional)] : []),
+    ...phaseB,
+    ...[phaseB[2]!, phaseB[0]!, phaseB[3]!, phaseB[1]!].map(completionFor),
+    call10,
+    completionFor(call10),
+    call11,
+    completionFor(call11),
+  ];
+  return withProjectedL1Events({
+    ...withOptional,
+    inferenceTurns: 4 + optionalOffset,
+    sdkNumTurns: 4 + optionalOffset,
+    toolEvidence,
+  });
+}
+
+function moveCompletionAfterRequest(
+  result: ManagedAgentProbeResult,
+  completedRequestIndex: number,
+  boundaryRequestIndex: number,
+): ManagedAgentProbeResult {
+  const requested = result.toolEvidence.filter(
+    ({ status }) => status === "requested",
+  );
+  const completedId = requested[completedRequestIndex]!.toolUseId;
+  const boundaryId = requested[boundaryRequestIndex]!.toolUseId;
+  const completion = result.toolEvidence.find(
+    (evidence) =>
+      evidence.toolUseId === completedId && evidence.status !== "requested",
+  )!;
+  const toolEvidence = result.toolEvidence.filter(
+    (evidence) => evidence !== completion,
+  );
+  const boundaryIndex = toolEvidence.findIndex(
+    (evidence) =>
+      evidence.toolUseId === boundaryId && evidence.status === "requested",
+  );
+  toolEvidence.splice(boundaryIndex + 1, 0, completion);
+  return withProjectedL1Events({ ...result, toolEvidence });
+}
+
+function moveCompletionBeforeOwnRequest(
+  result: ManagedAgentProbeResult,
+  requestIndex: number,
+): ManagedAgentProbeResult {
+  const request = result.toolEvidence.filter(
+    ({ status }) => status === "requested",
+  )[requestIndex]!;
+  const completion = result.toolEvidence.find(
+    (evidence) =>
+      evidence.toolUseId === request.toolUseId &&
+      evidence.status !== "requested",
+  )!;
+  const toolEvidence = result.toolEvidence.filter(
+    (evidence) => evidence !== completion,
+  );
+  const ownRequestIndex = toolEvidence.indexOf(request);
+  toolEvidence.splice(ownRequestIndex, 0, completion);
+  return withProjectedL1Events({ ...result, toolEvidence });
 }
 
 describe("managed-agent probe CLI", () => {
@@ -453,6 +618,174 @@ describe("managed-agent probe CLI", () => {
     expect(
       evaluateManagedAgentProbe(passingL1Result()).l1Certification,
     ).not.toHaveProperty("optionalReadRole");
+  });
+
+  it.each([
+    ["none", undefined],
+    ["clean_target", "clean_target"],
+    ["dirty_sentinel", "dirty_sentinel"],
+    ["untracked_sentinel", "untracked_sentinel"],
+  ] as const)(
+    "accepts maximally batched phase completions with %s optional Read",
+    (_name, optionalRole) => {
+      expect(
+        evaluateManagedAgentProbe(maximallyBatchedL1Result(optionalRole)),
+      ).toMatchObject({
+        outcome: "pass",
+        checks: expect.arrayContaining([
+          { id: "exact_l1_tool_trace", passed: true },
+        ]),
+      });
+    },
+  );
+
+  it("rejects the all-requests-first false-pass counterexample", () => {
+    const passing = passingL1Result();
+    const allRequestsFirst = withProjectedL1Events({
+      ...passing,
+      inferenceTurns: 1,
+      sdkNumTurns: 1,
+      toolEvidence: [
+        ...passing.toolEvidence.filter(({ status }) => status === "requested"),
+        ...passing.toolEvidence.filter(({ status }) => status !== "requested"),
+      ],
+    });
+
+    expectL1TraceFailure(allRequestsFirst);
+    expectProbeCheckFailure(allRequestsFirst, "minimum_l1_inference_turns");
+  });
+
+  it.each([0, 1, 2, 3, 4])(
+    "rejects phase A completion %i delayed until after call 6 starts",
+    (phaseAIndex) => {
+      expectL1TraceFailure(
+        moveCompletionAfterRequest(maximallyBatchedL1Result(), phaseAIndex, 5),
+      );
+    },
+  );
+
+  it.each([0, 1, 2, 3, 4])(
+    "rejects phase A completion %i delayed until after the optional Read starts",
+    (phaseAIndex) => {
+      expectL1TraceFailure(
+        moveCompletionAfterRequest(
+          maximallyBatchedL1Result("clean_target"),
+          phaseAIndex,
+          5,
+        ),
+      );
+    },
+  );
+
+  it.each(["clean_target", "dirty_sentinel", "untracked_sentinel"] as const)(
+    "rejects the %s optional completion delayed until after call 6 starts",
+    (optionalRole) => {
+      expectL1TraceFailure(
+        moveCompletionAfterRequest(
+          maximallyBatchedL1Result(optionalRole),
+          5,
+          6,
+        ),
+      );
+    },
+  );
+
+  it.each([5, 6, 7, 8])(
+    "rejects phase B request-index %i completion delayed until after call 10 starts",
+    (phaseBRequestIndex) => {
+      expectL1TraceFailure(
+        moveCompletionAfterRequest(
+          maximallyBatchedL1Result(),
+          phaseBRequestIndex,
+          9,
+        ),
+      );
+    },
+  );
+
+  it("rejects call 10 completion delayed until after call 11 starts", () => {
+    expectL1TraceFailure(
+      moveCompletionAfterRequest(maximallyBatchedL1Result(), 9, 10),
+    );
+  });
+
+  it.each([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10])(
+    "rejects completion-before-own-request at request index %i",
+    (requestIndex) => {
+      expectL1TraceFailure(
+        moveCompletionBeforeOwnRequest(
+          maximallyBatchedL1Result(),
+          requestIndex,
+        ),
+      );
+    },
+  );
+
+  it.each([
+    ["without optional Read", undefined, 3],
+    ["with optional Read", "clean_target", 4],
+  ] as const)(
+    "rejects too few inference turns %s",
+    (_name, optionalRole, inferenceTurns) => {
+      expectProbeCheckFailure(
+        {
+          ...maximallyBatchedL1Result(optionalRole),
+          inferenceTurns,
+        },
+        "minimum_l1_inference_turns",
+      );
+    },
+  );
+
+  it("rejects a normalized tool-event projection mismatch", () => {
+    const passing = maximallyBatchedL1Result();
+    const firstToolEvent = passing.events.findIndex(
+      ({ type }) => type === "tool_requested",
+    );
+    const events = [...passing.events];
+    events[firstToolEvent] = {
+      ...events[firstToolEvent]!,
+      toolName: "Write",
+    };
+    expectProbeCheckFailure(
+      { ...passing, events },
+      "normalized_event_projection",
+    );
+  });
+
+  it.each(["sdk_result", "terminal"] as const)(
+    "rejects %s before the Bash completion",
+    (eventType) => {
+      const passing = maximallyBatchedL1Result();
+      const events = [...passing.events];
+      const bashCompletionIndex = events.findIndex(
+        (event) => event.type === "tool_completed" && event.toolName === "Bash",
+      );
+      const movedIndex = events.findIndex(({ type }) => type === eventType);
+      const [moved] = events.splice(movedIndex, 1);
+      events.splice(bashCompletionIndex, 0, moved!);
+      expectProbeCheckFailure(
+        withResequencedEvents(passing, events),
+        "bash_sdk_terminal_order",
+      );
+    },
+  );
+
+  it("rejects terminal before the successful SDK result", () => {
+    const passing = maximallyBatchedL1Result();
+    const events = [...passing.events];
+    const sdkResultIndex = events.findIndex(
+      ({ type }) => type === "sdk_result",
+    );
+    const terminalIndex = events.findIndex(({ type }) => type === "terminal");
+    [events[sdkResultIndex], events[terminalIndex]] = [
+      events[terminalIndex]!,
+      events[sdkResultIndex]!,
+    ];
+    expectProbeCheckFailure(
+      withResequencedEvents(passing, events),
+      "bash_sdk_terminal_order",
+    );
   });
 
   it("rejects a second optional verification Read", () => {

@@ -86,6 +86,22 @@ reordering, omission, retries, and every other extra operation fail closed.
 The optional Read count and role are reported separately as nonblocking
 efficiency evidence.
 
+Requests keep their exact canonical order while completions may be permuted
+within the two batchable phases. Every request must precede its own completion;
+all five discovery completions must precede the optional verification Read (or
+Edit when it is absent), the optional Read must complete before Edit, and the
+Edit/Write/MCP phase must complete before the recovery retry. The first
+`fail_once` error must complete before its retry, and that retry must complete
+before Bash. The evaluator additionally requires at least four distinct
+assistant inference turns, plus one when the optional Read is present. This
+accepts observed SDK batching without allowing an all-requests-first trace to
+masquerade as multi-turn recovery.
+
+Normalized tool and permission events must be an exact chronological
+projection of their evidence arrays. A successful Bash completion must precede
+the single successful SDK result, which must precede the final successful
+terminal event.
+
 Filesystem acceptance is also exact: only the clean target may be modified and
 only the managed output may be created, in either evidence order. Trusted
 SHA-256 expectations prove the final bytes of both mutation targets, while the

@@ -196,6 +196,106 @@ function hasExactManagedAgentL1FinalBytes(
   );
 }
 
+function hasConsistentManagedAgentL1EventProjection(
+  result: ManagedAgentProbeResult,
+): boolean {
+  if (
+    result.events.some(
+      (event, index) =>
+        event.sequence !== index + 1 || event.runId !== result.runId,
+    )
+  ) {
+    return false;
+  }
+  const toolEvents = result.events.filter(
+    ({ type }) => type === "tool_requested" || type === "tool_completed",
+  );
+  if (toolEvents.length !== result.toolEvidence.length) return false;
+  for (const [index, evidence] of result.toolEvidence.entries()) {
+    const event = toolEvents[index];
+    if (
+      !event ||
+      event.toolUseId !== evidence.toolUseId ||
+      event.toolName !== evidence.toolName
+    ) {
+      return false;
+    }
+    if (evidence.status === "requested") {
+      if (event.type !== "tool_requested" || event.isError !== undefined) {
+        return false;
+      }
+    } else if (
+      event.type !== "tool_completed" ||
+      event.isError !== (evidence.status === "error")
+    ) {
+      return false;
+    }
+  }
+
+  const permissionEvents = result.events.filter(
+    ({ type }) => type === "permission",
+  );
+  if (permissionEvents.length !== result.permissionEvidence.length) {
+    return false;
+  }
+  return result.permissionEvidence.every((evidence, index) => {
+    const event = permissionEvents[index];
+    return Boolean(
+      event &&
+      event.toolUseId === evidence.toolUseId &&
+      event.toolName === evidence.toolName &&
+      event.permissionDecision === evidence.decision &&
+      event.permissionReason === evidence.reason &&
+      event.permissionSource === evidence.source &&
+      event.operationId === evidence.operationId,
+    );
+  });
+}
+
+function hasManagedAgentL1BashSdkTerminalOrder(
+  result: ManagedAgentProbeResult,
+): boolean {
+  const bashRequest = result.toolEvidence.find(
+    ({ toolName, status }) => toolName === "Bash" && status === "requested",
+  );
+  if (!bashRequest?.toolUseId) return false;
+  const bashCompletionIndexes = result.events.flatMap((event, index) =>
+    event.type === "tool_completed" &&
+    event.toolUseId === bashRequest.toolUseId &&
+    event.toolName === "Bash" &&
+    event.isError === false
+      ? [index]
+      : [],
+  );
+  const sdkResultIndexes = result.events.flatMap((event, index) =>
+    event.type === "sdk_result" &&
+    event.subtype === "success" &&
+    event.isError === false
+      ? [index]
+      : [],
+  );
+  const terminalIndexes = result.events.flatMap((event, index) =>
+    event.type === "terminal" && event.terminal === "success" ? [index] : [],
+  );
+  const bashCompletionIndex = bashCompletionIndexes[0];
+  const sdkResultIndex = sdkResultIndexes[0];
+  const terminalIndex = terminalIndexes[0];
+  return Boolean(
+    bashCompletionIndexes.length === 1 &&
+    result.events.filter(({ type }) => type === "sdk_result").length === 1 &&
+    sdkResultIndexes.length === 1 &&
+    result.events.filter(({ type }) => type === "terminal").length === 1 &&
+    terminalIndexes.length === 1 &&
+    result.terminationEvidence.sdkResult === "success" &&
+    bashCompletionIndex !== undefined &&
+    sdkResultIndex !== undefined &&
+    terminalIndex !== undefined &&
+    bashCompletionIndex < sdkResultIndex &&
+    sdkResultIndex < terminalIndex &&
+    terminalIndex === result.events.length - 1,
+  );
+}
+
 function analyzeManagedAgentL1ToolTrace(
   result: ManagedAgentProbeResult,
 ): ManagedAgentL1TraceAnalysis {
@@ -222,6 +322,18 @@ function analyzeManagedAgentL1ToolTrace(
   const decisionById = new Map(
     primaryDecisions.map((evidence) => [evidence.toolUseId, evidence]),
   );
+  const requestPositionById = new Map<string, number>();
+  const completionPositionById = new Map<string, number>();
+  for (const [position, evidence] of result.toolEvidence.entries()) {
+    if (!evidence.toolUseId) continue;
+    if (evidence.status === "requested") {
+      if (!requestPositionById.has(evidence.toolUseId)) {
+        requestPositionById.set(evidence.toolUseId, position);
+      }
+    } else if (!completionPositionById.has(evidence.toolUseId)) {
+      completionPositionById.set(evidence.toolUseId, position);
+    }
+  }
   let invalid =
     requestedIds.length !== requested.length ||
     new Set(requestedIds).size !== requestedIds.length ||
@@ -295,11 +407,13 @@ function analyzeManagedAgentL1ToolTrace(
   const candidateDecision = candidate?.toolUseId
     ? decisionById.get(candidate.toolUseId)
     : undefined;
+  let optionalRequestIndex: number | undefined;
   if (
     candidate?.toolName === "Read" &&
     candidateDecision &&
     MANAGED_AGENT_L1_OPTIONAL_READ_OPERATIONS.has(candidateDecision.operationId)
   ) {
+    optionalRequestIndex = cursor;
     const completion = candidate.toolUseId
       ? completionById.get(candidate.toolUseId)
       : undefined;
@@ -317,6 +431,69 @@ function analyzeManagedAgentL1ToolTrace(
     cursor += 1;
   }
   invalid ||= cursor !== requested.length;
+
+  const requestPosition = (requestIndex: number): number | undefined => {
+    const toolUseId = requested[requestIndex]?.toolUseId;
+    return toolUseId ? requestPositionById.get(toolUseId) : undefined;
+  };
+  const completionPosition = (requestIndex: number): number | undefined => {
+    const toolUseId = requested[requestIndex]?.toolUseId;
+    return toolUseId ? completionPositionById.get(toolUseId) : undefined;
+  };
+  const allRequestsPrecedeOwnCompletion = requested.every((_, index) => {
+    const request = requestPosition(index);
+    const completion = completionPosition(index);
+    return (
+      request !== undefined && completion !== undefined && request < completion
+    );
+  });
+  const completionsBeforeRequest = (
+    completedRequestIndexes: readonly number[],
+    boundaryRequestIndex: number,
+  ): boolean => {
+    const boundary = requestPosition(boundaryRequestIndex);
+    const completions = completedRequestIndexes.map(completionPosition);
+    return Boolean(
+      boundary !== undefined &&
+      completions.every(
+        (completion) => completion !== undefined && completion < boundary,
+      ),
+    );
+  };
+  const optionalOffset = optionalRequestIndex === undefined ? 0 : 1;
+  const call6RequestIndex = 5 + optionalOffset;
+  const call10RequestIndex = 9 + optionalOffset;
+  const call11RequestIndex = 10 + optionalOffset;
+  const phaseABoundaryRequestIndex = optionalRequestIndex ?? call6RequestIndex;
+  invalid ||=
+    !allRequestsPrecedeOwnCompletion ||
+    !completionsBeforeRequest([0, 1, 2, 3, 4], phaseABoundaryRequestIndex) ||
+    !completionsBeforeRequest(
+      [
+        call6RequestIndex,
+        call6RequestIndex + 1,
+        call6RequestIndex + 2,
+        call6RequestIndex + 3,
+      ],
+      call10RequestIndex,
+    );
+  if (optionalRequestIndex !== undefined) {
+    const optionalRequest = requestPosition(optionalRequestIndex);
+    const optionalCompletion = completionPosition(optionalRequestIndex);
+    const call6Request = requestPosition(call6RequestIndex);
+    invalid ||=
+      optionalRequest === undefined ||
+      optionalCompletion === undefined ||
+      call6Request === undefined ||
+      optionalRequest >= optionalCompletion ||
+      optionalCompletion >= call6Request;
+  }
+  const call10Completion = completionPosition(call10RequestIndex);
+  const call11Request = requestPosition(call11RequestIndex);
+  invalid ||=
+    call10Completion === undefined ||
+    call11Request === undefined ||
+    call10Completion >= call11Request;
 
   return {
     passed: !invalid,
@@ -549,6 +726,20 @@ export function evaluateManagedAgentProbe(
       {
         id: "exact_l1_tool_trace",
         passed: l1Trace?.passed === true,
+      },
+      {
+        id: "minimum_l1_inference_turns",
+        passed:
+          Number.isInteger(result.inferenceTurns) &&
+          result.inferenceTurns >= 4 + (l1Trace?.optionalReadCount ?? 0),
+      },
+      {
+        id: "normalized_event_projection",
+        passed: hasConsistentManagedAgentL1EventProjection(result),
+      },
+      {
+        id: "bash_sdk_terminal_order",
+        passed: hasManagedAgentL1BashSdkTerminalOrder(result),
       },
       {
         id: "exact_workspace_delta",
