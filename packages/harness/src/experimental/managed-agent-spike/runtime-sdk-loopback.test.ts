@@ -318,6 +318,7 @@ it("enforces real-SDK built-in and in-process MCP calls with exact loopback corr
       });
       return child;
     },
+    beginTeardown: (deadline) => observer.beginTeardown(deadline),
     armToolProcessContainment: () => observer.armToolProcessContainment(),
     prepareCancellation: () => observer.prepareCancellation(),
     observeProcessTree: (timeoutMs) => observer.observeProcessTree(timeoutMs),
@@ -524,6 +525,14 @@ it("enforces real-SDK built-in and in-process MCP calls with exact loopback corr
         terminationEvidence: result.terminationEvidence,
       }),
     ).toBe("success");
+    expect(result.sdkModelEvidence).toEqual({
+      authority: "sdk_non_authoritative",
+      initModelObserved: true,
+      initModelMatchesExpectedAlias: true,
+      resultModelUsageObserved: true,
+      resultModelUsageMatchesExpectedAlias: true,
+      resultModelCount: 1,
+    });
 
     const requested = result.toolEvidence.filter(
       ({ status }) => status === "requested",
@@ -604,8 +613,7 @@ it("enforces real-SDK built-in and in-process MCP calls with exact loopback corr
     expect(result.queryClosed).toBe(true);
     expect(result.teardown.quiescent).toBe(true);
   } finally {
-    await observer.emergencyCleanup(1_000);
-    observer.dispose();
+    await observer.dispose();
     server.closeAllConnections();
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await fixture.cleanup();
@@ -682,6 +690,7 @@ it.skipIf(
         supervisorPid = typeof pid === "number" ? pid : undefined;
         return child;
       },
+      beginTeardown: (deadline) => observer.beginTeardown(deadline),
       armToolProcessContainment: () => observer.armToolProcessContainment(),
       prepareCancellation: () => observer.prepareCancellation(),
       observeProcessTree: (timeoutMs) => observer.observeProcessTree(timeoutMs),
@@ -916,7 +925,6 @@ it.skipIf(
         cleanupOrder.indexOf("host_emergency_cleanup"),
       );
     } finally {
-      await observer.emergencyCleanup(1_000);
       await observer.dispose();
       server.closeAllConnections();
       await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -956,6 +964,7 @@ it.skipIf(
           signal: neverForwardedController.signal,
         });
       },
+      beginTeardown: (deadline) => observer.beginTeardown(deadline),
       armToolProcessContainment: () => observer.armToolProcessContainment(),
       prepareCancellation: () => observer.prepareCancellation(),
       observeProcessTree: (timeoutMs) => observer.observeProcessTree(timeoutMs),
@@ -1102,7 +1111,6 @@ it.skipIf(
         cleanupOrder.indexOf("sdk_forwarded_signal_unobserved"),
       ).toBeLessThan(cleanupOrder.indexOf("host_timeout_fallback"));
     } finally {
-      await observer.emergencyCleanup(1_000);
       await observer.dispose();
       server.closeAllConnections();
       await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -1235,7 +1243,6 @@ it.skipIf(
         ),
       ).toBe(true);
     } finally {
-      await observer.emergencyCleanup(1_000);
       await observer.dispose();
       server.closeAllConnections();
       await new Promise<void>((resolve) => server.close(() => resolve()));

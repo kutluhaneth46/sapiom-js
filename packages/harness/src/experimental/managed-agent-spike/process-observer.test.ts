@@ -9,6 +9,7 @@ import {
 import { readFile, writeFile } from "node:fs/promises";
 import { createConnection, type Socket as NetSocket } from "node:net";
 import { join } from "node:path";
+import { performance } from "node:perf_hooks";
 import { promisify } from "node:util";
 
 import type { SpawnedProcess } from "@anthropic-ai/claude-agent-sdk";
@@ -32,6 +33,13 @@ import {
 
 const fixtures: ManagedAgentFixture[] = [];
 const execFileAsync = promisify(execFile);
+
+function deadlineAfter(timeoutMs: number, startedAtMs = performance.now()) {
+  return Object.freeze({
+    startedAtMs,
+    deadlineAtMs: startedAtMs + timeoutMs,
+  });
+}
 
 afterEach(async () => {
   await Promise.all(fixtures.splice(0).map((fixture) => fixture.cleanup()));
@@ -685,7 +693,9 @@ async function proveRetainedGroupAuthority(
     expect(escapedReadiness.observedPids).not.toContain(unrelated.pid);
     expect(processExists(nonCooperativeChildPid)).toBe(true);
     expect(processExists(unrelated.pid!)).toBe(true);
-    await expect(observer.waitForQuiescence(0)).resolves.toMatchObject({
+    await expect(
+      observer.waitForQuiescence(deadlineAfter(1)),
+    ).resolves.toMatchObject({
       quiescent: false,
       deadlineMet: false,
       containmentSupported: false,
@@ -1148,7 +1158,9 @@ describe("LocalManagedAgentProcessObserver", () => {
         expect(anchor.kill("SIGTERM")).toBe(false);
         expect(nativeKillSpy).not.toHaveBeenCalled();
         expect(processExists(processGroupId)).toBe(true);
-        await expect(observer.waitForQuiescence(0)).resolves.toMatchObject({
+        await expect(
+          observer.waitForQuiescence(deadlineAfter(1)),
+        ).resolves.toMatchObject({
           quiescent: false,
           containmentSupported: true,
           forceKillIssued: false,
@@ -1211,7 +1223,7 @@ describe("LocalManagedAgentProcessObserver", () => {
 
         const startedAt = Date.now();
         forwardedController.abort();
-        const teardown = await observer.emergencyCleanup(1_000);
+        const teardown = await observer.emergencyCleanup(deadlineAfter(1_000));
 
         expect(teardown).toMatchObject({
           quiescent: true,
@@ -1379,7 +1391,7 @@ describe("LocalManagedAgentProcessObserver", () => {
         reason: "root_not_active",
       });
       forwardedController.abort();
-      await observer.emergencyCleanup(0);
+      await observer.emergencyCleanup(deadlineAfter(1));
       expect(signals).toEqual([]);
     } finally {
       observer.dispose();
@@ -1442,7 +1454,7 @@ describe("LocalManagedAgentProcessObserver", () => {
           ownershipProven: true,
         });
 
-        const teardown = await observer.emergencyCleanup(2_000);
+        const teardown = await observer.emergencyCleanup(deadlineAfter(2_000));
 
         expect(teardown).toMatchObject({
           quiescent: true,
@@ -1489,6 +1501,8 @@ describe("LocalManagedAgentProcessObserver", () => {
         rootProcessGroupId = run.anchor.pid!;
         toolProcessGroupId = run.toolProcessGroupId;
 
+        const teardownDeadline = deadlineAfter(3_000);
+        observer.beginTeardown(teardownDeadline);
         run.forwardedController.abort();
         const deadline = Date.now() + 2_000;
         while (
@@ -1508,7 +1522,9 @@ describe("LocalManagedAgentProcessObserver", () => {
           [toolProcessGroupId, "SIGKILL"],
           [rootProcessGroupId, "SIGKILL"],
         ]);
-        await expect(observer.waitForQuiescence(1_000)).resolves.toMatchObject({
+        await expect(
+          observer.waitForQuiescence(teardownDeadline),
+        ).resolves.toMatchObject({
           quiescent: true,
           deadlineMet: true,
           containmentSupported: true,
@@ -1599,7 +1615,7 @@ describe("LocalManagedAgentProcessObserver", () => {
         toolProcessGroupId = run.toolProcessGroupId;
         injectForeignMember = true;
 
-        const teardown = await observer.emergencyCleanup(250);
+        const teardown = await observer.emergencyCleanup(deadlineAfter(250));
 
         expect(teardown).toMatchObject({
           quiescent: false,
@@ -1671,7 +1687,7 @@ describe("LocalManagedAgentProcessObserver", () => {
         registeredPids = run.toolPids;
         simulatePidReuse = true;
 
-        const teardown = await observer.emergencyCleanup(250);
+        const teardown = await observer.emergencyCleanup(deadlineAfter(250));
 
         expect(teardown).toMatchObject({
           quiescent: false,
@@ -1724,7 +1740,7 @@ describe("LocalManagedAgentProcessObserver", () => {
         );
         toolProcessGroupId = run.toolProcessGroupId;
 
-        const teardown = await observer.emergencyCleanup(3_000);
+        const teardown = await observer.emergencyCleanup(deadlineAfter(3_000));
 
         expect(teardown).toMatchObject({
           quiescent: true,
@@ -1775,7 +1791,7 @@ describe("LocalManagedAgentProcessObserver", () => {
         await forceKillRetainedTestGroup(run.anchor);
         expect(processGroupExists(toolProcessGroupId)).toBe(true);
 
-        const teardown = await observer.emergencyCleanup(250);
+        const teardown = await observer.emergencyCleanup(deadlineAfter(250));
 
         expect(teardown).toMatchObject({
           quiescent: false,
@@ -1855,7 +1871,7 @@ describe("LocalManagedAgentProcessObserver", () => {
           reason: "tool_process_not_registered",
         });
 
-        const teardown = await observer.emergencyCleanup(100);
+        const teardown = await observer.emergencyCleanup(deadlineAfter(100));
 
         expect(teardown.quiescent).toBe(false);
         expect(processGroupExists(detachedTool.pid!)).toBe(true);
@@ -1934,8 +1950,11 @@ describe("LocalManagedAgentProcessObserver", () => {
             ),
           ),
         );
+        const teardownDeadline = deadlineAfter(1_000);
+        observer.beginTeardown(teardownDeadline);
         forwardedController.abort();
-        const openChannelObservation = await observer.emergencyCleanup(1_000);
+        const openChannelObservation =
+          await observer.emergencyCleanup(teardownDeadline);
         await waitForChildExitBounded(anchor);
         expect(openChannelObservation).toMatchObject({
           quiescent: false,
@@ -1944,7 +1963,8 @@ describe("LocalManagedAgentProcessObserver", () => {
 
         parentRegistration.destroy();
         childRegistration.destroy();
-        const finalObservation = await observer.waitForQuiescence(3_000);
+        const finalObservation =
+          await observer.waitForQuiescence(teardownDeadline);
         expect(finalObservation).toMatchObject({
           quiescent: false,
           deadlineMet: false,
@@ -1981,12 +2001,17 @@ describe("LocalManagedAgentProcessObserver", () => {
         if (anchor.exitCode === null && anchor.signalCode === null) {
           await once(anchor, "exit");
         }
-        await expect(observer.waitForQuiescence(50)).resolves.toMatchObject({
+        const teardownDeadline = deadlineAfter(50);
+        await expect(
+          observer.waitForQuiescence(teardownDeadline),
+        ).resolves.toMatchObject({
           quiescent: false,
           deadlineMet: false,
           containmentSupported: false,
         });
-        await expect(observer.emergencyCleanup(50)).resolves.toMatchObject({
+        await expect(
+          observer.emergencyCleanup(teardownDeadline),
+        ).resolves.toMatchObject({
           quiescent: false,
           deadlineMet: false,
           containmentSupported: false,
@@ -2032,7 +2057,9 @@ describe("LocalManagedAgentProcessObserver", () => {
       });
       expect(Date.now() - startedAt).toBeLessThan(1_000);
       const shortConfirmationStartedAt = Date.now();
-      await expect(observer.waitForQuiescence(50)).resolves.toMatchObject({
+      await expect(
+        observer.waitForQuiescence(deadlineAfter(50)),
+      ).resolves.toMatchObject({
         quiescent: false,
         deadlineMet: false,
         processTableAvailable: false,
@@ -2047,6 +2074,117 @@ describe("LocalManagedAgentProcessObserver", () => {
       observer.dispose();
     }
   });
+
+  it("remembers an SDK abort but grants no fallback signal before deadline adoption", async () => {
+    let rootPid = 0;
+    const signals: Array<readonly [number, "SIGSTOP" | "SIGKILL"]> = [];
+    const observer = new LocalManagedAgentProcessObserver({
+      platform: "darwin",
+      readProcessTable: async () =>
+        available([
+          [
+            rootPid,
+            {
+              parentPid: process.pid,
+              processGroupId: rootPid,
+              sessionId: rootPid,
+              state: signals.some(([, signal]) => signal === "SIGSTOP")
+                ? "T"
+                : "S",
+              startedAt: "abort-before-deadline",
+            },
+          ],
+        ]),
+      signalProcessGroup: (groupId, signal) => {
+        signals.push([groupId, signal]);
+        return "sent";
+      },
+    });
+    const controller = new AbortController();
+    const child = asChildProcess(
+      observer.spawn({
+        ...activeNodeCommand(),
+        cwd: process.cwd(),
+        env: { ...process.env },
+        signal: controller.signal,
+      }),
+    );
+    rootPid = child.pid!;
+    try {
+      await expect(observer.prepareCancellation()).resolves.toMatchObject({
+        supported: true,
+        reason: "ready",
+      });
+
+      controller.abort();
+      expect(signals).toEqual([]);
+
+      observer.beginTeardown(deadlineAfter(100));
+      expect(signals).toEqual([[rootPid, "SIGSTOP"]]);
+    } finally {
+      await forceKillRetainedTestGroup(child);
+      await observer.dispose();
+    }
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "kills a stopped owned group during disposal when post-stop observation misses the deadline",
+    async () => {
+      let hangAfterStop = false;
+      const signals: Array<readonly [number, "SIGSTOP" | "SIGKILL"]> = [];
+      const observer = new LocalManagedAgentProcessObserver({
+        readProcessTable: () =>
+          hangAfterStop
+            ? new Promise<ManagedAgentProcessTableObservation>(() => undefined)
+            : readRealPosixProcessTable(),
+        signalProcessGroup: (groupId, signal) => {
+          signals.push([groupId, signal]);
+          const outcome = signalRealProcessGroup(groupId, signal);
+          if (signal === "SIGSTOP" && outcome === "sent") {
+            hangAfterStop = true;
+          }
+          return outcome;
+        },
+      });
+      const controller = new AbortController();
+      const anchor = asChildProcess(
+        observer.spawn({
+          ...activeNodeCommand(),
+          cwd: process.cwd(),
+          env: { ...process.env },
+          signal: controller.signal,
+        }),
+      );
+      try {
+        await expect(
+          prepareCancellationAfterTransientReadFailure(observer),
+        ).resolves.toMatchObject({ supported: true, reason: "ready" });
+        const teardownDeadline = deadlineAfter(75);
+        observer.beginTeardown(teardownDeadline);
+        controller.abort();
+
+        const teardown = await observer.emergencyCleanup(teardownDeadline);
+        expect(teardown).toMatchObject({
+          quiescent: false,
+          deadlineMet: false,
+          forceKillIssued: false,
+        });
+        expect(signals.map(([, signal]) => signal)).toEqual(["SIGSTOP"]);
+
+        await observer.dispose();
+        await waitForChildExitBounded(anchor);
+        expect(signals.map(([, signal]) => signal)).toEqual([
+          "SIGSTOP",
+          "SIGKILL",
+        ]);
+        expect(processGroupExists(anchor.pid!)).toBe(false);
+      } finally {
+        await forceKillRetainedTestGroup(anchor);
+        await observer.dispose();
+      }
+    },
+    10_000,
+  );
 
   it("marks an observed POSIX group escape unsupported without authorizing an individual signal", async () => {
     let rootPid = 0;
@@ -2093,7 +2231,9 @@ describe("LocalManagedAgentProcessObserver", () => {
       });
       escaped = true;
       await observer.observeProcessTree();
-      await expect(observer.waitForQuiescence(0)).resolves.toMatchObject({
+      await expect(
+        observer.waitForQuiescence(deadlineAfter(1)),
+      ).resolves.toMatchObject({
         quiescent: false,
         containmentSupported: false,
       });
@@ -2163,7 +2303,9 @@ describe("LocalManagedAgentProcessObserver", () => {
       zombie = true;
       await observer.observeProcessTree();
 
-      const observation = await observer.waitForQuiescence(1);
+      const observation = await observer.waitForQuiescence(
+        deadlineAfter(1, now),
+      );
       expect(observation).toMatchObject({
         quiescent: false,
         containmentSupported: true,
@@ -2239,7 +2381,8 @@ describe("LocalManagedAgentProcessObserver", () => {
       escaped = true;
       await observer.observeProcessTree();
 
-      const observation = await observer.waitForQuiescence(1);
+      const teardownDeadline = deadlineAfter(1, now);
+      const observation = await observer.waitForQuiescence(teardownDeadline);
       expect(observation).toMatchObject({
         quiescent: false,
         containmentSupported: false,
@@ -2252,7 +2395,9 @@ describe("LocalManagedAgentProcessObserver", () => {
       controller.abort();
       gone = true;
       await observer.observeProcessTree();
-      await expect(observer.waitForQuiescence(1)).resolves.toMatchObject({
+      await expect(
+        observer.waitForQuiescence(teardownDeadline),
+      ).resolves.toMatchObject({
         quiescent: false,
         containmentSupported: false,
       });
@@ -2339,6 +2484,8 @@ describe("LocalManagedAgentProcessObserver", () => {
         supported: true,
         reason: "ready",
       });
+      const teardownDeadline = deadlineAfter(100, now);
+      observer.beginTeardown(teardownDeadline);
       controller.abort();
       await observer.observeProcessTree();
       expect(signals).toEqual([
@@ -2351,7 +2498,9 @@ describe("LocalManagedAgentProcessObserver", () => {
 
       stage = "gone";
       await observer.observeProcessTree();
-      await expect(observer.waitForQuiescence(0)).resolves.toMatchObject({
+      await expect(
+        observer.waitForQuiescence(teardownDeadline),
+      ).resolves.toMatchObject({
         quiescent: true,
         deadlineMet: true,
         containmentSupported: true,
@@ -2489,7 +2638,9 @@ describe("LocalManagedAgentProcessObserver", () => {
       await observer.observeProcessTree();
       rootAlive = false;
       await observer.observeProcessTree();
-      await expect(observer.waitForQuiescence(0)).resolves.toMatchObject({
+      await expect(
+        observer.waitForQuiescence(deadlineAfter(1)),
+      ).resolves.toMatchObject({
         quiescent: true,
         deadlineMet: true,
         containmentSupported: true,
@@ -2548,7 +2699,9 @@ describe("LocalManagedAgentProcessObserver", () => {
     rootPid = anchor.pid!;
     try {
       await observer.observeProcessTree();
-      await expect(observer.waitForQuiescence(0)).resolves.toMatchObject({
+      await expect(
+        observer.waitForQuiescence(deadlineAfter(1)),
+      ).resolves.toMatchObject({
         quiescent: false,
         deadlineMet: false,
         containmentSupported: false,
@@ -2620,7 +2773,9 @@ describe("LocalManagedAgentProcessObserver", () => {
       await observer.observeProcessTree();
       subgroupState = "gone";
       await observer.observeProcessTree();
-      await expect(observer.waitForQuiescence(0)).resolves.toMatchObject({
+      await expect(
+        observer.waitForQuiescence(deadlineAfter(1)),
+      ).resolves.toMatchObject({
         quiescent: false,
         deadlineMet: false,
         containmentSupported: false,
@@ -2798,6 +2953,8 @@ describe("LocalManagedAgentProcessObserver", () => {
         supported: true,
         reason: "ready",
       });
+      const teardownDeadline = deadlineAfter(100);
+      observer.beginTeardown(teardownDeadline);
       controller.abort();
       expect(signals).toEqual([[rootPid, "SIGSTOP"]]);
       await observer.observeProcessTree();
@@ -2808,7 +2965,9 @@ describe("LocalManagedAgentProcessObserver", () => {
       await observer.observeProcessTree();
       subgroupState = "gone";
       await observer.observeProcessTree();
-      await expect(observer.waitForQuiescence(0)).resolves.toMatchObject({
+      await expect(
+        observer.waitForQuiescence(teardownDeadline),
+      ).resolves.toMatchObject({
         quiescent: false,
         deadlineMet: false,
         containmentSupported: false,
@@ -2994,7 +3153,7 @@ describe("LocalManagedAgentProcessObserver", () => {
         await Promise.all(registrationClosures);
         await forceKillRetainedTestGroup(anchor);
 
-        const teardown = await observer.emergencyCleanup(50);
+        const teardown = await observer.emergencyCleanup(deadlineAfter(50));
 
         expect(teardown).toMatchObject({
           quiescent: false,
@@ -3064,6 +3223,7 @@ describe("LocalManagedAgentProcessObserver", () => {
     rootPid = child.pid!;
     try {
       await observer.prepareCancellation();
+      observer.beginTeardown(deadlineAfter(100));
       forwardedController.abort();
       forwardedController.abort();
       expect(signals).toEqual([[rootPid, "SIGSTOP"]]);
@@ -3125,7 +3285,8 @@ describe("LocalManagedAgentProcessObserver", () => {
     rootPid = child.pid!;
     try {
       await observer.prepareCancellation();
-      await observer.emergencyCleanup(100);
+      const teardownDeadline = deadlineAfter(100);
+      await observer.emergencyCleanup(teardownDeadline);
 
       expect(signals).toEqual([
         [rootPid, "SIGSTOP"],
@@ -3139,7 +3300,9 @@ describe("LocalManagedAgentProcessObserver", () => {
             index === 0 || readCount > signalReadCounts[index - 1]!,
         ),
       ).toBe(true);
-      await expect(observer.waitForQuiescence(0)).resolves.toMatchObject({
+      await expect(
+        observer.waitForQuiescence(teardownDeadline),
+      ).resolves.toMatchObject({
         containmentSupported: true,
         forceKillIssued: true,
         quiescent: false,
@@ -3182,7 +3345,9 @@ describe("LocalManagedAgentProcessObserver", () => {
     rootPid = child.pid!;
     await once(child, "exit");
     try {
-      await expect(observer.waitForQuiescence(0)).resolves.toMatchObject({
+      await expect(
+        observer.waitForQuiescence(deadlineAfter(1)),
+      ).resolves.toMatchObject({
         quiescent: false,
         deadlineMet: false,
         containmentSupported: false,
@@ -3216,7 +3381,9 @@ describe("LocalManagedAgentProcessObserver", () => {
     await once(child, "exit");
     try {
       await observer.observeProcessTree();
-      await expect(observer.waitForQuiescence(0)).resolves.toMatchObject({
+      await expect(
+        observer.waitForQuiescence(deadlineAfter(1)),
+      ).resolves.toMatchObject({
         quiescent: true,
         deadlineMet: true,
         containmentSupported: true,
@@ -3254,7 +3421,9 @@ describe("LocalManagedAgentProcessObserver", () => {
       now = 0;
       measureOverrun = true;
 
-      await expect(observer.waitForQuiescence(1)).resolves.toMatchObject({
+      await expect(
+        observer.waitForQuiescence(deadlineAfter(1, 0)),
+      ).resolves.toMatchObject({
         quiescent: true,
         deadlineMet: false,
         elapsedMs: 2,
@@ -3302,8 +3471,9 @@ describe("LocalManagedAgentProcessObserver", () => {
         forgedPids,
       );
       await observer.observeProcessTree();
-      const teardown = await observer.waitForQuiescence(0);
-      await observer.emergencyCleanup(0);
+      const teardownDeadline = deadlineAfter(1);
+      const teardown = await observer.waitForQuiescence(teardownDeadline);
+      await observer.emergencyCleanup(teardownDeadline);
 
       expect(teardown.observedPids).not.toContain(forgedPids[0]);
       expect(teardown.observedPids).not.toContain(forgedPids[1]);
@@ -3373,6 +3543,7 @@ describe("LocalManagedAgentProcessObserver", () => {
 
       const preSignalSample = observer.observeProcessTree();
       await vi.waitFor(() => expect(reads).toHaveLength(1));
+      observer.beginTeardown(deadlineAfter(1_000));
       forwardedController.abort();
       expect(signals).toEqual([[rootPid, "SIGSTOP"]]);
 

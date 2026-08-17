@@ -11,7 +11,7 @@ const SESSION_ID = "11111111-1111-4111-8111-111111111111";
 
 describe("ManagedAgentEventRecorder", () => {
   it("retains structural evidence while redacting message and tool content", () => {
-    const recorder = new ManagedAgentEventRecorder("run-1");
+    const recorder = new ManagedAgentEventRecorder("run-1", "expected-model");
     recorder.observeSdkEvent({
       type: "system",
       subtype: "init",
@@ -62,6 +62,12 @@ describe("ManagedAgentEventRecorder", () => {
       },
       total_cost_usd: 0.001,
       num_turns: 7,
+      modelUsage: {
+        "unexpected-model": {
+          inputTokens: 7,
+          outputTokens: 3,
+        },
+      },
     });
     expect(recorder.recordTerminal("success")).toBe(true);
     expect(recorder.recordTerminal("query_error")).toBe(false);
@@ -77,6 +83,14 @@ describe("ManagedAgentEventRecorder", () => {
     });
     expect(recorder.inferenceTurns).toBe(1);
     expect(recorder.sdkNumTurns).toBe(7);
+    expect(recorder.modelEvidence).toEqual({
+      authority: "sdk_non_authoritative",
+      initModelObserved: true,
+      initModelMatchesExpectedAlias: false,
+      resultModelUsageObserved: true,
+      resultModelUsageMatchesExpectedAlias: false,
+      resultModelCount: 1,
+    });
     expect(recorder.toolEvidence).toEqual([
       {
         toolUseId: normalizeManagedAgentToolUseId("tool-1"),
@@ -107,7 +121,7 @@ describe("ManagedAgentEventRecorder", () => {
   });
 
   it("redacts attacker-controlled session, tool, and permission identifiers from all evidence", () => {
-    const recorder = new ManagedAgentEventRecorder("run-2");
+    const recorder = new ManagedAgentEventRecorder("run-2", "expected-model");
     const sessionSecret = "session-secret-credential";
     const toolIdSecret = "tool-id-secret-credential";
     const permissionIdSecret = "permission-id-secret-credential";
@@ -192,6 +206,31 @@ describe("ManagedAgentEventRecorder", () => {
     }
   });
 
+  it("requires both SDK init and result usage to report only the selected alias", () => {
+    const expectedModel = "claude-sonnet-5-anthropic-anthropic-eval";
+    const recorder = new ManagedAgentEventRecorder("run-model", expectedModel);
+    recorder.observeSdkEvent({
+      type: "system",
+      subtype: "init",
+      model: expectedModel,
+    });
+    recorder.observeSdkEvent({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      modelUsage: { [expectedModel]: { inputTokens: 1, outputTokens: 1 } },
+    });
+
+    expect(recorder.modelEvidence).toEqual({
+      authority: "sdk_non_authoritative",
+      initModelObserved: true,
+      initModelMatchesExpectedAlias: true,
+      resultModelUsageObserved: true,
+      resultModelUsageMatchesExpectedAlias: true,
+      resultModelCount: 1,
+    });
+  });
+
   it("rejects missing, empty, and overlong tool-use identifiers instead of normalizing sentinels", () => {
     const invalidIds = [
       undefined,
@@ -204,7 +243,10 @@ describe("ManagedAgentEventRecorder", () => {
         ManagedAgentEventError,
       );
 
-      const requested = new ManagedAgentEventRecorder("invalid-requested");
+      const requested = new ManagedAgentEventRecorder(
+        "invalid-requested",
+        "expected-model",
+      );
       expect(() =>
         requested.observeSdkEvent({
           type: "assistant",
@@ -223,7 +265,10 @@ describe("ManagedAgentEventRecorder", () => {
       ).toThrow(ManagedAgentEventError);
       expect(requested.toolEvidence).toEqual([]);
 
-      const completed = new ManagedAgentEventRecorder("invalid-completed");
+      const completed = new ManagedAgentEventRecorder(
+        "invalid-completed",
+        "expected-model",
+      );
       expect(() =>
         completed.observeSdkEvent({
           type: "user",
@@ -243,7 +288,7 @@ describe("ManagedAgentEventRecorder", () => {
   });
 
   it("counts distinct hashed assistant ids and keeps bounded SDK turns separate", () => {
-    const recorder = new ManagedAgentEventRecorder("run-3");
+    const recorder = new ManagedAgentEventRecorder("run-3", "expected-model");
     for (const messageId of [
       "private-message-a",
       "private-message-a",

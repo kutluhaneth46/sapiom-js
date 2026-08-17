@@ -687,7 +687,13 @@ export function evaluateManagedAgentProbe(
       id: "exact_model_alias",
       passed:
         result.modelAlias ===
-        resolveManagedAgentModelTarget(result.target).alias,
+          resolveManagedAgentModelTarget(result.target).alias &&
+        result.sdkModelEvidence.initModelObserved &&
+        result.sdkModelEvidence.initModelMatchesExpectedAlias &&
+        (result.sdkModelEvidence.resultModelUsageObserved
+          ? result.sdkModelEvidence.resultModelUsageMatchesExpectedAlias &&
+            result.sdkModelEvidence.resultModelCount === 1
+          : result.scenario === "L2" && result.terminal === "cancelled"),
     },
     { id: "sdk_session_observed", passed: Boolean(result.sdkSessionId) },
     { id: "query_closed", passed: result.queryClosed },

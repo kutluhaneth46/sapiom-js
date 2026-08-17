@@ -452,7 +452,7 @@ export async function runManagedAgentProbe(
     config.target,
     executionId,
   );
-  const recorder = new ManagedAgentEventRecorder(runId);
+  const recorder = new ManagedAgentEventRecorder(runId, validated.model.alias);
   const mcpRuntime = createManagedAgentMcpRuntime(config.expectedMcpNonce);
   const abortController = new AbortController();
   const triggerController = new AbortController();
@@ -460,6 +460,18 @@ export async function runManagedAgentProbe(
   const before = await captureManagedAgentWorkspaceSnapshot(
     validated.canonicalWorkspaceRoot,
   );
+  const childEnvironment = buildManagedAgentChildEnvironment({
+    ambient: process.env,
+    configRoot: validated.canonicalConfigRoot,
+    gatewayOrigin: validated.gatewayOrigin,
+    gatewayCredential: config.gatewayCredential,
+    modelAlias: validated.model.alias,
+    evalSource,
+    executionId,
+  });
+  const processObserver =
+    dependencies.processObserver ??
+    createLocalManagedAgentProcessObserver({ monotonicNow });
   let cancellationRequested = false;
   let teardownDeadline: ManagedAgentTeardownDeadline | undefined;
   const ensureTeardownDeadline = (): ManagedAgentTeardownDeadline => {
@@ -469,6 +481,10 @@ export async function runManagedAgentProbe(
         startedAtMs,
         deadlineAtMs: startedAtMs + MANAGED_AGENT_TEARDOWN_TIMEOUT_MS,
       });
+      // The observer must see the exact same deadline before the first abort,
+      // SDK close, or iterator return. This also arms a previously observed
+      // SDK-forwarded abort without granting it an unbounded cleanup window.
+      processObserver.beginTeardown(teardownDeadline);
     }
     return teardownDeadline;
   };
@@ -486,18 +502,6 @@ export async function runManagedAgentProbe(
   let queryExecution: ManagedAgentQueryExecutionOutcome = "not_started";
   const guardRejections: ManagedAgentPreToolUseGuardRejection[] = [];
 
-  const childEnvironment = buildManagedAgentChildEnvironment({
-    ambient: process.env,
-    configRoot: validated.canonicalConfigRoot,
-    gatewayOrigin: validated.gatewayOrigin,
-    gatewayCredential: config.gatewayCredential,
-    modelAlias: validated.model.alias,
-    evalSource,
-    executionId,
-  });
-  const processObserver =
-    dependencies.processObserver ??
-    createLocalManagedAgentProcessObserver({ monotonicNow });
   const policyBoundary = createManagedAgentPolicyBoundary({
     canonicalWorkspaceRoot: validated.canonicalWorkspaceRoot,
     allowedBuiltinTools:
@@ -802,6 +806,7 @@ export async function runManagedAgentProbe(
     scenario: config.scenario,
     target: config.target,
     modelAlias: validated.model.alias,
+    sdkModelEvidence: recorder.modelEvidence,
     ...(recorder.sessionId ? { sdkSessionId: recorder.sessionId } : {}),
     inferenceTurns: recorder.inferenceTurns,
     ...(recorder.sdkNumTurns === undefined

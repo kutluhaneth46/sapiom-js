@@ -52,6 +52,7 @@ export const MANAGED_AGENT_LOGICAL_KILL_SHIM_SDK_VERSION = "0.3.228" as const;
  */
 const MANAGED_AGENT_POSIX_SUPERVISOR_SOURCE = String.raw`
 import { spawn } from "node:child_process";
+import { performance } from "node:perf_hooks";
 
 const PAYLOAD_ENV = "SAPIOM_MANAGED_AGENT_SUPERVISOR_PAYLOAD";
 const HELPER_TIMEOUT_MS = 200;
@@ -185,7 +186,7 @@ async function checkMembership() {
   const members = await readOtherGroupMembers();
   membershipCheckRunning = false;
   if (members && members.length === 0) {
-    const now = Date.now();
+    const now = performance.now();
     emptyGroupObservedAt ??= now;
     const remainingGrace =
       EMPTY_GROUP_EXIT_GRACE_MS - (now - emptyGroupObservedAt);
@@ -583,6 +584,7 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
   #lifecycleEpoch = 0;
   #sealed = false;
   #hostDisposing = false;
+  #abortObserved = false;
   #teardownDeadline: ManagedAgentTeardownDeadline | undefined;
   #sampleTask: ProcessSampleTask | undefined;
   #disposeTask: Promise<void> | undefined;
@@ -630,6 +632,11 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
     return this.#teardownDeadline;
   }
 
+  public beginTeardown(deadline: ManagedAgentTeardownDeadline): void {
+    this.#adoptDeadline(deadline);
+    if (this.#abortObserved) this.#requestFallbackCleanupSynchronously();
+  }
+
   #remainingMs(deadline: ManagedAgentTeardownDeadline): number {
     return Math.max(0, deadline.deadlineAtMs - this.#monotonicNow());
   }
@@ -643,20 +650,6 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
     }
     this.#seal();
     return true;
-  }
-
-  #normalizeDeadline(
-    input: ManagedAgentTeardownDeadline | number,
-  ): ManagedAgentTeardownDeadline {
-    if (typeof input !== "number") return this.#adoptDeadline(input);
-    if (this.#teardownDeadline) return this.#teardownDeadline;
-    const startedAtMs = this.#monotonicNow();
-    return this.#adoptDeadline(
-      Object.freeze({
-        startedAtMs,
-        deadlineAtMs: startedAtMs + Math.max(0, input),
-      }),
-    );
   }
 
   #seal(): void {
@@ -793,13 +786,19 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
     signal.addEventListener(
       "abort",
       () => {
+        this.#abortObserved = true;
+        // The SDK may forward its private signal before runtime enters its
+        // teardown path. Remember it, but never signal from an unbounded
+        // window; beginTeardown() will synchronously replay the request.
+        if (!this.#teardownDeadline) return;
         if (this.#sealed || this.#deadlineExpiredAndSeal()) return;
         this.#requestFallbackCleanupSynchronously();
       },
       { once: true },
     );
     if (signal.aborted) {
-      this.#requestFallbackCleanupSynchronously();
+      this.#abortObserved = true;
+      if (this.#teardownDeadline) this.#requestFallbackCleanupSynchronously();
     }
   }
 
@@ -1795,6 +1794,36 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
     this.#stopOwnedRootsSynchronously();
   }
 
+  /**
+   * Disposal may run after the evidence deadline has irreversibly sealed the
+   * observer. A group for which this observer successfully issued SIGSTOP
+   * cannot execute, exit, fork, or have its PGID recycled while stopped, so
+   * that frozen kernel anchor remains safe for one final SIGKILL without a
+   * new process-table sample. This is leak prevention only: it never changes
+   * the already-finalized teardown evidence or grants authority for a group
+   * that was not stopped before sealing.
+   */
+  #forceKillStoppedGroupsForDisposalSynchronously(): void {
+    if (this.#platform !== "darwin" && this.#platform !== "linux") return;
+
+    const toolProcessGroupId = this.#toolProcessGroupId;
+    if (
+      this.#toolProcessStopIssued &&
+      !this.#toolProcessForceKillIssued &&
+      typeof toolProcessGroupId === "number"
+    ) {
+      const outcome = this.#signalProcessGroup(toolProcessGroupId, "SIGKILL");
+      this.#toolProcessForceKillIssued = outcome === "sent";
+    }
+
+    for (const root of this.#roots.values()) {
+      if (root.stopIssued && !root.forceKillIssued && childActive(root.child)) {
+        const outcome = this.#signalProcessGroup(root.pid, "SIGKILL");
+        root.forceKillIssued = outcome === "sent";
+      }
+    }
+  }
+
   #advanceFallbackCleanup(): void {
     if (
       this.#sealed ||
@@ -2013,34 +2042,14 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
   }
 
   public async waitForQuiescence(
-    deadlineInput: ManagedAgentTeardownDeadline | number,
+    deadline: ManagedAgentTeardownDeadline,
   ): Promise<ManagedAgentTeardownObservation> {
-    const adoptedDeadline = this.#normalizeDeadline(deadlineInput);
+    const adoptedDeadline = this.#adoptDeadline(deadline);
     const startedAt = adoptedDeadline.startedAtMs;
     const boundedTimeoutMs = Math.max(
       0,
       adoptedDeadline.deadlineAtMs - adoptedDeadline.startedAtMs,
     );
-    if (
-      this.#remainingMs(adoptedDeadline) === 0 &&
-      this.#processTableAvailable &&
-      !this.#processTableNeedsRefresh &&
-      !this.#sampleTask
-    ) {
-      const cachedObservation = this.#currentObservation(startedAt, false);
-      if (cachedObservation.quiescent) {
-        // The fresh cached table already proved quiescence at call entry. Its
-        // evidence elapsed is therefore zero even if returning the Promise
-        // crosses a wall-clock millisecond boundary.
-        const result = {
-          ...cachedObservation,
-          deadlineMet: true,
-          elapsedMs: 0,
-        };
-        this.#seal();
-        return result;
-      }
-    }
     for (;;) {
       if (this.#remainingMs(adoptedDeadline) <= 0 || this.#sealed) {
         const observation = this.#currentObservation(startedAt, false);
@@ -2072,9 +2081,9 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
   }
 
   public async emergencyCleanup(
-    deadlineInput: ManagedAgentTeardownDeadline | number,
+    deadline: ManagedAgentTeardownDeadline,
   ): Promise<ManagedAgentTeardownObservation> {
-    const adoptedDeadline = this.#normalizeDeadline(deadlineInput);
+    const adoptedDeadline = this.#adoptDeadline(deadline);
     const startedAt = adoptedDeadline.startedAtMs;
     this.#requestFallbackCleanupSynchronously();
     const confirmation = await this.waitForQuiescence(adoptedDeadline);
@@ -2102,6 +2111,7 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
   async #disposeInternal(): Promise<void> {
     this.#hostDisposing = true;
     this.#seal();
+    this.#forceKillStoppedGroupsForDisposalSynchronously();
 
     // The two exact fixture processes authenticated these retained channels
     // with an observer-created capability that was never written into the

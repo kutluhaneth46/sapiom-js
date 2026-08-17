@@ -111,6 +111,14 @@ function passingL1Result(): ManagedAgentProbeResult {
     scenario: "L1",
     target: "sonnet-5",
     modelAlias: "claude-sonnet-5-anthropic-anthropic-eval",
+    sdkModelEvidence: {
+      authority: "sdk_non_authoritative",
+      initModelObserved: true,
+      initModelMatchesExpectedAlias: true,
+      resultModelUsageObserved: true,
+      resultModelUsageMatchesExpectedAlias: true,
+      resultModelCount: 1,
+    },
     sdkSessionId: "11111111-1111-4111-8111-111111111111",
     inferenceTurns: 8,
     sdkNumTurns: 8,
@@ -630,6 +638,24 @@ describe("managed-agent probe CLI", () => {
         ({ id }) => id === "builtin_tools_succeeded",
       ),
     ).toEqual({ id: "builtin_tools_succeeded", passed: false });
+  });
+
+  it("fails exact-model certification when SDK-observed model evidence is missing or mixed", () => {
+    const passing = passingL1Result();
+    const report = evaluateManagedAgentProbe({
+      ...passing,
+      sdkModelEvidence: {
+        ...passing.sdkModelEvidence,
+        resultModelUsageMatchesExpectedAlias: false,
+        resultModelCount: 2,
+      },
+    });
+
+    expect(report.checks).toContainEqual({
+      id: "exact_model_alias",
+      passed: false,
+    });
+    expect(report.outcome).toBe("fail");
   });
 
   it.each([

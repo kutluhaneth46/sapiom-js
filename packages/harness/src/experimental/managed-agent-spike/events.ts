@@ -5,6 +5,7 @@ import type {
   ManagedAgentEventNormalizationFailureReason,
   ManagedAgentPermissionEvidence,
   ManagedAgentProbeEvent,
+  ManagedAgentSdkModelEvidence,
   ManagedAgentSdkUsageEstimate,
   ManagedAgentTerminalClassification,
   ManagedAgentToolEvidence,
@@ -155,16 +156,23 @@ export class ManagedAgentEventRecorder {
   readonly #permissionEvidence: ManagedAgentPermissionEvidence[] = [];
   readonly #inferenceMessageIds = new Set<string>();
   readonly #runId: string;
+  readonly #expectedModelAlias: string;
   #terminalRecorded = false;
   #sessionId: string | undefined;
   #usage: ManagedAgentSdkUsageEstimate | undefined;
   #sdkNumTurns: number | undefined;
+  #initModelObserved = false;
+  #initModelMatchesExpectedAlias = false;
+  #resultModelUsageObserved = false;
+  #resultModelUsageMatchesExpectedAlias = false;
+  #resultModelCount = 0;
   #sdkResult:
     | { readonly isError: boolean; readonly subtype?: string }
     | undefined;
 
-  public constructor(runId: string) {
+  public constructor(runId: string, expectedModelAlias: string) {
     this.#runId = runId;
+    this.#expectedModelAlias = expectedModelAlias;
   }
 
   public get events(): readonly ManagedAgentProbeEvent[] {
@@ -185,6 +193,18 @@ export class ManagedAgentEventRecorder {
 
   public get usage(): ManagedAgentSdkUsageEstimate | undefined {
     return this.#usage;
+  }
+
+  public get modelEvidence(): ManagedAgentSdkModelEvidence {
+    return {
+      authority: "sdk_non_authoritative",
+      initModelObserved: this.#initModelObserved,
+      initModelMatchesExpectedAlias: this.#initModelMatchesExpectedAlias,
+      resultModelUsageObserved: this.#resultModelUsageObserved,
+      resultModelUsageMatchesExpectedAlias:
+        this.#resultModelUsageMatchesExpectedAlias,
+      resultModelCount: this.#resultModelCount,
+    };
   }
 
   public get inferenceTurns(): number {
@@ -243,6 +263,10 @@ export class ManagedAgentEventRecorder {
     if (sessionId && !this.#sessionId) this.#sessionId = sessionId;
 
     if (type === "system" && subtype === "init") {
+      const initModel = optionalString(event.model);
+      this.#initModelObserved = initModel !== undefined;
+      this.#initModelMatchesExpectedAlias =
+        initModel === this.#expectedModelAlias;
       this.#append({ type: "lifecycle", subtype: "sdk_init", sessionId });
       return;
     }
@@ -325,6 +349,13 @@ export class ManagedAgentEventRecorder {
       const isError = event.is_error === true || subtype !== "success";
       this.#sdkResult = { isError, ...(subtype ? { subtype } : {}) };
       this.#usage = sdkUsage(event);
+      const modelUsage = asRecord(event.modelUsage);
+      const resultModels = modelUsage ? Object.keys(modelUsage) : [];
+      this.#resultModelCount = resultModels.length;
+      this.#resultModelUsageObserved = resultModels.length > 0;
+      this.#resultModelUsageMatchesExpectedAlias =
+        resultModels.length === 1 &&
+        resultModels[0] === this.#expectedModelAlias;
       this.#append({
         type: "sdk_result",
         subtype,

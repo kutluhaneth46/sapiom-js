@@ -59,6 +59,14 @@ in memory; raw or hashed IDs are not emitted. SDK `result.num_turns` is retained
 separately as bounded informational evidence and is not used as the BigQuery
 call-count key.
 
+The durable result also records content-free, non-authoritative SDK model
+evidence. A completed L1 run must observe the selected alias in both the SDK
+init event and the sole `result.modelUsage` key. A cancelled L2 run may have no
+result event, so it requires the matching init model and then relies on gateway
+reconciliation. These checks prove what the SDK reported, not what the gateway
+served: BigQuery provider/model, fallback, token, and cost rows remain the
+authoritative exact-deployment evidence for every live inference turn.
+
 The hermetic pinned-SDK loopback exercises Read, allowed and denied Bash, and a
 real in-process `echo_nonce` MCP turn. It requires one primary `PreToolUse`
 decision for each request and separately verifies the MCP handler invocation
@@ -142,8 +150,12 @@ permanently fails containment closed. Once L2 tool containment is armed, only
 the authenticated supervisor and fixture groups are permitted; an additional
 descendant group rejects readiness.
 
-The runtime gives the Agent SDK its documented abort and bounded query-close
-path first. It does not bind the raw per-run `Options.abortController` to host
+The runtime creates one immutable monotonic deadline and makes the observer
+adopt that same object before the first abort, `Query.close()`, or
+`Query.return()`. An SDK-forwarded signal observed before adoption is remembered
+but grants no signal authority until the bounded deadline exists. The runtime
+then gives the Agent SDK its documented abort and bounded query-close path
+first. It does not bind the raw per-run `Options.abortController` to host
 signals. Only the SDK-forwarded post-grace `SpawnOptions.signal` can trigger the
 fallback. In SDK 0.3.228, `Query.close()` starts cleanup but returns `void`, so
 the runtime immediately follows it with and awaits `Query.return()` under the
@@ -171,6 +183,13 @@ fourth must prove that root group absent. Failed stop/kill attempts remain
 retryable, but every attempt—including an ESRCH or helper failure—advances the
 sample generation and requires another fresh proof. The five-second absolute
 deadline bounds the entire sequence.
+
+Deadline expiry seals all evidence collection and ordinary fallback authority.
+Disposal has one narrower leak-prevention rule: if this observer successfully
+stopped an owned group before sealing, that stopped kernel group cannot execute,
+fork, exit, or have its PGID recycled, so disposal may issue its final `SIGKILL`
+without a new sample. This never changes a failed deadline result and never
+applies to a group that was not stopped while authority was fresh.
 
 If the root exits, a stable identity changes parent/group/session, a foreign
 member appears, ancestry is lost, both channels close prematurely, or a
@@ -209,6 +228,12 @@ credential is opened. The detached-group path is limited to this exact fixture;
 universal Bash containment, other command shapes, Windows Job Objects, and
 production recovery belong to later epics, and this probe does not claim those
 guarantees.
+
+The disposable fixture uses a host-owned lifetime lease outside the writable
+workspace. The lease exists before launch; `shutdown` contents or a missing
+lease both make the fixture parent stop its child and exit. Cleanup can therefore
+remove the temporary root without turning a startup race into a permanently
+running process.
 
 ## Pre-v2 live evidence
 

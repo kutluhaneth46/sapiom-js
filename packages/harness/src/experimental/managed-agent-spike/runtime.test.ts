@@ -61,6 +61,7 @@ function quiescentTeardown(): ManagedAgentTeardownObservation {
 function fakeObserver(
   teardown: ManagedAgentTeardownObservation = quiescentTeardown(),
 ): ManagedAgentProcessObserver & {
+  beginTeardown: ReturnType<typeof vi.fn>;
   waitForQuiescence: ReturnType<typeof vi.fn>;
   emergencyCleanup: ReturnType<typeof vi.fn>;
   dispose: ReturnType<typeof vi.fn>;
@@ -69,6 +70,7 @@ function fakeObserver(
     spawn: vi.fn(() => {
       throw new Error("fake query must not spawn");
     }),
+    beginTeardown: vi.fn(),
     armToolProcessContainment: vi.fn(),
     prepareCancellation: vi.fn(async () => ({
       supported: true,
@@ -1287,6 +1289,7 @@ const teardown = {
 };
 const observer = {
   spawn() { throw new Error("fake query must not spawn"); },
+  beginTeardown() {},
   armToolProcessContainment() {},
   async prepareCancellation() {
     return {
@@ -1384,6 +1387,45 @@ process.stdout.write(JSON.stringify({
       elapsedMs: 2_250,
     });
     expect(result.terminal).toBe("cancelled");
+  });
+
+  it("adopts the exact teardown deadline before close and iterator return", async () => {
+    const { config } = await probeConfig();
+    const observer = fakeObserver();
+    const order: string[] = [];
+    observer.beginTeardown.mockImplementation(() => {
+      order.push("observer_deadline_adopted");
+    });
+    const close = vi.fn(() => {
+      order.push("query_close");
+    });
+    const queryReturn = vi.fn(async () => {
+      order.push("query_return");
+      return { done: true as const, value: undefined };
+    });
+
+    await runManagedAgentProbe(config, {
+      hermeticGatewayOrigin: config.gatewayOrigin,
+      processObserver: observer,
+      queryFactory: () => ({
+        [Symbol.asyncIterator]() {
+          return {
+            next: async () => ({ done: true as const, value: undefined }),
+          };
+        },
+        close,
+        return: queryReturn,
+      }),
+    });
+
+    expect(order).toEqual([
+      "observer_deadline_adopted",
+      "query_close",
+      "query_return",
+    ]);
+    expect(observer.beginTeardown).toHaveBeenCalledOnce();
+    const adoptedDeadline = observer.beginTeardown.mock.calls[0]?.[0];
+    expect(observer.waitForQuiescence.mock.calls[0]?.[0]).toBe(adoptedDeadline);
   });
 
   it("never extends the teardown budget or reports deadline success when wall time rolls back", async () => {

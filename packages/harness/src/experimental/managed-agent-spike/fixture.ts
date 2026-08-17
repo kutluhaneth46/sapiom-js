@@ -15,6 +15,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join, relative, resolve } from "node:path";
+import { performance } from "node:perf_hooks";
 
 import { MANAGED_AGENT_L1_CERTIFICATION_CONTRACT } from "./contract.js";
 import {
@@ -84,7 +85,7 @@ function shellQuote(value: string): string {
 
 const LONG_RUNNING_SCRIPT = `
 import { spawn } from "node:child_process";
-import { existsSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { createConnection } from "node:net";
 import { resolve } from "node:path";
 
@@ -205,7 +206,16 @@ if (cleanupMarker) {
     try { unlinkSync(cleanupMarker); } catch {}
   });
   const cleanupPoll = setInterval(() => {
-    if (!existsSync(cleanupMarker)) return;
+    // The host creates a lifetime lease before launch. A missing lease means
+    // the disposable fixture root was removed during a startup race and must
+    // therefore be treated as shutdown, never as permission to keep running.
+    const shutdownRequested =
+      !existsSync(cleanupMarker) ||
+      (() => {
+        try { return readFileSync(cleanupMarker, "utf8") === "shutdown\\n"; }
+        catch { return true; }
+      })();
+    if (!shutdownRequested) return;
     clearInterval(cleanupPoll);
     if (child.connected) child.send("host-shutdown");
     child.once("exit", () => process.exit(0));
@@ -367,6 +377,9 @@ export async function createManagedAgentFixture(
       { mode: 0o600 },
     ),
     writeFile(outsideSentinel, outsideContents),
+    // This host-owned lease lives outside the model-writable workspace. The
+    // fixture treats deletion as shutdown too, closing the setup/cleanup race.
+    writeFile(cooperativeExitMarker, "run\n", { mode: 0o600 }),
   ]);
   await symlink(outsideSentinel, join(workspaceRoot, FIXTURE_PATHS.escapeLink));
 
@@ -420,22 +433,13 @@ export async function createManagedAgentFixture(
   let cooperativeExitRequested = false;
   const requestCooperativeExit = async (): Promise<void> => {
     if (!existsSync(root)) return;
-    if (
-      cooperativeExitRequested ||
-      !existsSync(join(workspaceRoot, FIXTURE_PATHS.processPidFile))
-    ) {
-      return;
+    if (!cooperativeExitRequested) {
+      cooperativeExitRequested = true;
+      await writeFile(cooperativeExitMarker, "shutdown\n", { mode: 0o600 });
     }
-    cooperativeExitRequested = true;
-    await writeFile(cooperativeExitMarker, "shutdown\n", { mode: 0o600 });
-    const deadline = Date.now() + 1_000;
-    while (existsSync(cooperativeExitMarker) && Date.now() < deadline) {
+    const deadline = performance.now() + 1_000;
+    while (existsSync(cooperativeExitMarker) && performance.now() < deadline) {
       await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
-    }
-    if (existsSync(cooperativeExitMarker)) {
-      // Permit a later cleanup attempt if the fixture process had not begun
-      // polling yet. The marker is still removed with the disposable root.
-      cooperativeExitRequested = false;
     }
   };
 

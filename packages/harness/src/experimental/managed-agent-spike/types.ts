@@ -136,6 +136,20 @@ export interface ManagedAgentSdkUsageEstimate {
   readonly estimatedCostUsd?: number;
 }
 
+/**
+ * Content-free SDK evidence that the configured alias was also reported by
+ * the running SDK. Gateway reconciliation remains authoritative for the
+ * upstream provider/model and fallback state.
+ */
+export interface ManagedAgentSdkModelEvidence {
+  readonly authority: "sdk_non_authoritative";
+  readonly initModelObserved: boolean;
+  readonly initModelMatchesExpectedAlias: boolean;
+  readonly resultModelUsageObserved: boolean;
+  readonly resultModelUsageMatchesExpectedAlias: boolean;
+  readonly resultModelCount: number;
+}
+
 export interface ManagedAgentWorkspaceChange {
   readonly path: string;
   readonly change: "created" | "modified" | "deleted";
@@ -250,6 +264,7 @@ export interface ManagedAgentProbeResult {
   readonly scenario: ManagedAgentProbeScenario;
   readonly target: ManagedAgentModelTargetId;
   readonly modelAlias: string;
+  readonly sdkModelEvidence: ManagedAgentSdkModelEvidence;
   readonly sdkSessionId?: string;
   /** Distinct, hashed assistant message IDs; authoritative for BQ call count. */
   readonly inferenceTurns: number;
@@ -303,6 +318,11 @@ export type ManagedAgentQueryFactory = (input: {
 
 export interface ManagedAgentProcessObserver {
   spawn(options: SpawnOptions): SpawnedProcess;
+  /**
+   * Adopt the runtime's one immutable monotonic teardown deadline before any
+   * abort, Query.close(), or Query.return() operation may begin.
+   */
+  beginTeardown(deadline: ManagedAgentTeardownDeadline): void;
   /**
    * Arm the two host-authenticated lifetime observations used only by the
    * exact E0.4 L2 fixture. Tool-reported identities never grant authority by

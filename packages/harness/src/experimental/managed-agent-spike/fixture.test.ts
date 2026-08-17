@@ -1,5 +1,6 @@
-import { execFileSync } from "node:child_process";
-import { writeFile } from "node:fs/promises";
+import { execFileSync, spawn } from "node:child_process";
+import { once } from "node:events";
+import { rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
@@ -55,6 +56,29 @@ describe("managed-agent disposable git fixture", () => {
       { path: FIXTURE_PATHS.dirtySentinel, preserved: true },
       { path: FIXTURE_PATHS.untrackedSentinel, preserved: true },
     ]);
+  });
+
+  it("treats a deleted host lifetime lease as shutdown during startup", async () => {
+    const fixture = await createManagedAgentFixture(() => "lease-shutdown");
+    fixtures.push(fixture);
+    await rm(fixture.cooperativeExitMarker, { force: true });
+    const processScript = join(
+      fixture.workspaceRoot,
+      FIXTURE_PATHS.processScript,
+    );
+    const child = spawn(
+      process.execPath,
+      [
+        processScript,
+        join(fixture.workspaceRoot, FIXTURE_PATHS.processPidFile),
+        "--host-cleanup-marker",
+        fixture.cooperativeExitMarker,
+      ],
+      { stdio: "ignore", windowsHide: true },
+    );
+
+    const [exitCode] = await once(child, "exit");
+    expect(exitCode).toBe(0);
   });
 
   it("renders L1 as eleven exact ordered calls without resolving the escape link", async () => {
