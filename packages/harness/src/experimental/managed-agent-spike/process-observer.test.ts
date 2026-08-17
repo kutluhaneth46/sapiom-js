@@ -2,7 +2,6 @@ import { once } from "node:events";
 import {
   ChildProcess,
   execFile,
-  execFileSync,
   spawn as spawnChild,
   type ChildProcessWithoutNullStreams,
 } from "node:child_process";
@@ -103,6 +102,20 @@ function activeNodeCommand(): { command: string; args: string[] } {
     command: process.execPath,
     args: ["-e", "setInterval(() => {}, 1000)"],
   };
+}
+
+function spawnCooperativeTestProcess(): ChildProcess {
+  return spawnChild(
+    process.execPath,
+    [
+      "-e",
+      'process.on("disconnect", () => process.exit(0)); setInterval(() => {}, 1000)',
+    ],
+    {
+      stdio: ["ignore", "ignore", "ignore", "ipc"],
+      windowsHide: true,
+    },
+  );
 }
 
 const FAST_EXIT_ROOT_SCRIPT = String.raw`
@@ -313,24 +326,8 @@ async function sendClosedToolRegistration(
 function asChildProcess(
   spawned: SpawnedProcess,
 ): ChildProcessWithoutNullStreams {
-  const child = spawned as ChildProcessWithoutNullStreams;
-  captureRetainedRootAuthority(child);
-  return child;
+  return spawned as ChildProcessWithoutNullStreams;
 }
-
-interface RetainedRootAuthority {
-  readonly pid: number;
-  readonly record: ManagedAgentKernelProcessRecord;
-  readonly ancestry: readonly (readonly [
-    number,
-    ManagedAgentKernelProcessRecord,
-  ])[];
-}
-
-const retainedRootAuthorities = new WeakMap<
-  ChildProcess,
-  RetainedRootAuthority
->();
 
 function sameFullTestIdentity(
   expected: ManagedAgentKernelProcessRecord,
@@ -341,72 +338,6 @@ function sameFullTestIdentity(
     expected.parentPid === current.parentPid &&
     expected.processGroupId === current.processGroupId &&
     expected.sessionId === current.sessionId
-  );
-}
-
-function processAncestry(
-  pid: number,
-  table: ReadonlyMap<number, ManagedAgentKernelProcessRecord>,
-): RetainedRootAuthority["ancestry"] {
-  const ancestry: Array<readonly [number, ManagedAgentKernelProcessRecord]> =
-    [];
-  const seen = new Set<number>();
-  let currentPid = pid;
-  while (currentPid > 0 && !seen.has(currentPid)) {
-    seen.add(currentPid);
-    const record = table.get(currentPid);
-    if (!record) break;
-    ancestry.push([currentPid, record]);
-    currentPid = record.parentPid;
-  }
-  return ancestry;
-}
-
-function captureRetainedRootAuthority(child: ChildProcess): void {
-  if (
-    process.platform === "win32" ||
-    typeof child.pid !== "number" ||
-    retainedRootAuthorities.has(child)
-  ) {
-    return;
-  }
-  try {
-    const sessionColumn = managedAgentPosixSessionColumn(process.platform);
-    const stdout = execFileSync(
-      "/bin/ps",
-      ["-axo", `pid=,ppid=,pgid=,${sessionColumn}=,stat=,lstart=`],
-      { encoding: "utf8", maxBuffer: 4 * 1024 * 1024 },
-    );
-    const table = parseManagedAgentPosixProcessTable(stdout);
-    const record = table.get(child.pid);
-    if (!record) return;
-    retainedRootAuthorities.set(child, {
-      pid: child.pid,
-      record,
-      ancestry: processAncestry(child.pid, table),
-    });
-  } catch {
-    // A missing acquisition snapshot permanently removes fallback authority.
-  }
-}
-
-function retainedRootAuthorityMatches(
-  authority: RetainedRootAuthority,
-  table: ReadonlyMap<number, ManagedAgentKernelProcessRecord>,
-): boolean {
-  const leader = table.get(authority.pid);
-  const currentAncestry = processAncestry(authority.pid, table);
-  return Boolean(
-    leader &&
-    !leader.state?.startsWith("Z") &&
-    leader.processGroupId === authority.pid &&
-    sameFullTestIdentity(authority.record, leader) &&
-    authority.ancestry.length === currentAncestry.length &&
-    authority.ancestry.every(
-      ([pid, record], index) =>
-        currentAncestry[index]?.[0] === pid &&
-        sameFullTestIdentity(record, currentAncestry[index]?.[1]),
-    ),
   );
 }
 
@@ -425,20 +356,6 @@ function processGroupExists(processGroupId: number): boolean {
     return true;
   } catch (error) {
     return (error as NodeJS.ErrnoException).code === "EPERM";
-  }
-}
-
-function signalRealProcessGroup(
-  processGroupId: number,
-  signal: "SIGSTOP" | "SIGKILL",
-): "sent" | "gone" | "failure" {
-  try {
-    process.kill(-processGroupId, signal);
-    return "sent";
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "ESRCH"
-      ? "gone"
-      : "failure";
   }
 }
 
@@ -511,10 +428,17 @@ async function waitForChildExitBounded(
   ]);
 }
 
-async function forceKillExactTestProcess(child: ChildProcess): Promise<void> {
+async function stopExactTestProcess(child: ChildProcess): Promise<void> {
   const pid = child.pid;
   if (typeof pid !== "number") return;
-  child.kill("SIGKILL");
+  if (child.exitCode === null && child.signalCode === null) {
+    if (!child.connected) {
+      throw new Error(
+        `Refusing cleanup for test process ${pid} without its retained IPC channel`,
+      );
+    }
+    child.disconnect();
+  }
   await waitForTestProcessDeath(
     () => processExists(pid),
     `Unrelated process ${pid}`,
@@ -571,39 +495,16 @@ async function waitForExactTestProcessIdentitiesToExit(
   }
 }
 
-async function forceKillRetainedTestGroup(root: ChildProcess): Promise<void> {
-  const authority = retainedRootAuthorities.get(root);
-  const processGroupId = authority?.pid;
-  if (
-    typeof processGroupId !== "number" ||
-    root.exitCode !== null ||
-    root.signalCode !== null
-  ) {
-    return;
-  }
-
-  const observation = await readRealPosixProcessTable();
-  if (!observation.available) {
-    throw new Error("Process table unavailable for retained group cleanup");
-  }
-  if (
-    !authority ||
-    !retainedRootAuthorityMatches(authority, observation.processes)
-  ) {
+async function stopRetainedTestGroup(root: ChildProcess): Promise<void> {
+  if (root.exitCode !== null || root.signalCode !== null) return;
+  if (!root.connected) {
     throw new Error(
-      `Refusing cached group cleanup for unverified root ${processGroupId}`,
+      "Refusing supervisor cleanup without its retained process-bound IPC channel",
     );
   }
-  if (root.exitCode !== null || root.signalCode !== null) return;
-
-  // The retained, still-active ChildProcess plus this fresh kernel snapshot is
-  // the complete authority for the one group signal below. Never probe or
-  // signal this negative PGID again after the leader can have exited.
-  try {
-    process.kill(-processGroupId, "SIGKILL");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
-  }
+  // The supervisor's disconnect handler kills its own current group. No
+  // cached numeric PID or PGID crosses this test-cleanup boundary.
+  root.disconnect();
   await waitForChildExitBounded(root);
 }
 
@@ -614,21 +515,15 @@ async function proveRetainedGroupAuthority(
     () => `fast-root-exit-${exitTiming}`,
   );
   fixtures.push(fixture);
-  const productionGroupSignals: Array<
-    readonly [number, "SIGSTOP" | "SIGKILL"]
-  > = [];
+  const productionGroupSignals: Array<readonly [number, "SIGKILL"]> = [];
   const observer = new LocalManagedAgentProcessObserver({
-    signalProcessGroup: (processGroupId, signal) => {
+    testOnlyRequestTermination: (processGroupId, signal) => {
       productionGroupSignals.push([processGroupId, signal]);
-      return signalRealProcessGroup(processGroupId, signal);
+      return "failure";
     },
   });
   const forwardedController = new AbortController();
-  const unrelated = spawnChild(
-    process.execPath,
-    ["-e", "setInterval(() => {}, 1000)"],
-    { stdio: "ignore", windowsHide: true },
-  );
+  const unrelated = spawnCooperativeTestProcess();
   await once(unrelated, "spawn");
   let anchor: ChildProcessWithoutNullStreams | undefined;
   let nonCooperativeChildPid: number | undefined;
@@ -717,7 +612,7 @@ async function proveRetainedGroupAuthority(
     }
     if (anchor && anchor.exitCode === null && anchor.signalCode === null) {
       if (anchor.connected) anchor.disconnect();
-      else await forceKillRetainedTestGroup(anchor);
+      else await stopRetainedTestGroup(anchor);
       await waitForChildExitBounded(anchor);
     }
     if (typeof nonCooperativeChildPid === "number") {
@@ -728,7 +623,7 @@ async function proveRetainedGroupAuthority(
     }
     forwardedController.abort();
     observer.dispose();
-    await forceKillExactTestProcess(unrelated);
+    await stopExactTestProcess(unrelated);
   }
 }
 
@@ -880,7 +775,7 @@ async function startRegisteredDescendantToolRun(
       cleanupErrors.push(error);
     }
     try {
-      await forceKillRetainedTestGroup(anchor);
+      await stopRetainedTestGroup(anchor);
     } catch (error) {
       cleanupErrors.push(error);
     } finally {
@@ -909,7 +804,7 @@ async function cleanupRegisteredDescendantToolRun(
     if (run.anchor.exitCode === null && run.anchor.signalCode === null) {
       await waitForChildExitBounded(run.anchor, 100).catch(() => undefined);
     }
-    await forceKillRetainedTestGroup(run.anchor);
+    await stopRetainedTestGroup(run.anchor);
   } catch (error) {
     cleanupErrors.push(error);
   } finally {
@@ -922,39 +817,6 @@ async function cleanupRegisteredDescendantToolRun(
 }
 
 describe("LocalManagedAgentProcessObserver", () => {
-  it.each([
-    ["parent", { parentPid: 2, processGroupId: 41, sessionId: 41 }],
-    ["process group", { parentPid: 1, processGroupId: 99, sessionId: 41 }],
-    ["session", { parentPid: 1, processGroupId: 41, sessionId: 99 }],
-  ] as const)(
-    "refuses retained-root fallback when same-start identity changes %s topology",
-    (_description, changedTopology) => {
-      const baseline = {
-        parentPid: 1,
-        processGroupId: 41,
-        sessionId: 41,
-        state: "S",
-        startedAt: "same-second-start",
-      } satisfies ManagedAgentKernelProcessRecord;
-      const authority: RetainedRootAuthority = {
-        pid: 41,
-        record: baseline,
-        ancestry: [[41, baseline]],
-      };
-      const current = new Map([
-        [
-          41,
-          {
-            ...baseline,
-            ...changedTopology,
-          },
-        ] as const,
-      ]);
-
-      expect(retainedRootAuthorityMatches(authority, current)).toBe(false);
-    },
-  );
-
   it.each([
     ["darwin", "sess"],
     ["linux", "sid"],
@@ -1007,7 +869,7 @@ describe("LocalManagedAgentProcessObserver", () => {
       await once(child, "exit");
       const killSpy = vi.spyOn(process, "kill");
       try {
-        await forceKillRetainedTestGroup(child);
+        await stopRetainedTestGroup(child);
         expect(
           killSpy.mock.calls.some(
             ([pid]) => typeof pid === "number" && pid < 0,
@@ -1052,7 +914,7 @@ describe("LocalManagedAgentProcessObserver", () => {
         expect(signalCode).toBeNull();
       } finally {
         if (typeof anchor.pid === "number") {
-          await forceKillRetainedTestGroup(anchor);
+          await stopRetainedTestGroup(anchor);
         }
         controller.abort();
         observer.dispose();
@@ -1089,7 +951,7 @@ describe("LocalManagedAgentProcessObserver", () => {
         expect(forwardedStderrBytes).toBe(1024 * 1024);
       } finally {
         if (typeof anchor.pid === "number") {
-          await forceKillRetainedTestGroup(anchor);
+          await stopRetainedTestGroup(anchor);
         }
         controller.abort();
         observer.dispose();
@@ -1128,7 +990,7 @@ describe("LocalManagedAgentProcessObserver", () => {
   );
 
   it.skipIf(process.platform === "win32")(
-    "records an SDK kill logically without signaling the live supervisor anchor",
+    "honors SDK SIGTERM calls while the supervisor keeps its owned group anchored",
     async () => {
       const nativeKillSpy = vi.spyOn(ChildProcess.prototype, "kill");
       const observer = new LocalManagedAgentProcessObserver();
@@ -1155,8 +1017,10 @@ describe("LocalManagedAgentProcessObserver", () => {
         expect(anchor.killed).toBe(false);
         expect(anchor.kill("SIGTERM")).toBe(true);
         expect(anchor.killed).toBe(true);
-        expect(anchor.kill("SIGTERM")).toBe(false);
-        expect(nativeKillSpy).not.toHaveBeenCalled();
+        expect(anchor.kill("SIGTERM")).toBe(true);
+        expect(nativeKillSpy).toHaveBeenCalledTimes(2);
+        expect(nativeKillSpy).toHaveBeenNthCalledWith(1, "SIGTERM");
+        expect(nativeKillSpy).toHaveBeenNthCalledWith(2, "SIGTERM");
         expect(processExists(processGroupId)).toBe(true);
         await expect(
           observer.waitForQuiescence(deadlineAfter(1)),
@@ -1189,11 +1053,7 @@ describe("LocalManagedAgentProcessObserver", () => {
       fixtures.push(fixture);
       const observer = new LocalManagedAgentProcessObserver();
       const forwardedController = new AbortController();
-      const unrelated = spawnChild(
-        process.execPath,
-        ["-e", "setInterval(() => {}, 1000)"],
-        { stdio: "ignore", windowsHide: true },
-      );
+      const unrelated = spawnCooperativeTestProcess();
       await once(unrelated, "spawn");
       let root: ChildProcessWithoutNullStreams | undefined;
       let ownedProcessGroupId: number | undefined;
@@ -1243,10 +1103,10 @@ describe("LocalManagedAgentProcessObserver", () => {
           // Test-harness safety must not depend on the observer behavior under
           // test. Exact test-owned PGID authority is retained until death is
           // independently confirmed, including when an assertion fails.
-          await forceKillRetainedTestGroup(root);
+          await stopRetainedTestGroup(root);
         }
         observer.dispose();
-        await forceKillExactTestProcess(unrelated);
+        await stopExactTestProcess(unrelated);
       }
     },
     15_000,
@@ -1259,11 +1119,7 @@ describe("LocalManagedAgentProcessObserver", () => {
       fixtures.push(fixture);
       const observer = new LocalManagedAgentProcessObserver();
       const controller = new AbortController();
-      const unrelated = spawnChild(
-        process.execPath,
-        ["-e", "setInterval(() => {}, 1000)"],
-        { stdio: "ignore", windowsHide: true },
-      );
+      const unrelated = spawnCooperativeTestProcess();
       await once(unrelated, "spawn");
       const anchor = asChildProcess(
         observer.spawn({
@@ -1310,11 +1166,11 @@ describe("LocalManagedAgentProcessObserver", () => {
           await waitForChildExitBounded(anchor, 250).catch(() => undefined);
         }
         if (anchor.exitCode === null && anchor.signalCode === null) {
-          await forceKillRetainedTestGroup(anchor);
+          await stopRetainedTestGroup(anchor);
         }
         controller.abort();
         if (!observerDisposed) await observer.dispose();
-        await forceKillExactTestProcess(unrelated);
+        await stopExactTestProcess(unrelated);
       }
     },
     10_000,
@@ -1325,7 +1181,7 @@ describe("LocalManagedAgentProcessObserver", () => {
     async () => {
       const signals: Array<readonly [number, string]> = [];
       const observer = new LocalManagedAgentProcessObserver({
-        signalProcessGroup: (groupId, signal) => {
+        testOnlyRequestTermination: (groupId, signal) => {
           signals.push([groupId, signal]);
           return "failure";
         },
@@ -1356,7 +1212,7 @@ describe("LocalManagedAgentProcessObserver", () => {
           run.anchor.exitCode === null &&
           run.anchor.signalCode === null
         ) {
-          await forceKillRetainedTestGroup(run.anchor);
+          await stopRetainedTestGroup(run.anchor);
         }
       }
     },
@@ -1367,7 +1223,7 @@ describe("LocalManagedAgentProcessObserver", () => {
     const signals: Array<readonly [number, string]> = [];
     const observer = new LocalManagedAgentProcessObserver({
       platform: "darwin",
-      signalProcessGroup: (groupId, signal) => {
+      testOnlyRequestTermination: (groupId, signal) => {
         signals.push([groupId, signal]);
         return "sent";
       },
@@ -1419,11 +1275,7 @@ describe("LocalManagedAgentProcessObserver", () => {
       fixtures.push(fixture);
       const observer = new LocalManagedAgentProcessObserver();
       const forwardedController = new AbortController();
-      const unrelated = spawnChild(
-        process.execPath,
-        ["-e", "setInterval(() => {}, 1000)"],
-        { stdio: "ignore", windowsHide: true },
-      );
+      const unrelated = spawnCooperativeTestProcess();
       await once(unrelated, "spawn");
       let anchor: ChildProcessWithoutNullStreams | undefined;
       let fixturePids: readonly number[] = [];
@@ -1472,24 +1324,26 @@ describe("LocalManagedAgentProcessObserver", () => {
         forwardedController.abort();
         await observer.dispose();
         if (anchor) {
-          await forceKillRetainedTestGroup(anchor);
+          await stopRetainedTestGroup(anchor);
         }
-        await forceKillExactTestProcess(unrelated);
+        await stopExactTestProcess(unrelated);
       }
     },
     15_000,
   );
 
   it.skipIf(process.platform === "win32")(
-    "advances forwarded-signal fallback on fresh samples and kills the supervisor anchor last",
+    "uses process-bound channels in tool-then-supervisor order without host SIGKILL",
     async () => {
       let rootProcessGroupId: number | undefined;
       let toolProcessGroupId: number | undefined;
-      const signals: Array<readonly [number, "SIGSTOP" | "SIGKILL"]> = [];
+      const terminationRequests: Array<readonly [number, "SIGKILL"]> = [];
+      const hostKillSpy = vi.spyOn(process, "kill");
       const observer = new LocalManagedAgentProcessObserver({
-        signalProcessGroup: (groupId, signal) => {
-          signals.push([groupId, signal]);
-          return signalRealProcessGroup(groupId, signal);
+        onTerminationRequest: ({ processGroupId }, outcome) => {
+          if (outcome === "sent") {
+            terminationRequests.push([processGroupId, "SIGKILL"]);
+          }
         },
       });
       let run: RegisteredDescendantToolRun | undefined;
@@ -1506,7 +1360,7 @@ describe("LocalManagedAgentProcessObserver", () => {
         run.forwardedController.abort();
         const deadline = Date.now() + 2_000;
         while (
-          !signals.some(
+          !terminationRequests.some(
             ([groupId, signal]) =>
               groupId === rootProcessGroupId && signal === "SIGKILL",
           ) &&
@@ -1516,10 +1370,13 @@ describe("LocalManagedAgentProcessObserver", () => {
           await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
         }
 
-        expect(signals).toEqual([
+        expect(terminationRequests).toEqual([
           [toolProcessGroupId, "SIGKILL"],
           [rootProcessGroupId, "SIGKILL"],
         ]);
+        expect(
+          hostKillSpy.mock.calls.some(([, signal]) => signal === "SIGKILL"),
+        ).toBe(false);
         await expect(
           observer.waitForQuiescence(teardownDeadline),
         ).resolves.toMatchObject({
@@ -1531,6 +1388,7 @@ describe("LocalManagedAgentProcessObserver", () => {
           alivePidsAtDeadline: [],
         });
       } finally {
+        hostKillSpy.mockRestore();
         await cleanupRegisteredDescendantToolRun(run);
         observer.dispose();
       }
@@ -1564,7 +1422,7 @@ describe("LocalManagedAgentProcessObserver", () => {
       } finally {
         if (setupEvidence) {
           await observer.dispose();
-          await forceKillRetainedTestGroup(setupEvidence.anchor);
+          await stopRetainedTestGroup(setupEvidence.anchor);
         }
         await observer.dispose();
       }
@@ -1577,7 +1435,7 @@ describe("LocalManagedAgentProcessObserver", () => {
     async () => {
       let injectForeignMember = false;
       let toolProcessGroupId: number | undefined;
-      const signals: Array<readonly [number, "SIGSTOP" | "SIGKILL"]> = [];
+      const signals: Array<readonly [number, "SIGKILL"]> = [];
       const observer = new LocalManagedAgentProcessObserver({
         readProcessTable: async () => {
           const observation = await readRealPosixProcessTable();
@@ -1599,9 +1457,9 @@ describe("LocalManagedAgentProcessObserver", () => {
           });
           return { available: true, processes };
         },
-        signalProcessGroup: (groupId, signal) => {
+        testOnlyRequestTermination: (groupId, signal) => {
           signals.push([groupId, signal]);
-          return signalRealProcessGroup(groupId, signal);
+          return "failure";
         },
       });
       let run: RegisteredDescendantToolRun | undefined;
@@ -1638,7 +1496,7 @@ describe("LocalManagedAgentProcessObserver", () => {
       let simulatePidReuse = false;
       let toolProcessGroupId: number | undefined;
       let registeredPids: readonly [number, number] | undefined;
-      const signals: Array<readonly [number, "SIGSTOP" | "SIGKILL"]> = [];
+      const signals: Array<readonly [number, "SIGKILL"]> = [];
       const observer = new LocalManagedAgentProcessObserver({
         readProcessTable: async () => {
           const observation = await readRealPosixProcessTable();
@@ -1670,9 +1528,9 @@ describe("LocalManagedAgentProcessObserver", () => {
           simulatePidReuse && groupId === toolProcessGroupId
             ? "alive"
             : realProcessGroupLiveness(groupId),
-        signalProcessGroup: (groupId, signal) => {
+        testOnlyRequestTermination: (groupId, signal) => {
           signals.push([groupId, signal]);
-          return signalRealProcessGroup(groupId, signal);
+          return "failure";
         },
       });
       let run: RegisteredDescendantToolRun | undefined;
@@ -1711,7 +1569,7 @@ describe("LocalManagedAgentProcessObserver", () => {
       let toolProcessGroupId: number | undefined;
       let killAttempts = 0;
       const toolSignals: Array<{
-        readonly signal: "SIGSTOP" | "SIGKILL";
+        readonly signal: "SIGKILL";
         readonly processTableReads: number;
       }> = [];
       const observer = new LocalManagedAgentProcessObserver({
@@ -1719,13 +1577,14 @@ describe("LocalManagedAgentProcessObserver", () => {
           processTableReads += 1;
           return readRealPosixProcessTable();
         },
-        signalProcessGroup: (groupId, signal) => {
-          if (groupId !== toolProcessGroupId) {
-            return signalRealProcessGroup(groupId, signal);
+        testOnlyBeforeTerminationRequest: ({ target }) => {
+          if (target === "tool" && killAttempts++ === 0) return "failure";
+          return undefined;
+        },
+        onTerminationRequest: ({ processGroupId, target }) => {
+          if (target === "tool" && processGroupId === toolProcessGroupId) {
+            toolSignals.push({ signal: "SIGKILL", processTableReads });
           }
-          toolSignals.push({ signal, processTableReads });
-          if (signal === "SIGKILL" && killAttempts++ === 0) return "failure";
-          return signalRealProcessGroup(groupId, signal);
         },
       });
       let run: RegisteredDescendantToolRun | undefined;
@@ -1768,11 +1627,11 @@ describe("LocalManagedAgentProcessObserver", () => {
     "never signals the detached tool group after the owned root exits and ancestry is lost",
     async () => {
       let toolProcessGroupId: number | undefined;
-      const signals: Array<readonly [number, "SIGSTOP" | "SIGKILL"]> = [];
+      const signals: Array<readonly [number, "SIGKILL"]> = [];
       const observer = new LocalManagedAgentProcessObserver({
-        signalProcessGroup: (groupId, signal) => {
+        testOnlyRequestTermination: (groupId, signal) => {
           signals.push([groupId, signal]);
-          return signalRealProcessGroup(groupId, signal);
+          return "failure";
         },
       });
       let run: RegisteredDescendantToolRun | undefined;
@@ -1782,7 +1641,7 @@ describe("LocalManagedAgentProcessObserver", () => {
           "root-exit-loses-tool-ancestry",
         );
         toolProcessGroupId = run.toolProcessGroupId;
-        await forceKillRetainedTestGroup(run.anchor);
+        await stopRetainedTestGroup(run.anchor);
         expect(processGroupExists(toolProcessGroupId)).toBe(true);
 
         const teardown = await observer.emergencyCleanup(deadlineAfter(250));
@@ -1876,7 +1735,7 @@ describe("LocalManagedAgentProcessObserver", () => {
         if (detachedTool) await waitForChildExitBounded(detachedTool);
         await observer.dispose();
         if (anchor) {
-          await forceKillRetainedTestGroup(anchor);
+          await stopRetainedTestGroup(anchor);
         }
         await observer.dispose();
       }
@@ -1969,7 +1828,7 @@ describe("LocalManagedAgentProcessObserver", () => {
         forwardedController.abort();
         await fixture.requestCooperativeExit();
         await observer.dispose();
-        if (anchor) await forceKillRetainedTestGroup(anchor);
+        if (anchor) await stopRetainedTestGroup(anchor);
         await observer.dispose();
       }
     },
@@ -2012,7 +1871,7 @@ describe("LocalManagedAgentProcessObserver", () => {
         });
       } finally {
         controller.abort();
-        await forceKillRetainedTestGroup(anchor);
+        await stopRetainedTestGroup(anchor);
         observer.dispose();
       }
     },
@@ -2024,14 +1883,9 @@ describe("LocalManagedAgentProcessObserver", () => {
     const observer = new LocalManagedAgentProcessObserver({
       platform: "darwin",
       readProcessTable: () => new Promise(() => undefined),
-      signalProcessGroup: (groupId, signal) => {
+      testOnlyRequestTermination: (groupId, signal) => {
         signals.push([groupId, signal]);
-        try {
-          process.kill(-groupId, signal);
-        } catch {
-          // The test-owned group may already have exited between signals.
-        }
-        return "sent";
+        return "failure";
       },
     });
     const controller = new AbortController();
@@ -2063,7 +1917,7 @@ describe("LocalManagedAgentProcessObserver", () => {
       controller.abort();
       expect(signals).toEqual([]);
     } finally {
-      await forceKillRetainedTestGroup(child);
+      await stopRetainedTestGroup(child);
       controller.abort();
       observer.dispose();
     }
@@ -2071,7 +1925,7 @@ describe("LocalManagedAgentProcessObserver", () => {
 
   it("remembers an SDK abort but grants no fallback signal before deadline adoption", async () => {
     let rootPid = 0;
-    const signals: Array<readonly [number, "SIGSTOP" | "SIGKILL"]> = [];
+    const signals: Array<readonly [number, "SIGKILL"]> = [];
     const observer = new LocalManagedAgentProcessObserver({
       platform: "darwin",
       readProcessTable: async () =>
@@ -2082,14 +1936,12 @@ describe("LocalManagedAgentProcessObserver", () => {
               parentPid: process.pid,
               processGroupId: rootPid,
               sessionId: rootPid,
-              state: signals.some(([, signal]) => signal === "SIGSTOP")
-                ? "T"
-                : "S",
+              state: "S",
               startedAt: "abort-before-deadline",
             },
           ],
         ]),
-      signalProcessGroup: (groupId, signal) => {
+      testOnlyRequestTermination: (groupId, signal) => {
         signals.push([groupId, signal]);
         return "sent";
       },
@@ -2116,7 +1968,7 @@ describe("LocalManagedAgentProcessObserver", () => {
       observer.beginTeardown(deadlineAfter(100));
       await vi.waitFor(() => expect(signals).toEqual([[rootPid, "SIGKILL"]]));
     } finally {
-      await forceKillRetainedTestGroup(child);
+      await stopRetainedTestGroup(child);
       await observer.dispose();
     }
   });
@@ -2164,27 +2016,23 @@ describe("LocalManagedAgentProcessObserver", () => {
   });
 
   it.skipIf(process.platform === "win32")(
-    "never signals a cached group during disposal after a post-kill observation misses the deadline",
+    "never uses a host numeric signal when channel confirmation misses the deadline",
     async () => {
-      let hangAfterKill = false;
-      let cachedNumericIdentityUnsafe = false;
-      const signals: Array<readonly [number, "SIGKILL"]> = [];
+      let hangAfterRequest = false;
+      const terminationRequests: Array<readonly [number, "SIGKILL"]> = [];
+      const hostKillSpy = vi.spyOn(process, "kill");
       const observer = new LocalManagedAgentProcessObserver({
         readProcessTable: () =>
-          hangAfterKill
+          hangAfterRequest
             ? new Promise<ManagedAgentProcessTableObservation>(() => undefined)
             : readRealPosixProcessTable(),
-        signalProcessGroup: (groupId, signal) => {
-          if (cachedNumericIdentityUnsafe) {
-            throw new Error("attempted to signal a potentially reused PGID");
+        onTerminationRequest: ({ processGroupId }, outcome) => {
+          if (outcome === "sent") {
+            terminationRequests.push([processGroupId, "SIGKILL"]);
+            // From this point onward, the sampled numeric PGID could be reused.
+            // No later host operation may signal it.
+            hangAfterRequest = true;
           }
-          signals.push([groupId, signal]);
-          // Once the kernel accepted SIGKILL, the original group can be reaped
-          // and its number reused before Node delivers ChildProcess close.
-          // Simulate that uncertainty by making every later numeric use fatal.
-          hangAfterKill = true;
-          cachedNumericIdentityUnsafe = true;
-          return "sent";
         },
       });
       const controller = new AbortController();
@@ -2210,15 +2058,19 @@ describe("LocalManagedAgentProcessObserver", () => {
           deadlineMet: false,
           forceKillIssued: true,
         });
-        expect(cachedNumericIdentityUnsafe).toBe(true);
-        expect(signals).toEqual([[anchor.pid!, "SIGKILL"]]);
+        expect(hangAfterRequest).toBe(true);
+        expect(terminationRequests).toEqual([[anchor.pid!, "SIGKILL"]]);
+        expect(
+          hostKillSpy.mock.calls.some(([, signal]) => signal === "SIGKILL"),
+        ).toBe(false);
 
         await observer.dispose();
         await waitForChildExitBounded(anchor);
-        expect(signals).toEqual([[anchor.pid!, "SIGKILL"]]);
+        expect(terminationRequests).toEqual([[anchor.pid!, "SIGKILL"]]);
         expect(processGroupExists(anchor.pid!)).toBe(false);
       } finally {
-        await forceKillRetainedTestGroup(anchor);
+        hostKillSpy.mockRestore();
+        await stopRetainedTestGroup(anchor);
         await observer.dispose();
       }
     },
@@ -2248,7 +2100,7 @@ describe("LocalManagedAgentProcessObserver", () => {
     const observer = new LocalManagedAgentProcessObserver({
       platform: "darwin",
       readProcessTable: table,
-      signalProcessGroup: (groupId, signal) => {
+      testOnlyRequestTermination: (groupId, signal) => {
         signals.push([groupId, signal]);
         return "sent";
       },
@@ -2278,7 +2130,7 @@ describe("LocalManagedAgentProcessObserver", () => {
       });
       expect(signals).toEqual([]);
     } finally {
-      await forceKillRetainedTestGroup(child);
+      await stopRetainedTestGroup(child);
       controller.abort();
       observer.dispose();
     }
@@ -2315,7 +2167,7 @@ describe("LocalManagedAgentProcessObserver", () => {
           ],
         ]),
       processGroupLiveness: () => "gone",
-      signalProcessGroup: (groupId, signal) => {
+      testOnlyRequestTermination: (groupId, signal) => {
         signals.push([groupId, signal]);
         return "sent";
       },
@@ -2353,7 +2205,7 @@ describe("LocalManagedAgentProcessObserver", () => {
       expect(observation.alivePidsAtDeadline).not.toContain(rootPid + 200);
       expect(signals).toEqual([]);
     } finally {
-      await forceKillRetainedTestGroup(anchor);
+      await stopRetainedTestGroup(anchor);
       controller.abort();
       observer.dispose();
     }
@@ -2393,7 +2245,7 @@ describe("LocalManagedAgentProcessObserver", () => {
               ],
             ]),
       processGroupLiveness: () => "gone",
-      signalProcessGroup: (groupId, signal) => {
+      testOnlyRequestTermination: (groupId, signal) => {
         signals.push([groupId, signal]);
         return "sent";
       },
@@ -2442,7 +2294,7 @@ describe("LocalManagedAgentProcessObserver", () => {
       });
       expect(signals).toEqual([]);
     } finally {
-      await forceKillRetainedTestGroup(anchor);
+      await stopRetainedTestGroup(anchor);
       controller.abort();
       observer.dispose();
     }
@@ -2452,7 +2304,7 @@ describe("LocalManagedAgentProcessObserver", () => {
     let rootPid = 0;
     let stage: "owned" | "exiting" | "gone" = "owned";
     let now = 0;
-    const signals: Array<readonly [number, "SIGSTOP" | "SIGKILL"]> = [];
+    const signals: Array<readonly [number, "SIGKILL"]> = [];
     const observer = new LocalManagedAgentProcessObserver({
       platform: "darwin",
       readProcessTable: async () => {
@@ -2478,9 +2330,7 @@ describe("LocalManagedAgentProcessObserver", () => {
               parentPid: process.pid,
               processGroupId: rootPid,
               sessionId: 0,
-              state: signals.some(([, signal]) => signal === "SIGSTOP")
-                ? "Ts"
-                : "Ss",
+              state: "Ss",
               startedAt: "root",
             },
           ],
@@ -2490,16 +2340,14 @@ describe("LocalManagedAgentProcessObserver", () => {
               parentPid: rootPid,
               processGroupId: rootPid,
               sessionId: 0,
-              state: signals.some(([, signal]) => signal === "SIGSTOP")
-                ? "T"
-                : "S",
+              state: "S",
               startedAt: "child",
             },
           ],
         ]);
       },
       processGroupLiveness: () => (stage === "gone" ? "gone" : "alive"),
-      signalProcessGroup: (groupId, signal) => {
+      testOnlyRequestTermination: (groupId, signal) => {
         signals.push([groupId, signal]);
         return "sent";
       },
@@ -2543,7 +2391,7 @@ describe("LocalManagedAgentProcessObserver", () => {
         alivePidsAtDeadline: [],
       });
     } finally {
-      await forceKillRetainedTestGroup(anchor);
+      await stopRetainedTestGroup(anchor);
       controller.abort();
       observer.dispose();
     }
@@ -2568,7 +2416,7 @@ describe("LocalManagedAgentProcessObserver", () => {
           ],
         ]),
       processGroupLiveness: () => "alive",
-      signalProcessGroup: (groupId, signal) => {
+      testOnlyRequestTermination: (groupId, signal) => {
         signals.push([groupId, signal]);
         return "sent";
       },
@@ -2592,7 +2440,7 @@ describe("LocalManagedAgentProcessObserver", () => {
       controller.abort();
       expect(signals).toEqual([]);
     } finally {
-      await forceKillRetainedTestGroup(anchor);
+      await stopRetainedTestGroup(anchor);
       controller.abort();
       observer.dispose();
     }
@@ -2645,7 +2493,7 @@ describe("LocalManagedAgentProcessObserver", () => {
           : subgroupAlive
             ? "alive"
             : "gone",
-      signalProcessGroup: (groupId, signal) => {
+      testOnlyRequestTermination: (groupId, signal) => {
         signals.push([groupId, signal]);
         return "sent";
       },
@@ -2684,7 +2532,7 @@ describe("LocalManagedAgentProcessObserver", () => {
       });
       expect(signals).toEqual([]);
     } finally {
-      await forceKillRetainedTestGroup(anchor);
+      await stopRetainedTestGroup(anchor);
       controller.abort();
       observer.dispose();
     }
@@ -2718,7 +2566,7 @@ describe("LocalManagedAgentProcessObserver", () => {
           ],
         ]),
       processGroupLiveness: () => "alive",
-      signalProcessGroup: (groupId, signal) => {
+      testOnlyRequestTermination: (groupId, signal) => {
         signals.push([groupId, signal]);
         return "sent";
       },
@@ -2745,7 +2593,7 @@ describe("LocalManagedAgentProcessObserver", () => {
       });
       expect(signals).toEqual([]);
     } finally {
-      await forceKillRetainedTestGroup(anchor);
+      await stopRetainedTestGroup(anchor);
       controller.abort();
       observer.dispose();
     }
@@ -2791,7 +2639,7 @@ describe("LocalManagedAgentProcessObserver", () => {
         ]);
       },
       processGroupLiveness: () => "gone",
-      signalProcessGroup: () => "sent",
+      testOnlyRequestTermination: () => "sent",
     });
     const controller = new AbortController();
     const anchor = asChildProcess(
@@ -2818,7 +2666,7 @@ describe("LocalManagedAgentProcessObserver", () => {
         alivePidsAtDeadline: [],
       });
     } finally {
-      await forceKillRetainedTestGroup(anchor);
+      await stopRetainedTestGroup(anchor);
       controller.abort();
       observer.dispose();
     }
@@ -2874,7 +2722,7 @@ describe("LocalManagedAgentProcessObserver", () => {
               ] as const)
             : []),
         ]),
-      signalProcessGroup: (groupId, signal) => {
+      testOnlyRequestTermination: (groupId, signal) => {
         signals.push([groupId, signal]);
         return "sent";
       },
@@ -2917,7 +2765,7 @@ describe("LocalManagedAgentProcessObserver", () => {
       });
       expect(signals).toEqual([]);
     } finally {
-      await forceKillRetainedTestGroup(anchor);
+      await stopRetainedTestGroup(anchor);
       forwardedController.abort();
       observer.dispose();
     }
@@ -2941,9 +2789,7 @@ describe("LocalManagedAgentProcessObserver", () => {
                     parentPid: process.pid,
                     processGroupId: rootPid,
                     sessionId: rootPid,
-                    state: signals.some(([, signal]) => signal === "SIGSTOP")
-                      ? "T"
-                      : "S",
+                    state: "S",
                     startedAt: "root",
                   },
                 ],
@@ -2957,20 +2803,16 @@ describe("LocalManagedAgentProcessObserver", () => {
                 subgroupState === "root_group" ? rootPid : subgroupPid(),
               sessionId:
                 subgroupState === "root_group" ? rootPid : subgroupPid(),
-              state:
-                subgroupState === "root_group" &&
-                signals.some(([, signal]) => signal === "SIGSTOP")
-                  ? "T"
-                  : "S",
+              state: "S",
               startedAt: "survived-root-kill",
             },
           ],
         ]);
       },
       processGroupLiveness: () => "alive",
-      signalProcessGroup: (groupId, signal) => {
+      testOnlyRequestTermination: (groupId, signal) => {
         signals.push([groupId, signal]);
-        if (signal === "SIGKILL") subgroupState = "reparented";
+        subgroupState = "reparented";
         return "sent";
       },
     });
@@ -3006,7 +2848,7 @@ describe("LocalManagedAgentProcessObserver", () => {
         alivePidsAtDeadline: [],
       });
     } finally {
-      await forceKillRetainedTestGroup(anchor);
+      await stopRetainedTestGroup(anchor);
       controller.abort();
       observer.dispose();
     }
@@ -3071,7 +2913,7 @@ describe("LocalManagedAgentProcessObserver", () => {
       let toolChildPid = 0;
       let toolGrandchildPid = 0;
       let escapedGroupId = 0;
-      const signals: Array<readonly [number, "SIGSTOP" | "SIGKILL"]> = [];
+      const signals: Array<readonly [number, "SIGKILL"]> = [];
       const observer = new LocalManagedAgentProcessObserver({
         readProcessTable: async () => {
           await Promise.resolve();
@@ -3138,7 +2980,7 @@ describe("LocalManagedAgentProcessObserver", () => {
         },
         processGroupLiveness: (groupId) =>
           escaped && groupId === escapedGroupId ? "alive" : "gone",
-        signalProcessGroup: (groupId, signal) => {
+        testOnlyRequestTermination: (groupId, signal) => {
           signals.push([groupId, signal]);
           return "sent";
         },
@@ -3183,7 +3025,7 @@ describe("LocalManagedAgentProcessObserver", () => {
         );
         for (const socket of registrations) socket.destroy();
         await Promise.all(registrationClosures);
-        await forceKillRetainedTestGroup(anchor);
+        await stopRetainedTestGroup(anchor);
 
         const teardown = await observer.emergencyCleanup(deadlineAfter(50));
 
@@ -3200,7 +3042,7 @@ describe("LocalManagedAgentProcessObserver", () => {
         );
       } finally {
         for (const socket of registrations) socket.destroy();
-        await forceKillRetainedTestGroup(anchor);
+        await stopRetainedTestGroup(anchor);
         controller.abort();
         observer.dispose();
       }
@@ -3220,9 +3062,7 @@ describe("LocalManagedAgentProcessObserver", () => {
             {
               parentPid: process.pid,
               processGroupId: rootPid,
-              state: signals.some(([, signal]) => signal === "SIGSTOP")
-                ? "T"
-                : "S",
+              state: "S",
               startedAt: "root",
             },
           ],
@@ -3231,14 +3071,12 @@ describe("LocalManagedAgentProcessObserver", () => {
             {
               parentPid: rootPid,
               processGroupId: rootPid,
-              state: signals.some(([, signal]) => signal === "SIGSTOP")
-                ? "T"
-                : "S",
+              state: "S",
               startedAt: "child",
             },
           ],
         ]),
-      signalProcessGroup: (groupId, signal) => {
+      testOnlyRequestTermination: (groupId, signal) => {
         signals.push([groupId, signal]);
         return "sent";
       },
@@ -3263,7 +3101,7 @@ describe("LocalManagedAgentProcessObserver", () => {
       await observer.observeProcessTree();
       expect(signals).toHaveLength(1);
     } finally {
-      await forceKillRetainedTestGroup(child);
+      await stopRetainedTestGroup(child);
       observer.dispose();
     }
   });
@@ -3284,18 +3122,16 @@ describe("LocalManagedAgentProcessObserver", () => {
             {
               parentPid: process.pid,
               processGroupId: rootPid,
-              state: signals.some(([, signal]) => signal === "SIGSTOP")
-                ? "T"
-                : "S",
+              state: "S",
               startedAt: "root",
             },
           ],
         ]);
       },
-      signalProcessGroup: (groupId, signal) => {
+      testOnlyRequestTermination: (groupId, signal) => {
         signals.push([groupId, signal]);
         signalReadCounts.push(processTableReads);
-        if (signal === "SIGKILL" && killAttempts++ === 0) return "failure";
+        if (killAttempts++ === 0) return "failure";
         return "sent";
       },
     });
@@ -3332,7 +3168,7 @@ describe("LocalManagedAgentProcessObserver", () => {
         quiescent: false,
       });
     } finally {
-      await forceKillRetainedTestGroup(child);
+      await stopRetainedTestGroup(child);
       observer.dispose();
     }
   });
@@ -3456,7 +3292,7 @@ describe("LocalManagedAgentProcessObserver", () => {
       });
     } finally {
       if (typeof child.pid === "number") {
-        await forceKillRetainedTestGroup(child);
+        await stopRetainedTestGroup(child);
       }
       controller.abort();
       observer.dispose();
@@ -3485,7 +3321,7 @@ describe("LocalManagedAgentProcessObserver", () => {
     );
     const signals: Array<readonly [number, string]> = [];
     const observer = new LocalManagedAgentProcessObserver({
-      signalProcessGroup: (groupId, signal) => {
+      testOnlyRequestTermination: (groupId, signal) => {
         signals.push([groupId, signal]);
         return "sent";
       },
@@ -3512,7 +3348,7 @@ describe("LocalManagedAgentProcessObserver", () => {
     const reads: Array<
       (observation: ManagedAgentProcessTableObservation) => void
     > = [];
-    const signals: Array<readonly [number, "SIGSTOP" | "SIGKILL"]> = [];
+    const signals: Array<readonly [number, "SIGKILL"]> = [];
     const observer = new LocalManagedAgentProcessObserver({
       platform: "darwin",
       readProcessTable: () =>
@@ -3520,7 +3356,7 @@ describe("LocalManagedAgentProcessObserver", () => {
           reads.push(resolveRead);
         }),
       processGroupLiveness: () => "alive",
-      signalProcessGroup: (groupId, signal) => {
+      testOnlyRequestTermination: (groupId, signal) => {
         signals.push([groupId, signal]);
         return "sent";
       },
@@ -3543,9 +3379,7 @@ describe("LocalManagedAgentProcessObserver", () => {
             parentPid: process.pid,
             processGroupId: rootPid,
             sessionId: rootPid,
-            state: signals.some(([, signal]) => signal === "SIGSTOP")
-              ? "T"
-              : "S",
+            state: "S",
             startedAt: "epoch-root",
           },
         ],
@@ -3573,20 +3407,20 @@ describe("LocalManagedAgentProcessObserver", () => {
       expect(signals).toEqual([]);
 
       // Completing the read that started before teardown cannot install its
-      // evidence or authorize a signal in the new lifecycle generation.
+      // evidence or authorize a request in the new lifecycle generation.
       reads.shift()!(rootTable());
       await preSignalSample;
       expect(signals).toEqual([]);
 
       // Only the complete read that started after teardown can authorize the
-      // one direct group kill.
+      // one process-bound termination request.
       const postSignalSample = observer.observeProcessTree();
       await vi.waitFor(() => expect(reads).toHaveLength(1));
       reads.shift()!(rootTable());
       await postSignalSample;
       expect(signals).toEqual([[rootPid, "SIGKILL"]]);
     } finally {
-      await forceKillRetainedTestGroup(anchor);
+      await stopRetainedTestGroup(anchor);
       forwardedController.abort();
       observer.dispose();
     }
@@ -3600,7 +3434,7 @@ describe("LocalManagedAgentProcessObserver", () => {
       let resolveRead!: (
         observation: ManagedAgentProcessTableObservation,
       ) => void;
-      const signals: Array<readonly [number, "SIGSTOP" | "SIGKILL"]> = [];
+      const signals: Array<readonly [number, "SIGKILL"]> = [];
       const observer = new LocalManagedAgentProcessObserver({
         platform: "darwin",
         monotonicNow: () => monotonicTime,
@@ -3608,7 +3442,7 @@ describe("LocalManagedAgentProcessObserver", () => {
           new Promise<ManagedAgentProcessTableObservation>((resolve) => {
             resolveRead = resolve;
           }),
-        signalProcessGroup: (groupId, signal) => {
+        testOnlyRequestTermination: (groupId, signal) => {
           signals.push([groupId, signal]);
           return "sent";
         },
@@ -3654,7 +3488,7 @@ describe("LocalManagedAgentProcessObserver", () => {
         expect(signals).toEqual(signalsAtSeal);
         expect(await observer.observeProcessTree(deadline)).toBe(false);
       } finally {
-        await forceKillRetainedTestGroup(anchor);
+        await stopRetainedTestGroup(anchor);
         forwardedController.abort();
         await observer.dispose();
       }
@@ -3666,7 +3500,7 @@ describe("LocalManagedAgentProcessObserver", () => {
     let resolveRead!: (
       observation: ManagedAgentProcessTableObservation,
     ) => void;
-    const signals: Array<readonly [number, "SIGSTOP" | "SIGKILL"]> = [];
+    const signals: Array<readonly [number, "SIGKILL"]> = [];
     const observer = new LocalManagedAgentProcessObserver({
       platform: "darwin",
       monotonicNow: () => monotonicTime,
@@ -3675,7 +3509,7 @@ describe("LocalManagedAgentProcessObserver", () => {
           resolveRead = resolve;
         }),
       processGroupLiveness: () => "gone",
-      signalProcessGroup: (groupId, signal) => {
+      testOnlyRequestTermination: (groupId, signal) => {
         signals.push([groupId, signal]);
         return "sent";
       },
@@ -3704,7 +3538,7 @@ describe("LocalManagedAgentProcessObserver", () => {
       expect(signals).toEqual([]);
       expect(await observer.observeProcessTree(deadline)).toBe(false);
     } finally {
-      await forceKillRetainedTestGroup(anchor);
+      await stopRetainedTestGroup(anchor);
       forwardedController.abort();
       await observer.dispose();
     }
@@ -3773,7 +3607,7 @@ describe("LocalManagedAgentProcessObserver", () => {
         socket?.destroy();
         forwardedController.abort();
         await observer.dispose();
-        await forceKillRetainedTestGroup(anchor);
+        await stopRetainedTestGroup(anchor);
       }
     },
   );

@@ -1,4 +1,4 @@
-import { execFile, spawn } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
 import { readFile } from "node:fs/promises";
 import { createServer, type ServerResponse } from "node:http";
@@ -78,6 +78,36 @@ async function waitForProcessDeath(
   }
   if (processExists(pid))
     throw new Error(`Test process ${pid} survived cleanup`);
+}
+
+function spawnCooperativeUnrelatedProcess(): ChildProcess {
+  return spawn(
+    process.execPath,
+    [
+      "-e",
+      'process.on("disconnect", () => process.exit(0)); setInterval(() => {}, 1000)',
+    ],
+    {
+      stdio: ["ignore", "ignore", "ignore", "ipc"],
+      windowsHide: true,
+    },
+  );
+}
+
+async function stopCooperativeUnrelatedProcess(
+  child: ChildProcess,
+): Promise<void> {
+  if (typeof child.pid !== "number") return;
+  const pid = child.pid;
+  if (child.exitCode === null && child.signalCode === null) {
+    if (!child.connected) {
+      throw new Error(
+        `Refusing cleanup for unrelated process ${pid} without retained IPC`,
+      );
+    }
+    child.disconnect();
+  }
+  await waitForProcessDeath(pid);
 }
 
 interface LoopbackObservation {
@@ -283,7 +313,7 @@ it("enforces real-SDK built-in and in-process MCP calls with exact loopback corr
   const groupSignals: Array<{
     readonly elapsedMs: number;
     readonly groupId: number;
-    readonly signal: "SIGSTOP" | "SIGKILL";
+    readonly signal: "SIGKILL";
     readonly outcome: "sent" | "gone" | "failure";
   }> = [];
   const lifecycle: Array<{
@@ -299,24 +329,13 @@ it("enforces real-SDK built-in and in-process MCP calls with exact loopback corr
       });
       return observation;
     },
-    signalProcessGroup: (groupId, signal) => {
-      let outcome: "sent" | "gone" | "failure";
-      try {
-        process.kill(-groupId, signal);
-        outcome = "sent";
-      } catch (error) {
-        outcome =
-          (error as NodeJS.ErrnoException).code === "ESRCH"
-            ? "gone"
-            : "failure";
-      }
+    onTerminationRequest: ({ processGroupId: groupId }, outcome) => {
       groupSignals.push({
         elapsedMs: Date.now() - startedAt,
         groupId,
-        signal,
+        signal: "SIGKILL",
         outcome,
       });
-      return outcome;
     },
   });
   let supervisorPid: number | undefined;
@@ -650,7 +669,7 @@ it.skipIf(
     const groupSignals: Array<{
       readonly elapsedMs: number;
       readonly groupId: number;
-      readonly signal: "SIGSTOP" | "SIGKILL";
+      readonly signal: "SIGKILL";
       readonly outcome: "sent" | "gone" | "failure";
     }> = [];
     const observer = new LocalManagedAgentProcessObserver({
@@ -664,24 +683,13 @@ it.skipIf(
         });
         return observation;
       },
-      signalProcessGroup: (groupId, signal) => {
-        let outcome: "sent" | "gone" | "failure";
-        try {
-          process.kill(-groupId, signal);
-          outcome = "sent";
-        } catch (error) {
-          outcome =
-            (error as NodeJS.ErrnoException).code === "ESRCH"
-              ? "gone"
-              : "failure";
-        }
+      onTerminationRequest: ({ processGroupId: groupId }, outcome) => {
         groupSignals.push({
           elapsedMs: Date.now() - startedAt,
           groupId,
-          signal,
+          signal: "SIGKILL",
           outcome,
         });
-        return outcome;
       },
     });
     const cleanupOrder: string[] = [];
@@ -694,10 +702,10 @@ it.skipIf(
           { once: true },
         );
         const child = observer.spawn(options);
-        const logicalKill = child.kill.bind(child);
+        const nativeKill = child.kill.bind(child);
         Reflect.set(child, "kill", (signal: NodeJS.Signals = "SIGTERM") => {
-          cleanupOrder.push("sdk_logical_kill");
-          return logicalKill(signal);
+          cleanupOrder.push("sdk_native_kill");
+          return nativeKill(signal);
         });
         const pid = Reflect.get(child, "pid");
         supervisorPid = typeof pid === "number" ? pid : undefined;
@@ -714,11 +722,7 @@ it.skipIf(
       },
       dispose: () => observer.dispose(),
     };
-    const unrelated = spawn(
-      process.execPath,
-      ["-e", "setInterval(() => {}, 1000)"],
-      { stdio: "ignore", windowsHide: true },
-    );
+    const unrelated = spawnCooperativeUnrelatedProcess();
     await once(unrelated, "spawn");
     let fixturePids: readonly number[] = [];
     let fixtureToolProcessGroupId: number | undefined;
@@ -922,22 +926,22 @@ it.skipIf(
         cleanupOrder.indexOf("host_emergency_cleanup"),
       );
       const forwardedSignalIndex = cleanupOrder.indexOf("sdk_forwarded_signal");
-      const logicalKillIndexes = cleanupOrder.flatMap((step, index) =>
-        step === "sdk_logical_kill" ? [index] : [],
+      const nativeKillIndexes = cleanupOrder.flatMap((step, index) =>
+        step === "sdk_native_kill" ? [index] : [],
       );
       expect(cleanupOrder).toEqual([
         "sdk_close_called",
         "sdk_return_started",
-        "sdk_logical_kill",
+        "sdk_native_kill",
         "sdk_forwarded_signal",
-        "sdk_logical_kill",
+        "sdk_native_kill",
         "sdk_return_settled",
         "host_emergency_cleanup",
       ]);
-      expect(logicalKillIndexes).toEqual([2, 4]);
+      expect(nativeKillIndexes).toEqual([2, 4]);
       expect(forwardedSignalIndex).toBeGreaterThanOrEqual(0);
-      expect(logicalKillIndexes[0]).toBeLessThan(forwardedSignalIndex);
-      expect(logicalKillIndexes[1]).toBeGreaterThan(forwardedSignalIndex);
+      expect(nativeKillIndexes[0]).toBeLessThan(forwardedSignalIndex);
+      expect(nativeKillIndexes[1]).toBeGreaterThan(forwardedSignalIndex);
       expect(forwardedSignalIndex).toBeLessThan(
         cleanupOrder.indexOf("host_emergency_cleanup"),
       );
@@ -946,10 +950,7 @@ it.skipIf(
       server.closeAllConnections();
       await new Promise<void>((resolve) => server.close(() => resolve()));
       await Promise.all(fixturePids.map((pid) => waitForProcessDeath(pid)));
-      if (typeof unrelated.pid === "number" && processExists(unrelated.pid)) {
-        unrelated.kill("SIGKILL");
-        await waitForProcessDeath(unrelated.pid);
-      }
+      await stopCooperativeUnrelatedProcess(unrelated);
       await fixture.cleanup();
     }
     expect(fixturePids.every((pid) => !processExists(pid))).toBe(true);
@@ -992,11 +993,7 @@ it.skipIf(
       },
       dispose: () => observer.dispose(),
     };
-    const unrelated = spawn(
-      process.execPath,
-      ["-e", "setInterval(() => {}, 1000)"],
-      { stdio: "ignore", windowsHide: true },
-    );
+    const unrelated = spawnCooperativeUnrelatedProcess();
     await once(unrelated, "spawn");
     let fixturePids: readonly number[] = [];
     let cancellationStartedAt: number | undefined;
@@ -1138,10 +1135,7 @@ it.skipIf(
       server.closeAllConnections();
       await new Promise<void>((resolve) => server.close(() => resolve()));
       await Promise.all(fixturePids.map((pid) => waitForProcessDeath(pid)));
-      if (typeof unrelated.pid === "number" && processExists(unrelated.pid)) {
-        unrelated.kill("SIGKILL");
-        await waitForProcessDeath(unrelated.pid);
-      }
+      await stopCooperativeUnrelatedProcess(unrelated);
       await fixture.cleanup();
     }
     expect(fixturePids.every((pid) => !processExists(pid))).toBe(true);

@@ -170,26 +170,30 @@ the runtime immediately follows it with and awaits `Query.return()` under the
 same deadline. `queryClosed` means that awaitable cleanup settled; invoking
 `close()` alone is never completion evidence. Host emergency cleanup starts
 only after that cleanup settles, the forwarded signal has already requested the
-fallback, or the bounded SDK-grace budget expires. As a compatibility shim
-certified only for the pinned Agent SDK 0.3.228, the returned handle accepts the
-first SDK `child.kill()` logically by setting `child.killed = true`, but it
-intentionally sends no native signal. The hermetic real-SDK loopback test is a
-sequence sentinel for 0.3.228's exact close/return behavior: one logical kill,
-the SDK-forwarded abort, a second rejected logical kill, return settlement,
-then host fallback. An SDK upgrade must remove or recertify the shim before the
-pin changes. The forwarded abort signal requests the sampled host fallback;
-only freshly validated host group cleanup sends signals. The request invalidates
+fallback, or the bounded SDK-grace budget expires. The returned process handle
+keeps the native `ChildProcess.kill()` contract. SDK `SIGTERM` calls are really
+sent to the observer-owned supervisor, whose explicit TERM/INT/HUP handlers keep
+the ancestry anchor alive for the bounded fallback. The hermetic real-SDK
+loopback test is the sequence sentinel for 0.3.228's close/return, native-kill,
+forwarded-abort, and fallback behavior.
+
+The forwarded abort signal requests the sampled host fallback and invalidates
 every sample started before teardown. A complete post-request sample must
 revalidate the active root identity, both role identities, their relationship
 and shared group, every current root/tool descendant's parent, group, session,
-and ancestry, and at least one open lifetime channel. Only that fresh proof
-authorizes one direct `SIGKILL` to the detached fixture group. The signal
-invalidates its authorizing sample. A second complete sample must prove the
-fixture group absent before a freshly revalidated supervisor group receives
-`SIGKILL`, and a third must prove that root group absent. Failed kill attempts
-remain retryable, but every attempt—including an ESRCH or helper failure—moves
-to a new sample generation and requires another fresh proof. The five-second
-absolute deadline bounds the entire sequence.
+and ancestry, and at least one open lifetime channel. This evidence never
+authorizes a host-side numeric signal. Instead, the observer writes a forced-
+termination request to a still-open authenticated fixture socket. That exact
+process instance calls `kill(0, SIGKILL)` and therefore terminates only its own
+current group. The request invalidates its authorizing sample. A second complete
+sample must prove the fixture group absent before the observer disconnects the
+retained supervisor IPC channel; that exact supervisor instance then terminates
+its own current group. A third complete sample proves the root group absent.
+Failed channel requests remain retryable, but every attempt moves to a new
+sample generation and requires another fresh proof. The five-second absolute
+deadline bounds the entire sequence. A PID or PGID can disappear and be reused
+between any sample and request without redirecting termination, because neither
+channel is addressed by that number.
 
 Deadline expiry or a successful quiescence observation seals all evidence,
 closes the spawn gate, and permanently revokes numeric signal authority.
@@ -200,15 +204,16 @@ still-running supervisor can kill only its own exact process group.
 
 If the root exits, a stable identity changes parent/group/session, a foreign
 member appears, ancestry is lost, both channels close prematurely, or a
-process-table read is unavailable, the observer never signals the detached
-group. This includes an inner SDK command exit that reparents a surviving
+process-table read is unavailable, the observer never requests detached-group
+termination. This includes an inner SDK command exit that reparents a surviving
 descendant: an unchanged old PGID does not retain authority after ancestry is
 lost. A successful complete table that no longer contains the stable identity
 is positive exit evidence; otherwise an escaped same-identity PID and its new
-group remain in final liveness accounting. The observer may still kill its own
-freshly revalidated live SDK supervisor group, but the run remains a fail-closed
-`teardown_timeout` while any tool process or lifetime channel remains. This also
-prevents numeric PID/PGID reuse from converting cached evidence into authority.
+group remain in final liveness accounting. The observer may still ask its exact
+live SDK supervisor over retained IPC to terminate itself, but the run remains
+a fail-closed `teardown_timeout` while any tool process or lifetime channel
+remains. This also prevents numeric PID/PGID reuse from converting cached
+evidence into authority.
 `forceKillIssued` describes only owned SDK supervisor roots and is not required
 when SDK graceful shutdown succeeds.
 

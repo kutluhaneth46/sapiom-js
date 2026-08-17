@@ -145,6 +145,10 @@ const childProgram = [
   '  });',
   '  socket.on("data", (chunk) => {',
   '    response += chunk;',
+  '    if (response.includes(' + JSON.stringify('"forceKill":true') + ')) {',
+  '      try { process.kill(0, "SIGKILL"); } catch { process.exit(1); }',
+  '      return;',
+  '    }',
   '    if (response.includes(' + JSON.stringify('"shutdown":true') + ')) {',
   '      socket.write(JSON.stringify({ shutdownAck: true }) + "\\\\n", () => process.exit(0));',
   '      return;',
@@ -180,7 +184,7 @@ const publishReadiness = () => {
   } catch {
     child.once("exit", () => process.exit(1));
     if (child.connected) child.send("host-shutdown");
-    else child.kill("SIGKILL");
+    else process.exit(1);
   }
 };
 child.once("message", () => {
@@ -205,6 +209,10 @@ const connectControl = () => {
   });
   socket.on("data", (chunk) => {
     response += chunk;
+    if (response.includes('"forceKill":true')) {
+      try { process.kill(0, "SIGKILL"); } catch { process.exit(1); }
+      return;
+    }
     if (response.includes('"shutdown":true')) {
       socket.write(JSON.stringify({ shutdownAck: true }) + "\\n", () =>
         process.exit(0),

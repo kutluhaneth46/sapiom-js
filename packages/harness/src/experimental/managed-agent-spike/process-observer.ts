@@ -20,7 +20,6 @@ import type {
   SpawnOptions,
 } from "@anthropic-ai/claude-agent-sdk";
 
-import { MANAGED_AGENT_CONTRACT } from "./contract.js";
 import type {
   ManagedAgentCancellationReadiness,
   ManagedAgentProcessObserver,
@@ -40,7 +39,6 @@ export const MANAGED_AGENT_TOOL_CONTROL_CAPABILITY_ENV =
   "SAPIOM_MANAGED_AGENT_TOOL_CONTROL_CAPABILITY";
 const TOOL_REGISTRATION_MAX_BYTES = 1_024;
 const DISPOSE_DRAIN_TIMEOUT_MS = 500;
-export const MANAGED_AGENT_LOGICAL_KILL_SHIM_SDK_VERSION = "0.3.228" as const;
 
 /**
  * The POSIX supervisor is the observer-owned process-group leader. The real
@@ -91,7 +89,7 @@ for (const signal of ["SIGHUP", "SIGINT", "SIGTERM"]) {
 
 function killOwnedGroup() {
   try {
-    process.kill(-process.pid, "SIGKILL");
+    process.kill(0, "SIGKILL");
   } catch {
     process.exit(1);
   }
@@ -124,7 +122,6 @@ function readOtherGroupMembers() {
       resolveMembers(members);
     };
     const timeout = setTimeout(() => {
-      try { helper.kill("SIGKILL"); } catch {}
       finish(undefined);
     }, HELPER_TIMEOUT_MS);
     helper.stdout.on("data", (chunk) => {
@@ -132,7 +129,7 @@ function readOtherGroupMembers() {
       output += chunk.toString("utf8");
       if (Buffer.byteLength(output) > MAX_PROCESS_TABLE_BYTES) {
         overflowed = true;
-        try { helper.kill("SIGKILL"); } catch {}
+        helper.stdout.destroy();
       }
     });
     helper.once("error", () => finish(undefined));
@@ -265,7 +262,13 @@ export type ManagedAgentProcessTableObservation =
   | { readonly available: false };
 
 export type ManagedAgentProcessGroupLiveness = "alive" | "gone" | "unknown";
-export type ManagedAgentProcessSignalOutcome = "sent" | "gone" | "failure";
+export type ManagedAgentTerminationRequestOutcome = "sent" | "gone" | "failure";
+
+export interface ManagedAgentTerminationRequest {
+  readonly target: "root" | "tool";
+  /** Diagnostic identity only. The production request path never signals it. */
+  readonly processGroupId: number;
+}
 
 export interface LocalManagedAgentProcessObserverOptions {
   readonly platform?: NodeJS.Platform;
@@ -273,10 +276,25 @@ export interface LocalManagedAgentProcessObserverOptions {
   readonly processGroupLiveness?: (
     processGroupId: number,
   ) => ManagedAgentProcessGroupLiveness;
-  readonly signalProcessGroup?: (
+  /**
+   * Deterministic unit-test seam. Production callers must leave this unset:
+   * the default path requests termination only over retained process-bound
+   * channels and never turns a sampled numeric PGID into signal authority.
+   */
+  readonly testOnlyRequestTermination?: (
     processGroupId: number,
     signal: "SIGKILL",
-  ) => ManagedAgentProcessSignalOutcome;
+    target: ManagedAgentTerminationRequest["target"],
+  ) => ManagedAgentTerminationRequestOutcome;
+  /** Return an outcome to veto one request; return undefined to use the channel. */
+  readonly testOnlyBeforeTerminationRequest?: (
+    request: ManagedAgentTerminationRequest,
+  ) => ManagedAgentTerminationRequestOutcome | undefined;
+  /** Read-only test telemetry emitted after a channel request is attempted. */
+  readonly onTerminationRequest?: (
+    request: ManagedAgentTerminationRequest,
+    outcome: ManagedAgentTerminationRequestOutcome,
+  ) => void;
   readonly monotonicNow?: () => number;
   readonly delay?: (milliseconds: number) => Promise<void>;
 }
@@ -476,19 +494,6 @@ function defaultProcessGroupLiveness(
   }
 }
 
-function defaultSignalProcessGroup(
-  processGroupId: number,
-  signal: "SIGKILL",
-): ManagedAgentProcessSignalOutcome {
-  try {
-    process.kill(-processGroupId, signal);
-    return "sent";
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    return code === "ESRCH" ? "gone" : "failure";
-  }
-}
-
 function childActive(child: ChildProcessWithoutNullStreams): boolean {
   return child.exitCode === null && child.signalCode === null;
 }
@@ -527,10 +532,11 @@ function descendantsOf(
  * This is not universal built-in Bash containment or a process-tree killer.
  * Windows, an unavailable process table, missing lifetime channels, or
  * identity/ancestry drift fail certification closed. The fallback freshly
- * validates and kills the exact fixture group, proves it absent with a new
- * sample, then freshly validates and kills the owned supervisor root. POSIX
- * `lstart` remains one component of fresh identity evidence, not standalone
- * authority. Workspace PID-file contents never enter this class.
+ * validates the exact fixture group, asks a still-open authenticated member to
+ * terminate its own current group, proves it absent with a new sample, then
+ * asks the owned supervisor over retained IPC to terminate its own group.
+ * POSIX `lstart` remains evidence only: a sampled numeric PID/PGID is never
+ * host signal authority. Workspace PID-file contents never enter this class.
  */
 export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObserver {
   readonly #platform: NodeJS.Platform;
@@ -538,10 +544,24 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
   readonly #processGroupLiveness: (
     processGroupId: number,
   ) => ManagedAgentProcessGroupLiveness;
-  readonly #signalProcessGroup: (
-    processGroupId: number,
-    signal: "SIGKILL",
-  ) => ManagedAgentProcessSignalOutcome;
+  readonly #testOnlyRequestTermination:
+    | ((
+        processGroupId: number,
+        signal: "SIGKILL",
+        target: ManagedAgentTerminationRequest["target"],
+      ) => ManagedAgentTerminationRequestOutcome)
+    | undefined;
+  readonly #testOnlyBeforeTerminationRequest:
+    | ((
+        request: ManagedAgentTerminationRequest,
+      ) => ManagedAgentTerminationRequestOutcome | undefined)
+    | undefined;
+  readonly #onTerminationRequest:
+    | ((
+        request: ManagedAgentTerminationRequest,
+        outcome: ManagedAgentTerminationRequestOutcome,
+      ) => void)
+    | undefined;
   readonly #monotonicNow: () => number;
   readonly #delay: (milliseconds: number) => Promise<void>;
   readonly #roots = new Map<number, OwnedRoot>();
@@ -594,8 +614,10 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
       (() => defaultReadProcessTable(this.#platform));
     this.#processGroupLiveness =
       options.processGroupLiveness ?? defaultProcessGroupLiveness;
-    this.#signalProcessGroup =
-      options.signalProcessGroup ?? defaultSignalProcessGroup;
+    this.#testOnlyRequestTermination = options.testOnlyRequestTermination;
+    this.#testOnlyBeforeTerminationRequest =
+      options.testOnlyBeforeTerminationRequest;
+    this.#onTerminationRequest = options.onTerminationRequest;
     this.#monotonicNow = options.monotonicNow ?? (() => performance.now());
     this.#delay = options.delay ?? defaultDelay;
     if (this.#platform === "darwin" || this.#platform === "linux") {
@@ -939,29 +961,6 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
     child.stderr.on("error", () => undefined);
     if (typeof child.pid === "number") {
       const pid = child.pid;
-      if (usePosixSupervisor) {
-        if (
-          MANAGED_AGENT_CONTRACT.agentSdkVersion !==
-          MANAGED_AGENT_LOGICAL_KILL_SHIM_SDK_VERSION
-        ) {
-          throw new Error(
-            `The managed-agent logical kill shim is certified only for Agent SDK ${MANAGED_AGENT_LOGICAL_KILL_SHIM_SDK_VERSION}`,
-          );
-        }
-        child.kill = ((_signal: NodeJS.Signals = "SIGTERM") => {
-          // Agent SDK 0.3.228's ProcessTransport calls kill() immediately before
-          // it forwards its private AbortSignal. This compatibility shim must
-          // be removed or recertified when that SDK pin changes. Treat the call
-          // as logical acceptance so the SDK will not retry through a cached
-          // PID, but preserve the live supervisor as the ancestry anchor. Only
-          // the subsequently forwarded signal may start sampled,
-          // identity-checked group cleanup. The real-SDK loopback test is the
-          // sequence sentinel for this exact kill-then-abort behavior.
-          if (!childActive(child) || child.killed) return false;
-          Reflect.set(child, "killed", true);
-          return true;
-        }) as typeof child.kill;
-      }
       this.#roots.set(pid, {
         pid,
         child,
@@ -1715,21 +1714,103 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
       : true;
   }
 
-  #signalValidatedProcessGroup(
-    processGroupId: number,
-    signal: "SIGKILL",
-  ): ManagedAgentProcessSignalOutcome {
-    if (this.#sealed || this.#deadlineExpiredAndSeal()) return "failure";
-    const outcome = this.#signalProcessGroup(processGroupId, signal);
-    // Every attempt invalidates every sample that started before it, including
-    // ESRCH and helper failures. Only a complete read started in this new
-    // generation may prove the attempted target gone or authorize a next step.
-    this.#sampleGeneration += 1;
-    this.#processTableNeedsRefresh = true;
+  #recordTerminationRequest(
+    request: ManagedAgentTerminationRequest,
+    outcome: ManagedAgentTerminationRequestOutcome,
+  ): ManagedAgentTerminationRequestOutcome {
+    this.#onTerminationRequest?.(request, outcome);
     return outcome;
   }
 
-  #killOwnedRootsSynchronously(): void {
+  #requestToolGroupTermination(
+    processGroupId: number,
+  ): ManagedAgentTerminationRequestOutcome {
+    if (this.#sealed || this.#deadlineExpiredAndSeal()) return "failure";
+    const request = { target: "tool", processGroupId } as const;
+    const vetoedOutcome = this.#testOnlyBeforeTerminationRequest?.(request);
+    if (vetoedOutcome) {
+      return this.#recordTerminationRequest(request, vetoedOutcome);
+    }
+    if (this.#testOnlyRequestTermination) {
+      return this.#recordTerminationRequest(
+        request,
+        this.#testOnlyRequestTermination(
+          request.processGroupId,
+          "SIGKILL",
+          request.target,
+        ),
+      );
+    }
+    const registration = (["parent", "child"] as const)
+      .map((role) => this.#toolProcessRegistrations.get(role))
+      .find(
+        (candidate) =>
+          candidate?.accepted &&
+          !candidate.closed &&
+          !candidate.socket.destroyed &&
+          candidate.socket.writable,
+      );
+    if (!registration) {
+      return this.#recordTerminationRequest(request, "failure");
+    }
+    try {
+      // This retained socket is bound to the authenticated process instance,
+      // not its numeric PID. The receiver calls kill(0, SIGKILL), so the
+      // still-running member terminates its own current group without a host
+      // snapshot-to-signal PGID reuse window.
+      registration.socket.write('{"forceKill":true}\n');
+      return this.#recordTerminationRequest(request, "sent");
+    } catch {
+      return this.#recordTerminationRequest(request, "failure");
+    }
+  }
+
+  #requestRootGroupTermination(
+    root: OwnedRoot,
+  ): ManagedAgentTerminationRequestOutcome {
+    if (this.#sealed || this.#deadlineExpiredAndSeal()) return "failure";
+    const request = { target: "root", processGroupId: root.pid } as const;
+    const vetoedOutcome = this.#testOnlyBeforeTerminationRequest?.(request);
+    if (vetoedOutcome) {
+      return this.#recordTerminationRequest(request, vetoedOutcome);
+    }
+    if (this.#testOnlyRequestTermination) {
+      return this.#recordTerminationRequest(
+        request,
+        this.#testOnlyRequestTermination(
+          request.processGroupId,
+          "SIGKILL",
+          request.target,
+        ),
+      );
+    }
+    if (!childActive(root.child)) {
+      return this.#recordTerminationRequest(request, "gone");
+    }
+    if (!root.child.connected) {
+      return this.#recordTerminationRequest(request, "failure");
+    }
+    try {
+      // The IPC endpoint belongs to the retained supervisor process instance.
+      // Its disconnect handler terminates its own current group. PID reuse can
+      // therefore make this request fail, but can never redirect it.
+      root.child.disconnect();
+      return this.#recordTerminationRequest(request, "sent");
+    } catch {
+      return this.#recordTerminationRequest(request, "failure");
+    }
+  }
+
+  #invalidateSampleAfterTerminationRequest(): void {
+    if (this.#sealed || this.#deadlineExpiredAndSeal()) return;
+    // Every request invalidates every sample that started before it, including
+    // channel failures. Only a complete read started in this new generation
+    // may prove the target gone or authorize the next teardown step.
+    this.#sampleGeneration += 1;
+    this.#processTableNeedsRefresh = true;
+  }
+
+  #requestOwnedRootTerminationSynchronously(): void {
     if (this.#sealed) return;
     if (this.#platform !== "darwin" && this.#platform !== "linux") return;
     for (const root of this.#roots.values()) {
@@ -1741,11 +1822,9 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
       ) {
         continue;
       }
-      const killOutcome = this.#signalValidatedProcessGroup(
-        root.pid,
-        "SIGKILL",
-      );
-      root.forceKillIssued = killOutcome === "sent";
+      const requestOutcome = this.#requestRootGroupTermination(root);
+      this.#invalidateSampleAfterTerminationRequest();
+      root.forceKillIssued = requestOutcome === "sent";
     }
   }
 
@@ -1754,8 +1833,8 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
     if (!this.#fallbackCleanupRequested) {
       this.#fallbackCleanupRequested = true;
       // The cleanup request itself is a lifecycle boundary. Discard any
-      // earlier sample so the first numeric signal can only be authorized by
-      // a complete process-table read that began after teardown started.
+      // earlier sample so the first process-bound termination request can only
+      // follow a complete process-table read begun after teardown started.
       this.#sampleGeneration += 1;
       this.#processTableNeedsRefresh = true;
     }
@@ -1773,7 +1852,7 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
       return;
     }
     if (!this.#toolProcessContainmentArmed) {
-      this.#killOwnedRootsSynchronously();
+      this.#requestOwnedRootTerminationSynchronously();
       return;
     }
     // Once tool containment is armed, fail closed until the authenticated
@@ -1791,7 +1870,7 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
     if (liveToolGroupMembers && this.#toolProcessForceKillIssued) return;
     const groupLiveness = this.#processGroupLiveness(processGroupId);
     if (groupLiveness === "gone") {
-      this.#killOwnedRootsSynchronously();
+      this.#requestOwnedRootTerminationSynchronously();
       return;
     }
     if (groupLiveness !== "alive") return;
@@ -1800,13 +1879,11 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
       return;
     }
     if (!this.#toolProcessForceKillIssued) {
-      const killOutcome = this.#signalValidatedProcessGroup(
-        processGroupId,
-        "SIGKILL",
-      );
-      this.#toolProcessForceKillIssued = killOutcome === "sent";
-      if (killOutcome === "gone") {
-        this.#killOwnedRootsSynchronously();
+      const requestOutcome = this.#requestToolGroupTermination(processGroupId);
+      this.#invalidateSampleAfterTerminationRequest();
+      this.#toolProcessForceKillIssued = requestOutcome === "sent";
+      if (requestOutcome === "gone") {
+        this.#requestOwnedRootTerminationSynchronously();
       }
     }
   }

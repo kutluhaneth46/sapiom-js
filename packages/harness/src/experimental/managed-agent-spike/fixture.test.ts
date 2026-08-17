@@ -28,6 +28,18 @@ function processExists(pid: number): boolean {
   }
 }
 
+async function waitForProcessExit(pid: number, timeoutMs = 2_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (processExists(pid) && Date.now() < deadline) {
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
+  }
+  if (processExists(pid)) {
+    throw new Error(
+      `Fixture descendant ${pid} survived its retained lifetime-lease shutdown`,
+    );
+  }
+}
+
 async function waitForDirectChildPid(parentPid: number): Promise<number> {
   const deadline = Date.now() + 2_000;
   while (Date.now() < deadline) {
@@ -142,10 +154,8 @@ describe("managed-agent disposable git fixture", () => {
         await new Promise((resolveDelay) => setTimeout(resolveDelay, 25));
         expect(processExists(descendantPid)).toBe(false);
       } finally {
-        if (processExists(descendantPid)) {
-          process.kill(descendantPid, "SIGKILL");
-        }
         await rm(externalLeaseRoot, { recursive: true, force: true });
+        await waitForProcessExit(descendantPid);
       }
     },
   );

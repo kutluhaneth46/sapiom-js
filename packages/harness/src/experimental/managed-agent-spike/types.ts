@@ -236,7 +236,7 @@ export interface ManagedAgentTeardownObservation {
   readonly containmentSupported: boolean;
   /** True after SDK-root authority and any required L2 observations are proven. */
   readonly ownershipProven: boolean;
-  /** True only when SIGKILL was issued to every owned SDK supervisor root. */
+  /** True only when forced termination was requested for every owned root. */
   readonly forceKillIssued: boolean;
   /** True after both exact L2 fixture lifetime channels pass fresh observation. */
   readonly toolProcessObservationComplete: boolean;
