@@ -20,6 +20,195 @@ const execFileAsync = promisify(execFile);
 const SAMPLE_INTERVAL_MS = 100;
 const QUIESCENCE_POLL_MS = 25;
 export const MANAGED_AGENT_PROCESS_HELPER_TIMEOUT_MS = 200;
+const MANAGED_AGENT_SUPERVISOR_PAYLOAD_ENV =
+  "SAPIOM_MANAGED_AGENT_SUPERVISOR_PAYLOAD";
+
+/**
+ * The POSIX supervisor is the observer-owned process-group leader. The real
+ * SDK command runs inside its group, while the supervisor stays alive after
+ * an inner-root exit whenever another group member survives. Its own bounded
+ * `ps` helper remains in the group so abort and parent-disconnect cleanup
+ * contain it too; the known helper PID is excluded only from the membership
+ * decision that determines whether the anchor may exit.
+ */
+const MANAGED_AGENT_POSIX_SUPERVISOR_SOURCE = String.raw`
+import { spawn } from "node:child_process";
+
+const PAYLOAD_ENV = "SAPIOM_MANAGED_AGENT_SUPERVISOR_PAYLOAD";
+const HELPER_TIMEOUT_MS = 200;
+const POLL_INTERVAL_MS = 25;
+const MAX_PROCESS_TABLE_BYTES = 4 * 1024 * 1024;
+
+function fail(message) {
+  try { process.stderr.write(message + "\n"); } catch {}
+  process.exit(1);
+}
+
+const encodedPayload = process.env[PAYLOAD_ENV];
+delete process.env[PAYLOAD_ENV];
+if (!encodedPayload) fail("managed-agent supervisor payload missing");
+
+let payload;
+try {
+  payload = JSON.parse(Buffer.from(encodedPayload, "base64url").toString("utf8"));
+} catch {
+  fail("managed-agent supervisor payload invalid");
+}
+if (
+  !payload ||
+  typeof payload.command !== "string" ||
+  payload.command.length === 0 ||
+  !Array.isArray(payload.args) ||
+  !payload.args.every((argument) => typeof argument === "string")
+) {
+  fail("managed-agent supervisor command invalid");
+}
+
+for (const signal of ["SIGHUP", "SIGINT", "SIGTERM"]) {
+  process.on(signal, () => {});
+}
+
+function killOwnedGroup() {
+  try {
+    process.kill(-process.pid, "SIGKILL");
+  } catch {
+    process.exit(1);
+  }
+}
+
+process.on("disconnect", killOwnedGroup);
+
+function readOtherGroupMembers() {
+  return new Promise((resolveMembers) => {
+    let helper;
+    try {
+      // Intentionally non-detached: the helper is synchronously contained by
+      // the same group. Its known PID is excluded from this one snapshot.
+      helper = spawn("/bin/ps", ["-axo", "pid=,pgid="], {
+        stdio: ["ignore", "pipe", "ignore"],
+        windowsHide: true,
+      });
+    } catch {
+      resolveMembers(undefined);
+      return;
+    }
+    const helperPid = helper.pid;
+    let output = "";
+    let settled = false;
+    let overflowed = false;
+    const finish = (members) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      resolveMembers(members);
+    };
+    const timeout = setTimeout(() => {
+      try { helper.kill("SIGKILL"); } catch {}
+      finish(undefined);
+    }, HELPER_TIMEOUT_MS);
+    helper.stdout.on("data", (chunk) => {
+      if (overflowed) return;
+      output += chunk.toString("utf8");
+      if (Buffer.byteLength(output) > MAX_PROCESS_TABLE_BYTES) {
+        overflowed = true;
+        try { helper.kill("SIGKILL"); } catch {}
+      }
+    });
+    helper.once("error", () => finish(undefined));
+    helper.once("close", (code) => {
+      if (code !== 0 || overflowed || typeof helperPid !== "number") {
+        finish(undefined);
+        return;
+      }
+      const records = new Map();
+      for (const line of output.split("\n")) {
+        const match = /^\s*(\d+)\s+(\d+)\s*$/.exec(line);
+        if (!match) continue;
+        records.set(Number(match[1]), Number(match[2]));
+      }
+      if (
+        records.get(process.pid) !== process.pid ||
+        records.get(helperPid) !== process.pid
+      ) {
+        finish(undefined);
+        return;
+      }
+      finish(
+        [...records.entries()]
+          .filter(
+            ([pid, processGroupId]) =>
+              processGroupId === process.pid &&
+              pid !== process.pid &&
+              pid !== helperPid,
+          )
+          .map(([pid]) => pid),
+      );
+    });
+  });
+}
+
+let innerClosed = false;
+let innerExitCode = 1;
+let membershipCheckRunning = false;
+let pollTimer;
+
+function scheduleMembershipCheck(delayMs = 0) {
+  if (pollTimer) clearTimeout(pollTimer);
+  pollTimer = setTimeout(checkMembership, delayMs);
+}
+
+async function checkMembership() {
+  pollTimer = undefined;
+  if (!innerClosed || membershipCheckRunning) return;
+  membershipCheckRunning = true;
+  const members = await readOtherGroupMembers();
+  membershipCheckRunning = false;
+  if (members && members.length === 0) {
+    process.stdin.unpipe();
+    process.stdin.destroy();
+    if (process.connected) {
+      process.off("disconnect", killOwnedGroup);
+      process.disconnect();
+    }
+    process.exitCode = innerExitCode;
+    return;
+  }
+  scheduleMembershipCheck(POLL_INTERVAL_MS);
+}
+
+let inner;
+try {
+  inner = spawn(payload.command, payload.args, {
+    cwd: process.cwd(),
+    env: process.env,
+    stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true,
+  });
+} catch {
+  innerClosed = true;
+  scheduleMembershipCheck();
+}
+
+if (inner) {
+  process.stdin.on("error", () => {});
+  inner.stdin.on("error", () => {});
+  inner.stdout.on("error", () => {});
+  inner.stderr.on("error", () => {});
+  process.stdout.on("error", () => {});
+  process.stderr.on("error", () => {});
+  process.stdin.pipe(inner.stdin);
+  inner.stdout.pipe(process.stdout, { end: false });
+  inner.stderr.pipe(process.stderr, { end: false });
+  inner.once("error", () => {
+    innerExitCode = 1;
+  });
+  inner.once("close", (code) => {
+    innerClosed = true;
+    innerExitCode = Number.isInteger(code) ? code : 1;
+    scheduleMembershipCheck();
+  });
+}
+`;
 
 export interface ManagedAgentKernelProcessRecord {
   readonly parentPid: number;
@@ -228,18 +417,20 @@ function descendantsOf(
 
 /**
  * E0.4 deliberately certifies one narrow containment model: the exact local
- * L2 fixture running inside a detached POSIX SDK process group. Before abort,
- * bounded host enumeration must observe an active trusted ChildProcess as its
- * PGID leader and observe the fixture PIDs in that group. Independently, the
- * detached spawn plus an active trusted root handle are safe signal authority,
- * so even a failed evidence preflight can synchronously stop and kill the
- * owned group without leaking it. Such a run still fails certification.
+ * L2 fixture running inside an observer-owned detached POSIX process group.
+ * Before abort, bounded host enumeration must observe the persistent trusted
+ * supervisor ChildProcess as its PGID leader and observe the fixture PIDs in
+ * that group. The supervisor remains the group anchor if the inner SDK root
+ * exits while a descendant survives. Independently, the detached spawn plus
+ * the active supervisor handle are safe signal authority, so even a failed
+ * evidence preflight can synchronously stop and kill the owned group without
+ * leaking it. Such a run still fails certification.
  *
- * This is not a universal sandbox or process-tree killer. Windows, a fast root
- * that exits before preparation, unavailable enumeration, and an observed
- * setsid/group escape all fail certification closed. POSIX `lstart` is evidence
- * only and never authorizes an individual or group signal. Workspace PID-file
- * contents never enter this class and can never become signal authority.
+ * This is not a universal sandbox or process-tree killer. Windows, an inactive
+ * or invalid supervisor anchor, unavailable enumeration, and an observed
+ * setsid/group escape all fail certification closed. POSIX `lstart` is
+ * evidence only and never authorizes an individual or group signal. Workspace
+ * PID-file contents never enter this class and can never become authority.
  */
 export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObserver {
   readonly #platform: NodeJS.Platform;
@@ -290,15 +481,69 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
   }
 
   public spawn(options: SpawnOptions): SpawnedProcess {
-    const child = spawnChild(options.command, options.args, {
-      cwd: options.cwd,
-      env: options.env,
-      detached: this.#platform !== "win32",
-      stdio: ["pipe", "pipe", "pipe"],
-      windowsHide: true,
-    });
+    const usePosixSupervisor =
+      this.#platform === "darwin" || this.#platform === "linux";
+    const child = (
+      usePosixSupervisor
+        ? spawnChild(
+            process.execPath,
+            [
+              "--input-type=module",
+              "--eval",
+              MANAGED_AGENT_POSIX_SUPERVISOR_SOURCE,
+            ],
+            {
+              cwd: options.cwd,
+              env: {
+                ...options.env,
+                [MANAGED_AGENT_SUPERVISOR_PAYLOAD_ENV]: Buffer.from(
+                  JSON.stringify({
+                    command: options.command,
+                    args: options.args,
+                  }),
+                  "utf8",
+                ).toString("base64url"),
+              },
+              detached: true,
+              stdio: ["pipe", "pipe", "pipe", "ipc"],
+              windowsHide: true,
+            },
+          )
+        : spawnChild(options.command, options.args, {
+            cwd: options.cwd,
+            env: options.env,
+            detached: false,
+            stdio: ["pipe", "pipe", "pipe"],
+            windowsHide: true,
+          })
+    ) as ChildProcessWithoutNullStreams;
+    // SpawnedProcess does not expose stderr to the SDK transport. Drain it
+    // here without retaining or printing content so a noisy inner command
+    // cannot deadlock the supervisor on pipe backpressure.
+    child.stderr.on("data", () => undefined);
+    child.stderr.on("error", () => undefined);
     if (typeof child.pid === "number") {
       const pid = child.pid;
+      if (usePosixSupervisor) {
+        let groupKillRequested = false;
+        Object.defineProperty(child, "killed", {
+          configurable: true,
+          enumerable: true,
+          get: () => groupKillRequested,
+        });
+        child.kill = ((signal: NodeJS.Signals = "SIGTERM") => {
+          try {
+            process.kill(-pid, signal);
+            groupKillRequested = true;
+            return true;
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "ESRCH") {
+              return false;
+            }
+            throw error;
+          }
+        }) as typeof child.kill;
+      }
       this.#roots.set(pid, {
         pid,
         child,
@@ -508,8 +753,10 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
       if (root.forceKillIssued || !childActive(root.child)) {
         continue;
       }
-      // detached:true plus the still-active trusted ChildProcess handle are
-      // sufficient signal authority even when ps evidence is unavailable.
+      // The detached observer-owned supervisor plus its still-active trusted
+      // ChildProcess handle are sufficient signal authority even when ps
+      // evidence is unavailable. The supervisor remains active across a fast
+      // inner SDK-root exit while any same-group descendant survives.
       // Certification readiness remains false in that case. Second-resolution
       // lstart and workspace PIDs are never signal authority.
       if (!root.stopIssued) {

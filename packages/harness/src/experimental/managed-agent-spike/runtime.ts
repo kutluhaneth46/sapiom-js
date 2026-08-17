@@ -295,7 +295,6 @@ async function closeQueryBounded(
           () => resolveTimeout(false),
           Math.min(QUERY_CLOSE_TIMEOUT_MS, timeoutMs),
         );
-        timeout.unref();
       }),
     ]);
   } catch {

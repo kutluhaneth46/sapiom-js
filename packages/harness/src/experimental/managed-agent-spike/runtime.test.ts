@@ -1,5 +1,7 @@
+import { execFile } from "node:child_process";
 import { lstat, mkdir, realpath, symlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { promisify } from "node:util";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -33,6 +35,7 @@ const SUCCESS_SESSION_ID = "11111111-1111-4111-8111-111111111111";
 const CANCEL_SESSION_ID = "22222222-2222-4222-8222-222222222222";
 const TIMEOUT_SESSION_ID = "33333333-3333-4333-8333-333333333333";
 const CLOSE_SESSION_ID = "44444444-4444-4444-8444-444444444444";
+const execFileAsync = promisify(execFile);
 
 afterEach(async () => {
   await Promise.all(fixtures.splice(0).map((fixture) => fixture.cleanup()));
@@ -913,6 +916,93 @@ describe("runManagedAgentProbe", () => {
     expect(close).toHaveBeenCalledOnce();
     expect(observer.bindAbortSignal).toHaveBeenCalledOnce();
   });
+
+  it("keeps a CLI-shaped process alive until bounded close and cleanup complete", async () => {
+    const { config } = await probeConfig("L2");
+    const childProgram = String.raw`
+const { runManagedAgentProbe } = await import(
+  process.env.SAPIOM_TEST_RUNTIME_MODULE_URL
+);
+const config = JSON.parse(process.env.SAPIOM_TEST_PROBE_CONFIG);
+let cleanupCalled = false;
+const teardown = {
+  quiescent: true,
+  deadlineMet: true,
+  processTableAvailable: true,
+  containmentSupported: true,
+  ownershipProven: true,
+  forceKillIssued: true,
+  elapsedMs: 0,
+  observedPids: [],
+  alivePidsAtDeadline: [],
+  emergencyCleanupAttempted: false,
+};
+const observer = {
+  spawn() { throw new Error("fake query must not spawn"); },
+  bindAbortSignal() {},
+  async prepareCancellation() {
+    return {
+      supported: true,
+      reason: "ready",
+      processTableAvailable: true,
+      containmentSupported: true,
+      ownershipProven: true,
+      observedPids: [],
+    };
+  },
+  async observeProcessTree() { return true; },
+  async waitForQuiescence() { return teardown; },
+  async emergencyCleanup() {
+    cleanupCalled = true;
+    return { ...teardown, emergencyCleanupAttempted: true };
+  },
+  dispose() {},
+};
+const result = await runManagedAgentProbe(config, {
+  hermeticGatewayOrigin: config.gatewayOrigin,
+  processObserver: observer,
+  policySettingsGuard: async () => undefined,
+  waitForCancellationSignal: async () => undefined,
+  queryFactory: () => ({
+    [Symbol.asyncIterator]() {
+      return { next: () => new Promise(() => undefined) };
+    },
+    close: () => new Promise(() => undefined),
+  }),
+});
+process.stdout.write(JSON.stringify({
+  cleanupCalled,
+  queryClosed: result.queryClosed,
+  terminal: result.terminal,
+}));
+`;
+    const startedAt = Date.now();
+    const { stdout } = await execFileAsync(
+      process.execPath,
+      ["--import", "tsx", "--input-type=module", "--eval", childProgram],
+      {
+        cwd: process.cwd(),
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          SAPIOM_TEST_PROBE_CONFIG: JSON.stringify(config),
+          SAPIOM_TEST_RUNTIME_MODULE_URL: new URL(
+            "./runtime.ts",
+            import.meta.url,
+          ).href,
+        },
+        timeout: 8_000,
+        killSignal: "SIGKILL",
+      },
+    );
+
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(1_500);
+    expect(JSON.parse(stdout)).toEqual({
+      cleanupCalled: true,
+      queryClosed: false,
+      terminal: "close_timeout",
+    });
+  }, 10_000);
 
   it("includes iterator abandonment and close in the one cancellation deadline", async () => {
     const { config } = await probeConfig("L2");

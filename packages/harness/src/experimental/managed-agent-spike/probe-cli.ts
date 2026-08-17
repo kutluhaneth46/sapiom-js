@@ -546,9 +546,9 @@ export async function executeManagedAgentProbeCli(
                   signal,
                 );
                 // The model-writable PID file is evidence only. Readiness is
-                // derived first from the trusted root handle and bounded host
-                // process table. These IDs are compared outside the observer
-                // and never become signal targets.
+                // derived first from the trusted supervisor handle and bounded
+                // host process table. These IDs are compared outside the
+                // observer and never become signal targets.
                 const readiness = await observer.prepareCancellation();
                 if (!readiness.supported) {
                   throw new ManagedAgentProbeCliError(

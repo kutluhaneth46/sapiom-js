@@ -41,6 +41,37 @@ function activeNodeCommand(): { command: string; args: string[] } {
   };
 }
 
+const FAST_EXIT_ROOT_SCRIPT = String.raw`
+import { spawn } from "node:child_process";
+import { existsSync, writeFileSync } from "node:fs";
+import { resolve } from "node:path";
+
+const pidFile = resolve(process.argv[1]);
+const exitTiming = process.argv[2];
+const exitMarker = resolve(process.argv[3]);
+const childProgram = [
+  'process.on("SIGTERM", () => {});',
+  'if (process.send) process.send("ready");',
+  'setInterval(() => {}, 1000);',
+].join("");
+const child = spawn(process.execPath, ["-e", childProgram], {
+  stdio: ["ignore", "ignore", "ignore", "ipc"],
+  windowsHide: true,
+});
+child.once("message", () => {
+  writeFileSync(pidFile, JSON.stringify({
+    parentPid: process.pid,
+    childPid: child.pid,
+  }));
+  if (exitTiming === "before-readiness") process.exit(0);
+  const exitPoll = setInterval(() => {
+    if (!existsSync(exitMarker)) return;
+    clearInterval(exitPoll);
+    process.exit(0);
+  }, 10);
+});
+`;
+
 function asChildProcess(
   spawned: SpawnedProcess,
 ): ChildProcessWithoutNullStreams {
@@ -117,7 +148,173 @@ async function forceKillExactTestProcess(child: ChildProcess): Promise<void> {
   );
 }
 
+async function proveRetainedGroupAuthority(
+  exitTiming: "before-readiness" | "after-readiness",
+): Promise<void> {
+  const fixture = await createManagedAgentFixture(
+    () => `fast-root-exit-${exitTiming}`,
+  );
+  fixtures.push(fixture);
+  const observer = new LocalManagedAgentProcessObserver();
+  const rawController = new AbortController();
+  const forwardedController = new AbortController();
+  const unrelated = spawnChild(
+    process.execPath,
+    ["-e", "setInterval(() => {}, 1000)"],
+    { stdio: "ignore", windowsHide: true },
+  );
+  await once(unrelated, "spawn");
+  observer.bindAbortSignal(rawController.signal);
+  let anchor: ChildProcessWithoutNullStreams | undefined;
+  let ownedProcessGroupId: number | undefined;
+  try {
+    const exitMarker = join(
+      fixture.workspaceRoot,
+      FIXTURE_PATHS.processDirectory,
+      "exit-inner-root",
+    );
+    anchor = asChildProcess(
+      observer.spawn({
+        command: process.execPath,
+        args: [
+          "--input-type=module",
+          "--eval",
+          FAST_EXIT_ROOT_SCRIPT,
+          FIXTURE_PATHS.processPidFile,
+          exitTiming,
+          exitMarker,
+        ],
+        cwd: fixture.workspaceRoot,
+        env: { ...process.env },
+        signal: forwardedController.signal,
+      }),
+    );
+    ownedProcessGroupId = anchor.pid;
+    expect(ownedProcessGroupId).toBeTypeOf("number");
+    const [workerRootPid, nonCooperativeChildPid] =
+      await waitForManagedAgentFixturePids(fixture);
+
+    let readiness;
+    if (exitTiming === "after-readiness") {
+      readiness = await observer.prepareCancellation();
+      await writeFile(exitMarker, "exit\n");
+    }
+    await waitForTestProcessDeath(
+      () => processExists(workerRootPid!),
+      `Fast SDK root ${workerRootPid}`,
+    );
+    expect(processExists(nonCooperativeChildPid!)).toBe(true);
+    if (!readiness) readiness = await observer.prepareCancellation();
+
+    expect(readiness).toMatchObject({
+      supported: true,
+      reason: "ready",
+      ownershipProven: true,
+    });
+    expect(readiness.observedPids).toContain(nonCooperativeChildPid);
+    expect(readiness.observedPids).not.toContain(unrelated.pid);
+
+    rawController.abort();
+    const teardown = await observer.emergencyCleanup(1_000);
+    expect(teardown).toMatchObject({
+      quiescent: true,
+      deadlineMet: true,
+      ownershipProven: true,
+      forceKillIssued: true,
+      alivePidsAtDeadline: [],
+    });
+    expect(processExists(nonCooperativeChildPid!)).toBe(false);
+    expect(processExists(unrelated.pid!)).toBe(true);
+  } finally {
+    rawController.abort();
+    forwardedController.abort();
+    if (anchor && typeof ownedProcessGroupId === "number") {
+      await forceKillExactTestGroup(ownedProcessGroupId, anchor);
+    }
+    observer.dispose();
+    await forceKillExactTestProcess(unrelated);
+  }
+}
+
 describe("LocalManagedAgentProcessObserver", () => {
+  it.skipIf(process.platform === "win32")(
+    "keeps inner arguments out of supervisor argv and scrubs its private payload",
+    async () => {
+      const observer = new LocalManagedAgentProcessObserver();
+      const controller = new AbortController();
+      const privateArgument = "inner-only-supervisor-argument";
+      const anchor = asChildProcess(
+        observer.spawn({
+          command: process.execPath,
+          args: [
+            "-e",
+            [
+              'const payload = "SAPIOM_MANAGED_AGENT_SUPERVISOR_PAYLOAD";',
+              "const valid = process.argv[1] === " +
+                JSON.stringify(privateArgument) +
+                " && !Object.hasOwn(process.env, payload);",
+              "process.exit(valid ? 0 : 31);",
+            ].join(""),
+            privateArgument,
+          ],
+          cwd: process.cwd(),
+          env: { ...process.env },
+          signal: controller.signal,
+        }),
+      );
+      try {
+        expect(anchor.spawnargs.join("\u0000")).not.toContain(privateArgument);
+        const [exitCode, signalCode] = await once(anchor, "exit");
+        expect(exitCode).toBe(0);
+        expect(signalCode).toBeNull();
+      } finally {
+        if (typeof anchor.pid === "number") {
+          await forceKillExactTestGroup(anchor.pid, anchor);
+        }
+        controller.abort();
+        observer.dispose();
+      }
+    },
+    5_000,
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "preserves a normal inner exit code without reporting a signal kill",
+    async () => {
+      const observer = new LocalManagedAgentProcessObserver();
+      const controller = new AbortController();
+      const anchor = asChildProcess(
+        observer.spawn({
+          command: process.execPath,
+          args: [
+            "-e",
+            'process.stderr.write("x".repeat(1024 * 1024), () => process.exit(23));',
+          ],
+          cwd: process.cwd(),
+          env: { ...process.env },
+          signal: controller.signal,
+        }),
+      );
+      let forwardedStderrBytes = 0;
+      anchor.stderr.on("data", (chunk: Buffer) => {
+        forwardedStderrBytes += chunk.byteLength;
+      });
+      try {
+        const [exitCode, signalCode] = await once(anchor, "exit");
+        expect(exitCode).toBe(23);
+        expect(signalCode).toBeNull();
+        expect(forwardedStderrBytes).toBe(1024 * 1024);
+      } finally {
+        if (typeof anchor.pid === "number") {
+          await forceKillExactTestGroup(anchor.pid, anchor);
+        }
+        controller.abort();
+        observer.dispose();
+      }
+    },
+    5_000,
+  );
+
   it.skipIf(process.platform === "win32")(
     "force-stops and kills the exact non-cooperative fixture group, then confirms death inside one deadline",
     async () => {
@@ -190,6 +387,61 @@ describe("LocalManagedAgentProcessObserver", () => {
     10_000,
   );
 
+  it.skipIf(process.platform === "win32")(
+    "kills the complete owned group on parent IPC disconnect without touching an unrelated process",
+    async () => {
+      const fixture = await createManagedAgentFixture(() => "ipc-disconnect");
+      fixtures.push(fixture);
+      const observer = new LocalManagedAgentProcessObserver();
+      const controller = new AbortController();
+      const unrelated = spawnChild(
+        process.execPath,
+        ["-e", "setInterval(() => {}, 1000)"],
+        { stdio: "ignore", windowsHide: true },
+      );
+      await once(unrelated, "spawn");
+      const anchor = asChildProcess(
+        observer.spawn({
+          command: process.execPath,
+          args: [FIXTURE_PATHS.processScript, FIXTURE_PATHS.processPidFile],
+          cwd: fixture.workspaceRoot,
+          env: { ...process.env },
+          signal: controller.signal,
+        }),
+      );
+      const ownedProcessGroupId = anchor.pid;
+      expect(ownedProcessGroupId).toBeTypeOf("number");
+      try {
+        const fixturePids = await waitForManagedAgentFixturePids(fixture);
+        await expect(observer.prepareCancellation()).resolves.toMatchObject({
+          supported: true,
+          reason: "ready",
+          ownershipProven: true,
+        });
+
+        anchor.disconnect();
+        const teardown = await observer.waitForQuiescence(1_000);
+        expect(teardown).toMatchObject({
+          quiescent: true,
+          deadlineMet: true,
+          ownershipProven: true,
+          forceKillIssued: false,
+          alivePidsAtDeadline: [],
+        });
+        expect(fixturePids.every((pid) => !processExists(pid))).toBe(true);
+        expect(processExists(unrelated.pid!)).toBe(true);
+      } finally {
+        if (typeof ownedProcessGroupId === "number") {
+          await forceKillExactTestGroup(ownedProcessGroupId, anchor);
+        }
+        controller.abort();
+        observer.dispose();
+        await forceKillExactTestProcess(unrelated);
+      }
+    },
+    10_000,
+  );
+
   it("fails preparation closed after a fast root exits and never signals its former numeric group", async () => {
     const signals: Array<readonly [number, string]> = [];
     const observer = new LocalManagedAgentProcessObserver({
@@ -225,6 +477,18 @@ describe("LocalManagedAgentProcessObserver", () => {
       observer.dispose();
     }
   });
+
+  it.skipIf(process.platform === "win32")(
+    "retains owned group authority when the SDK root exits before its non-cooperative child",
+    () => proveRetainedGroupAuthority("before-readiness"),
+    10_000,
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "retains owned group authority when the SDK root exits after readiness while its child survives",
+    () => proveRetainedGroupAuthority("after-readiness"),
+    10_000,
+  );
 
   it("bounds a hanging process-table read and never turns unknown observation into quiescence", async () => {
     const signals: Array<readonly [number, string]> = [];

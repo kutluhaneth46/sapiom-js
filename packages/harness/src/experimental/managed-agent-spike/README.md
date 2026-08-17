@@ -67,28 +67,35 @@ and SDK tool-result event.
 ## L2 cancellation containment boundary
 
 E0.4 certifies one deliberately narrow host model: the exact non-cooperative
-fixture command running under the active Agent SDK root in a detached macOS or
-Linux process group. Before cancellation may fire, a bounded host `ps` sample
-must prove that the trusted SDK `ChildProcess` is still active and is the group
+fixture command running under an observer-owned supervisor in a detached macOS
+or Linux process group. The supervisor is the persistent group leader and stays
+alive when the inner Agent SDK root exits while a same-group descendant
+survives. Before cancellation may fire, a bounded host `ps` sample must prove
+that the trusted supervisor `ChildProcess` is still active and is the group
 leader, and both PIDs read from the fixture file must already be present in the
 independently host-observed group. The file is comparison evidence only; its
 contents are never passed into the observer or used as signal targets.
 
 The runtime binds the observer directly to the per-run `Options.abortController`
 signal. On abort it synchronously and idempotently sends `SIGSTOP` followed by
-`SIGKILL` to the observer-created group while the trusted root handle remains
-active. The fixture parent and child intentionally ignore `SIGTERM`, making the
-forced path load-bearing. Iterator abandonment, query close, bounded process
-enumeration, and group-death confirmation share one absolute five-second
-process-termination deadline. Workspace snapshots and result assembly occur
-afterward.
+`SIGKILL` to the supervisor-owned group while the trusted anchor handle remains
+active. The returned SDK process also maps direct kills to that group, and a
+parent IPC disconnect kills the group. The fixture parent and child
+intentionally ignore `SIGTERM`, making the forced path load-bearing. The
+supervisor's bounded `ps` helper remains inside the owned group and only its
+known PID plus the anchor PID are excluded from its membership decision.
+Iterator abandonment, query close, bounded process enumeration, and
+group-death confirmation share one absolute five-second process-termination
+deadline. Workspace snapshots and result assembly occur afterward. The
+close-deadline timer remains referenced so a CLI host cannot exit before
+cleanup and result reporting finish.
 
 An unavailable or timed-out process table is explicit unknown evidence, never
-an empty process table. The active detached root still authorizes safe cleanup
-of its owned group, but the run fails certification. A fast root exit before
-preparation, an observed `setsid`/group escape, unknown group liveness, failed
-signals, and Windows all fail closed. Windows live L2 is rejected before the
-query or credential is opened. Universal containment, POSIX group escape,
+an empty process table. The active detached supervisor still authorizes safe
+cleanup of its owned group, but the run fails certification. An invalid or
+inactive supervisor, an observed `setsid`/group escape, unknown group liveness,
+failed signals, and Windows all fail closed. Windows live L2 is rejected before
+the query or credential is opened. Universal containment, POSIX group escape,
 Windows Job Objects, and production recovery belong to later epics; this probe
 does not claim those guarantees.
 

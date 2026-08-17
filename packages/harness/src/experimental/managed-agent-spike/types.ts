@@ -169,7 +169,7 @@ export interface ManagedAgentTeardownObservation {
   readonly processTableAvailable: boolean;
   /** False means the owned E0 containment model was escaped or unproven. */
   readonly containmentSupported: boolean;
-  /** True only after an active POSIX root was observed as its PGID leader. */
+  /** True only after the active POSIX supervisor is observed as PGID leader. */
   readonly ownershipProven: boolean;
   /** True only when the bound raw abort synchronously issued SIGSTOP+SIGKILL. */
   readonly forceKillIssued: boolean;
@@ -241,12 +241,12 @@ export interface ManagedAgentProcessObserver {
   bindAbortSignal(signal: AbortSignal): void;
   /** Prove the narrow POSIX ownership model before allowing L2 to cancel. */
   prepareCancellation(): Promise<ManagedAgentCancellationReadiness>;
-  /** Sample only descendants of the host-observed SDK process roots. */
+  /** Sample only members owned by the host-observed process anchors. */
   observeProcessTree(timeoutMs?: number): Promise<boolean>;
   waitForQuiescence(
     timeoutMs: number,
   ): Promise<ManagedAgentTeardownObservation>;
-  /** Idempotently force a proven active group and confirm within this budget. */
+  /** Idempotently force an anchored owned group and confirm within this budget. */
   emergencyCleanup(timeoutMs: number): Promise<ManagedAgentTeardownObservation>;
   dispose(): void;
 }
