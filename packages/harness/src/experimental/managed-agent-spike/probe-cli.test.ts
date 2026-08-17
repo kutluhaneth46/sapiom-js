@@ -402,6 +402,58 @@ function moveCompletionBeforeOwnRequest(
   return withProjectedL1Events({ ...result, toolEvidence });
 }
 
+function eventSubstream(
+  result: ManagedAgentProbeResult,
+  types: readonly ManagedAgentProbeEvent["type"][],
+): readonly Omit<ManagedAgentProbeEvent, "sequence">[] {
+  return result.events
+    .filter(({ type }) => types.includes(type))
+    .map(({ sequence: _sequence, ...event }) => event);
+}
+
+function movePermissionAfterOwnCompletion(
+  result: ManagedAgentProbeResult,
+  requestIndex: number,
+): ManagedAgentProbeResult {
+  const request = result.toolEvidence.filter(
+    ({ status }) => status === "requested",
+  )[requestIndex]!;
+  const events = [...result.events];
+  const permissionIndex = events.findIndex(
+    (event) =>
+      event.type === "permission" && event.toolUseId === request.toolUseId,
+  );
+  const [permission] = events.splice(permissionIndex, 1);
+  const completionIndex = events.findIndex(
+    (event) =>
+      event.type === "tool_completed" && event.toolUseId === request.toolUseId,
+  );
+  events.splice(completionIndex + 1, 0, permission!);
+  return withResequencedEvents(result, events);
+}
+
+function withPermissionsBeforeOwnRequests(
+  result: ManagedAgentProbeResult,
+): ManagedAgentProbeResult {
+  const events = [...result.events];
+  for (const request of result.toolEvidence.filter(
+    ({ status }) => status === "requested",
+  )) {
+    const permissionIndex = events.findIndex(
+      (event) =>
+        event.type === "permission" && event.toolUseId === request.toolUseId,
+    );
+    const [permission] = events.splice(permissionIndex, 1);
+    const requestEventIndex = events.findIndex(
+      (event) =>
+        event.type === "tool_requested" &&
+        event.toolUseId === request.toolUseId,
+    );
+    events.splice(requestEventIndex, 0, permission!);
+  }
+  return withResequencedEvents(result, events);
+}
+
 describe("managed-agent probe CLI", () => {
   it("is opt-in and never accepts credentials through arguments", () => {
     expect(() =>
@@ -750,6 +802,53 @@ describe("managed-agent probe CLI", () => {
     expectProbeCheckFailure(
       { ...passing, events },
       "normalized_event_projection",
+    );
+  });
+
+  it.each(Array.from({ length: 11 }, (_, index) => index))(
+    "rejects canonical permission %i moved after its own completion while preserving both substreams",
+    (requestIndex) => {
+      const passing = passingL1Result();
+      const invalid = movePermissionAfterOwnCompletion(passing, requestIndex);
+
+      expect(
+        eventSubstream(invalid, ["tool_requested", "tool_completed"]),
+      ).toEqual(eventSubstream(passing, ["tool_requested", "tool_completed"]));
+      expect(eventSubstream(invalid, ["permission"])).toEqual(
+        eventSubstream(passing, ["permission"]),
+      );
+      expectProbeCheckFailure(invalid, "normalized_event_projection");
+    },
+  );
+
+  it("rejects an optional Read permission moved after its own completion while preserving both substreams", () => {
+    const passing = insertL1ToolStep(
+      passingL1Result(),
+      5,
+      optionalReadStep("read:clean_target"),
+      "e",
+    );
+    const invalid = movePermissionAfterOwnCompletion(passing, 5);
+
+    expect(
+      eventSubstream(invalid, ["tool_requested", "tool_completed"]),
+    ).toEqual(eventSubstream(passing, ["tool_requested", "tool_completed"]));
+    expect(eventSubstream(invalid, ["permission"])).toEqual(
+      eventSubstream(passing, ["permission"]),
+    );
+    expectProbeCheckFailure(invalid, "normalized_event_projection");
+  });
+
+  it("accepts permissions before their requests when each permission still precedes its completion", () => {
+    const requestBeforePermission = passingL1Result();
+    const permissionBeforeRequest =
+      withPermissionsBeforeOwnRequests(passingL1Result());
+
+    expect(evaluateManagedAgentProbe(requestBeforePermission).outcome).toBe(
+      "pass",
+    );
+    expect(evaluateManagedAgentProbe(permissionBeforeRequest).outcome).toBe(
+      "pass",
     );
   });
 

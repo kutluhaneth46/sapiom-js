@@ -232,14 +232,22 @@ function hasConsistentManagedAgentL1EventProjection(
     }
   }
 
-  const permissionEvents = result.events.filter(
-    ({ type }) => type === "permission",
+  const permissionEvents = result.events.flatMap((event, index) =>
+    event.type === "permission" ? [{ event, index }] : [],
   );
   if (permissionEvents.length !== result.permissionEvidence.length) {
     return false;
   }
+  const completionIndexByToolUseId = new Map<string, number>();
+  for (const [index, event] of result.events.entries()) {
+    if (event.type === "tool_completed" && event.toolUseId) {
+      completionIndexByToolUseId.set(event.toolUseId, index);
+    }
+  }
   return result.permissionEvidence.every((evidence, index) => {
-    const event = permissionEvents[index];
+    const permission = permissionEvents[index];
+    const event = permission?.event;
+    const completionIndex = completionIndexByToolUseId.get(evidence.toolUseId);
     return Boolean(
       event &&
       event.toolUseId === evidence.toolUseId &&
@@ -247,7 +255,9 @@ function hasConsistentManagedAgentL1EventProjection(
       event.permissionDecision === evidence.decision &&
       event.permissionReason === evidence.reason &&
       event.permissionSource === evidence.source &&
-      event.operationId === evidence.operationId,
+      event.operationId === evidence.operationId &&
+      completionIndex !== undefined &&
+      permission.index < completionIndex,
     );
   });
 }

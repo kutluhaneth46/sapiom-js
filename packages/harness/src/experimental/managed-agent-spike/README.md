@@ -98,9 +98,11 @@ accepts observed SDK batching without allowing an all-requests-first trace to
 masquerade as multi-turn recovery.
 
 Normalized tool and permission events must be an exact chronological
-projection of their evidence arrays. A successful Bash completion must precede
-the single successful SDK result, which must precede the final successful
-terminal event.
+projection of their evidence arrays. Each primary permission event must precede
+its matching tool completion. It may appear before or after the matching request
+event because the SDK hook and yielded message have independent observation
+order. A successful Bash completion must precede the single successful SDK
+result, which must precede the final successful terminal event.
 
 Filesystem acceptance is also exact: only the clean target may be modified and
 only the managed output may be created, in either evidence order. Trusted
