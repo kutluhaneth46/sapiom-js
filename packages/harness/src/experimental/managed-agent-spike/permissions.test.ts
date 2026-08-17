@@ -91,6 +91,109 @@ function preToolUseInput(
 }
 
 describe("managed-agent universal policy boundary", () => {
+  it("classifies registered paths by lexical identity before realpath containment", async () => {
+    const evidence: ManagedAgentPermissionEvidence[] = [];
+    const resolveToolPath = vi.fn(resolveManagedAgentToolPath);
+    const outsidePath = join(outside, "secret.txt");
+    const boundary = createManagedAgentPolicyBoundary({
+      canonicalWorkspaceRoot: workspace,
+      allowedBashCommands: [],
+      allowedMcpTools: [],
+      pathRoleBindings: [
+        { path: "inside.txt", role: "clean_target" },
+        { path: outsidePath, role: "outside_sentinel" },
+        { path: "escape.txt", role: "escape_link" },
+      ],
+      requireRegisteredFilePaths: true,
+      onDecision: (decision) => evidence.push(decision),
+      resolveToolPath,
+    });
+    const signal = new AbortController().signal;
+    const invoke = (filePath: string, toolUseId: string) =>
+      boundary.preToolUseHook(
+        preToolUseInput("Read", { file_path: filePath }, toolUseId),
+        toolUseId,
+        { signal },
+      );
+
+    await expect(invoke("inside.txt", "relative")).resolves.toMatchObject({
+      hookSpecificOutput: { permissionDecision: "allow" },
+    });
+    await expect(
+      invoke(join(workspace, "inside.txt"), "absolute"),
+    ).resolves.toMatchObject({
+      hookSpecificOutput: { permissionDecision: "allow" },
+    });
+    await expect(invoke(outsidePath, "outside")).resolves.toMatchObject({
+      hookSpecificOutput: { permissionDecision: "deny" },
+    });
+    await expect(invoke("escape.txt", "escape")).resolves.toMatchObject({
+      hookSpecificOutput: { permissionDecision: "deny" },
+    });
+    await expect(
+      invoke(join(workspace, "not-registered.txt"), "unregistered"),
+    ).resolves.toMatchObject({
+      hookSpecificOutput: { permissionDecision: "deny" },
+    });
+
+    expect(
+      evidence.map(({ decision, reason, operationId }) => ({
+        decision,
+        reason,
+        operationId,
+      })),
+    ).toEqual([
+      {
+        decision: "allow",
+        reason: "fixture_path",
+        operationId: "read:clean_target",
+      },
+      {
+        decision: "allow",
+        reason: "fixture_path",
+        operationId: "read:clean_target",
+      },
+      {
+        decision: "deny",
+        reason: "path_outside_workspace",
+        operationId: "read:outside_sentinel",
+      },
+      {
+        decision: "deny",
+        reason: "path_symlink_escape",
+        operationId: "read:escape_link",
+      },
+      {
+        decision: "deny",
+        reason: "path_role_not_allowed",
+        operationId: "read:unregistered",
+      },
+    ]);
+    expect(resolveToolPath).toHaveBeenCalledTimes(4);
+    const serialized = JSON.stringify(evidence);
+    expect(serialized).not.toContain(workspace);
+    expect(serialized).not.toContain(outsidePath);
+    expect(serialized).not.toContain("inside.txt");
+  });
+
+  it("rejects path-role bindings with the same normalized lexical target", () => {
+    expect(() =>
+      createManagedAgentPolicyBoundary({
+        canonicalWorkspaceRoot: workspace,
+        allowedBashCommands: [],
+        allowedMcpTools: [],
+        pathRoleBindings: [
+          { path: "inside.txt", role: "clean_target" },
+          {
+            path: join(workspace, "inside.txt"),
+            role: "dirty_sentinel",
+          },
+        ],
+        onDecision: () => undefined,
+      }),
+    ).toThrow("unique lexical paths");
+  });
+
   it("can enforce an L2 Bash-only boundary before evaluating model-authored inputs", async () => {
     const evidence: ManagedAgentPermissionEvidence[] = [];
     const boundary = createManagedAgentPolicyBoundary({
@@ -167,6 +270,12 @@ describe("managed-agent universal policy boundary", () => {
     const evidence: ManagedAgentPermissionEvidence[] = [];
     const boundary = createManagedAgentPolicyBoundary({
       canonicalWorkspaceRoot: workspace,
+      pathRoleBindings: [
+        { path: "inside.txt", role: "clean_target" },
+        { path: "nested/new.txt", role: "managed_output" },
+        { path: join(outside, "secret.txt"), role: "outside_sentinel" },
+        { path: "escape.txt", role: "escape_link" },
+      ],
       allowedBashCommands: ["git status --short"],
       allowedMcpTools: ["mcp__probe__echo_nonce"],
       onDecision: (decision) => evidence.push(decision),
@@ -236,20 +345,26 @@ describe("managed-agent universal policy boundary", () => {
     });
 
     expect(
-      evidence.map(({ decision, reason, source }) => [
+      evidence.map(({ decision, reason, source, operationId }) => [
         decision,
         reason,
         source,
+        operationId,
       ]),
     ).toEqual([
-      ["allow", "exact_bash_command", "pre_tool_use"],
-      ["deny", "bash_command_not_allowed", "pre_tool_use"],
-      ["allow", "fixture_path", "pre_tool_use"],
-      ["allow", "fixture_path", "pre_tool_use"],
-      ["deny", "path_outside_workspace", "pre_tool_use"],
-      ["deny", "path_symlink_escape", "pre_tool_use"],
-      ["allow", "managed_mcp_tool", "pre_tool_use"],
-      ["deny", "tool_not_allowed", "pre_tool_use"],
+      ["allow", "exact_bash_command", "pre_tool_use", "bash:exact_command"],
+      ["deny", "bash_command_not_allowed", "pre_tool_use", "bash:unregistered"],
+      ["allow", "fixture_path", "pre_tool_use", "read:clean_target"],
+      ["allow", "fixture_path", "pre_tool_use", "write:managed_output"],
+      [
+        "deny",
+        "path_outside_workspace",
+        "pre_tool_use",
+        "read:outside_sentinel",
+      ],
+      ["deny", "path_symlink_escape", "pre_tool_use", "read:escape_link"],
+      ["allow", "managed_mcp_tool", "pre_tool_use", "mcp:echo_nonce"],
+      ["deny", "tool_not_allowed", "pre_tool_use", "unknown"],
     ]);
     expect(JSON.stringify(evidence)).not.toContain(join(outside, "secret.txt"));
     expect(JSON.stringify(evidence)).not.toContain("secret");

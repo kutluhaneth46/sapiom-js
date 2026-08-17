@@ -8,6 +8,9 @@ import type {
 } from "@anthropic-ai/claude-agent-sdk";
 
 import type {
+  ManagedAgentOperationId,
+  ManagedAgentPathRole,
+  ManagedAgentPathRoleBinding,
   ManagedAgentPermissionEvidence,
   ManagedAgentPermissionReason,
   ManagedAgentPermissionSource,
@@ -140,6 +143,10 @@ export interface ManagedAgentPolicyBoundaryOptions {
   readonly allowedBuiltinTools?: readonly string[];
   readonly allowedBashCommands: readonly string[];
   readonly allowedMcpTools: readonly string[];
+  /** Exact prompt literals mapped to content-free evidence roles. */
+  readonly pathRoleBindings?: readonly ManagedAgentPathRoleBinding[];
+  /** Certification mode denies file paths without a predeclared role. */
+  readonly requireRegisteredFilePaths?: boolean;
   readonly onDecision: (evidence: ManagedAgentPermissionEvidence) => void;
   readonly onGuardRejection?: (
     diagnostic: ManagedAgentPreToolUseGuardRejection,
@@ -165,6 +172,7 @@ export interface ManagedAgentPolicyBoundary {
 interface ManagedAgentPolicyDecision {
   readonly decision: "allow" | "deny";
   readonly reason: ManagedAgentPermissionReason;
+  readonly operationId: ManagedAgentOperationId;
   readonly updatedInput?: Record<string, unknown>;
 }
 
@@ -226,8 +234,53 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 
 function denied(
   reason: ManagedAgentPermissionReason,
+  operationId: ManagedAgentOperationId = "unknown",
 ): ManagedAgentPolicyDecision {
-  return { decision: "deny", reason };
+  return { decision: "deny", reason, operationId };
+}
+
+function fileOperationId(
+  toolName: "Read" | "Edit" | "Write",
+  role: ManagedAgentPathRole,
+): ManagedAgentOperationId {
+  return `${toolName.toLowerCase()}:${role}` as ManagedAgentOperationId;
+}
+
+function lexicalPathRoleKey(
+  canonicalWorkspaceRoot: string,
+  requestedPath: string,
+): string {
+  return comparisonPath(resolve(canonicalWorkspaceRoot, requestedPath));
+}
+
+function classifyManagedAgentOperation(
+  canonicalWorkspaceRoot: string,
+  toolName: string,
+  rawInput: unknown,
+  allowedCommands: ReadonlySet<string>,
+  pathRoles: ReadonlyMap<string, ManagedAgentPathRole>,
+): ManagedAgentOperationId {
+  const input = asRecord(rawInput);
+  if (toolName === "Bash") {
+    return input &&
+      typeof input.command === "string" &&
+      allowedCommands.has(input.command)
+      ? "bash:exact_command"
+      : "bash:unregistered";
+  }
+  if (toolName.endsWith("__echo_nonce")) return "mcp:echo_nonce";
+  if (toolName.endsWith("__fail_once")) return "mcp:fail_once";
+  if (toolName.startsWith("mcp__")) return "mcp:managed";
+  if (toolName === "Read" || toolName === "Edit" || toolName === "Write") {
+    const requestedPath = input ? filePathFromInput(input) : undefined;
+    const role = requestedPath
+      ? (pathRoles.get(
+          lexicalPathRoleKey(canonicalWorkspaceRoot, requestedPath),
+        ) ?? "unregistered")
+      : "unregistered";
+    return fileOperationId(toolName, role);
+  }
+  return "unknown";
 }
 
 async function evaluateManagedAgentPolicy(
@@ -235,62 +288,80 @@ async function evaluateManagedAgentPolicy(
   allowedBuiltinTools: ReadonlySet<string>,
   allowedCommands: ReadonlySet<string>,
   allowedMcpTools: ReadonlySet<string>,
+  pathRoles: ReadonlyMap<string, ManagedAgentPathRole>,
   toolName: string,
   rawInput: unknown,
   signal: AbortSignal,
 ): Promise<ManagedAgentPolicyDecision> {
-  if (signal.aborted) return denied("policy_aborted");
+  const operationId = classifyManagedAgentOperation(
+    options.canonicalWorkspaceRoot,
+    toolName,
+    rawInput,
+    allowedCommands,
+    pathRoles,
+  );
+  if (signal.aborted) return denied("policy_aborted", operationId);
   if (!allowedBuiltinTools.has(toolName) && !allowedMcpTools.has(toolName)) {
-    return denied("tool_not_allowed");
+    return denied("tool_not_allowed", operationId);
   }
   const input = asRecord(rawInput);
-  if (!input) return denied("invalid_input");
+  if (!input) return denied("invalid_input", operationId);
 
   if (allowedMcpTools.has(toolName)) {
     return signal.aborted
-      ? denied("policy_aborted")
+      ? denied("policy_aborted", operationId)
       : {
           decision: "allow",
           reason: "managed_mcp_tool",
+          operationId,
           updatedInput: { ...input },
         };
   }
   if (toolName === "Bash") {
     const command =
       typeof input.command === "string" ? input.command : undefined;
-    if (!command) return denied("invalid_input");
+    if (!command) return denied("invalid_input", operationId);
     if (!allowedCommands.has(command)) {
-      return denied("bash_command_not_allowed");
+      return denied("bash_command_not_allowed", operationId);
     }
     return signal.aborted
-      ? denied("policy_aborted")
+      ? denied("policy_aborted", operationId)
       : {
           decision: "allow",
           reason: "exact_bash_command",
+          operationId,
           updatedInput: { ...input },
         };
   }
   if (toolName === "Read" || toolName === "Edit" || toolName === "Write") {
     const requestedPath = filePathFromInput(input);
-    if (!requestedPath) return denied("invalid_input");
+    if (!requestedPath) return denied("invalid_input", operationId);
+    if (
+      options.requireRegisteredFilePaths &&
+      operationId.endsWith(":unregistered")
+    ) {
+      return denied("path_role_not_allowed", operationId);
+    }
     try {
       const canonicalPath = await (
         options.resolveToolPath ?? resolveManagedAgentToolPath
       )(options.canonicalWorkspaceRoot, requestedPath);
-      if (signal.aborted) return denied("policy_aborted");
+      if (signal.aborted) return denied("policy_aborted", operationId);
       return {
         decision: "allow",
         reason: "fixture_path",
+        operationId,
         updatedInput: { ...input, file_path: canonicalPath },
       };
     } catch (error) {
-      if (signal.aborted) return denied("policy_aborted");
+      if (signal.aborted) return denied("policy_aborted", operationId);
       return denied(
         error instanceof ManagedAgentPathError ? error.reason : "invalid_input",
+        operationId,
       );
     }
   }
-  return denied("tool_not_allowed");
+  return denied("tool_not_allowed", operationId);
 }
 
 /**
@@ -306,6 +377,19 @@ export function createManagedAgentPolicyBoundary(
   );
   const allowedCommands = new Set(options.allowedBashCommands);
   const allowedMcpTools = new Set(options.allowedMcpTools);
+  const pathRoles = new Map<string, ManagedAgentPathRole>();
+  for (const binding of options.pathRoleBindings ?? []) {
+    const key = lexicalPathRoleKey(
+      options.canonicalWorkspaceRoot,
+      binding.path,
+    );
+    if (pathRoles.has(key)) {
+      throw new Error(
+        "Managed-agent path role bindings must resolve to unique lexical paths",
+      );
+    }
+    pathRoles.set(key, binding.role);
+  }
   const decisions = new Map<
     string,
     {
@@ -337,10 +421,17 @@ export function createManagedAgentPolicyBoundary(
     signal: AbortSignal,
     source: ManagedAgentPermissionSource,
   ): Promise<ManagedAgentRecordedPolicyDecision> => {
+    const attemptedOperationId = classifyManagedAgentOperation(
+      options.canonicalWorkspaceRoot,
+      toolName,
+      input,
+      allowedCommands,
+      pathRoles,
+    );
     const existing = decisions.get(toolUseID);
     if (existing) {
       if (signal.aborted) {
-        return { ...denied("policy_aborted"), source };
+        return { ...denied("policy_aborted", attemptedOperationId), source };
       }
       // The only valid duplicate is the SDK consulting canUseTool after the
       // primary hook. A repeated primary ID or fallback-first sequence is
@@ -348,13 +439,14 @@ export function createManagedAgentPolicyBoundary(
       return source === "can_use_tool_fallback" &&
         existing.source === "pre_tool_use"
         ? existing.pending
-        : { ...denied("invalid_input"), source };
+        : { ...denied("invalid_input", attemptedOperationId), source };
     }
     const pending = evaluateManagedAgentPolicy(
       options,
       allowedBuiltinTools,
       allowedCommands,
       allowedMcpTools,
+      pathRoles,
       toolName,
       input,
       signal,
@@ -366,6 +458,7 @@ export function createManagedAgentPolicyBoundary(
         decision: recorded.decision,
         reason: recorded.reason,
         source,
+        operationId: recorded.operationId,
       });
       return recorded;
     });

@@ -9,6 +9,7 @@ import {
   createManagedAgentFixture,
   diffManagedAgentWorkspaceSnapshots,
   fixtureGitStatus,
+  observeManagedAgentL1FinalBytes,
   verifyManagedAgentFixtureBytes,
   type ManagedAgentFixture,
 } from "./fixture.js";
@@ -41,6 +42,14 @@ describe("managed-agent disposable git fixture", () => {
     const fixture = await createManagedAgentFixture(() => "prompt-contract");
     fixtures.push(fixture);
     const prompt = fixture.prompt("L1");
+    expect(prompt.split("\n")[0]).toBe("SAPIOM_MANAGED_AGENT_L1_PROMPT_V2");
+    expect(prompt).toContain(
+      "at most one optional verification Read after call 5 and before call 6",
+    );
+    expect(prompt).toContain(
+      "exactly repeat call 1, 2, or 3 with the same literal file_path",
+    );
+    expect(prompt).toContain("Do not Read any other fixture path");
     const numberedLines = prompt
       .split("\n")
       .filter((line) => /^\d+\./.test(line));
@@ -98,6 +107,25 @@ describe("managed-agent disposable git fixture", () => {
     expect(diffManagedAgentWorkspaceSnapshots(before, after)).toEqual([
       { path: FIXTURE_PATHS.cleanTarget, change: "modified" },
       { path: FIXTURE_PATHS.createdTarget, change: "created" },
+    ]);
+    expect(
+      observeManagedAgentL1FinalBytes(after, fixture.expectedL1FinalBytes),
+    ).toEqual([
+      { role: "clean_target", matched: true },
+      { role: "managed_output", matched: true },
+    ]);
+    await writeFile(
+      join(fixture.workspaceRoot, FIXTURE_PATHS.createdTarget),
+      "wrong final bytes\n",
+    );
+    const incorrect = await captureManagedAgentWorkspaceSnapshot(
+      fixture.workspaceRoot,
+    );
+    expect(
+      observeManagedAgentL1FinalBytes(incorrect, fixture.expectedL1FinalBytes),
+    ).toEqual([
+      { role: "clean_target", matched: true },
+      { role: "managed_output", matched: false },
     ]);
     expect(await verifyManagedAgentFixtureBytes(fixture)).toEqual([
       { path: FIXTURE_PATHS.dirtySentinel, preserved: true },

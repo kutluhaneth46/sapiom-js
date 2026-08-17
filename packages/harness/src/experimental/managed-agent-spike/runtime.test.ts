@@ -145,6 +145,9 @@ async function probeConfig(scenario: "L1" | "L2" = "L1") {
       allowedBashCommands: [
         scenario === "L1" ? fixture.l1BashCommand : fixture.l2BashCommand,
       ],
+      pathRoleBindings: scenario === "L1" ? fixture.pathRoleBindings : [],
+      expectedL1FinalBytes:
+        scenario === "L1" ? fixture.expectedL1FinalBytes : [],
       ...(scenario === "L1" ? { expectedMcpNonce: fixture.nonce } : {}),
       preservePaths: [
         FIXTURE_PATHS.dirtySentinel,
@@ -321,6 +324,15 @@ describe("runManagedAgentProbe", () => {
       expect(result.inferenceTurns).toBe(1);
       expect(result.sdkNumTurns).toBe(1);
       expect(result.correlation.promptEmbedded).toBe(true);
+      expect(result.l1Certification).toEqual({
+        contractVersion: 2,
+        promptVersion: "managed-agent-l1-prompt-v2",
+      });
+      expect(result.l1FinalBytes).toEqual([
+        { role: "clean_target", matched: false },
+        { role: "managed_output", matched: false },
+      ]);
+      expect(result.nonceVerified).toBe(false);
       expect(capturedPrompt).toContain(
         "SAPIOM_CERTIFICATION_CORRELATION_V1;eval_source=studio-managed-agent-e0-l1-sonnet-5-00000000-0000-4000-8000-000000000002;execution_id=00000000-0000-4000-8000-000000000002",
       );

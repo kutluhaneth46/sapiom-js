@@ -230,6 +230,7 @@ export class ManagedAgentEventRecorder {
       permissionDecision: normalizedEvidence.decision,
       permissionReason: normalizedEvidence.reason,
       permissionSource: normalizedEvidence.source,
+      operationId: normalizedEvidence.operationId,
     });
   }
 

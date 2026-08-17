@@ -2,9 +2,11 @@ import { realpathSync, statSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 
 import type {
+  ManagedAgentL1FinalByteRole,
   ManagedAgentModelTarget,
   ManagedAgentModelTargetId,
   ManagedAgentProbeConfig,
+  ManagedAgentRegisteredPathRole,
 } from "./types.js";
 
 /**
@@ -21,6 +23,27 @@ export const MANAGED_AGENT_CONTRACT = {
   maxBudgetUsd: 1,
   maxTurns: 20,
 } as const;
+
+export const MANAGED_AGENT_L1_CERTIFICATION_CONTRACT = Object.freeze({
+  contractVersion: 2 as const,
+  promptVersion: "managed-agent-l1-prompt-v2" as const,
+  promptMarker: "SAPIOM_MANAGED_AGENT_L1_PROMPT_V2" as const,
+  evaluatorVersion: "managed-agent-l1-evaluator-v2" as const,
+});
+
+export const MANAGED_AGENT_L1_REGISTERED_PATH_ROLES = Object.freeze([
+  "clean_target",
+  "dirty_sentinel",
+  "untracked_sentinel",
+  "managed_output",
+  "outside_sentinel",
+  "escape_link",
+] as const satisfies readonly ManagedAgentRegisteredPathRole[]);
+
+export const MANAGED_AGENT_L1_FINAL_BYTE_ROLES = Object.freeze([
+  "clean_target",
+  "managed_output",
+] as const satisfies readonly ManagedAgentL1FinalByteRole[]);
 
 export const MANAGED_AGENT_MODEL_TARGETS: Readonly<
   Record<ManagedAgentModelTargetId, ManagedAgentModelTarget>
@@ -196,6 +219,57 @@ export function validateManagedAgentProbeConfig(
   }
   if (!config.prompt.trim()) {
     throw new ManagedAgentConfigurationError("prompt is required");
+  }
+  if (config.scenario === "L1") {
+    if (
+      config.prompt.split("\n", 1)[0] !==
+      MANAGED_AGENT_L1_CERTIFICATION_CONTRACT.promptMarker
+    ) {
+      throw new ManagedAgentConfigurationError(
+        "L1 prompt must use the frozen managed-agent-l1-prompt-v2 marker",
+      );
+    }
+    const roles = config.pathRoleBindings.map(({ role }) => role);
+    const paths = config.pathRoleBindings.map(({ path }) => path);
+    if (
+      roles.length !== MANAGED_AGENT_L1_REGISTERED_PATH_ROLES.length ||
+      new Set(roles).size !== roles.length ||
+      new Set(paths).size !== paths.length ||
+      MANAGED_AGENT_L1_REGISTERED_PATH_ROLES.some(
+        (role) => !roles.includes(role),
+      ) ||
+      paths.some((path) => !path || path.includes("\0") || /[\r\n]/.test(path))
+    ) {
+      throw new ManagedAgentConfigurationError(
+        "L1 pathRoleBindings must bind each frozen fixture role exactly once",
+      );
+    }
+    const finalByteRoles = config.expectedL1FinalBytes.map(({ role }) => role);
+    if (
+      finalByteRoles.length !== MANAGED_AGENT_L1_FINAL_BYTE_ROLES.length ||
+      new Set(finalByteRoles).size !== finalByteRoles.length ||
+      MANAGED_AGENT_L1_FINAL_BYTE_ROLES.some(
+        (role) => !finalByteRoles.includes(role),
+      ) ||
+      config.expectedL1FinalBytes.some(
+        ({ path, role, sha256 }) =>
+          !/^[a-f0-9]{64}$/.test(sha256) ||
+          !config.pathRoleBindings.some(
+            (binding) => binding.role === role && binding.path === path,
+          ),
+      )
+    ) {
+      throw new ManagedAgentConfigurationError(
+        "L1 expectedL1FinalBytes must bind exact hashes to the clean target and managed output roles",
+      );
+    }
+  } else if (
+    config.pathRoleBindings.length !== 0 ||
+    config.expectedL1FinalBytes.length !== 0
+  ) {
+    throw new ManagedAgentConfigurationError(
+      "L2 must not configure file path roles or L1 final-byte expectations",
+    );
   }
   if (
     config.scenario === "L1" &&

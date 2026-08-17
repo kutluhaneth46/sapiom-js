@@ -295,6 +295,8 @@ it("enforces real-SDK built-in and in-process MCP calls with exact loopback corr
         maxTurns: 6,
         maxBudgetUsd: 0.25,
         allowedBashCommands: [ALLOWED_BASH_COMMAND],
+        pathRoleBindings: fixture.pathRoleBindings,
+        expectedL1FinalBytes: fixture.expectedL1FinalBytes,
         expectedMcpNonce: fixture.nonce,
         preservePaths: [
           FIXTURE_PATHS.dirtySentinel,
@@ -514,6 +516,8 @@ it.skipIf(
           maxTurns: 4,
           maxBudgetUsd: 0.25,
           allowedBashCommands: [],
+          pathRoleBindings: fixture.pathRoleBindings,
+          expectedL1FinalBytes: fixture.expectedL1FinalBytes,
           expectedMcpNonce: fixture.nonce,
           preservePaths: [
             FIXTURE_PATHS.dirtySentinel,

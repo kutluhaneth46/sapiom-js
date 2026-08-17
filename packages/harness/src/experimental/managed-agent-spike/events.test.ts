@@ -153,6 +153,7 @@ describe("ManagedAgentEventRecorder", () => {
       decision: "deny",
       reason: "tool_not_allowed",
       source: "pre_tool_use",
+      operationId: "unknown",
     });
     recorder.recordTerminal("success");
 
@@ -169,6 +170,7 @@ describe("ManagedAgentEventRecorder", () => {
         decision: "deny",
         reason: "tool_not_allowed",
         source: "pre_tool_use",
+        operationId: "unknown",
       },
     ]);
     const serialized = JSON.stringify({

@@ -64,6 +64,35 @@ real in-process `echo_nonce` MCP turn. It requires one primary `PreToolUse`
 decision for each request and separately verifies the MCP handler invocation
 and SDK tool-result event.
 
+## L1 certification contract v2
+
+L1 is independently versioned as `managed-agent-l1-prompt-v2` and
+`managed-agent-l1-evaluator-v2` while the transport result remains contract
+version 1. The frozen prompt contains 11 canonical calls. It permits at most
+one additional verification Read, only after both denial probes and before the
+Edit, and only for the clean target, dirty sentinel, or untracked sentinel.
+
+The host registers the six prompt path literals under content-free roles. Role
+lookup uses normalized lexical path identity before realpath containment so an
+SDK-normalized absolute path retains the same role as its relative prompt
+literal. A different in-workspace path remains unregistered and is denied.
+Permission evidence contains only an operation ID such as
+`read:clean_target`; it never contains the raw path or tool input.
+
+The evaluator requires every canonical request ID to be non-empty and unique,
+with exactly one matching completion and one primary `PreToolUse` decision.
+Fallback-only decisions, duplicate or orphan evidence, mismatched tools,
+reordering, omission, retries, and every other extra operation fail closed.
+The optional Read count and role are reported separately as nonblocking
+efficiency evidence.
+
+Filesystem acceptance is also exact: only the clean target may be modified and
+only the managed output may be created, in either evidence order. Trusted
+SHA-256 expectations prove the final bytes of both mutation targets, while the
+durable result exposes only `{ role, matched }`. The dirty and untracked
+sentinels must remain byte-identical, and successful `echo_nonce` handling is
+recorded as a content-free nonce-verification boolean.
+
 ## L2 cancellation containment boundary
 
 E0.4 certifies one deliberately narrow host model: the exact non-cooperative
@@ -99,14 +128,15 @@ the query or credential is opened. Universal containment, POSIX group escape,
 Windows Job Objects, and production recovery belong to later epics; this probe
 does not claim those guarantees.
 
-## Pre-fix live evidence
+## Pre-v2 live evidence
 
-The first Sonnet 5 L1 attempt reached an SDK success result and clean teardown,
-but SDK default permissions executed successful Read and Bash calls without
-invoking the former `canUseTool` boundary. The fixed matrix stopped immediately;
-no retry or later model/scenario attempt ran. BigQuery showed exact Sonnet
-provider/model, no fallback, positive tokens, and cost for all 11 calls, but no
-durable correlation field and no independent SDK inference count.
+The exact-trace-v1 campaign completed both Sonnet 5 L1 repetitions and the
+first MiniMax M3 L1 repetition. The second M3 L1 run had a successful terminal
+result, exact model provenance, complete primary permission coverage, and clean
+teardown, but made one additional allowed in-root verification Read. The v1
+exact-trace evaluator rejected that run and the campaign stopped immediately;
+no L2 run followed.
 
-That attempt is not acceptance evidence. Do not run another paid L1/L2 matrix
-until this correction has independent review and explicit authorization.
+Those runs remain diagnostic history, not v2 acceptance evidence. Do not
+restart the paid L1/L2 matrix until this v2 correction has clean CI,
+independent review, and explicit authorization.

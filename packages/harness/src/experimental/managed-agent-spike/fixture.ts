@@ -15,8 +15,12 @@ import {
 import { tmpdir } from "node:os";
 import { basename, join, relative, resolve } from "node:path";
 
+import { MANAGED_AGENT_L1_CERTIFICATION_CONTRACT } from "./contract.js";
 import type {
+  ManagedAgentL1ExpectedFileHash,
+  ManagedAgentL1FinalByteObservation,
   ManagedAgentPreservationObservation,
+  ManagedAgentPathRoleBinding,
   ManagedAgentProbeScenario,
   ManagedAgentWorkspaceChange,
 } from "./types.js";
@@ -42,6 +46,8 @@ export interface ManagedAgentFixture {
   readonly createdTargetContents: string;
   readonly l1BashCommand: string;
   readonly l2BashCommand: string;
+  readonly pathRoleBindings: readonly ManagedAgentPathRoleBinding[];
+  readonly expectedL1FinalBytes: readonly ManagedAgentL1ExpectedFileHash[];
   readonly preservedBytes: Readonly<Record<string, Buffer>>;
   prompt(scenario: ManagedAgentProbeScenario): string;
   cleanup(): Promise<void>;
@@ -147,6 +153,16 @@ export function observeManagedAgentPreservation(
   return paths.map((path) => ({
     path,
     preserved: before.has(path) && before.get(path) === after.get(path),
+  }));
+}
+
+export function observeManagedAgentL1FinalBytes(
+  after: ManagedAgentWorkspaceSnapshot,
+  expected: readonly ManagedAgentL1ExpectedFileHash[],
+): ManagedAgentL1FinalByteObservation[] {
+  return expected.map(({ path, role, sha256 }) => ({
+    role,
+    matched: after.get(path) === sha256,
   }));
 }
 
@@ -256,6 +272,26 @@ export async function createManagedAgentFixture(
     shellQuote(FIXTURE_PATHS.processScript),
     shellQuote(FIXTURE_PATHS.processPidFile),
   ].join(" ");
+  const pathRoleBindings = [
+    { path: FIXTURE_PATHS.cleanTarget, role: "clean_target" },
+    { path: FIXTURE_PATHS.dirtySentinel, role: "dirty_sentinel" },
+    { path: FIXTURE_PATHS.untrackedSentinel, role: "untracked_sentinel" },
+    { path: FIXTURE_PATHS.createdTarget, role: "managed_output" },
+    { path: outsideSentinel, role: "outside_sentinel" },
+    { path: FIXTURE_PATHS.escapeLink, role: "escape_link" },
+  ] as const satisfies readonly ManagedAgentPathRoleBinding[];
+  const expectedL1FinalBytes = [
+    {
+      path: FIXTURE_PATHS.cleanTarget,
+      role: "clean_target",
+      sha256: hash(cleanTargetReplacement),
+    },
+    {
+      path: FIXTURE_PATHS.createdTarget,
+      role: "managed_output",
+      sha256: hash(createdTargetContents),
+    },
+  ] as const satisfies readonly ManagedAgentL1ExpectedFileHash[];
 
   return {
     root,
@@ -267,6 +303,8 @@ export async function createManagedAgentFixture(
     createdTargetContents,
     l1BashCommand,
     l2BashCommand,
+    pathRoleBindings,
+    expectedL1FinalBytes,
     preservedBytes: {
       [FIXTURE_PATHS.dirtySentinel]: Buffer.from(dirtyContents),
       [FIXTURE_PATHS.untrackedSentinel]: Buffer.from(untrackedContents),
@@ -281,13 +319,16 @@ export async function createManagedAgentFixture(
         ].join("\n");
       }
       return [
-        "Perform exactly these 11 tool calls in numbered order. Make each numbered call exactly once, do not combine calls, and make no unlisted tool call.",
+        MANAGED_AGENT_L1_CERTIFICATION_CONTRACT.promptMarker,
+        "Perform exactly these 11 canonical tool calls in numbered order. Make each numbered call exactly once and do not combine calls.",
         "Use every literal path, argument, and command exactly as written. Do not resolve, normalize, substitute, or retry a path or command. Continue after the two expected Read denials and the first expected fail_once error.",
         `1. Call Read with exactly ${JSON.stringify({ file_path: FIXTURE_PATHS.cleanTarget })}.`,
         `2. Call Read with exactly ${JSON.stringify({ file_path: FIXTURE_PATHS.dirtySentinel })}.`,
         `3. Call Read with exactly ${JSON.stringify({ file_path: FIXTURE_PATHS.untrackedSentinel })}. Save its sole line without surrounding whitespace for calls 8-10.`,
         `4. Call Read with exactly ${JSON.stringify({ file_path: outsideSentinel })}. A denial is expected; continue without retrying.`,
         `5. Call Read with exactly ${JSON.stringify({ file_path: FIXTURE_PATHS.escapeLink })}. This must remain the exact relative path shown: do not replace it with an absolute path or its symlink target. A denial is expected; continue without retrying.`,
+        "You may make at most one optional verification Read after call 5 and before call 6. If used, exactly repeat call 1, 2, or 3 with the same literal file_path; do not combine it with a numbered call.",
+        "Do not Read any other fixture path. Do not make a second optional Read, repeat either denial probe, or retry any other call.",
         `6. Call Edit with exactly ${JSON.stringify({ file_path: FIXTURE_PATHS.cleanTarget, old_string: cleanTargetContents, new_string: cleanTargetReplacement, replace_all: false })}.`,
         `7. Call Write with exactly ${JSON.stringify({ file_path: FIXTURE_PATHS.createdTarget, content: createdTargetContents })}.`,
         `8. Call echo_nonce exactly once with the saved line as its nonce argument.`,
@@ -295,7 +336,7 @@ export async function createManagedAgentFixture(
         `10. Call fail_once a second and final time with the same nonce argument.`,
         `11. Call Bash with exactly ${JSON.stringify({ command: l1BashCommand })}.`,
         `Never modify ${FIXTURE_PATHS.dirtySentinel} or ${FIXTURE_PATHS.untrackedSentinel}.`,
-        "After call 11 completes, make no further tool calls and return one short final text confirmation.",
+        "Except for the one optional verification Read above, make no unlisted tool call. After call 11 completes, make no further tool calls and return one short final text confirmation.",
       ].join("\n");
     },
     async cleanup() {

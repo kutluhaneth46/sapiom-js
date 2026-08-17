@@ -11,23 +11,34 @@ import {
 } from "./probe-cli.js";
 import { FIXTURE_PATHS } from "./fixture.js";
 import { qualifiedManagedAgentMcpToolName } from "./runtime.js";
-import type { ManagedAgentProbeResult } from "./types.js";
+import type {
+  ManagedAgentOperationId,
+  ManagedAgentPermissionDecision,
+  ManagedAgentPermissionReason,
+  ManagedAgentProbeResult,
+} from "./types.js";
 
 function passingL1Result(): ManagedAgentProbeResult {
   const echoTool = qualifiedManagedAgentMcpToolName("echo_nonce");
   const failOnceTool = qualifiedManagedAgentMcpToolName("fail_once");
   const steps = [
-    ["Read", "success", "allow", "fixture_path"],
-    ["Read", "success", "allow", "fixture_path"],
-    ["Read", "success", "allow", "fixture_path"],
-    ["Read", "error", "deny", "path_outside_workspace"],
-    ["Read", "error", "deny", "path_symlink_escape"],
-    ["Edit", "success", "allow", "fixture_path"],
-    ["Write", "success", "allow", "fixture_path"],
-    [echoTool, "success", "allow", "managed_mcp_tool"],
-    [failOnceTool, "error", "allow", "managed_mcp_tool"],
-    [failOnceTool, "success", "allow", "managed_mcp_tool"],
-    ["Bash", "success", "allow", "exact_bash_command"],
+    ["Read", "success", "allow", "fixture_path", "read:clean_target"],
+    ["Read", "success", "allow", "fixture_path", "read:dirty_sentinel"],
+    ["Read", "success", "allow", "fixture_path", "read:untracked_sentinel"],
+    [
+      "Read",
+      "error",
+      "deny",
+      "path_outside_workspace",
+      "read:outside_sentinel",
+    ],
+    ["Read", "error", "deny", "path_symlink_escape", "read:escape_link"],
+    ["Edit", "success", "allow", "fixture_path", "edit:clean_target"],
+    ["Write", "success", "allow", "fixture_path", "write:managed_output"],
+    [echoTool, "success", "allow", "managed_mcp_tool", "mcp:echo_nonce"],
+    [failOnceTool, "error", "allow", "managed_mcp_tool", "mcp:fail_once"],
+    [failOnceTool, "success", "allow", "managed_mcp_tool", "mcp:fail_once"],
+    ["Bash", "success", "allow", "exact_bash_command", "bash:exact_command"],
   ] as const;
   const ids = steps.map(
     (_, index) => `tool_${(index + 1).toString(16).padStart(64, "0")}`,
@@ -61,13 +72,16 @@ function passingL1Result(): ManagedAgentProbeResult {
         status: completion,
       },
     ]),
-    permissionEvidence: steps.map(([toolName, , decision, reason], index) => ({
-      toolUseId: ids[index]!,
-      toolName,
-      decision,
-      reason,
-      source: "pre_tool_use" as const,
-    })),
+    permissionEvidence: steps.map(
+      ([toolName, , decision, reason, operationId], index) => ({
+        toolUseId: ids[index]!,
+        toolName,
+        decision,
+        reason,
+        source: "pre_tool_use" as const,
+        operationId,
+      }),
+    ),
     policyDiagnostics: [],
     workspaceChanges: [
       { path: FIXTURE_PATHS.cleanTarget, change: "modified" },
@@ -96,7 +110,16 @@ function passingL1Result(): ManagedAgentProbeResult {
       evalSource: "eval-1",
       promptEmbedded: true,
     },
-  };
+    l1Certification: {
+      contractVersion: 2,
+      promptVersion: "managed-agent-l1-prompt-v2",
+    },
+    l1FinalBytes: [
+      { role: "clean_target", matched: true },
+      { role: "managed_output", matched: true },
+    ],
+    nonceVerified: true,
+  } as ManagedAgentProbeResult;
 }
 
 function passingL2Result(): ManagedAgentProbeResult {
@@ -116,6 +139,7 @@ function passingL2Result(): ManagedAgentProbeResult {
         decision: "allow",
         reason: "exact_bash_command",
         source: "pre_tool_use",
+        operationId: "bash:exact_command",
       },
     ],
     workspaceChanges: [],
@@ -136,6 +160,81 @@ function evidenceForToolId(
   return result.toolEvidence.filter(
     (evidence) => evidence.toolUseId === toolUseId,
   );
+}
+
+interface TestToolStep {
+  readonly toolName: string;
+  readonly completion: "success" | "error";
+  readonly decision: ManagedAgentPermissionDecision;
+  readonly reason: ManagedAgentPermissionReason;
+  readonly operationId: ManagedAgentOperationId;
+}
+
+function insertL1ToolStep(
+  result: ManagedAgentProbeResult,
+  beforeRequestIndex: number,
+  step: TestToolStep,
+  idCharacter: string,
+): ManagedAgentProbeResult {
+  const requested = result.toolEvidence.filter(
+    ({ status }) => status === "requested",
+  );
+  const nextRequest = requested[beforeRequestIndex];
+  const insertionIndex = nextRequest
+    ? result.toolEvidence.findIndex(
+        (evidence) =>
+          evidence.toolUseId === nextRequest.toolUseId &&
+          evidence.status === "requested",
+      )
+    : result.toolEvidence.length;
+  const toolUseId = `tool_${idCharacter.repeat(64)}`;
+  const toolEvidence = [...result.toolEvidence];
+  toolEvidence.splice(
+    insertionIndex,
+    0,
+    { toolUseId, toolName: step.toolName, status: "requested" },
+    { toolUseId, toolName: step.toolName, status: step.completion },
+  );
+  const permissionEvidence = [...result.permissionEvidence];
+  permissionEvidence.splice(beforeRequestIndex, 0, {
+    toolUseId,
+    toolName: step.toolName,
+    decision: step.decision,
+    reason: step.reason,
+    source: "pre_tool_use",
+    operationId: step.operationId,
+  });
+  return { ...result, toolEvidence, permissionEvidence };
+}
+
+function optionalReadStep(
+  operationId: Extract<ManagedAgentOperationId, `read:${string}`>,
+): TestToolStep {
+  return {
+    toolName: "Read",
+    completion: "success",
+    decision: "allow",
+    reason: "fixture_path",
+    operationId,
+  };
+}
+
+function expectL1TraceFailure(result: ManagedAgentProbeResult): void {
+  const report = evaluateManagedAgentProbe(result);
+  expect(report.outcome).toBe("fail");
+  expect(report.checks).toContainEqual({
+    id: "exact_l1_tool_trace",
+    passed: false,
+  });
+}
+
+function expectProbeCheckFailure(
+  result: ManagedAgentProbeResult,
+  checkId: string,
+): void {
+  const report = evaluateManagedAgentProbe(result);
+  expect(report.outcome).toBe("fail");
+  expect(report.checks).toContainEqual({ id: checkId, passed: false });
 }
 
 describe("managed-agent probe CLI", () => {
@@ -314,6 +413,223 @@ describe("managed-agent probe CLI", () => {
     ).toEqual({ id: "builtin_tools_succeeded", passed: false });
   });
 
+  it.each([
+    ["clean_target", "e"],
+    ["dirty_sentinel", "f"],
+    ["untracked_sentinel", "a"],
+  ] as const)(
+    "accepts one optional %s verification Read in the v2 window",
+    (role, idCharacter) => {
+      const passing = passingL1Result();
+      const result = insertL1ToolStep(
+        passing,
+        5,
+        optionalReadStep(`read:${role}`),
+        idCharacter,
+      );
+      const report = evaluateManagedAgentProbe(result);
+
+      expect(report.outcome).toBe("pass");
+      expect(report).toMatchObject({
+        l1Certification: {
+          contractVersion: 2,
+          promptVersion: "managed-agent-l1-prompt-v2",
+          evaluatorVersion: "managed-agent-l1-evaluator-v2",
+          optionalReadCount: 1,
+          optionalReadRole: role,
+        },
+      });
+    },
+  );
+
+  it("records zero optional Reads as nonblocking efficiency evidence", () => {
+    expect(evaluateManagedAgentProbe(passingL1Result())).toMatchObject({
+      outcome: "pass",
+      l1Certification: {
+        evaluatorVersion: "managed-agent-l1-evaluator-v2",
+        optionalReadCount: 0,
+      },
+    });
+    expect(
+      evaluateManagedAgentProbe(passingL1Result()).l1Certification,
+    ).not.toHaveProperty("optionalReadRole");
+  });
+
+  it("rejects a second optional verification Read", () => {
+    const first = insertL1ToolStep(
+      passingL1Result(),
+      5,
+      optionalReadStep("read:clean_target"),
+      "e",
+    );
+    const second = insertL1ToolStep(
+      first,
+      6,
+      optionalReadStep("read:dirty_sentinel"),
+      "f",
+    );
+
+    const report = evaluateManagedAgentProbe(second);
+    expect(report.l1Certification).toMatchObject({ optionalReadCount: 2 });
+    expectL1TraceFailure(second);
+  });
+
+  it.each([
+    ["managed_output", "e"],
+    ["outside_sentinel", "f"],
+    ["escape_link", "a"],
+  ] as const)(
+    "rejects an optional Read of the registered but disallowed %s role",
+    (role, idCharacter) => {
+      expectL1TraceFailure(
+        insertL1ToolStep(
+          passingL1Result(),
+          5,
+          optionalReadStep(`read:${role}`),
+          idCharacter,
+        ),
+      );
+    },
+  );
+
+  it.each([
+    ["before the denial probes", 3],
+    ["after Edit", 6],
+  ] as const)("rejects an otherwise valid optional Read %s", (_name, index) => {
+    expectL1TraceFailure(
+      insertL1ToolStep(
+        passingL1Result(),
+        index,
+        optionalReadStep("read:clean_target"),
+        "e",
+      ),
+    );
+  });
+
+  it.each([
+    ["outside denial", "path_outside_workspace", "read:outside_sentinel"],
+    ["symlink denial", "path_symlink_escape", "read:escape_link"],
+  ] as const)(
+    "rejects an extra denied Read retry of the %s",
+    (_name, reason, operationId) => {
+      expectL1TraceFailure(
+        insertL1ToolStep(
+          passingL1Result(),
+          5,
+          {
+            toolName: "Read",
+            completion: "error",
+            decision: "deny",
+            reason,
+            operationId,
+          },
+          "e",
+        ),
+      );
+    },
+  );
+
+  it.each([
+    [
+      "Edit",
+      {
+        toolName: "Edit",
+        completion: "success",
+        decision: "allow",
+        reason: "fixture_path",
+        operationId: "edit:clean_target",
+      },
+    ],
+    [
+      "Write",
+      {
+        toolName: "Write",
+        completion: "success",
+        decision: "allow",
+        reason: "fixture_path",
+        operationId: "write:managed_output",
+      },
+    ],
+    [
+      "Bash",
+      {
+        toolName: "Bash",
+        completion: "success",
+        decision: "allow",
+        reason: "exact_bash_command",
+        operationId: "bash:exact_command",
+      },
+    ],
+    [
+      "MCP",
+      {
+        toolName: qualifiedManagedAgentMcpToolName("echo_nonce"),
+        completion: "success",
+        decision: "allow",
+        reason: "managed_mcp_tool",
+        operationId: "mcp:echo_nonce",
+      },
+    ],
+    [
+      "unknown tool",
+      {
+        toolName: "unknown",
+        completion: "error",
+        decision: "deny",
+        reason: "tool_not_allowed",
+        operationId: "unknown",
+      },
+    ],
+  ] as const)("rejects any extra %s operation", (_name, step) => {
+    expectL1TraceFailure(insertL1ToolStep(passingL1Result(), 5, step, "e"));
+  });
+
+  it("rejects any workspace delta beyond the two canonical L1 changes", () => {
+    const passing = passingL1Result();
+    const report = evaluateManagedAgentProbe({
+      ...passing,
+      workspaceChanges: [
+        ...passing.workspaceChanges,
+        { path: "unexpected.txt", change: "created" },
+      ],
+    });
+
+    expect(report.outcome).toBe("fail");
+    expect(report.checks).toContainEqual({
+      id: "exact_workspace_delta",
+      passed: false,
+    });
+  });
+
+  it("accepts the exact workspace delta in either evidence order", () => {
+    const passing = passingL1Result();
+    const report = evaluateManagedAgentProbe({
+      ...passing,
+      workspaceChanges: [...passing.workspaceChanges].reverse(),
+    });
+
+    expect(report.outcome).toBe("pass");
+    expect(report.checks).toContainEqual({
+      id: "exact_workspace_delta",
+      passed: true,
+    });
+  });
+
+  it("rejects a duplicate canonical workspace entry with the other path missing", () => {
+    const passing = passingL1Result();
+    const duplicate = passing.workspaceChanges[0]!;
+    const report = evaluateManagedAgentProbe({
+      ...passing,
+      workspaceChanges: [duplicate, duplicate],
+    });
+
+    expect(report.outcome).toBe("fail");
+    expect(report.checks).toContainEqual({
+      id: "exact_workspace_delta",
+      passed: false,
+    });
+  });
+
   it("accepts exactly one permitted Bash request for L2 and rejects any extra tool call", () => {
     const passing = passingL2Result();
     expect(evaluateManagedAgentProbe(passing, [12_345, 12_346])).toMatchObject({
@@ -340,6 +656,7 @@ describe("managed-agent probe CLI", () => {
           decision: "allow",
           reason: "fixture_path",
           source: "pre_tool_use",
+          operationId: "write:unregistered",
         },
       ],
     };
@@ -407,6 +724,7 @@ describe("managed-agent probe CLI", () => {
               decision: "allow" as const,
               reason: "fixture_path" as const,
               source: "pre_tool_use" as const,
+              operationId: "read:clean_target" as const,
             },
           ],
         };
@@ -431,6 +749,7 @@ describe("managed-agent probe CLI", () => {
               decision: "allow" as const,
               reason: "exact_bash_command" as const,
               source: "pre_tool_use" as const,
+              operationId: "bash:exact_command" as const,
             },
           ],
         };
@@ -443,6 +762,325 @@ describe("managed-agent probe CLI", () => {
     expect(report.checks).toContainEqual({
       id: "exact_l1_tool_trace",
       passed: false,
+    });
+  });
+
+  describe("L1 v2 request correlation", () => {
+    it("rejects duplicate request IDs", () => {
+      const passing = passingL1Result();
+      const requestIds = passing.toolEvidence.flatMap((evidence) =>
+        evidence.status === "requested" && evidence.toolUseId
+          ? [evidence.toolUseId]
+          : [],
+      );
+      const firstId = requestIds[0]!;
+      const duplicateId = requestIds[1]!;
+      expectL1TraceFailure({
+        ...passing,
+        toolEvidence: passing.toolEvidence.map((evidence) =>
+          evidence.status === "requested" && evidence.toolUseId === firstId
+            ? { ...evidence, toolUseId: duplicateId }
+            : evidence,
+        ),
+      });
+    });
+
+    it("rejects an empty request ID", () => {
+      const passing = passingL1Result();
+      const firstId = passing.toolEvidence.find(
+        ({ status }) => status === "requested",
+      )!.toolUseId!;
+      expectL1TraceFailure({
+        ...passing,
+        toolEvidence: passing.toolEvidence.map((evidence) =>
+          evidence.status === "requested" && evidence.toolUseId === firstId
+            ? { ...evidence, toolUseId: "   " }
+            : evidence,
+        ),
+      });
+    });
+
+    it("rejects a request with no completion", () => {
+      const passing = passingL1Result();
+      const firstId = passing.toolEvidence.find(
+        ({ status }) => status === "requested",
+      )!.toolUseId!;
+      expectL1TraceFailure({
+        ...passing,
+        toolEvidence: passing.toolEvidence.filter(
+          (evidence) =>
+            evidence.toolUseId !== firstId || evidence.status === "requested",
+        ),
+      });
+    });
+
+    it("rejects duplicate completions for one request", () => {
+      const passing = passingL1Result();
+      const completion = passing.toolEvidence.find(
+        ({ status }) => status !== "requested",
+      )!;
+      expectL1TraceFailure({
+        ...passing,
+        toolEvidence: [...passing.toolEvidence, completion],
+      });
+    });
+
+    it("rejects a completion whose tool does not match its request", () => {
+      const passing = passingL1Result();
+      const firstId = passing.toolEvidence.find(
+        ({ status }) => status === "requested",
+      )!.toolUseId!;
+      expectL1TraceFailure({
+        ...passing,
+        toolEvidence: passing.toolEvidence.map((evidence) =>
+          evidence.toolUseId === firstId && evidence.status !== "requested"
+            ? { ...evidence, toolName: "Write" }
+            : evidence,
+        ),
+      });
+    });
+
+    it("rejects a request with no primary PreToolUse decision", () => {
+      const passing = passingL1Result();
+      const firstDecision = passing.permissionEvidence[0]!;
+      expectL1TraceFailure({
+        ...passing,
+        permissionEvidence: passing.permissionEvidence.filter(
+          ({ toolUseId }) => toolUseId !== firstDecision.toolUseId,
+        ),
+      });
+    });
+
+    it("rejects duplicate primary decisions for one request", () => {
+      const passing = passingL1Result();
+      expectL1TraceFailure({
+        ...passing,
+        permissionEvidence: [
+          ...passing.permissionEvidence,
+          passing.permissionEvidence[0]!,
+        ],
+      });
+    });
+
+    it("rejects a primary decision whose tool does not match its request", () => {
+      const passing = passingL1Result();
+      const firstDecision = passing.permissionEvidence[0]!;
+      expectL1TraceFailure({
+        ...passing,
+        permissionEvidence: passing.permissionEvidence.map((evidence) =>
+          evidence.toolUseId === firstDecision.toolUseId
+            ? { ...evidence, toolName: "Write" }
+            : evidence,
+        ),
+      });
+    });
+
+    it("rejects a fallback decision in addition to the primary decision", () => {
+      const passing = passingL1Result();
+      expectL1TraceFailure({
+        ...passing,
+        permissionEvidence: [
+          ...passing.permissionEvidence,
+          {
+            ...passing.permissionEvidence[0]!,
+            source: "can_use_tool_fallback",
+          },
+        ],
+      });
+    });
+
+    it("rejects a fallback decision that replaces the primary decision", () => {
+      const passing = passingL1Result();
+      const firstDecision = passing.permissionEvidence[0]!;
+      expectL1TraceFailure({
+        ...passing,
+        permissionEvidence: passing.permissionEvidence.map((evidence) =>
+          evidence.toolUseId === firstDecision.toolUseId
+            ? { ...evidence, source: "can_use_tool_fallback" }
+            : evidence,
+        ),
+      });
+    });
+
+    it("rejects an orphan completion", () => {
+      const passing = passingL1Result();
+      expectL1TraceFailure({
+        ...passing,
+        toolEvidence: [
+          ...passing.toolEvidence,
+          {
+            toolUseId: `tool_${"e".repeat(64)}`,
+            toolName: "Read",
+            status: "success",
+          },
+        ],
+      });
+    });
+
+    it("rejects an orphan primary decision", () => {
+      const passing = passingL1Result();
+      expectL1TraceFailure({
+        ...passing,
+        permissionEvidence: [
+          ...passing.permissionEvidence,
+          {
+            ...passing.permissionEvidence[0]!,
+            toolUseId: `tool_${"e".repeat(64)}`,
+          },
+        ],
+      });
+    });
+  });
+
+  describe("L1 v2 outcome and certification evidence", () => {
+    it("rejects an allowed canonical operation that completes with an error", () => {
+      const passing = passingL1Result();
+      const firstId = passing.toolEvidence.find(
+        ({ status }) => status === "requested",
+      )!.toolUseId!;
+      expectL1TraceFailure({
+        ...passing,
+        toolEvidence: passing.toolEvidence.map((evidence) =>
+          evidence.toolUseId === firstId && evidence.status === "success"
+            ? { ...evidence, status: "error" }
+            : evidence,
+        ),
+      });
+    });
+
+    it("rejects a denied canonical operation that reports success", () => {
+      const passing = passingL1Result();
+      const deniedId = passing.permissionEvidence.find(
+        ({ decision }) => decision === "deny",
+      )!.toolUseId;
+      expectL1TraceFailure({
+        ...passing,
+        toolEvidence: passing.toolEvidence.map((evidence) =>
+          evidence.toolUseId === deniedId && evidence.status === "error"
+            ? { ...evidence, status: "success" }
+            : evidence,
+        ),
+      });
+    });
+
+    it("rejects an incoherent decision, reason, or operation ID", () => {
+      const passing = passingL1Result();
+      const firstDecision = passing.permissionEvidence[0]!;
+      for (const replacement of [
+        { decision: "deny" as const },
+        { reason: "path_outside_workspace" as const },
+        { operationId: "read:dirty_sentinel" as const },
+      ]) {
+        expectL1TraceFailure({
+          ...passing,
+          permissionEvidence: passing.permissionEvidence.map((evidence) =>
+            evidence.toolUseId === firstDecision.toolUseId
+              ? { ...evidence, ...replacement }
+              : evidence,
+          ),
+        });
+      }
+    });
+
+    it("rejects missing or stale L1 v2 contract evidence", () => {
+      const passing = passingL1Result();
+      expectProbeCheckFailure(
+        { ...passing, l1Certification: undefined },
+        "l1_contract_v2",
+      );
+      expectProbeCheckFailure(
+        {
+          ...passing,
+          l1Certification: {
+            contractVersion: 1,
+            promptVersion: "managed-agent-l1-prompt-v1",
+          },
+        } as unknown as ManagedAgentProbeResult,
+        "l1_contract_v2",
+      );
+      expectProbeCheckFailure(
+        {
+          ...passing,
+          correlation: { ...passing.correlation, promptEmbedded: false },
+        },
+        "l1_contract_v2",
+      );
+    });
+
+    it("requires positive nonce evidence", () => {
+      expectProbeCheckFailure(
+        { ...passingL1Result(), nonceVerified: false },
+        "nonce_verified",
+      );
+    });
+
+    it.each([
+      ["missing", undefined],
+      [
+        "false",
+        [
+          { role: "clean_target", matched: true },
+          { role: "managed_output", matched: false },
+        ],
+      ],
+      [
+        "extra",
+        [
+          { role: "clean_target", matched: true },
+          { role: "managed_output", matched: true },
+          { role: "clean_target", matched: true },
+        ],
+      ],
+    ] as const)("rejects %s L1 final-byte evidence", (_name, l1FinalBytes) => {
+      expectProbeCheckFailure(
+        {
+          ...passingL1Result(),
+          l1FinalBytes,
+        } as ManagedAgentProbeResult,
+        "expected_final_bytes",
+      );
+    });
+
+    it.each([
+      ["terminal success", "terminal_success", { terminal: "incomplete" }],
+      ["query close", "query_closed", { queryClosed: false }],
+      [
+        "process quiescence",
+        "process_tree_quiescent",
+        { teardown: { ...passingL1Result().teardown, quiescent: false } },
+      ],
+    ] as const)("requires %s", (_name, checkId, mutation) => {
+      expectProbeCheckFailure(
+        {
+          ...passingL1Result(),
+          ...mutation,
+        } as ManagedAgentProbeResult,
+        checkId,
+      );
+    });
+
+    it.each([
+      ["missing", []],
+      [
+        "false",
+        [
+          { path: FIXTURE_PATHS.dirtySentinel, preserved: true },
+          { path: FIXTURE_PATHS.untrackedSentinel, preserved: false },
+        ],
+      ],
+      [
+        "extra",
+        [
+          { path: FIXTURE_PATHS.dirtySentinel, preserved: true },
+          { path: FIXTURE_PATHS.untrackedSentinel, preserved: true },
+          { path: "extra-sentinel.txt", preserved: true },
+        ],
+      ],
+    ] as const)("rejects %s preservation evidence", (_name, preservation) => {
+      expectProbeCheckFailure(
+        { ...passingL1Result(), preservation: [...preservation] },
+        "dirty_and_untracked_preserved",
+      );
     });
   });
 
@@ -482,6 +1120,7 @@ describe("managed-agent probe CLI", () => {
           decision: "deny",
           reason: "path_outside_workspace",
           source: "pre_tool_use",
+          operationId: "read:outside_sentinel",
         },
         {
           toolUseId: `tool_${"b".repeat(64)}`,
@@ -489,6 +1128,7 @@ describe("managed-agent probe CLI", () => {
           decision: "deny",
           reason: "path_outside_workspace",
           source: "pre_tool_use",
+          operationId: "read:outside_sentinel",
         },
       ],
     };

@@ -29,6 +29,10 @@ export interface ManagedAgentProbeConfig {
   readonly maxTurns: number;
   readonly maxBudgetUsd: number;
   readonly allowedBashCommands: readonly string[];
+  /** Exact prompt literals mapped to privacy-safe roles inside the host policy. */
+  readonly pathRoleBindings: readonly ManagedAgentPathRoleBinding[];
+  /** Trusted expected hashes for the two L1 mutation targets; empty for L2. */
+  readonly expectedL1FinalBytes: readonly ManagedAgentL1ExpectedFileHash[];
   /** Expected only for L1 and never copied into structural evidence. */
   readonly expectedMcpNonce?: string;
   readonly preservePaths?: readonly string[];
@@ -43,12 +47,56 @@ export type ManagedAgentPermissionReason =
   | "invalid_input"
   | "path_outside_workspace"
   | "path_symlink_escape"
+  | "path_role_not_allowed"
   | "bash_command_not_allowed"
   | "tool_not_allowed";
 
 export type ManagedAgentPermissionSource =
   | "pre_tool_use"
   | "can_use_tool_fallback";
+
+export type ManagedAgentRegisteredPathRole =
+  | "clean_target"
+  | "dirty_sentinel"
+  | "untracked_sentinel"
+  | "managed_output"
+  | "outside_sentinel"
+  | "escape_link";
+
+export type ManagedAgentPathRole =
+  | ManagedAgentRegisteredPathRole
+  | "unregistered";
+
+export interface ManagedAgentPathRoleBinding {
+  /** Sensitive prompt literal; this value never crosses the evidence boundary. */
+  readonly path: string;
+  readonly role: ManagedAgentRegisteredPathRole;
+}
+
+export type ManagedAgentL1FinalByteRole = "clean_target" | "managed_output";
+
+export interface ManagedAgentL1ExpectedFileHash {
+  /** Sensitive fixture path; this value never crosses the evidence boundary. */
+  readonly path: string;
+  readonly role: ManagedAgentL1FinalByteRole;
+  readonly sha256: string;
+}
+
+export interface ManagedAgentL1FinalByteObservation {
+  readonly role: ManagedAgentL1FinalByteRole;
+  readonly matched: boolean;
+}
+
+export type ManagedAgentOperationId =
+  | `read:${ManagedAgentPathRole}`
+  | `edit:${ManagedAgentPathRole}`
+  | `write:${ManagedAgentPathRole}`
+  | "bash:exact_command"
+  | "bash:unregistered"
+  | "mcp:echo_nonce"
+  | "mcp:fail_once"
+  | "mcp:managed"
+  | "unknown";
 
 export type ManagedAgentProbeEventType =
   | "lifecycle"
@@ -74,6 +122,7 @@ export interface ManagedAgentProbeEvent {
   readonly permissionDecision?: ManagedAgentPermissionDecision;
   readonly permissionReason?: ManagedAgentPermissionReason;
   readonly permissionSource?: ManagedAgentPermissionSource;
+  readonly operationId?: ManagedAgentOperationId;
   readonly isError?: boolean;
   readonly terminal?: ManagedAgentTerminalClassification;
 }
@@ -109,6 +158,8 @@ export interface ManagedAgentPermissionEvidence {
   readonly decision: ManagedAgentPermissionDecision;
   readonly reason: ManagedAgentPermissionReason;
   readonly source: ManagedAgentPermissionSource;
+  /** Trusted, content-free operation identity; never contains a raw path/input. */
+  readonly operationId: ManagedAgentOperationId;
 }
 
 export type ManagedAgentPreToolUseGuardRejectionReason =
@@ -219,6 +270,15 @@ export interface ManagedAgentProbeResult {
     /** True only after the marked prompt is handed to the query factory. */
     readonly promptEmbedded: boolean;
   };
+  /** Present only for an L1 prompt validated against the frozen v2 marker. */
+  readonly l1Certification?: {
+    readonly contractVersion: 2;
+    readonly promptVersion: "managed-agent-l1-prompt-v2";
+  };
+  /** Content-free proof of exact final bytes for both intended L1 mutations. */
+  readonly l1FinalBytes?: readonly ManagedAgentL1FinalByteObservation[];
+  /** Content-free proof that echo_nonce received the expected sentinel nonce. */
+  readonly nonceVerified?: boolean;
   readonly sdkUsage?: ManagedAgentSdkUsageEstimate;
 }
 

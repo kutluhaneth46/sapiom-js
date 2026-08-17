@@ -9,12 +9,16 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 
-import { validateManagedAgentProbeConfig } from "./contract.js";
+import {
+  MANAGED_AGENT_L1_CERTIFICATION_CONTRACT,
+  validateManagedAgentProbeConfig,
+} from "./contract.js";
 import { buildManagedAgentChildEnvironment } from "./environment.js";
 import { ManagedAgentEventError, ManagedAgentEventRecorder } from "./events.js";
 import {
   captureManagedAgentWorkspaceSnapshot,
   diffManagedAgentWorkspaceSnapshots,
+  observeManagedAgentL1FinalBytes,
   observeManagedAgentPreservation,
 } from "./fixture.js";
 import {
@@ -416,6 +420,8 @@ export async function runManagedAgentProbe(
     allowedBashCommands: config.allowedBashCommands,
     allowedMcpTools:
       config.scenario === "L1" ? mcpRuntime.qualifiedToolNames : [],
+    pathRoleBindings: config.pathRoleBindings,
+    requireRegisteredFilePaths: config.scenario === "L1",
     onDecision: (evidence) => recorder.recordPermission(evidence),
     onGuardRejection: (diagnostic) => guardRejections.push(diagnostic),
   });
@@ -698,6 +704,25 @@ export async function runManagedAgentProbe(
     queryClosed,
     teardown,
     correlation: { executionId, evalSource, promptEmbedded },
+    ...(config.scenario === "L1"
+      ? {
+          l1Certification: {
+            contractVersion:
+              MANAGED_AGENT_L1_CERTIFICATION_CONTRACT.contractVersion,
+            promptVersion:
+              MANAGED_AGENT_L1_CERTIFICATION_CONTRACT.promptVersion,
+          },
+          l1FinalBytes: observeManagedAgentL1FinalBytes(
+            after,
+            config.expectedL1FinalBytes,
+          ),
+          nonceVerified: mcpRuntime.invocations.some(
+            ({ toolName, status }) =>
+              toolName === qualifiedManagedAgentMcpToolName("echo_nonce") &&
+              status === "success",
+          ),
+        }
+      : {}),
     ...(recorder.usage ? { sdkUsage: recorder.usage } : {}),
   };
 }

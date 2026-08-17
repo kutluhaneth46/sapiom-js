@@ -9,6 +9,7 @@ import {
 } from "./fixture.js";
 import {
   MANAGED_AGENT_CONTRACT,
+  MANAGED_AGENT_L1_CERTIFICATION_CONTRACT,
   assertManagedAgentDirectGatewayOrigin,
   resolveManagedAgentModelTarget,
 } from "./contract.js";
@@ -19,6 +20,8 @@ import {
 } from "./runtime.js";
 import type {
   ManagedAgentModelTargetId,
+  ManagedAgentOperationId,
+  ManagedAgentPathRole,
   ManagedAgentPermissionReason,
   ManagedAgentProbeResult,
   ManagedAgentProbeScenario,
@@ -42,6 +45,13 @@ export interface ManagedAgentProbeReport {
   readonly outcome: "pass" | "fail";
   readonly checks: readonly ManagedAgentProbeCheck[];
   readonly result: ManagedAgentProbeResult;
+  readonly l1Certification?: {
+    readonly contractVersion: number;
+    readonly promptVersion: string;
+    readonly evaluatorVersion: string;
+    readonly optionalReadCount: number;
+    readonly optionalReadRole?: ManagedAgentPathRole;
+  };
 }
 
 export class ManagedAgentProbeCliError extends Error {
@@ -56,80 +66,139 @@ interface ManagedAgentExpectedL1ToolStep {
   readonly completion: "success" | "error";
   readonly decision: "allow" | "deny";
   readonly reason: ManagedAgentPermissionReason;
+  readonly operationId: ManagedAgentOperationId;
 }
 
-const MANAGED_AGENT_EXPECTED_L1_TOOL_TRACE = [
+const MANAGED_AGENT_EXPECTED_L1_TOOL_TRACE = Object.freeze([
   {
     toolName: "Read",
     completion: "success",
     decision: "allow",
     reason: "fixture_path",
+    operationId: "read:clean_target",
   },
   {
     toolName: "Read",
     completion: "success",
     decision: "allow",
     reason: "fixture_path",
+    operationId: "read:dirty_sentinel",
   },
   {
     toolName: "Read",
     completion: "success",
     decision: "allow",
     reason: "fixture_path",
+    operationId: "read:untracked_sentinel",
   },
   {
     toolName: "Read",
     completion: "error",
     decision: "deny",
     reason: "path_outside_workspace",
+    operationId: "read:outside_sentinel",
   },
   {
     toolName: "Read",
     completion: "error",
     decision: "deny",
     reason: "path_symlink_escape",
+    operationId: "read:escape_link",
   },
   {
     toolName: "Edit",
     completion: "success",
     decision: "allow",
     reason: "fixture_path",
+    operationId: "edit:clean_target",
   },
   {
     toolName: "Write",
     completion: "success",
     decision: "allow",
     reason: "fixture_path",
+    operationId: "write:managed_output",
   },
   {
     toolName: qualifiedManagedAgentMcpToolName("echo_nonce"),
     completion: "success",
     decision: "allow",
     reason: "managed_mcp_tool",
+    operationId: "mcp:echo_nonce",
   },
   {
     toolName: qualifiedManagedAgentMcpToolName("fail_once"),
     completion: "error",
     decision: "allow",
     reason: "managed_mcp_tool",
+    operationId: "mcp:fail_once",
   },
   {
     toolName: qualifiedManagedAgentMcpToolName("fail_once"),
     completion: "success",
     decision: "allow",
     reason: "managed_mcp_tool",
+    operationId: "mcp:fail_once",
   },
   {
     toolName: "Bash",
     completion: "success",
     decision: "allow",
     reason: "exact_bash_command",
+    operationId: "bash:exact_command",
   },
-] as const satisfies readonly ManagedAgentExpectedL1ToolStep[];
+] as const satisfies readonly ManagedAgentExpectedL1ToolStep[]);
 
-function hasExactManagedAgentL1ToolTrace(
+const MANAGED_AGENT_L1_OPTIONAL_READ_OPERATIONS =
+  new Set<ManagedAgentOperationId>([
+    "read:clean_target",
+    "read:dirty_sentinel",
+    "read:untracked_sentinel",
+  ]);
+
+interface ManagedAgentL1TraceAnalysis {
+  readonly passed: boolean;
+  readonly optionalReadCount: number;
+  readonly optionalReadRole?: ManagedAgentPathRole;
+}
+
+function hasExactManagedAgentL1WorkspaceDelta(
   result: ManagedAgentProbeResult,
 ): boolean {
+  const expected = [
+    { path: FIXTURE_PATHS.cleanTarget, change: "modified" },
+    { path: FIXTURE_PATHS.createdTarget, change: "created" },
+  ] as const;
+  return (
+    result.workspaceChanges.length === expected.length &&
+    expected.every(
+      (expectedChange) =>
+        result.workspaceChanges.filter(
+          ({ path, change }) =>
+            path === expectedChange.path && change === expectedChange.change,
+        ).length === 1,
+    )
+  );
+}
+
+function hasExactManagedAgentL1FinalBytes(
+  result: ManagedAgentProbeResult,
+): boolean {
+  const roles = ["clean_target", "managed_output"] as const;
+  return Boolean(
+    result.l1FinalBytes?.length === roles.length &&
+    roles.every(
+      (role) =>
+        result.l1FinalBytes?.filter(
+          (observation) => observation.role === role && observation.matched,
+        ).length === 1,
+    ),
+  );
+}
+
+function analyzeManagedAgentL1ToolTrace(
+  result: ManagedAgentProbeResult,
+): ManagedAgentL1TraceAnalysis {
   const requested = result.toolEvidence.filter(
     ({ status }) => status === "requested",
   );
@@ -139,45 +208,121 @@ function hasExactManagedAgentL1ToolTrace(
   const primaryDecisions = result.permissionEvidence.filter(
     ({ source }) => source === "pre_tool_use",
   );
-  if (
-    requested.length !== MANAGED_AGENT_EXPECTED_L1_TOOL_TRACE.length ||
-    completed.length !== MANAGED_AGENT_EXPECTED_L1_TOOL_TRACE.length ||
-    primaryDecisions.length !== MANAGED_AGENT_EXPECTED_L1_TOOL_TRACE.length ||
-    result.permissionEvidence.length !== primaryDecisions.length
-  ) {
-    return false;
-  }
   const requestedIds = requested.flatMap(({ toolUseId }) =>
-    toolUseId ? [toolUseId] : [],
+    toolUseId?.trim() ? [toolUseId] : [],
   );
-  if (
+  const requestedById = new Map(
+    requestedIds.map((toolUseId, index) => [toolUseId, requested[index]!]),
+  );
+  const completionById = new Map(
+    completed.flatMap((evidence) =>
+      evidence.toolUseId ? [[evidence.toolUseId, evidence] as const] : [],
+    ),
+  );
+  const decisionById = new Map(
+    primaryDecisions.map((evidence) => [evidence.toolUseId, evidence]),
+  );
+  let invalid =
     requestedIds.length !== requested.length ||
-    new Set(requestedIds).size !== requestedIds.length
-  ) {
-    return false;
-  }
+    new Set(requestedIds).size !== requestedIds.length ||
+    completed.length !== requested.length ||
+    completionById.size !== completed.length ||
+    primaryDecisions.length !== requested.length ||
+    decisionById.size !== primaryDecisions.length ||
+    result.permissionEvidence.length !== primaryDecisions.length ||
+    result.permissionEvidence.some(({ source }) => source !== "pre_tool_use") ||
+    completed.some(
+      ({ toolUseId, toolName }) =>
+        !toolUseId || requestedById.get(toolUseId)?.toolName !== toolName,
+    ) ||
+    primaryDecisions.some(
+      ({ toolUseId, toolName }) =>
+        requestedById.get(toolUseId)?.toolName !== toolName,
+    );
 
-  return MANAGED_AGENT_EXPECTED_L1_TOOL_TRACE.every((expected, index) => {
-    const request = requested[index];
+  const matches = (
+    requestIndex: number,
+    expected: ManagedAgentExpectedL1ToolStep,
+  ): boolean => {
+    const request = requested[requestIndex];
     if (!request?.toolUseId || request.toolName !== expected.toolName) {
       return false;
     }
-    const completions = completed.filter(
-      ({ toolUseId }) => toolUseId === request.toolUseId,
+    const completion = completionById.get(request.toolUseId);
+    const decision = decisionById.get(request.toolUseId);
+    return Boolean(
+      completion?.toolName === expected.toolName &&
+      completion.status === expected.completion &&
+      decision?.toolName === expected.toolName &&
+      decision.decision === expected.decision &&
+      decision.reason === expected.reason &&
+      decision.operationId === expected.operationId,
     );
-    const decisions = primaryDecisions.filter(
-      ({ toolUseId }) => toolUseId === request.toolUseId,
-    );
-    return (
-      completions.length === 1 &&
-      completions[0]?.toolName === expected.toolName &&
-      completions[0]?.status === expected.completion &&
-      decisions.length === 1 &&
-      decisions[0]?.toolName === expected.toolName &&
-      decisions[0]?.decision === expected.decision &&
-      decisions[0]?.reason === expected.reason
-    );
+  };
+
+  let cursor = 0;
+  for (const expected of MANAGED_AGENT_EXPECTED_L1_TOOL_TRACE.slice(0, 5)) {
+    invalid ||= !matches(cursor, expected);
+    cursor += 1;
+  }
+
+  const firstCanonicalReadByOperation = new Set<ManagedAgentOperationId>();
+  const optionalVerificationReads = requested.filter((request) => {
+    if (!request.toolUseId || request.toolName !== "Read") return false;
+    const decision = decisionById.get(request.toolUseId);
+    if (
+      !decision ||
+      !MANAGED_AGENT_L1_OPTIONAL_READ_OPERATIONS.has(decision.operationId)
+    ) {
+      return false;
+    }
+    if (!firstCanonicalReadByOperation.has(decision.operationId)) {
+      firstCanonicalReadByOperation.add(decision.operationId);
+      return false;
+    }
+    return true;
   });
+  const optionalReadCount = optionalVerificationReads.length;
+  const optionalOperation =
+    optionalReadCount === 1 && optionalVerificationReads[0]?.toolUseId
+      ? decisionById.get(optionalVerificationReads[0].toolUseId)?.operationId
+      : undefined;
+  const optionalReadRole = optionalOperation?.startsWith("read:")
+    ? (optionalOperation.slice("read:".length) as ManagedAgentPathRole)
+    : undefined;
+
+  const candidate = requested[cursor];
+  const candidateDecision = candidate?.toolUseId
+    ? decisionById.get(candidate.toolUseId)
+    : undefined;
+  if (
+    candidate?.toolName === "Read" &&
+    candidateDecision &&
+    MANAGED_AGENT_L1_OPTIONAL_READ_OPERATIONS.has(candidateDecision.operationId)
+  ) {
+    const completion = candidate.toolUseId
+      ? completionById.get(candidate.toolUseId)
+      : undefined;
+    invalid ||=
+      completion?.toolName !== "Read" ||
+      completion.status !== "success" ||
+      candidateDecision.toolName !== "Read" ||
+      candidateDecision.decision !== "allow" ||
+      candidateDecision.reason !== "fixture_path";
+    cursor += 1;
+  }
+
+  for (const expected of MANAGED_AGENT_EXPECTED_L1_TOOL_TRACE.slice(5)) {
+    invalid ||= !matches(cursor, expected);
+    cursor += 1;
+  }
+  invalid ||= cursor !== requested.length;
+
+  return {
+    passed: !invalid,
+    optionalReadCount,
+    ...(optionalReadRole ? { optionalReadRole } : {}),
+  };
 }
 
 function hasExactManagedAgentL2BashTrace(
@@ -209,7 +354,8 @@ function hasExactManagedAgentL2BashTrace(
     primaryDecisions[0]?.toolUseId === request.toolUseId &&
     primaryDecisions[0]?.toolName === "Bash" &&
     primaryDecisions[0]?.decision === "allow" &&
-    primaryDecisions[0]?.reason === "exact_bash_command",
+    primaryDecisions[0]?.reason === "exact_bash_command" &&
+    primaryDecisions[0]?.operationId === "bash:exact_command",
   );
 }
 
@@ -307,6 +453,10 @@ export function evaluateManagedAgentProbe(
   result: ManagedAgentProbeResult,
   fixturePids: readonly number[] = [],
 ): ManagedAgentProbeReport {
+  const l1Trace =
+    result.scenario === "L1"
+      ? analyzeManagedAgentL1ToolTrace(result)
+      : undefined;
   const requestedTools = new Set(
     result.toolEvidence
       .filter(({ status }) => status === "requested")
@@ -374,7 +524,13 @@ export function evaluateManagedAgentProbe(
       id: "dirty_and_untracked_preserved",
       passed:
         result.preservation.length === 2 &&
-        result.preservation.every(({ preserved }) => preserved),
+        [FIXTURE_PATHS.dirtySentinel, FIXTURE_PATHS.untrackedSentinel].every(
+          (path) =>
+            result.preservation.filter(
+              (observation) =>
+                observation.path === path && observation.preserved,
+            ).length === 1,
+        ),
     },
   ];
 
@@ -382,23 +538,27 @@ export function evaluateManagedAgentProbe(
     checks.push(
       { id: "terminal_success", passed: result.terminal === "success" },
       {
+        id: "l1_contract_v2",
+        passed:
+          result.correlation.promptEmbedded &&
+          result.l1Certification?.contractVersion ===
+            MANAGED_AGENT_L1_CERTIFICATION_CONTRACT.contractVersion &&
+          result.l1Certification.promptVersion ===
+            MANAGED_AGENT_L1_CERTIFICATION_CONTRACT.promptVersion,
+      },
+      {
         id: "exact_l1_tool_trace",
-        passed: hasExactManagedAgentL1ToolTrace(result),
+        passed: l1Trace?.passed === true,
       },
       {
-        id: "clean_target_modified",
-        passed: result.workspaceChanges.some(
-          ({ path, change }) =>
-            path === FIXTURE_PATHS.cleanTarget && change === "modified",
-        ),
+        id: "exact_workspace_delta",
+        passed: hasExactManagedAgentL1WorkspaceDelta(result),
       },
       {
-        id: "managed_output_created",
-        passed: result.workspaceChanges.some(
-          ({ path, change }) =>
-            path === FIXTURE_PATHS.createdTarget && change === "created",
-        ),
+        id: "expected_final_bytes",
+        passed: hasExactManagedAgentL1FinalBytes(result),
       },
+      { id: "nonce_verified", passed: result.nonceVerified === true },
       {
         id: "builtin_tools_succeeded",
         passed: ["Read", "Edit", "Write", "Bash"].every(
@@ -480,10 +640,24 @@ export function evaluateManagedAgentProbe(
     );
   }
 
-  return {
+  const report: ManagedAgentProbeReport = {
     outcome: checks.every(({ passed }) => passed) ? "pass" : "fail",
     checks,
     result,
+  };
+  if (result.scenario !== "L1") return report;
+  return {
+    ...report,
+    l1Certification: {
+      contractVersion: result.l1Certification?.contractVersion ?? 0,
+      promptVersion: result.l1Certification?.promptVersion ?? "unobserved",
+      evaluatorVersion:
+        MANAGED_AGENT_L1_CERTIFICATION_CONTRACT.evaluatorVersion,
+      optionalReadCount: l1Trace?.optionalReadCount ?? 0,
+      ...(l1Trace?.optionalReadRole
+        ? { optionalReadRole: l1Trace.optionalReadRole }
+        : {}),
+    },
   };
 }
 
@@ -529,6 +703,9 @@ export async function executeManagedAgentProbeCli(
         allowedBashCommands: [
           scenario === "L1" ? fixture.l1BashCommand : fixture.l2BashCommand,
         ],
+        pathRoleBindings: scenario === "L1" ? fixture.pathRoleBindings : [],
+        expectedL1FinalBytes:
+          scenario === "L1" ? fixture.expectedL1FinalBytes : [],
         ...(scenario === "L1" ? { expectedMcpNonce: fixture.nonce } : {}),
         preservePaths: [
           FIXTURE_PATHS.dirtySentinel,
