@@ -1,6 +1,8 @@
+import { readFile } from "node:fs/promises";
 import { createServer, type ServerResponse } from "node:http";
+import { createRequire } from "node:module";
 import type { AddressInfo } from "node:net";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { query as agentSdkQuery } from "@anthropic-ai/claude-agent-sdk";
 import { expect, it } from "vitest";
@@ -10,6 +12,7 @@ import {
   createManagedAgentFixture,
   fixturePathExists,
 } from "./fixture.js";
+import { MANAGED_AGENT_CONTRACT } from "./contract.js";
 import {
   qualifiedManagedAgentMcpToolName,
   runManagedAgentProbe,
@@ -24,6 +27,7 @@ const CORRELATION_MARKER = `SAPIOM_CERTIFICATION_CORRELATION_V1;eval_source=${EV
 const ALLOWED_BASH_COMMAND = "git status --short";
 const DENIED_BASH_COMMAND = "touch denied-side-effect.txt";
 const ECHO_NONCE_TOOL = qualifiedManagedAgentMcpToolName("echo_nonce");
+const require = createRequire(import.meta.url);
 
 interface LoopbackObservation {
   readonly headerNames: readonly string[];
@@ -62,6 +66,35 @@ function hasSuccessfulMcpResult(body: string, expectedNonce: string): boolean {
           containsExactText(result.content, expectedNonce)
         );
       });
+    });
+  } catch {
+    return false;
+  }
+}
+
+function hasToolResult(
+  body: string,
+  toolUseId: string,
+  expectedError: boolean,
+): boolean {
+  try {
+    const payload = JSON.parse(body) as { messages?: unknown };
+    if (!Array.isArray(payload.messages)) return false;
+    return payload.messages.some((message) => {
+      if (typeof message !== "object" || message === null) return false;
+      const content = (message as { content?: unknown }).content;
+      return (
+        Array.isArray(content) &&
+        content.some(
+          (block) =>
+            typeof block === "object" &&
+            block !== null &&
+            (block as Record<string, unknown>).type === "tool_result" &&
+            (block as Record<string, unknown>).tool_use_id === toolUseId &&
+            ((block as Record<string, unknown>).is_error === true) ===
+              expectedError,
+        )
+      );
     });
   } catch {
     return false;
@@ -383,3 +416,182 @@ it("enforces real-SDK built-in and in-process MCP calls with exact loopback corr
     await fixture.cleanup();
   }
 }, 45_000);
+
+it.skipIf(
+  process.versions.node !== MANAGED_AGENT_CONTRACT.certificationNodeVersion,
+)(
+  "keeps malformed real-SDK Edit requests outside strict primary-hook coverage",
+  async () => {
+    const fixture = await createManagedAgentFixture(
+      () => "loopback-malformed-edit",
+    );
+    const malformedToolUseId = "toolu_loopback_malformed_edit";
+    const validToolUseId = "toolu_loopback_valid_edit";
+    const observedMalformedError: boolean[] = [];
+    const observedValidSuccess: boolean[] = [];
+    let inferenceTurn = 0;
+    const server = createServer((request, response) => {
+      if (request.method === "HEAD" && request.url === "/api/hello") {
+        response.writeHead(200).end();
+        return;
+      }
+      if (
+        request.method !== "POST" ||
+        request.url?.split("?")[0] !== "/v1/messages"
+      ) {
+        response.writeHead(404).end();
+        return;
+      }
+
+      let body = "";
+      request.setEncoding("utf8");
+      request.on("data", (chunk: string) => {
+        body += chunk;
+        if (body.length > 2_000_000) request.destroy();
+      });
+      request.on("end", () => {
+        inferenceTurn += 1;
+        observedMalformedError.push(
+          hasToolResult(body, malformedToolUseId, true),
+        );
+        observedValidSuccess.push(hasToolResult(body, validToolUseId, false));
+        if (inferenceTurn === 1) {
+          writeToolUseResponse(response, inferenceTurn, {
+            id: malformedToolUseId,
+            name: "Edit",
+            input: {
+              file_path: FIXTURE_PATHS.cleanTarget,
+              new_string: fixture.cleanTargetReplacement,
+            },
+          });
+        } else if (inferenceTurn === 2) {
+          writeToolUseResponse(response, inferenceTurn, {
+            id: validToolUseId,
+            name: "Edit",
+            input: {
+              file_path: FIXTURE_PATHS.cleanTarget,
+              old_string: "clean target base\n",
+              new_string: fixture.cleanTargetReplacement,
+              replace_all: false,
+            },
+          });
+        } else {
+          writeFinalResponse(response, inferenceTurn);
+        }
+      });
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    try {
+      const sdkPackage = JSON.parse(
+        await readFile(
+          join(
+            dirname(require.resolve("@anthropic-ai/claude-agent-sdk")),
+            "package.json",
+          ),
+          "utf8",
+        ),
+      ) as { version?: unknown };
+      expect(sdkPackage.version).toBe(MANAGED_AGENT_CONTRACT.agentSdkVersion);
+      expect(process.versions.node).toBe(
+        MANAGED_AGENT_CONTRACT.certificationNodeVersion,
+      );
+
+      const address = server.address() as AddressInfo;
+      const ids = [RUN_ID, EXECUTION_ID];
+      const result = await runManagedAgentProbe(
+        {
+          scenario: "L1",
+          workspaceRoot: fixture.workspaceRoot,
+          configRoot: fixture.configRoot,
+          target: "sonnet-5",
+          gatewayOrigin: `http://127.0.0.1:${address.port}`,
+          gatewayCredential: "sk-ant-api03-local-loopback-only",
+          prompt: fixture.prompt("L1"),
+          maxTurns: 4,
+          maxBudgetUsd: 0.25,
+          allowedBashCommands: [],
+          expectedMcpNonce: fixture.nonce,
+          preservePaths: [
+            FIXTURE_PATHS.dirtySentinel,
+            FIXTURE_PATHS.untrackedSentinel,
+          ],
+        },
+        {
+          hermeticGatewayOrigin: `http://127.0.0.1:${address.port}`,
+          queryFactory: ({ prompt, options }) =>
+            agentSdkQuery({ prompt, options }),
+          uuid: () => {
+            const id = ids.shift();
+            if (!id) throw new Error("unexpected UUID request");
+            return id;
+          },
+        },
+      );
+
+      expect(inferenceTurn).toBe(3);
+      expect(observedMalformedError).toEqual([false, true, true]);
+      expect(observedValidSuccess).toEqual([false, false, true]);
+      const requestedEdits = result.toolEvidence.filter(
+        ({ toolName, status }) => toolName === "Edit" && status === "requested",
+      );
+      expect(requestedEdits).toHaveLength(2);
+      const [malformedEdit, validEdit] = requestedEdits;
+      expect(
+        result.permissionEvidence.filter(
+          ({ toolUseId, source }) =>
+            toolUseId === malformedEdit?.toolUseId && source === "pre_tool_use",
+        ),
+      ).toHaveLength(0);
+      expect(
+        result.toolEvidence.filter(
+          ({ toolUseId, status }) =>
+            toolUseId === malformedEdit?.toolUseId && status === "error",
+        ),
+      ).toHaveLength(1);
+      expect(
+        result.permissionEvidence.filter(
+          ({ toolUseId, source, decision }) =>
+            toolUseId === validEdit?.toolUseId &&
+            source === "pre_tool_use" &&
+            decision === "allow",
+        ),
+      ).toHaveLength(1);
+      expect(
+        result.toolEvidence.filter(
+          ({ toolUseId, status }) =>
+            toolUseId === validEdit?.toolUseId && status === "success",
+        ),
+      ).toHaveLength(1);
+      expect(result.policyDiagnostics).toEqual([
+        {
+          kind: "missing_pre_tool_use_callback",
+          reason: "no_callback_observed",
+          toolName: "Edit",
+          correlatedRequest: true,
+        },
+      ]);
+      expect(result.policyHookCoverage).toBe(false);
+      expect(result.terminal).toBe("policy_violation");
+      expect(result.terminationEvidence).toEqual({
+        beforePolicyOverride: "success",
+        queryExecution: "iteration_completed",
+        sdkResult: "success",
+      });
+      expect(
+        await readFile(
+          join(fixture.workspaceRoot, FIXTURE_PATHS.cleanTarget),
+          "utf8",
+        ),
+      ).toBe(fixture.cleanTargetReplacement);
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await fixture.cleanup();
+    }
+  },
+  45_000,
+);

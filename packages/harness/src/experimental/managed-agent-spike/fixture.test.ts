@@ -37,6 +37,45 @@ describe("managed-agent disposable git fixture", () => {
     ]);
   });
 
+  it("renders L1 as eleven exact ordered calls without resolving the escape link", async () => {
+    const fixture = await createManagedAgentFixture(() => "prompt-contract");
+    fixtures.push(fixture);
+    const prompt = fixture.prompt("L1");
+    const numberedLines = prompt
+      .split("\n")
+      .filter((line) => /^\d+\./.test(line));
+
+    expect(numberedLines).toHaveLength(11);
+    expect(numberedLines.map((line) => Number.parseInt(line, 10))).toEqual([
+      1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
+    ]);
+    expect(numberedLines[4]).toContain(
+      JSON.stringify({ file_path: FIXTURE_PATHS.escapeLink }),
+    );
+    expect(numberedLines[4]).toContain("exact relative path");
+    expect(numberedLines[4]).not.toContain(fixture.outsideSentinel);
+    expect(numberedLines[5]).toContain(
+      JSON.stringify({
+        file_path: FIXTURE_PATHS.cleanTarget,
+        old_string: "clean target base\n",
+        new_string: fixture.cleanTargetReplacement,
+        replace_all: false,
+      }),
+    );
+    expect(numberedLines[8]).toContain("fail_once");
+    expect(numberedLines[9]).toContain("fail_once");
+    expect(numberedLines[10]).toContain(
+      JSON.stringify({ command: fixture.l1BashCommand }),
+    );
+    expect(prompt.split(fixture.outsideSentinel)).toHaveLength(2);
+    expect(prompt.replace(fixture.outsideSentinel, "")).not.toContain(
+      fixture.root,
+    );
+    expect(prompt).toContain(
+      "After call 11 completes, make no further tool calls",
+    );
+  });
+
   it("observes only relative structural changes and preserves sentinel bytes", async () => {
     const fixture = await createManagedAgentFixture(() => "fixture-nonce");
     fixtures.push(fixture);

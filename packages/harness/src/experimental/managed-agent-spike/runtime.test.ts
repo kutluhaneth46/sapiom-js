@@ -85,6 +85,7 @@ async function invokePreToolUse(
     readonly toolName: string;
     readonly toolInput: unknown;
     readonly toolUseId: string;
+    readonly callbackToolUseId?: string;
   },
   signal = new AbortController().signal,
 ): Promise<void> {
@@ -102,7 +103,7 @@ async function invokePreToolUse(
       tool_input: input.toolInput,
       tool_use_id: input.toolUseId,
     },
-    input.toolUseId,
+    input.callbackToolUseId ?? input.toolUseId,
     { signal },
   );
 }
@@ -291,7 +292,13 @@ describe("runManagedAgentProbe", () => {
       );
       expect(capturedOptions?.env).not.toHaveProperty("SAPIOM_API_KEY");
       expect(result.terminal).toBe("success");
+      expect(result.terminationEvidence).toEqual({
+        beforePolicyOverride: "success",
+        queryExecution: "iteration_completed",
+        sdkResult: "success",
+      });
       expect(result.policyHookCoverage).toBe(true);
+      expect(result.policyDiagnostics).toEqual([]);
       expect(result.inferenceTurns).toBe(1);
       expect(result.sdkNumTurns).toBe(1);
       expect(result.correlation.promptEmbedded).toBe(true);
@@ -383,6 +390,11 @@ describe("runManagedAgentProbe", () => {
 
     expect(queryFactory).not.toHaveBeenCalled();
     expect(result.terminal).toBe("policy_violation");
+    expect(result.terminationEvidence).toEqual({
+      beforePolicyOverride: "incomplete",
+      queryExecution: "not_started",
+      sdkResult: "not_observed",
+    });
     expect(result.policyHookCoverage).toBe(false);
     expect(result.queryClosed).toBe(false);
     expect(result.correlation.promptEmbedded).toBe(false);
@@ -406,6 +418,58 @@ describe("runManagedAgentProbe", () => {
     expect(result.correlation.promptEmbedded).toBe(true);
     expect(result.queryClosed).toBe(false);
     expect(result.terminal).toBe("query_error");
+    expect(result.terminationEvidence).toEqual({
+      beforePolicyOverride: "query_error",
+      queryExecution: "construction_failed",
+      sdkResult: "not_observed",
+    });
+  });
+
+  it("distinguishes query iteration failure from construction failure", async () => {
+    const { config } = await probeConfig();
+    const result = await runManagedAgentProbe(config, {
+      hermeticGatewayOrigin: config.gatewayOrigin,
+      processObserver: fakeObserver(),
+      policySettingsGuard: async () => undefined,
+      queryFactory: () => ({
+        async *[Symbol.asyncIterator]() {
+          yield {
+            type: "system",
+            subtype: "init",
+            session_id: SUCCESS_SESSION_ID,
+          };
+          throw new Error("synthetic private iteration failure");
+        },
+        close: vi.fn(),
+      }),
+    });
+
+    expect(result.terminal).toBe("query_error");
+    expect(result.terminationEvidence).toEqual({
+      beforePolicyOverride: "query_error",
+      queryExecution: "iteration_failed",
+      sdkResult: "not_observed",
+    });
+    expect(JSON.stringify(result)).not.toContain(
+      "synthetic private iteration failure",
+    );
+  });
+
+  it("reports a completed iteration that emitted no SDK result", async () => {
+    const { config } = await probeConfig();
+    const result = await runManagedAgentProbe(config, {
+      hermeticGatewayOrigin: config.gatewayOrigin,
+      processObserver: fakeObserver(),
+      policySettingsGuard: async () => undefined,
+      queryFactory: () => queryFromEvents([]),
+    });
+
+    expect(result.terminal).toBe("incomplete");
+    expect(result.terminationEvidence).toEqual({
+      beforePolicyOverride: "incomplete",
+      queryExecution: "iteration_completed",
+      sdkResult: "not_observed",
+    });
   });
 
   it("preserves teardown failure priority when policy preflight fails", async () => {
@@ -469,6 +533,19 @@ describe("runManagedAgentProbe", () => {
     expect(result.policyHookCoverage).toBe(false);
     expect(result.terminal).toBe("policy_violation");
     expect(result.permissionEvidence).toEqual([]);
+    expect(result.policyDiagnostics).toEqual([
+      {
+        kind: "missing_pre_tool_use_callback",
+        reason: "no_callback_observed",
+        toolName: "Read",
+        correlatedRequest: true,
+      },
+    ]);
+    expect(result.terminationEvidence).toEqual({
+      beforePolicyOverride: "success",
+      queryExecution: "iteration_completed",
+      sdkResult: "success",
+    });
   });
 
   it("cannot certify a malformed SDK tool-use identifier as policy-covered evidence", async () => {
@@ -506,6 +583,81 @@ describe("runManagedAgentProbe", () => {
     expect(result.permissionEvidence).toEqual([]);
     expect(result.policyHookCoverage).toBe(false);
     expect(result.terminal).toBe("policy_violation");
+    expect(result.terminationEvidence).toEqual({
+      beforePolicyOverride: "query_error",
+      queryExecution: "event_normalization_failed",
+      sdkResult: "not_observed",
+      eventNormalizationFailure: "tool_request_id_invalid",
+    });
+  });
+
+  it("reports a correlated PreToolUse guard rejection without certifying coverage", async () => {
+    const { config } = await probeConfig();
+    const requestIdSecret = "guarded-request-id-secret";
+    const callbackIdSecret = "mismatched-callback-id-secret";
+    const result = await runManagedAgentProbe(config, {
+      hermeticGatewayOrigin: config.gatewayOrigin,
+      processObserver: fakeObserver(),
+      policySettingsGuard: async () => undefined,
+      queryFactory: ({ options }) => ({
+        async *[Symbol.asyncIterator]() {
+          yield {
+            type: "assistant",
+            message: {
+              id: "guard-rejection-message",
+              content: [
+                {
+                  type: "tool_use",
+                  id: requestIdSecret,
+                  name: "Edit",
+                  input: { file_path: FIXTURE_PATHS.cleanTarget },
+                },
+              ],
+            },
+          };
+          await invokePreToolUse(options, {
+            toolName: "Edit",
+            toolInput: { file_path: FIXTURE_PATHS.cleanTarget },
+            toolUseId: requestIdSecret,
+            callbackToolUseId: callbackIdSecret,
+          });
+          yield {
+            type: "user",
+            message: {
+              content: [
+                {
+                  type: "tool_result",
+                  tool_use_id: requestIdSecret,
+                  is_error: true,
+                },
+              ],
+            },
+          };
+          yield {
+            type: "result",
+            subtype: "success",
+            is_error: false,
+            num_turns: 1,
+          };
+        },
+        close: vi.fn(),
+      }),
+    });
+
+    expect(result.permissionEvidence).toEqual([]);
+    expect(result.policyDiagnostics).toEqual([
+      {
+        kind: "pre_tool_use_guard_rejection",
+        reason: "callback_tool_use_id_mismatch",
+        toolName: "Edit",
+        correlatedRequest: true,
+      },
+    ]);
+    expect(result.policyHookCoverage).toBe(false);
+    expect(result.terminal).toBe("policy_violation");
+    const serialized = JSON.stringify(result);
+    expect(serialized).not.toContain(requestIdSecret);
+    expect(serialized).not.toContain(callbackIdSecret);
   });
 
   it("rejects duplicate requested tool ids instead of reusing one policy decision", async () => {

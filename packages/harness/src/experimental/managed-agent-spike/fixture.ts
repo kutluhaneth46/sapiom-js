@@ -207,6 +207,7 @@ export async function createManagedAgentFixture(
   ]);
 
   const nonce = createNonce().split("-").join("");
+  const cleanTargetContents = "clean target base\n";
   const dirtyBase = "tracked dirty sentinel base\n";
   const dirtyContents = "tracked dirty sentinel user change\n";
   const untrackedContents = `${nonce}\n`;
@@ -218,7 +219,7 @@ export async function createManagedAgentFixture(
   await Promise.all([
     writeFile(
       join(workspaceRoot, FIXTURE_PATHS.cleanTarget),
-      "clean target base\n",
+      cleanTargetContents,
     ),
     writeFile(join(workspaceRoot, FIXTURE_PATHS.dirtySentinel), dirtyBase),
     writeFile(
@@ -279,17 +280,21 @@ export async function createManagedAgentFixture(
         ].join("\n");
       }
       return [
-        "Complete this deterministic local-tool probe in order.",
-        `1. Read ${FIXTURE_PATHS.cleanTarget}, ${FIXTURE_PATHS.dirtySentinel}, and ${FIXTURE_PATHS.untrackedSentinel}.`,
-        `2. Attempt to Read the absolute outside path ${outsideSentinel}; after denial, continue.`,
-        `3. Attempt to Read ${FIXTURE_PATHS.escapeLink}; after denial, continue.`,
-        `4. Edit ${FIXTURE_PATHS.cleanTarget}, replacing its complete current contents with exactly ${JSON.stringify(cleanTargetReplacement)}.`,
-        `5. Write ${FIXTURE_PATHS.createdTarget} with exactly ${JSON.stringify(createdTargetContents)}.`,
-        `6. Call echo_nonce with the exact sole line you read from ${FIXTURE_PATHS.untrackedSentinel}, without surrounding whitespace.`,
-        `7. Call fail_once with that same value; after its planned error, call fail_once once more with the same value.`,
-        `8. Use Bash with exactly this command: ${l1BashCommand}`,
+        "Perform exactly these 11 tool calls in numbered order. Make each numbered call exactly once, do not combine calls, and make no unlisted tool call.",
+        "Use every literal path, argument, and command exactly as written. Do not resolve, normalize, substitute, or retry a path or command. Continue after the two expected Read denials and the first expected fail_once error.",
+        `1. Call Read with exactly ${JSON.stringify({ file_path: FIXTURE_PATHS.cleanTarget })}.`,
+        `2. Call Read with exactly ${JSON.stringify({ file_path: FIXTURE_PATHS.dirtySentinel })}.`,
+        `3. Call Read with exactly ${JSON.stringify({ file_path: FIXTURE_PATHS.untrackedSentinel })}. Save its sole line without surrounding whitespace for calls 8-10.`,
+        `4. Call Read with exactly ${JSON.stringify({ file_path: outsideSentinel })}. A denial is expected; continue without retrying.`,
+        `5. Call Read with exactly ${JSON.stringify({ file_path: FIXTURE_PATHS.escapeLink })}. This must remain the exact relative path shown: do not replace it with an absolute path or its symlink target. A denial is expected; continue without retrying.`,
+        `6. Call Edit with exactly ${JSON.stringify({ file_path: FIXTURE_PATHS.cleanTarget, old_string: cleanTargetContents, new_string: cleanTargetReplacement, replace_all: false })}.`,
+        `7. Call Write with exactly ${JSON.stringify({ file_path: FIXTURE_PATHS.createdTarget, content: createdTargetContents })}.`,
+        `8. Call echo_nonce exactly once with the saved line as its nonce argument.`,
+        `9. Call fail_once with the saved line as its nonce argument. Its planned error is expected; continue.`,
+        `10. Call fail_once a second and final time with the same nonce argument.`,
+        `11. Call Bash with exactly ${JSON.stringify({ command: l1BashCommand })}.`,
         `Never modify ${FIXTURE_PATHS.dirtySentinel} or ${FIXTURE_PATHS.untrackedSentinel}.`,
-        "Finish with a short confirmation after all steps.",
+        "After call 11 completes, make no further tool calls and return one short final text confirmation.",
       ].join("\n");
     },
     async cleanup() {

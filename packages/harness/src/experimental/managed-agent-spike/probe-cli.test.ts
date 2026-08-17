@@ -33,6 +33,11 @@ function passingL1Result(): ManagedAgentProbeResult {
     sdkNumTurns: 8,
     policyHookCoverage: true,
     terminal: "success",
+    terminationEvidence: {
+      beforePolicyOverride: "success",
+      queryExecution: "iteration_completed",
+      sdkResult: "success",
+    },
     events: [],
     toolEvidence: [
       ...builtins.flatMap((toolName, index) => [
@@ -95,6 +100,7 @@ function passingL1Result(): ManagedAgentProbeResult {
         source: "pre_tool_use",
       },
     ],
+    policyDiagnostics: [],
     workspaceChanges: [
       { path: FIXTURE_PATHS.cleanTarget, change: "modified" },
       { path: FIXTURE_PATHS.createdTarget, change: "created" },

@@ -11,8 +11,10 @@ import type {
   ManagedAgentPermissionEvidence,
   ManagedAgentPermissionReason,
   ManagedAgentPermissionSource,
+  ManagedAgentPreToolUseGuardRejectionReason,
 } from "./types.js";
 import {
+  MANAGED_AGENT_TOOL_USE_ID_MAX_LENGTH,
   isBoundedManagedAgentToolUseId,
   normalizeManagedAgentToolUseId,
   sanitizeManagedAgentToolName,
@@ -137,8 +139,18 @@ export interface ManagedAgentPolicyBoundaryOptions {
   readonly allowedBashCommands: readonly string[];
   readonly allowedMcpTools: readonly string[];
   readonly onDecision: (evidence: ManagedAgentPermissionEvidence) => void;
+  readonly onGuardRejection?: (
+    diagnostic: ManagedAgentPreToolUseGuardRejection,
+  ) => void;
   /** Test seam for proving cancellation after asynchronous path validation. */
   readonly resolveToolPath?: typeof resolveManagedAgentToolPath;
+}
+
+/** Internal correlation is normalized immediately and is removed from output. */
+export interface ManagedAgentPreToolUseGuardRejection {
+  readonly reason: ManagedAgentPreToolUseGuardRejectionReason;
+  readonly toolName: string;
+  readonly normalizedToolUseId?: string;
 }
 
 export interface ManagedAgentPolicyBoundary {
@@ -156,6 +168,26 @@ interface ManagedAgentPolicyDecision {
 
 interface ManagedAgentRecordedPolicyDecision extends ManagedAgentPolicyDecision {
   readonly source: ManagedAgentPermissionSource;
+}
+
+function toolUseIdIssue(
+  value: unknown,
+  role: "input" | "callback",
+): ManagedAgentPreToolUseGuardRejectionReason | undefined {
+  if (role === "input" && value === undefined) {
+    return "input_tool_use_id_missing";
+  }
+  if (typeof value !== "string" || value.trim().length === 0) {
+    return role === "input"
+      ? "input_tool_use_id_invalid"
+      : "callback_tool_use_id_invalid";
+  }
+  if (value.length > MANAGED_AGENT_TOOL_USE_ID_MAX_LENGTH) {
+    return role === "input"
+      ? "input_tool_use_id_too_long"
+      : "callback_tool_use_id_too_long";
+  }
+  return undefined;
 }
 
 function permissionResult(
@@ -273,6 +305,22 @@ export function createManagedAgentPolicyBoundary(
     }
   >();
 
+  const recordGuardRejection = (
+    reason: ManagedAgentPreToolUseGuardRejectionReason,
+    toolName: unknown,
+    inputToolUseID?: unknown,
+  ): void => {
+    options.onGuardRejection?.({
+      reason,
+      toolName: sanitizeManagedAgentToolName(toolName),
+      ...(isBoundedManagedAgentToolUseId(inputToolUseID)
+        ? {
+            normalizedToolUseId: normalizeManagedAgentToolUseId(inputToolUseID),
+          }
+        : {}),
+    });
+  };
+
   const decide = async (
     toolUseID: string,
     toolName: string,
@@ -321,8 +369,8 @@ export function createManagedAgentPolicyBoundary(
     { signal },
   ) => {
     const isPreToolUse = input.hook_event_name === "PreToolUse";
-    const inputToolUseID = isPreToolUse ? input.tool_use_id : undefined;
-    if (!isPreToolUse || !isBoundedManagedAgentToolUseId(inputToolUseID)) {
+    if (!isPreToolUse) {
+      recordGuardRejection("unexpected_hook_event", undefined);
       return {
         hookSpecificOutput: {
           hookEventName: "PreToolUse",
@@ -331,11 +379,13 @@ export function createManagedAgentPolicyBoundary(
         },
       };
     }
-    if (
-      callbackToolUseID !== undefined &&
-      (!isBoundedManagedAgentToolUseId(callbackToolUseID) ||
-        callbackToolUseID !== inputToolUseID)
-    ) {
+    const inputToolUseID = input.tool_use_id;
+    const inputIssue = toolUseIdIssue(inputToolUseID, "input");
+    if (inputIssue || !isBoundedManagedAgentToolUseId(inputToolUseID)) {
+      recordGuardRejection(
+        inputIssue ?? "input_tool_use_id_invalid",
+        input.tool_name,
+      );
       return {
         hookSpecificOutput: {
           hookEventName: "PreToolUse",
@@ -343,6 +393,37 @@ export function createManagedAgentPolicyBoundary(
           permissionDecisionReason: "Managed-agent policy: invalid_input",
         },
       };
+    }
+    if (callbackToolUseID !== undefined) {
+      const callbackIssue = toolUseIdIssue(callbackToolUseID, "callback");
+      if (callbackIssue || !isBoundedManagedAgentToolUseId(callbackToolUseID)) {
+        recordGuardRejection(
+          callbackIssue ?? "callback_tool_use_id_invalid",
+          input.tool_name,
+          inputToolUseID,
+        );
+        return {
+          hookSpecificOutput: {
+            hookEventName: "PreToolUse",
+            permissionDecision: "deny",
+            permissionDecisionReason: "Managed-agent policy: invalid_input",
+          },
+        };
+      }
+      if (callbackToolUseID !== inputToolUseID) {
+        recordGuardRejection(
+          "callback_tool_use_id_mismatch",
+          input.tool_name,
+          inputToolUseID,
+        );
+        return {
+          hookSpecificOutput: {
+            hookEventName: "PreToolUse",
+            permissionDecision: "deny",
+            permissionDecisionReason: "Managed-agent policy: invalid_input",
+          },
+        };
+      }
     }
     const toolUseID = inputToolUseID;
     const policy = await decide(

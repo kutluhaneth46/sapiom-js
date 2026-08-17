@@ -111,6 +111,57 @@ export interface ManagedAgentPermissionEvidence {
   readonly source: ManagedAgentPermissionSource;
 }
 
+export type ManagedAgentPreToolUseGuardRejectionReason =
+  | "unexpected_hook_event"
+  | "input_tool_use_id_missing"
+  | "input_tool_use_id_invalid"
+  | "input_tool_use_id_too_long"
+  | "callback_tool_use_id_invalid"
+  | "callback_tool_use_id_too_long"
+  | "callback_tool_use_id_mismatch";
+
+/**
+ * Content-free policy diagnostics. They explain why strict hook coverage
+ * failed, but never count as permission evidence and therefore cannot certify
+ * a tool request as authorized.
+ */
+export type ManagedAgentPolicyDiagnostic =
+  | {
+      readonly kind: "pre_tool_use_guard_rejection";
+      readonly reason: ManagedAgentPreToolUseGuardRejectionReason;
+      readonly toolName: string;
+      readonly correlatedRequest: boolean;
+    }
+  | {
+      readonly kind: "missing_pre_tool_use_callback";
+      readonly reason: "no_callback_observed";
+      readonly toolName: string;
+      readonly correlatedRequest: true;
+    };
+
+export type ManagedAgentEventNormalizationFailureReason =
+  | "assistant_message_id_invalid"
+  | "inference_turn_limit_exceeded"
+  | "tool_request_id_invalid"
+  | "tool_result_id_invalid"
+  | "sdk_num_turns_invalid";
+
+export type ManagedAgentQueryExecutionOutcome =
+  | "not_started"
+  | "construction_failed"
+  | "iteration_completed"
+  | "iteration_failed"
+  | "iteration_aborted"
+  | "event_normalization_failed";
+
+export interface ManagedAgentTerminationEvidence {
+  /** Terminal classification before the strict policy override is applied. */
+  readonly beforePolicyOverride: ManagedAgentTerminalClassification;
+  readonly queryExecution: ManagedAgentQueryExecutionOutcome;
+  readonly sdkResult: "not_observed" | "success" | "error";
+  readonly eventNormalizationFailure?: ManagedAgentEventNormalizationFailureReason;
+}
+
 export interface ManagedAgentTeardownObservation {
   readonly quiescent: boolean;
   readonly deadlineMet: boolean;
@@ -144,9 +195,11 @@ export interface ManagedAgentProbeResult {
   /** False if any requested tool lacked exactly one primary PreToolUse decision. */
   readonly policyHookCoverage: boolean;
   readonly terminal: ManagedAgentTerminalClassification;
+  readonly terminationEvidence: ManagedAgentTerminationEvidence;
   readonly events: readonly ManagedAgentProbeEvent[];
   readonly toolEvidence: readonly ManagedAgentToolEvidence[];
   readonly permissionEvidence: readonly ManagedAgentPermissionEvidence[];
+  readonly policyDiagnostics: readonly ManagedAgentPolicyDiagnostic[];
   readonly workspaceChanges: readonly ManagedAgentWorkspaceChange[];
   readonly preservation: readonly ManagedAgentPreservationObservation[];
   readonly cancellationRequested: boolean;

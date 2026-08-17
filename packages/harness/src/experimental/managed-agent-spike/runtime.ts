@@ -21,6 +21,7 @@ import {
   MANAGED_AGENT_BUILTIN_TOOLS,
   MANAGED_AGENT_DISALLOWED_TOOLS,
   createManagedAgentPolicyBoundary,
+  type ManagedAgentPreToolUseGuardRejection,
 } from "./permissions.js";
 import { createLocalManagedAgentProcessObserver } from "./process-observer.js";
 import {
@@ -30,8 +31,10 @@ import {
 import type {
   ManagedAgentProbeConfig,
   ManagedAgentProbeDependencies,
+  ManagedAgentPolicyDiagnostic,
   ManagedAgentProbeResult,
   ManagedAgentQuery,
+  ManagedAgentQueryExecutionOutcome,
   ManagedAgentTeardownObservation,
   ManagedAgentTerminalClassification,
   ManagedAgentToolEvidence,
@@ -212,6 +215,55 @@ function hasUniversalPolicyHookCoverage(
   });
 }
 
+function buildManagedAgentPolicyDiagnostics(
+  toolEvidence: readonly ManagedAgentToolEvidence[],
+  permissionEvidence: ManagedAgentProbeResult["permissionEvidence"],
+  guardRejections: readonly ManagedAgentPreToolUseGuardRejection[],
+): ManagedAgentPolicyDiagnostic[] {
+  const requestedIds = new Set(
+    toolEvidence.flatMap(({ status, toolUseId }) =>
+      status === "requested" && toolUseId ? [toolUseId] : [],
+    ),
+  );
+  const diagnostics: ManagedAgentPolicyDiagnostic[] = guardRejections.map(
+    ({ reason, toolName, normalizedToolUseId }) => ({
+      kind: "pre_tool_use_guard_rejection",
+      reason,
+      toolName,
+      correlatedRequest:
+        normalizedToolUseId !== undefined &&
+        requestedIds.has(normalizedToolUseId),
+    }),
+  );
+  const primaryDecisionIds = new Set(
+    permissionEvidence.flatMap(({ toolUseId, source }) =>
+      source === "pre_tool_use" ? [toolUseId] : [],
+    ),
+  );
+  const guardedRequestIds = new Set(
+    guardRejections.flatMap(({ normalizedToolUseId }) =>
+      normalizedToolUseId ? [normalizedToolUseId] : [],
+    ),
+  );
+  for (const evidence of toolEvidence) {
+    if (
+      evidence.status !== "requested" ||
+      !evidence.toolUseId ||
+      primaryDecisionIds.has(evidence.toolUseId) ||
+      guardedRequestIds.has(evidence.toolUseId)
+    ) {
+      continue;
+    }
+    diagnostics.push({
+      kind: "missing_pre_tool_use_callback",
+      reason: "no_callback_observed",
+      toolName: evidence.toolName,
+      correlatedRequest: true,
+    });
+  }
+  return diagnostics;
+}
+
 async function closeQueryBounded(query: ManagedAgentQuery): Promise<boolean> {
   let timeout: NodeJS.Timeout | undefined;
   try {
@@ -293,7 +345,9 @@ export async function runManagedAgentProbe(
   let cancellationTriggerFailed = false;
   let policyPreflightFailed = false;
   let promptEmbedded = false;
-  let eventNormalizationFailed = false;
+  let eventNormalizationFailure: ManagedAgentProbeResult["terminationEvidence"]["eventNormalizationFailure"];
+  let queryExecution: ManagedAgentQueryExecutionOutcome = "not_started";
+  const guardRejections: ManagedAgentPreToolUseGuardRejection[] = [];
 
   const childEnvironment = buildManagedAgentChildEnvironment({
     ambient: process.env,
@@ -309,6 +363,7 @@ export async function runManagedAgentProbe(
     allowedBashCommands: config.allowedBashCommands,
     allowedMcpTools: mcpRuntime.qualifiedToolNames,
     onDecision: (evidence) => recorder.recordPermission(evidence),
+    onGuardRejection: (diagnostic) => guardRejections.push(diagnostic),
   });
   const processObserver =
     dependencies.processObserver ?? createLocalManagedAgentProcessObserver();
@@ -353,6 +408,7 @@ export async function runManagedAgentProbe(
 
   let teardown!: ManagedAgentTeardownObservation;
   let terminal!: ManagedAgentTerminalClassification;
+  let terminationEvidence!: ManagedAgentProbeResult["terminationEvidence"];
   let policyHookCoverage = false;
   try {
     recorder.recordLifecycle("starting");
@@ -397,19 +453,37 @@ export async function runManagedAgentProbe(
           executionId,
         });
         promptEmbedded = true;
-        query = (dependencies.queryFactory ?? defaultQueryFactory)({
-          prompt,
-          options,
-        });
+        try {
+          query = (dependencies.queryFactory ?? defaultQueryFactory)({
+            prompt,
+            options,
+          });
+        } catch (error) {
+          queryExecution = "construction_failed";
+          throw error;
+        }
         for await (const event of query) {
           try {
             recorder.observeSdkEvent(event);
           } catch (error) {
-            eventNormalizationFailed = error instanceof ManagedAgentEventError;
+            if (error instanceof ManagedAgentEventError) {
+              eventNormalizationFailure = error.reason;
+              queryExecution = "event_normalization_failed";
+            }
             throw error;
           }
         }
+        queryExecution = "iteration_completed";
       } catch {
+        if (eventNormalizationFailure) {
+          queryExecution = "event_normalization_failed";
+        } else if (!query) {
+          queryExecution = "construction_failed";
+        } else {
+          queryExecution = abortController.signal.aborted
+            ? "iteration_aborted"
+            : "iteration_failed";
+        }
         if (!abortController.signal.aborted) queryFailed = true;
       } finally {
         triggerController.abort();
@@ -440,7 +514,7 @@ export async function runManagedAgentProbe(
           totalElapsedMs <= MANAGED_AGENT_TEARDOWN_TIMEOUT_MS,
       };
     }
-    terminal = classifyTerminal({
+    const beforePolicyOverride = classifyTerminal({
       teardown,
       queryCreated: query !== undefined,
       queryClosed,
@@ -448,6 +522,7 @@ export async function runManagedAgentProbe(
       queryFailed,
       sdkResult: recorder.result,
     });
+    terminal = beforePolicyOverride;
     if (
       policyPreflightFailed &&
       terminal !== "teardown_timeout" &&
@@ -457,7 +532,7 @@ export async function runManagedAgentProbe(
     }
     policyHookCoverage =
       !policyPreflightFailed &&
-      !eventNormalizationFailed &&
+      !eventNormalizationFailure &&
       hasUniversalPolicyHookCoverage(
         recorder.toolEvidence,
         recorder.permissionEvidence,
@@ -476,12 +551,29 @@ export async function runManagedAgentProbe(
       teardown = { ...teardown, emergencyCleanupAttempted: true };
       terminal = "teardown_timeout";
     }
+
+    const sdkResult = recorder.result
+      ? recorder.result.isError
+        ? "error"
+        : "success"
+      : "not_observed";
+    terminationEvidence = {
+      beforePolicyOverride,
+      queryExecution,
+      sdkResult,
+      ...(eventNormalizationFailure ? { eventNormalizationFailure } : {}),
+    };
   } finally {
     processObserver.dispose();
   }
 
   const after = await captureManagedAgentWorkspaceSnapshot(
     validated.canonicalWorkspaceRoot,
+  );
+  const policyDiagnostics = buildManagedAgentPolicyDiagnostics(
+    recorder.toolEvidence,
+    recorder.permissionEvidence,
+    guardRejections,
   );
   return {
     contractVersion: 1,
@@ -496,9 +588,11 @@ export async function runManagedAgentProbe(
       : { sdkNumTurns: recorder.sdkNumTurns }),
     policyHookCoverage,
     terminal,
+    terminationEvidence,
     events: [...recorder.events],
     toolEvidence: [...recorder.toolEvidence, ...mcpRuntime.invocations],
     permissionEvidence: [...recorder.permissionEvidence],
+    policyDiagnostics,
     workspaceChanges: diffManagedAgentWorkspaceSnapshots(before, after),
     preservation: observeManagedAgentPreservation(
       before,

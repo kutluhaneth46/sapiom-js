@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 
 import { MANAGED_AGENT_CONTRACT } from "./contract.js";
 import type {
+  ManagedAgentEventNormalizationFailureReason,
   ManagedAgentPermissionEvidence,
   ManagedAgentProbeEvent,
   ManagedAgentSdkUsageEstimate,
@@ -47,7 +48,10 @@ const MAX_ASSISTANT_MESSAGE_ID_LENGTH = 512;
 export const MANAGED_AGENT_TOOL_USE_ID_MAX_LENGTH = 512;
 
 export class ManagedAgentEventError extends Error {
-  public constructor(message: string) {
+  public constructor(
+    public readonly reason: ManagedAgentEventNormalizationFailureReason,
+    message: string,
+  ) {
     super(message);
     this.name = "ManagedAgentEventError";
   }
@@ -71,6 +75,7 @@ export function isBoundedManagedAgentToolUseId(
 export function normalizeManagedAgentToolUseId(value: unknown): string {
   if (!isBoundedManagedAgentToolUseId(value)) {
     throw new ManagedAgentEventError(
+      "tool_request_id_invalid",
       "Managed-agent event has no bounded string tool-use id",
     );
   }
@@ -94,6 +99,7 @@ function normalizeAssistantMessageId(value: unknown): string {
   const messageId = optionalString(value);
   if (!messageId || messageId.length > MAX_ASSISTANT_MESSAGE_ID_LENGTH) {
     throw new ManagedAgentEventError(
+      "assistant_message_id_invalid",
       "Assistant event has no bounded string message id",
     );
   }
@@ -111,6 +117,7 @@ function boundedSdkNumTurns(value: unknown): number | undefined {
     Number(value) > MANAGED_AGENT_CONTRACT.maxTurns
   ) {
     throw new ManagedAgentEventError(
+      "sdk_num_turns_invalid",
       `SDK num_turns must be an integer between 0 and ${MANAGED_AGENT_CONTRACT.maxTurns}`,
     );
   }
@@ -245,6 +252,7 @@ export class ManagedAgentEventRecorder {
       this.#inferenceMessageIds.add(normalizeAssistantMessageId(message?.id));
       if (this.#inferenceMessageIds.size > MANAGED_AGENT_CONTRACT.maxTurns) {
         throw new ManagedAgentEventError(
+          "inference_turn_limit_exceeded",
           `Distinct assistant message ids exceed ${MANAGED_AGENT_CONTRACT.maxTurns}`,
         );
       }
@@ -255,7 +263,18 @@ export class ManagedAgentEventRecorder {
     if (type === "assistant") {
       for (const block of blocks) {
         if (block.type !== "tool_use") continue;
-        const toolUseId = normalizeManagedAgentToolUseId(block.id);
+        let toolUseId: string;
+        try {
+          toolUseId = normalizeManagedAgentToolUseId(block.id);
+        } catch (error) {
+          if (error instanceof ManagedAgentEventError) {
+            throw new ManagedAgentEventError(
+              "tool_request_id_invalid",
+              error.message,
+            );
+          }
+          throw error;
+        }
         const toolName = sanitizeManagedAgentToolName(block.name);
         this.#toolEvidence.push({ toolUseId, toolName, status: "requested" });
         this.#append({
@@ -269,7 +288,18 @@ export class ManagedAgentEventRecorder {
     if (type === "user") {
       for (const block of blocks) {
         if (block.type !== "tool_result") continue;
-        const toolUseId = normalizeManagedAgentToolUseId(block.tool_use_id);
+        let toolUseId: string;
+        try {
+          toolUseId = normalizeManagedAgentToolUseId(block.tool_use_id);
+        } catch (error) {
+          if (error instanceof ManagedAgentEventError) {
+            throw new ManagedAgentEventError(
+              "tool_result_id_invalid",
+              error.message,
+            );
+          }
+          throw error;
+        }
         const isError = block.is_error === true;
         const matchingTool = [...this.#toolEvidence]
           .reverse()

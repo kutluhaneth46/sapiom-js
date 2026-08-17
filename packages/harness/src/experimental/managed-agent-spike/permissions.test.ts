@@ -191,12 +191,18 @@ describe("managed-agent universal policy boundary", () => {
 
   it("rejects malformed hook identifiers before policy evaluation", async () => {
     const evidence: ManagedAgentPermissionEvidence[] = [];
+    const guardDiagnostics: Array<{
+      reason: string;
+      toolName: string;
+      normalizedToolUseId?: string;
+    }> = [];
     const resolveToolPath = vi.fn(async () => join(workspace, "inside.txt"));
     const boundary = createManagedAgentPolicyBoundary({
       canonicalWorkspaceRoot: workspace,
       allowedBashCommands: [],
       allowedMcpTools: [],
       onDecision: (decision) => evidence.push(decision),
+      onGuardRejection: (diagnostic) => guardDiagnostics.push(diagnostic),
       resolveToolPath,
     });
     const signal = new AbortController().signal;
@@ -245,6 +251,58 @@ describe("managed-agent universal policy boundary", () => {
     });
     expect(resolveToolPath).not.toHaveBeenCalled();
     expect(evidence).toEqual([]);
+    expect(
+      guardDiagnostics.map(({ reason, toolName, normalizedToolUseId }) => ({
+        reason,
+        toolName,
+        correlated: normalizedToolUseId !== undefined,
+      })),
+    ).toEqual([
+      {
+        reason: "input_tool_use_id_missing",
+        toolName: "Read",
+        correlated: false,
+      },
+      {
+        reason: "input_tool_use_id_invalid",
+        toolName: "Read",
+        correlated: false,
+      },
+      {
+        reason: "input_tool_use_id_invalid",
+        toolName: "Read",
+        correlated: false,
+      },
+      {
+        reason: "input_tool_use_id_too_long",
+        toolName: "Read",
+        correlated: false,
+      },
+      {
+        reason: "callback_tool_use_id_invalid",
+        toolName: "Read",
+        correlated: true,
+      },
+      {
+        reason: "callback_tool_use_id_invalid",
+        toolName: "Read",
+        correlated: true,
+      },
+      {
+        reason: "callback_tool_use_id_too_long",
+        toolName: "Read",
+        correlated: true,
+      },
+      {
+        reason: "callback_tool_use_id_mismatch",
+        toolName: "Read",
+        correlated: true,
+      },
+    ]);
+    const serializedDiagnostics = JSON.stringify(guardDiagnostics);
+    expect(serializedDiagnostics).not.toContain("valid-input-id");
+    expect(serializedDiagnostics).not.toContain("mismatched-callback-id");
+    expect(serializedDiagnostics).not.toContain(overlong);
 
     await expect(
       boundary.preToolUseHook(
