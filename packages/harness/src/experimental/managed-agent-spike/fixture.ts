@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import {
   lstat,
   mkdir,
@@ -53,6 +54,9 @@ export interface ManagedAgentFixture {
   readonly pathRoleBindings: readonly ManagedAgentPathRoleBinding[];
   readonly expectedL1FinalBytes: readonly ManagedAgentL1ExpectedFileHash[];
   readonly preservedBytes: Readonly<Record<string, Buffer>>;
+  /** Host-only cooperative marker outside the model-writable workspace. */
+  readonly cooperativeExitMarker: string;
+  requestCooperativeExit(): Promise<void>;
   prompt(scenario: ManagedAgentProbeScenario): string;
   cleanup(): Promise<void>;
 }
@@ -80,12 +84,16 @@ function shellQuote(value: string): string {
 
 const LONG_RUNNING_SCRIPT = `
 import { spawn } from "node:child_process";
-import { writeFileSync } from "node:fs";
+import { existsSync, unlinkSync, writeFileSync } from "node:fs";
 import { createConnection } from "node:net";
 import { resolve } from "node:path";
 
 const pidFile = resolve(process.argv[2]);
 const requireControlRegistration = process.argv[3] === "--register-control";
+const cleanupMarkerIndex = process.argv.indexOf("--host-cleanup-marker");
+const cleanupMarker = cleanupMarkerIndex >= 0
+  ? resolve(process.argv[cleanupMarkerIndex + 1])
+  : undefined;
 const controlSocket = process.env[${JSON.stringify(MANAGED_AGENT_TOOL_CONTROL_SOCKET_ENV)}];
 const controlCapability = process.env[${JSON.stringify(MANAGED_AGENT_TOOL_CONTROL_CAPABILITY_ENV)}];
 if (requireControlRegistration && (!controlSocket || !controlCapability)) {
@@ -100,6 +108,7 @@ const childProgram = [
   'delete process.env["${MANAGED_AGENT_TOOL_CONTROL_SOCKET_ENV}"];',
   'delete process.env["${MANAGED_AGENT_TOOL_CONTROL_CAPABILITY_ENV}"];',
   'process.on("SIGTERM", () => {});',
+  'process.on("message", (message) => { if (message === "host-shutdown") process.exit(0); });',
   'const publishReady = () => { if (process.send) process.send("ready"); };',
   'const connectControl = () => {',
   '  if (!controlSocket || !controlCapability) { publishReady(); return; }',
@@ -119,6 +128,10 @@ const childProgram = [
   '  });',
   '  socket.on("data", (chunk) => {',
   '    response += chunk;',
+  '    if (response.includes(' + JSON.stringify('"shutdown":true') + ')) {',
+  '      socket.write(JSON.stringify({ shutdownAck: true }) + "\\\\n", () => process.exit(0));',
+  '      return;',
+  '    }',
   '    if (!response.includes("\\\\n")) return;',
   '    if (!response.includes(' + JSON.stringify('"registered":true') + ')) { socket.destroy(); return; }',
   '    registered = true;',
@@ -169,6 +182,12 @@ const connectControl = () => {
   });
   socket.on("data", (chunk) => {
     response += chunk;
+    if (response.includes('"shutdown":true')) {
+      socket.write(JSON.stringify({ shutdownAck: true }) + "\\n", () =>
+        process.exit(0),
+      );
+      return;
+    }
     if (!response.includes("\\n")) return;
     if (!response.includes('"registered":true')) {
       throw new Error("managed-agent tool registration rejected");
@@ -181,6 +200,17 @@ const connectControl = () => {
   socket.once("close", retry);
 };
 if (requireControlRegistration) connectControl();
+if (cleanupMarker) {
+  process.on("exit", () => {
+    try { unlinkSync(cleanupMarker); } catch {}
+  });
+  const cleanupPoll = setInterval(() => {
+    if (!existsSync(cleanupMarker)) return;
+    clearInterval(cleanupPoll);
+    if (child.connected) child.send("host-shutdown");
+    child.once("exit", () => process.exit(0));
+  }, 10);
+}
 setInterval(() => {}, 1000);
 `.trimStart();
 
@@ -320,6 +350,10 @@ export async function createManagedAgentFixture(
   const cleanTargetReplacement = "managed target updated\n";
   const createdTargetContents = "managed output created\n";
   const outsideSentinel = join(outsideRoot, "outside-sentinel.txt");
+  const cooperativeExitMarker = join(
+    root,
+    `.host-cleanup-${randomUUID().split("-").join("")}`,
+  );
 
   await Promise.all([
     writeFile(
@@ -360,6 +394,8 @@ export async function createManagedAgentFixture(
     shellQuote(FIXTURE_PATHS.processScript),
     shellQuote(FIXTURE_PATHS.processPidFile),
     shellQuote("--register-control"),
+    shellQuote("--host-cleanup-marker"),
+    shellQuote(cooperativeExitMarker),
   ].join(" ");
   const pathRoleBindings = [
     { path: FIXTURE_PATHS.cleanTarget, role: "clean_target" },
@@ -381,6 +417,27 @@ export async function createManagedAgentFixture(
       sha256: hash(createdTargetContents),
     },
   ] as const satisfies readonly ManagedAgentL1ExpectedFileHash[];
+  let cooperativeExitRequested = false;
+  const requestCooperativeExit = async (): Promise<void> => {
+    if (!existsSync(root)) return;
+    if (
+      cooperativeExitRequested ||
+      !existsSync(join(workspaceRoot, FIXTURE_PATHS.processPidFile))
+    ) {
+      return;
+    }
+    cooperativeExitRequested = true;
+    await writeFile(cooperativeExitMarker, "shutdown\n", { mode: 0o600 });
+    const deadline = Date.now() + 1_000;
+    while (existsSync(cooperativeExitMarker) && Date.now() < deadline) {
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
+    }
+    if (existsSync(cooperativeExitMarker)) {
+      // Permit a later cleanup attempt if the fixture process had not begun
+      // polling yet. The marker is still removed with the disposable root.
+      cooperativeExitRequested = false;
+    }
+  };
 
   return {
     root,
@@ -398,6 +455,8 @@ export async function createManagedAgentFixture(
       [FIXTURE_PATHS.dirtySentinel]: Buffer.from(dirtyContents),
       [FIXTURE_PATHS.untrackedSentinel]: Buffer.from(untrackedContents),
     },
+    cooperativeExitMarker,
+    requestCooperativeExit,
     prompt(scenario) {
       if (scenario === "L2") {
         return [
@@ -429,6 +488,7 @@ export async function createManagedAgentFixture(
       ].join("\n");
     },
     async cleanup() {
+      await requestCooperativeExit().catch(() => undefined);
       await rm(root, { recursive: true, force: true });
     },
   };

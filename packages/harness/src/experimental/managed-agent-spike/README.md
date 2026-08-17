@@ -150,20 +150,27 @@ the runtime immediately follows it with and awaits `Query.return()` under the
 same deadline. `queryClosed` means that awaitable cleanup settled; invoking
 `close()` alone is never completion evidence. Host emergency cleanup starts
 only after that cleanup settles, the forwarded signal has already requested the
-fallback, or the bounded SDK-grace budget expires. The returned handle accepts
-the first SDK `child.kill()` logically by setting `child.killed = true`, but it
-intentionally sends no native signal. The SDK-forwarded abort signal requests
-the sampled host fallback; only freshly validated host group cleanup sends
-signals. The fallback first stops the observer-created SDK supervisor group. A
-new process-table sample must then revalidate the active root identity, both
-role identities, their relationship and shared group, every
-current root/tool descendant's parent, group, session, and ancestry, and at
-least one open lifetime channel. Only that fresh proof authorizes `SIGSTOP` to
-the detached fixture group. A second fresh sample must show both the root and
-every tool-group member stopped before `SIGKILL` is sent to the fixture group
-and then the SDK supervisor group. Failed tool stop/kill attempts remain
-retryable, but every retry requires another fresh proof. The five-second
-absolute deadline bounds the entire sequence.
+fallback, or the bounded SDK-grace budget expires. As a compatibility shim
+certified only for the pinned Agent SDK 0.3.228, the returned handle accepts the
+first SDK `child.kill()` logically by setting `child.killed = true`, but it
+intentionally sends no native signal. The hermetic real-SDK loopback test is a
+sequence sentinel for 0.3.228's exact close/return behavior: one logical kill,
+the SDK-forwarded abort, a second rejected logical kill, return settlement,
+then host fallback. An SDK upgrade must remove or recertify the shim before the
+pin changes. The forwarded abort signal requests the sampled host fallback;
+only freshly validated host group cleanup sends signals. The fallback first
+stops the observer-created SDK supervisor group. A new process-table sample
+must then revalidate the active root identity, both role identities, their
+relationship and shared group, every current root/tool descendant's parent,
+group, session, and ancestry, and at least one open lifetime channel. Only that
+fresh proof authorizes `SIGSTOP` to the detached fixture group. A second fresh
+sample must show both the root and every tool-group member stopped before
+`SIGKILL` is sent to the fixture group. A third fresh sample must prove the
+fixture group absent before the supervisor group receives `SIGKILL`, and a
+fourth must prove that root group absent. Failed stop/kill attempts remain
+retryable, but every attempt—including an ESRCH or helper failure—advances the
+sample generation and requires another fresh proof. The five-second absolute
+deadline bounds the entire sequence.
 
 If the root exits, a stable identity changes parent/group/session, a foreign
 member appears, ancestry is lost, both channels close prematurely, or a

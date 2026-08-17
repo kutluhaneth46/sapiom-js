@@ -46,6 +46,11 @@ describe("managed-agent disposable git fixture", () => {
     expect(fixture.prompt("L1")).toContain(FIXTURE_PATHS.untrackedSentinel);
     expect(fixture.prompt("L1")).not.toContain(fixture.nonce);
     expect(fixture.prompt("L2")).toContain(fixture.l2BashCommand);
+    expect(fixture.l2BashCommand).toContain("--host-cleanup-marker");
+    expect(fixture.l2BashCommand).toContain(fixture.cooperativeExitMarker);
+    expect(
+      fixture.cooperativeExitMarker.startsWith(fixture.workspaceRoot),
+    ).toBe(false);
     expect(await verifyManagedAgentFixtureBytes(fixture)).toEqual([
       { path: FIXTURE_PATHS.dirtySentinel, preserved: true },
       { path: FIXTURE_PATHS.untrackedSentinel, preserved: true },

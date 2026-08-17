@@ -69,7 +69,6 @@ function fakeObserver(
     spawn: vi.fn(() => {
       throw new Error("fake query must not spawn");
     }),
-    bindAbortSignal: vi.fn(),
     armToolProcessContainment: vi.fn(),
     prepareCancellation: vi.fn(async () => ({
       supported: true,
@@ -358,6 +357,29 @@ describe("runManagedAgentProbe", () => {
     }
   });
 
+  it("returns recursively immutable evidence after observer finalization", async () => {
+    const { config } = await probeConfig();
+    const result = await runManagedAgentProbe(config, {
+      hermeticGatewayOrigin: config.gatewayOrigin,
+      processObserver: fakeObserver(),
+      queryFactory: () =>
+        queryFromEvents([
+          {
+            type: "system",
+            subtype: "init",
+            session_id: SUCCESS_SESSION_ID,
+          },
+          { type: "result", subtype: "success", is_error: false },
+        ]),
+    });
+
+    expect(Object.isFrozen(result)).toBe(true);
+    expect(Object.isFrozen(result.teardown)).toBe(true);
+    expect(Object.isFrozen(result.events)).toBe(true);
+    expect(Object.isFrozen(result.events[0])).toBe(true);
+    expect(Object.isFrozen(result.correlation)).toBe(true);
+  });
+
   it("does not follow pre-existing config child symlinks and fails invalid roots before query construction", async () => {
     const { config, fixture } = await probeConfig();
     const externalConfig = join(fixture.root, "external-config");
@@ -496,7 +518,6 @@ describe("runManagedAgentProbe", () => {
     expect(JSON.stringify(result)).not.toContain(
       "synthetic private iteration failure",
     );
-    expect(observer.bindAbortSignal).not.toHaveBeenCalled();
     expect(shutdownOrder).toEqual(["sdk_query_close", "host_fallback"]);
   });
 
@@ -920,7 +941,7 @@ describe("runManagedAgentProbe", () => {
     const result = await runManagedAgentProbe(config, {
       hermeticGatewayOrigin: config.gatewayOrigin,
       processObserver: observer,
-      now: () => now,
+      monotonicNow: () => now,
       waitForCancellationSignal: (signal) =>
         new Promise<void>((resolveReadiness, rejectReadiness) => {
           const timer = setTimeout(() => {
@@ -961,7 +982,10 @@ describe("runManagedAgentProbe", () => {
     expect(readinessCompleted).toBe(true);
     expect(readinessWasAborted).toBe(false);
     expect(observer.armToolProcessContainment).toHaveBeenCalledOnce();
-    expect(observer.emergencyCleanup).toHaveBeenCalledWith(2_750);
+    expect(observer.emergencyCleanup).toHaveBeenCalledWith({
+      startedAtMs: 1_000,
+      deadlineAtMs: 6_000,
+    });
     expect(result.teardown.elapsedMs).toBe(2_250);
     expect(result.cancellationRequested).toBe(false);
     expect(result.terminationEvidence.beforePolicyOverride).toBe("query_error");
@@ -1057,13 +1081,36 @@ describe("runManagedAgentProbe", () => {
   }, 10_000);
 
   it.each([
-    ["clean completion", false, "incomplete"],
-    ["SDK error-result completion", true, "sdk_result_error"],
+    ["clean completion", false, "incomplete", undefined],
+    ["SDK error-result completion", true, "sdk_result_error", undefined],
+    [
+      "clean completion with a live process",
+      false,
+      "teardown_timeout",
+      "liveness",
+    ],
+    [
+      "SDK error-result completion with an open tool channel",
+      true,
+      "teardown_timeout",
+      "channel",
+    ],
   ] as const)(
     "retains armed L2 readiness and one deadline after %s",
-    async (_description, emitErrorResult, expectedTerminal) => {
+    async (_description, emitErrorResult, expectedTerminal, failClosedOn) => {
       const { config } = await probeConfig("L2");
-      const observer = fakeObserver();
+      const observer = fakeObserver(
+        failClosedOn
+          ? {
+              ...quiescentTeardown(),
+              quiescent: false,
+              deadlineMet: false,
+              toolProcessChannelsClosed: failClosedOn !== "channel",
+              observedPids: failClosedOn === "liveness" ? [7_001] : [],
+              alivePidsAtDeadline: failClosedOn === "liveness" ? [7_001] : [],
+            }
+          : quiescentTeardown(),
+      );
       let now = 1_000;
       let readinessCompleted = false;
       let readinessWasAborted = false;
@@ -1072,7 +1119,7 @@ describe("runManagedAgentProbe", () => {
       const result = await runManagedAgentProbe(config, {
         hermeticGatewayOrigin: config.gatewayOrigin,
         processObserver: observer,
-        now: () => now,
+        monotonicNow: () => now,
         waitForCancellationSignal: (signal) =>
           new Promise<void>((resolveReadiness, rejectReadiness) => {
             const timer = setTimeout(() => {
@@ -1130,11 +1177,23 @@ describe("runManagedAgentProbe", () => {
       expect(readinessCompleted).toBe(true);
       expect(readinessWasAborted).toBe(false);
       expect(capturedOptions?.abortController?.signal.aborted).toBe(true);
-      expect(observer.emergencyCleanup).toHaveBeenCalledWith(2_750);
+      expect(observer.emergencyCleanup).toHaveBeenCalledWith({
+        startedAtMs: 1_000,
+        deadlineAtMs: 6_000,
+      });
       expect(result.teardown.elapsedMs).toBe(2_250);
       expect(result.queryClosed).toBe(true);
       expect(result.cancellationRequested).toBe(false);
       expect(result.terminal).toBe(expectedTerminal);
+      expect(result.terminationEvidence.beforePolicyOverride).toBe(
+        expectedTerminal,
+      );
+      if (failClosedOn === "liveness") {
+        expect(result.teardown.alivePidsAtDeadline).toEqual([7_001]);
+      }
+      if (failClosedOn === "channel") {
+        expect(result.teardown.toolProcessChannelsClosed).toBe(false);
+      }
     },
     10_000,
   );
@@ -1179,7 +1238,6 @@ describe("runManagedAgentProbe", () => {
     expect(result.terminal).toBe("cancelled");
     expect(result.terminationEvidence.queryExecution).toBe("iteration_aborted");
     expect(close).toHaveBeenCalledOnce();
-    expect(observer.bindAbortSignal).not.toHaveBeenCalled();
   });
 
   it("accepts an awaited close promise when no iterator return exists", async () => {
@@ -1229,7 +1287,6 @@ const teardown = {
 };
 const observer = {
   spawn() { throw new Error("fake query must not spawn"); },
-  bindAbortSignal() {},
   armToolProcessContainment() {},
   async prepareCancellation() {
     return {
@@ -1305,7 +1362,7 @@ process.stdout.write(JSON.stringify({
     const result = await runManagedAgentProbe(config, {
       hermeticGatewayOrigin: config.gatewayOrigin,
       processObserver: observer,
-      now: () => now,
+      monotonicNow: () => now,
       waitForCancellationSignal: async () => undefined,
       queryFactory: () => ({
         [Symbol.asyncIterator]() {
@@ -1317,13 +1374,59 @@ process.stdout.write(JSON.stringify({
       }),
     });
 
-    expect(observer.emergencyCleanup).toHaveBeenCalledWith(2_750);
+    expect(observer.emergencyCleanup).toHaveBeenCalledWith({
+      startedAtMs: 1_000,
+      deadlineAtMs: 6_000,
+    });
     expect(result.teardown).toMatchObject({
       quiescent: true,
       deadlineMet: true,
       elapsedMs: 2_250,
     });
     expect(result.terminal).toBe("cancelled");
+  });
+
+  it("never extends the teardown budget or reports deadline success when wall time rolls back", async () => {
+    const wallClock = vi.spyOn(Date, "now").mockReturnValue(10_000);
+    try {
+      const { config } = await probeConfig("L2");
+      let monotonicTime = 10_000;
+      const observer = fakeObserver();
+      const result = await runManagedAgentProbe(config, {
+        hermeticGatewayOrigin: config.gatewayOrigin,
+        processObserver: observer,
+        monotonicNow: () => monotonicTime,
+        waitForCancellationSignal: async () => undefined,
+        queryFactory: () => ({
+          [Symbol.asyncIterator]() {
+            return {
+              next: () => new Promise<IteratorResult<unknown>>(() => undefined),
+              return: () =>
+                new Promise<IteratorResult<unknown>>(() => undefined),
+            };
+          },
+          close: () => {
+            wallClock.mockReturnValue(-100_000);
+            monotonicTime = 15_001;
+          },
+          return: () =>
+            new Promise<IteratorResult<unknown, void>>(() => undefined),
+        }),
+      });
+      const deadline = observer.emergencyCleanup.mock.calls[0]?.[0] as
+        | { readonly startedAtMs: number; readonly deadlineAtMs: number }
+        | undefined;
+
+      expect(deadline).toEqual({
+        startedAtMs: 10_000,
+        deadlineAtMs: 15_000,
+      });
+      expect(deadline!.deadlineAtMs - deadline!.startedAtMs).toBe(5_000);
+      expect(result.teardown.deadlineMet).toBe(false);
+      expect(result.teardown.elapsedMs).toBeGreaterThanOrEqual(5_000);
+    } finally {
+      wallClock.mockRestore();
+    }
   });
 
   it("records teardown failure before attempting emergency cleanup", async () => {

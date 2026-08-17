@@ -303,8 +303,6 @@ export type ManagedAgentQueryFactory = (input: {
 
 export interface ManagedAgentProcessObserver {
   spawn(options: SpawnOptions): SpawnedProcess;
-  /** Bind only the SDK-forwarded post-grace SpawnOptions signal. */
-  bindAbortSignal(signal: AbortSignal): void;
   /**
    * Arm the two host-authenticated lifetime observations used only by the
    * exact E0.4 L2 fixture. Tool-reported identities never grant authority by
@@ -314,13 +312,25 @@ export interface ManagedAgentProcessObserver {
   /** Prove the narrow POSIX observation model before allowing L2 to cancel. */
   prepareCancellation(): Promise<ManagedAgentCancellationReadiness>;
   /** Sample only members owned by the host-observed process anchors. */
-  observeProcessTree(timeoutMs?: number): Promise<boolean>;
+  observeProcessTree(deadline?: ManagedAgentTeardownDeadline): Promise<boolean>;
   waitForQuiescence(
-    timeoutMs: number,
+    deadline: ManagedAgentTeardownDeadline,
   ): Promise<ManagedAgentTeardownObservation>;
-  /** Idempotently run the anchored fallback and confirm within this budget. */
-  emergencyCleanup(timeoutMs: number): Promise<ManagedAgentTeardownObservation>;
-  dispose(): void;
+  /** Idempotently run the anchored fallback and confirm before this deadline. */
+  emergencyCleanup(
+    deadline: ManagedAgentTeardownDeadline,
+  ): Promise<ManagedAgentTeardownObservation>;
+  dispose(): void | Promise<void>;
+}
+
+/**
+ * One immutable monotonic deadline shared by SDK close/return and host process
+ * containment. It is created once at the first teardown-relevant event and is
+ * never extended from wall-clock time or a later cleanup phase.
+ */
+export interface ManagedAgentTeardownDeadline {
+  readonly startedAtMs: number;
+  readonly deadlineAtMs: number;
 }
 
 export type ManagedAgentCancellationReadinessReason =
@@ -352,7 +362,8 @@ export interface ManagedAgentProbeDependencies {
   readonly hermeticGatewayOrigin?: string;
   readonly processObserver?: ManagedAgentProcessObserver;
   readonly uuid?: () => string;
-  readonly now?: () => number;
+  /** Injectable monotonic clock; wall time is never cancellation authority. */
+  readonly monotonicNow?: () => number;
   readonly waitForCancellationSignal?: (signal: AbortSignal) => Promise<void>;
   readonly policySettingsGuard?: (input: {
     readonly cwd: string;

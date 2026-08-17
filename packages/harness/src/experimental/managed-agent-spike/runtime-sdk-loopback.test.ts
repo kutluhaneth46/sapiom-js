@@ -80,15 +80,6 @@ async function waitForProcessDeath(
     throw new Error(`Test process ${pid} survived cleanup`);
 }
 
-async function forceKillTestProcess(pid: number): Promise<void> {
-  try {
-    process.kill(pid, "SIGKILL");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
-  }
-  await waitForProcessDeath(pid);
-}
-
 interface LoopbackObservation {
   readonly headerNames: readonly string[];
   readonly evalSourceMatches: boolean;
@@ -327,7 +318,6 @@ it("enforces real-SDK built-in and in-process MCP calls with exact loopback corr
       });
       return child;
     },
-    bindAbortSignal: (signal) => observer.bindAbortSignal(signal),
     armToolProcessContainment: () => observer.armToolProcessContainment(),
     prepareCancellation: () => observer.prepareCancellation(),
     observeProcessTree: (timeoutMs) => observer.observeProcessTree(timeoutMs),
@@ -683,11 +673,15 @@ it.skipIf(
           { once: true },
         );
         const child = observer.spawn(options);
+        const logicalKill = child.kill.bind(child);
+        Reflect.set(child, "kill", (signal: NodeJS.Signals = "SIGTERM") => {
+          cleanupOrder.push("sdk_logical_kill");
+          return logicalKill(signal);
+        });
         const pid = Reflect.get(child, "pid");
         supervisorPid = typeof pid === "number" ? pid : undefined;
         return child;
       },
-      bindAbortSignal: (signal) => observer.bindAbortSignal(signal),
       armToolProcessContainment: () => observer.armToolProcessContainment(),
       prepareCancellation: () => observer.prepareCancellation(),
       observeProcessTree: (timeoutMs) => observer.observeProcessTree(timeoutMs),
@@ -902,19 +896,31 @@ it.skipIf(
         cleanupOrder.indexOf("host_emergency_cleanup"),
       );
       const forwardedSignalIndex = cleanupOrder.indexOf("sdk_forwarded_signal");
+      const logicalKillIndexes = cleanupOrder.flatMap((step, index) =>
+        step === "sdk_logical_kill" ? [index] : [],
+      );
+      expect(cleanupOrder).toEqual([
+        "sdk_close_called",
+        "sdk_return_started",
+        "sdk_logical_kill",
+        "sdk_forwarded_signal",
+        "sdk_logical_kill",
+        "sdk_return_settled",
+        "host_emergency_cleanup",
+      ]);
+      expect(logicalKillIndexes).toEqual([2, 4]);
       expect(forwardedSignalIndex).toBeGreaterThanOrEqual(0);
+      expect(logicalKillIndexes[0]).toBeLessThan(forwardedSignalIndex);
+      expect(logicalKillIndexes[1]).toBeGreaterThan(forwardedSignalIndex);
       expect(forwardedSignalIndex).toBeLessThan(
         cleanupOrder.indexOf("host_emergency_cleanup"),
       );
     } finally {
       await observer.emergencyCleanup(1_000);
-      observer.dispose();
+      await observer.dispose();
       server.closeAllConnections();
       await new Promise<void>((resolve) => server.close(() => resolve()));
-      for (const pid of fixturePids) {
-        if (!processExists(pid)) continue;
-        await forceKillTestProcess(pid);
-      }
+      await Promise.all(fixturePids.map((pid) => waitForProcessDeath(pid)));
       if (typeof unrelated.pid === "number" && processExists(unrelated.pid)) {
         unrelated.kill("SIGKILL");
         await waitForProcessDeath(unrelated.pid);
@@ -950,7 +956,6 @@ it.skipIf(
           signal: neverForwardedController.signal,
         });
       },
-      bindAbortSignal: (signal) => observer.bindAbortSignal(signal),
       armToolProcessContainment: () => observer.armToolProcessContainment(),
       prepareCancellation: () => observer.prepareCancellation(),
       observeProcessTree: (timeoutMs) => observer.observeProcessTree(timeoutMs),
@@ -1098,13 +1103,10 @@ it.skipIf(
       ).toBeLessThan(cleanupOrder.indexOf("host_timeout_fallback"));
     } finally {
       await observer.emergencyCleanup(1_000);
-      observer.dispose();
+      await observer.dispose();
       server.closeAllConnections();
       await new Promise<void>((resolve) => server.close(() => resolve()));
-      for (const pid of fixturePids) {
-        if (!processExists(pid)) continue;
-        await forceKillTestProcess(pid);
-      }
+      await Promise.all(fixturePids.map((pid) => waitForProcessDeath(pid)));
       if (typeof unrelated.pid === "number" && processExists(unrelated.pid)) {
         unrelated.kill("SIGKILL");
         await waitForProcessDeath(unrelated.pid);
@@ -1120,7 +1122,7 @@ it.skipIf(
   process.platform === "win32" ||
     process.versions.node !== MANAGED_AGENT_CONTRACT.certificationNodeVersion,
 )(
-  "records a teardown timeout when readiness failure leaves the Bash fixture alive",
+  "keeps readiness-failure evidence fail-closed after cooperative disposal",
   async () => {
     const fixture = await createManagedAgentFixture(
       () => "loopback-l2-early-error",
@@ -1224,16 +1226,20 @@ it.skipIf(
           result.teardown.alivePidsAtDeadline.includes(pid),
         ),
       ).toBe(true);
-      expect(fixturePids.every((pid) => processExists(pid))).toBe(true);
+      await Promise.all(fixturePids.map((pid) => waitForProcessDeath(pid)));
+      expect(fixturePids.every((pid) => !processExists(pid))).toBe(true);
+      expect(result.terminal).toBe("teardown_timeout");
+      expect(
+        fixturePids.every((pid) =>
+          result.teardown.alivePidsAtDeadline.includes(pid),
+        ),
+      ).toBe(true);
     } finally {
       await observer.emergencyCleanup(1_000);
-      observer.dispose();
+      await observer.dispose();
       server.closeAllConnections();
       await new Promise<void>((resolve) => server.close(() => resolve()));
-      for (const pid of fixturePids) {
-        if (!processExists(pid)) continue;
-        await forceKillTestProcess(pid);
-      }
+      await Promise.all(fixturePids.map((pid) => waitForProcessDeath(pid)));
       await fixture.cleanup();
     }
     expect(recordedTerminal).toBe("teardown_timeout");

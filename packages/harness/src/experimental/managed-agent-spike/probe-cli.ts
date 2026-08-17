@@ -960,7 +960,7 @@ export async function executeManagedAgentProbeCli(
     };
     return evaluateManagedAgentProbe(resultWithByteEvidence, fixturePids);
   } finally {
-    observer.dispose();
+    await observer.dispose();
     await fixture.cleanup();
   }
 }

@@ -2,6 +2,7 @@ import { once } from "node:events";
 import {
   ChildProcess,
   execFile,
+  execFileSync,
   spawn as spawnChild,
   type ChildProcessWithoutNullStreams,
 } from "node:child_process";
@@ -139,7 +140,7 @@ const DESCENDANT_TOOL_SCRIPT = String.raw`
 import { spawn } from "node:child_process";
 import { writeFileSync } from "node:fs";
 
-const [toolScript, pidFile, credentialFile] = process.argv.slice(1);
+const [toolScript, pidFile, credentialFile, cleanupMarker] = process.argv.slice(1);
 writeFileSync(credentialFile, JSON.stringify({
   socketPath: process.env.SAPIOM_MANAGED_AGENT_TOOL_CONTROL_SOCKET,
   capability: process.env.SAPIOM_MANAGED_AGENT_TOOL_CONTROL_CAPABILITY,
@@ -150,11 +151,13 @@ const tool = spawn(
     "--noprofile",
     "--norc",
     "-c",
-    'exec "$1" "$2" "$3"',
+    'exec "$1" "$2" "$3" "$4" "$5"',
     "managed-agent-tool",
     process.execPath,
     toolScript,
     pidFile,
+    "--host-cleanup-marker",
+    cleanupMarker,
   ],
   {
     detached: true,
@@ -302,7 +305,101 @@ async function sendClosedToolRegistration(
 function asChildProcess(
   spawned: SpawnedProcess,
 ): ChildProcessWithoutNullStreams {
-  return spawned as ChildProcessWithoutNullStreams;
+  const child = spawned as ChildProcessWithoutNullStreams;
+  captureRetainedRootAuthority(child);
+  return child;
+}
+
+interface RetainedRootAuthority {
+  readonly pid: number;
+  readonly record: ManagedAgentKernelProcessRecord;
+  readonly ancestry: readonly (readonly [
+    number,
+    ManagedAgentKernelProcessRecord,
+  ])[];
+}
+
+const retainedRootAuthorities = new WeakMap<
+  ChildProcess,
+  RetainedRootAuthority
+>();
+
+function sameFullTestIdentity(
+  expected: ManagedAgentKernelProcessRecord,
+  current: ManagedAgentKernelProcessRecord | undefined,
+): boolean {
+  return (
+    expected.startedAt === current?.startedAt &&
+    expected.parentPid === current.parentPid &&
+    expected.processGroupId === current.processGroupId &&
+    expected.sessionId === current.sessionId
+  );
+}
+
+function processAncestry(
+  pid: number,
+  table: ReadonlyMap<number, ManagedAgentKernelProcessRecord>,
+): RetainedRootAuthority["ancestry"] {
+  const ancestry: Array<readonly [number, ManagedAgentKernelProcessRecord]> =
+    [];
+  const seen = new Set<number>();
+  let currentPid = pid;
+  while (currentPid > 0 && !seen.has(currentPid)) {
+    seen.add(currentPid);
+    const record = table.get(currentPid);
+    if (!record) break;
+    ancestry.push([currentPid, record]);
+    currentPid = record.parentPid;
+  }
+  return ancestry;
+}
+
+function captureRetainedRootAuthority(child: ChildProcess): void {
+  if (
+    process.platform === "win32" ||
+    typeof child.pid !== "number" ||
+    retainedRootAuthorities.has(child)
+  ) {
+    return;
+  }
+  try {
+    const sessionColumn = managedAgentPosixSessionColumn(process.platform);
+    const stdout = execFileSync(
+      "/bin/ps",
+      ["-axo", `pid=,ppid=,pgid=,${sessionColumn}=,stat=,lstart=`],
+      { encoding: "utf8", maxBuffer: 4 * 1024 * 1024 },
+    );
+    const table = parseManagedAgentPosixProcessTable(stdout);
+    const record = table.get(child.pid);
+    if (!record) return;
+    retainedRootAuthorities.set(child, {
+      pid: child.pid,
+      record,
+      ancestry: processAncestry(child.pid, table),
+    });
+  } catch {
+    // A missing acquisition snapshot permanently removes fallback authority.
+  }
+}
+
+function retainedRootAuthorityMatches(
+  authority: RetainedRootAuthority,
+  table: ReadonlyMap<number, ManagedAgentKernelProcessRecord>,
+): boolean {
+  const leader = table.get(authority.pid);
+  const currentAncestry = processAncestry(authority.pid, table);
+  return Boolean(
+    leader &&
+    !leader.state?.startsWith("Z") &&
+    leader.processGroupId === authority.pid &&
+    sameFullTestIdentity(authority.record, leader) &&
+    authority.ancestry.length === currentAncestry.length &&
+    authority.ancestry.every(
+      ([pid, record], index) =>
+        currentAncestry[index]?.[0] === pid &&
+        sameFullTestIdentity(record, currentAncestry[index]?.[1]),
+    ),
+  );
 }
 
 function processExists(pid: number): boolean {
@@ -409,11 +506,7 @@ async function waitForChildExitBounded(
 async function forceKillExactTestProcess(child: ChildProcess): Promise<void> {
   const pid = child.pid;
   if (typeof pid !== "number") return;
-  try {
-    process.kill(pid, "SIGKILL");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
-  }
+  child.kill("SIGKILL");
   await waitForTestProcessDeath(
     () => processExists(pid),
     `Unrelated process ${pid}`,
@@ -436,44 +529,6 @@ async function captureExactTestProcessIdentities(
   return identities;
 }
 
-async function forceKillExactTestProcessIdentities(
-  identities: ReadonlyMap<number, ManagedAgentKernelProcessRecord>,
-): Promise<void> {
-  if (identities.size === 0) return;
-  const observation = await readRealPosixProcessTable();
-  if (!observation.available) {
-    throw new Error("Process table unavailable for exact test cleanup");
-  }
-  for (const [pid, identity] of identities) {
-    const current = observation.processes.get(pid);
-    if (
-      !current ||
-      current.startedAt !== identity.startedAt ||
-      current.state?.startsWith("Z")
-    ) {
-      continue;
-    }
-    try {
-      process.kill(pid, "SIGKILL");
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
-    }
-  }
-  const deadline = Date.now() + 1_000;
-  for (;;) {
-    const survivors = await liveExactTestProcessIdentities(identities);
-    if (survivors.length === 0) return;
-    if (Date.now() >= deadline) {
-      throw new Error(
-        `Exact test processes ${survivors
-          .map((pid) => pid)
-          .join(", ")} survived test cleanup`,
-      );
-    }
-    await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
-  }
-}
-
 async function liveExactTestProcessIdentities(
   identities: ReadonlyMap<number, ManagedAgentKernelProcessRecord>,
 ): Promise<readonly number[]> {
@@ -483,15 +538,34 @@ async function liveExactTestProcessIdentities(
   }
   return [...identities].flatMap(([pid, identity]) => {
     const record = current.processes.get(pid);
-    return record?.startedAt === identity.startedAt &&
+    return record &&
+      sameFullTestIdentity(identity, record) &&
       !record.state?.startsWith("Z")
       ? [pid]
       : [];
   });
 }
 
+async function waitForExactTestProcessIdentitiesToExit(
+  identities: ReadonlyMap<number, ManagedAgentKernelProcessRecord>,
+  timeoutMs = 1_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  let survivors = await liveExactTestProcessIdentities(identities);
+  while (survivors.length > 0 && Date.now() < deadline) {
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
+    survivors = await liveExactTestProcessIdentities(identities);
+  }
+  if (survivors.length > 0) {
+    throw new Error(
+      `Authenticated cooperative cleanup left ${survivors.length} tool process(es)`,
+    );
+  }
+}
+
 async function forceKillRetainedTestGroup(root: ChildProcess): Promise<void> {
-  const processGroupId = root.pid;
+  const authority = retainedRootAuthorities.get(root);
+  const processGroupId = authority?.pid;
   if (
     typeof processGroupId !== "number" ||
     root.exitCode !== null ||
@@ -504,26 +578,12 @@ async function forceKillRetainedTestGroup(root: ChildProcess): Promise<void> {
   if (!observation.available) {
     throw new Error("Process table unavailable for retained group cleanup");
   }
-  const leader = observation.processes.get(processGroupId);
   if (
-    !leader ||
-    leader.state?.startsWith("Z") ||
-    leader.processGroupId !== processGroupId
+    !authority ||
+    !retainedRootAuthorityMatches(authority, observation.processes)
   ) {
     throw new Error(
       `Refusing cached group cleanup for unverified root ${processGroupId}`,
-    );
-  }
-  const identities = new Map(
-    [...observation.processes].filter(
-      ([, record]) =>
-        record.processGroupId === processGroupId &&
-        !record.state?.startsWith("Z"),
-    ),
-  );
-  if (!identities.has(processGroupId)) {
-    throw new Error(
-      `Refusing group cleanup without live leader identity ${processGroupId}`,
     );
   }
   if (root.exitCode !== null || root.signalCode !== null) return;
@@ -537,7 +597,6 @@ async function forceKillRetainedTestGroup(root: ChildProcess): Promise<void> {
     if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
   }
   await waitForChildExitBounded(root);
-  await forceKillExactTestProcessIdentities(identities);
 }
 
 async function proveRetainedGroupAuthority(
@@ -556,7 +615,6 @@ async function proveRetainedGroupAuthority(
       return signalRealProcessGroup(processGroupId, signal);
     },
   });
-  const rawController = new AbortController();
   const forwardedController = new AbortController();
   const unrelated = spawnChild(
     process.execPath,
@@ -564,7 +622,6 @@ async function proveRetainedGroupAuthority(
     { stdio: "ignore", windowsHide: true },
   );
   await once(unrelated, "spawn");
-  observer.bindAbortSignal(rawController.signal);
   let anchor: ChildProcessWithoutNullStreams | undefined;
   let nonCooperativeChildPid: number | undefined;
   let exitMarker: string | undefined;
@@ -659,7 +716,6 @@ async function proveRetainedGroupAuthority(
         `Escaped fixture child ${nonCooperativeChildPid}`,
       );
     }
-    rawController.abort();
     forwardedController.abort();
     observer.dispose();
     await forceKillExactTestProcess(unrelated);
@@ -793,8 +849,16 @@ async function startRegisteredDescendantToolRun(
   } catch (setupError) {
     const cleanupErrors: unknown[] = [];
     try {
+      await observer.dispose();
       if (toolIdentities) {
-        await forceKillExactTestProcessIdentities(toolIdentities);
+        const survivors = await liveExactTestProcessIdentities(toolIdentities);
+        if (survivors.length > 0) {
+          cleanupErrors.push(
+            new Error(
+              `Authenticated cooperative cleanup left ${survivors.length} tool process(es)`,
+            ),
+          );
+        }
       } else if (toolPids || typeof toolProcessGroupId === "number") {
         cleanupErrors.push(
           new Error(
@@ -811,7 +875,7 @@ async function startRegisteredDescendantToolRun(
       cleanupErrors.push(error);
     } finally {
       forwardedController.abort();
-      observer.dispose();
+      await observer.dispose();
     }
     if (cleanupErrors.length > 0) {
       throw setupAndCleanupFailure(setupError, cleanupErrors);
@@ -826,7 +890,8 @@ async function cleanupRegisteredDescendantToolRun(
   if (!run) return;
   const cleanupErrors: unknown[] = [];
   try {
-    await forceKillExactTestProcessIdentities(run.toolIdentities);
+    await run.observer.dispose();
+    await waitForExactTestProcessIdentitiesToExit(run.toolIdentities);
   } catch (error) {
     cleanupErrors.push(error);
   }
@@ -839,7 +904,7 @@ async function cleanupRegisteredDescendantToolRun(
     cleanupErrors.push(error);
   } finally {
     run.forwardedController.abort();
-    run.observer.dispose();
+    await run.observer.dispose();
   }
   if (cleanupErrors.length > 0) {
     throw registeredDescendantCleanupFailure(cleanupErrors);
@@ -847,6 +912,39 @@ async function cleanupRegisteredDescendantToolRun(
 }
 
 describe("LocalManagedAgentProcessObserver", () => {
+  it.each([
+    ["parent", { parentPid: 2, processGroupId: 41, sessionId: 41 }],
+    ["process group", { parentPid: 1, processGroupId: 99, sessionId: 41 }],
+    ["session", { parentPid: 1, processGroupId: 41, sessionId: 99 }],
+  ] as const)(
+    "refuses retained-root fallback when same-start identity changes %s topology",
+    (_description, changedTopology) => {
+      const baseline = {
+        parentPid: 1,
+        processGroupId: 41,
+        sessionId: 41,
+        state: "S",
+        startedAt: "same-second-start",
+      } satisfies ManagedAgentKernelProcessRecord;
+      const authority: RetainedRootAuthority = {
+        pid: 41,
+        record: baseline,
+        ancestry: [[41, baseline]],
+      };
+      const current = new Map([
+        [
+          41,
+          {
+            ...baseline,
+            ...changedTopology,
+          },
+        ] as const,
+      ]);
+
+      expect(retainedRootAuthorityMatches(authority, current)).toBe(false);
+    },
+  );
+
   it.each([
     ["darwin", "sess"],
     ["linux", "sid"],
@@ -1057,8 +1155,12 @@ describe("LocalManagedAgentProcessObserver", () => {
         });
       } finally {
         nativeKillSpy.mockRestore();
-        observer.dispose();
-        if (anchor.exitCode === null && anchor.signalCode === null) {
+        await observer.dispose();
+        if (
+          anchor.connected &&
+          anchor.exitCode === null &&
+          anchor.signalCode === null
+        ) {
           anchor.disconnect();
           await waitForChildExitBounded(anchor);
         }
@@ -1074,7 +1176,6 @@ describe("LocalManagedAgentProcessObserver", () => {
       const fixture = await createManagedAgentFixture(() => "process-observer");
       fixtures.push(fixture);
       const observer = new LocalManagedAgentProcessObserver();
-      const rawController = new AbortController();
       const forwardedController = new AbortController();
       const unrelated = spawnChild(
         process.execPath,
@@ -1084,7 +1185,6 @@ describe("LocalManagedAgentProcessObserver", () => {
       await once(unrelated, "spawn");
       let root: ChildProcessWithoutNullStreams | undefined;
       let ownedProcessGroupId: number | undefined;
-      observer.bindAbortSignal(rawController.signal);
       try {
         root = asChildProcess(
           observer.spawn({
@@ -1110,7 +1210,7 @@ describe("LocalManagedAgentProcessObserver", () => {
         expect(readiness.observedPids).not.toContain(unrelated.pid);
 
         const startedAt = Date.now();
-        rawController.abort();
+        forwardedController.abort();
         const teardown = await observer.emergencyCleanup(1_000);
 
         expect(teardown).toMatchObject({
@@ -1126,7 +1226,6 @@ describe("LocalManagedAgentProcessObserver", () => {
         expect(Date.now() - startedAt).toBeLessThan(1_000);
         expect(processExists(unrelated.pid!)).toBe(true);
       } finally {
-        rawController.abort();
         forwardedController.abort();
         if (root && typeof ownedProcessGroupId === "number") {
           // Test-harness safety must not depend on the observer behavior under
@@ -1166,14 +1265,8 @@ describe("LocalManagedAgentProcessObserver", () => {
       const ownedProcessGroupId = anchor.pid;
       expect(ownedProcessGroupId).toBeTypeOf("number");
       let observerDisposed = false;
-      let fixtureIdentities: ReadonlyMap<
-        number,
-        ManagedAgentKernelProcessRecord
-      > = new Map();
       try {
         const fixturePids = await waitForManagedAgentFixturePids(fixture);
-        fixtureIdentities =
-          await captureExactTestProcessIdentities(fixturePids);
         await expect(
           prepareCancellationAfterTransientReadFailure(observer),
         ).resolves.toMatchObject({
@@ -1186,9 +1279,8 @@ describe("LocalManagedAgentProcessObserver", () => {
         // observer sampling before the kernel delivers the group SIGKILL so a
         // transient, already-signalled reparent cannot make the assertion
         // scheduler-dependent.
-        observer.dispose();
+        await observer.dispose();
         observerDisposed = true;
-        anchor.disconnect();
         await waitForChildExitBounded(anchor);
         await Promise.all(
           fixturePids.map((pid) =>
@@ -1208,10 +1300,52 @@ describe("LocalManagedAgentProcessObserver", () => {
         if (anchor.exitCode === null && anchor.signalCode === null) {
           await forceKillRetainedTestGroup(anchor);
         }
-        await forceKillExactTestProcessIdentities(fixtureIdentities);
         controller.abort();
-        if (!observerDisposed) observer.dispose();
+        if (!observerDisposed) await observer.dispose();
         await forceKillExactTestProcess(unrelated);
+      }
+    },
+    10_000,
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "cooperatively shuts down both authenticated fixture processes without a numeric fixture signal",
+    async () => {
+      const signals: Array<readonly [number, string]> = [];
+      const observer = new LocalManagedAgentProcessObserver({
+        signalProcessGroup: (groupId, signal) => {
+          signals.push([groupId, signal]);
+          return "failure";
+        },
+      });
+      let run: RegisteredDescendantToolRun | undefined;
+      try {
+        run = await startRegisteredDescendantToolRun(
+          observer,
+          "cooperative-cleanup",
+        );
+
+        await observer.dispose();
+
+        await Promise.all(
+          run.toolPids.map((pid) =>
+            waitForTestProcessDeath(
+              () => processExists(pid),
+              `Cooperative fixture process ${pid}`,
+            ),
+          ),
+        );
+        expect(signals).toEqual([]);
+      } finally {
+        await observer.dispose();
+        run?.forwardedController.abort();
+        if (
+          run &&
+          run.anchor.exitCode === null &&
+          run.anchor.signalCode === null
+        ) {
+          await forceKillRetainedTestGroup(run.anchor);
+        }
       }
     },
     10_000,
@@ -1226,9 +1360,7 @@ describe("LocalManagedAgentProcessObserver", () => {
         return "sent";
       },
     });
-    const rawController = new AbortController();
     const forwardedController = new AbortController();
-    observer.bindAbortSignal(rawController.signal);
     const child = asChildProcess(
       observer.spawn({
         command: process.execPath,
@@ -1246,7 +1378,6 @@ describe("LocalManagedAgentProcessObserver", () => {
         supported: false,
         reason: "root_not_active",
       });
-      rawController.abort();
       forwardedController.abort();
       await observer.emergencyCleanup(0);
       expect(signals).toEqual([]);
@@ -1284,10 +1415,6 @@ describe("LocalManagedAgentProcessObserver", () => {
       await once(unrelated, "spawn");
       let anchor: ChildProcessWithoutNullStreams | undefined;
       let fixturePids: readonly number[] = [];
-      let fixtureIdentities: ReadonlyMap<
-        number,
-        ManagedAgentKernelProcessRecord
-      > = new Map();
       try {
         observer.armToolProcessContainment();
         anchor = asChildProcess(
@@ -1307,8 +1434,6 @@ describe("LocalManagedAgentProcessObserver", () => {
           }),
         );
         fixturePids = await waitForManagedAgentFixturePids(fixture);
-        fixtureIdentities =
-          await captureExactTestProcessIdentities(fixturePids);
         await expect(
           prepareCancellationAfterTransientReadFailure(observer),
         ).resolves.toMatchObject({
@@ -1333,11 +1458,10 @@ describe("LocalManagedAgentProcessObserver", () => {
         expect(processExists(unrelated.pid!)).toBe(true);
       } finally {
         forwardedController.abort();
-        await forceKillExactTestProcessIdentities(fixtureIdentities);
+        await observer.dispose();
         if (anchor) {
           await forceKillRetainedTestGroup(anchor);
         }
-        observer.dispose();
         await forceKillExactTestProcess(unrelated);
       }
     },
@@ -1425,12 +1549,10 @@ describe("LocalManagedAgentProcessObserver", () => {
         expect(setupEvidence!.anchor.signalCode).toBe("SIGKILL");
       } finally {
         if (setupEvidence) {
-          await forceKillExactTestProcessIdentities(
-            setupEvidence.toolIdentities,
-          );
+          await observer.dispose();
           await forceKillRetainedTestGroup(setupEvidence.anchor);
         }
-        observer.dispose();
+        await observer.dispose();
       }
     },
     15_000,
@@ -1482,7 +1604,7 @@ describe("LocalManagedAgentProcessObserver", () => {
         expect(teardown).toMatchObject({
           quiescent: false,
           deadlineMet: false,
-          forceKillIssued: true,
+          forceKillIssued: false,
         });
         expect(
           signals.filter(([groupId]) => groupId === toolProcessGroupId),
@@ -1547,7 +1669,6 @@ describe("LocalManagedAgentProcessObserver", () => {
         );
         toolProcessGroupId = run.toolProcessGroupId;
         registeredPids = run.toolPids;
-        await forceKillExactTestProcessIdentities(run.toolIdentities);
         simulatePidReuse = true;
 
         const teardown = await observer.emergencyCleanup(250);
@@ -1555,7 +1676,7 @@ describe("LocalManagedAgentProcessObserver", () => {
         expect(teardown).toMatchObject({
           quiescent: false,
           deadlineMet: false,
-          forceKillIssued: true,
+          forceKillIssued: false,
         });
         expect(
           signals.filter(([groupId]) => groupId === toolProcessGroupId),
@@ -1685,10 +1806,6 @@ describe("LocalManagedAgentProcessObserver", () => {
       const credentialFile = join(fixture.root, "tool-control.json");
       let anchor: ChildProcessWithoutNullStreams | undefined;
       let detachedTool: ChildProcess | undefined;
-      let detachedToolIdentities: ReadonlyMap<
-        number,
-        ManagedAgentKernelProcessRecord
-      > = new Map();
       let registrations: readonly NetSocket[] = [];
       try {
         observer.armToolProcessContainment();
@@ -1709,7 +1826,12 @@ describe("LocalManagedAgentProcessObserver", () => {
         const credentials = await waitForToolControlCredentials(credentialFile);
         detachedTool = spawnChild(
           process.execPath,
-          [FIXTURE_PATHS.processScript, FIXTURE_PATHS.processPidFile],
+          [
+            FIXTURE_PATHS.processScript,
+            FIXTURE_PATHS.processPidFile,
+            "--host-cleanup-marker",
+            fixture.cooperativeExitMarker,
+          ],
           {
             cwd: fixture.workspaceRoot,
             detached: true,
@@ -1720,10 +1842,8 @@ describe("LocalManagedAgentProcessObserver", () => {
         );
         const [toolParentPid, toolChildPid] =
           await waitForManagedAgentFixturePids(fixture);
-        detachedToolIdentities = await captureExactTestProcessIdentities([
-          toolParentPid,
-          toolChildPid,
-        ]);
+        expect(toolParentPid).toBe(detachedTool.pid);
+        expect(toolChildPid).toBeTypeOf("number");
         registrations = await Promise.all([
           startToolRegistration(credentials, "parent", toolParentPid),
           startToolRegistration(credentials, "child", toolChildPid),
@@ -1742,12 +1862,13 @@ describe("LocalManagedAgentProcessObserver", () => {
       } finally {
         for (const registration of registrations) registration.destroy();
         forwardedController.abort();
-        await forceKillExactTestProcessIdentities(detachedToolIdentities);
+        await fixture.requestCooperativeExit();
         if (detachedTool) await waitForChildExitBounded(detachedTool);
+        await observer.dispose();
         if (anchor) {
           await forceKillRetainedTestGroup(anchor);
         }
-        observer.dispose();
+        await observer.dispose();
       }
     },
     15_000,
@@ -1764,10 +1885,7 @@ describe("LocalManagedAgentProcessObserver", () => {
       const forwardedController = new AbortController();
       const credentialFile = join(fixture.root, "tool-control.json");
       let anchor: ChildProcessWithoutNullStreams | undefined;
-      let detachedToolIdentities: ReadonlyMap<
-        number,
-        ManagedAgentKernelProcessRecord
-      > = new Map();
+      let toolPids: readonly number[] = [];
       let parentRegistration: NetSocket | undefined;
       let childRegistration: NetSocket | undefined;
       try {
@@ -1782,6 +1900,7 @@ describe("LocalManagedAgentProcessObserver", () => {
               join(fixture.workspaceRoot, FIXTURE_PATHS.processScript),
               join(fixture.workspaceRoot, FIXTURE_PATHS.processPidFile),
               credentialFile,
+              fixture.cooperativeExitMarker,
             ],
             cwd: fixture.workspaceRoot,
             env: { ...process.env },
@@ -1791,10 +1910,7 @@ describe("LocalManagedAgentProcessObserver", () => {
         const credentials = await waitForToolControlCredentials(credentialFile);
         const [toolParentPid, toolChildPid] =
           await waitForManagedAgentFixturePids(fixture);
-        detachedToolIdentities = await captureExactTestProcessIdentities([
-          toolParentPid,
-          toolChildPid,
-        ]);
+        toolPids = [toolParentPid, toolChildPid];
 
         await sendClosedToolRegistration(credentials, "parent", toolParentPid);
         [parentRegistration, childRegistration] = await Promise.all([
@@ -1809,7 +1925,15 @@ describe("LocalManagedAgentProcessObserver", () => {
           containmentSupported: true,
         });
 
-        await forceKillExactTestProcessIdentities(detachedToolIdentities);
+        await fixture.requestCooperativeExit();
+        await Promise.all(
+          toolPids.map((pid) =>
+            waitForTestProcessDeath(
+              () => processExists(pid),
+              `Marker-authenticated fixture process ${pid}`,
+            ),
+          ),
+        );
         forwardedController.abort();
         const openChannelObservation = await observer.emergencyCleanup(1_000);
         await waitForChildExitBounded(anchor);
@@ -1822,16 +1946,17 @@ describe("LocalManagedAgentProcessObserver", () => {
         childRegistration.destroy();
         const finalObservation = await observer.waitForQuiescence(3_000);
         expect(finalObservation).toMatchObject({
-          quiescent: true,
-          deadlineMet: true,
+          quiescent: false,
+          deadlineMet: false,
         });
       } finally {
         parentRegistration?.destroy();
         childRegistration?.destroy();
         forwardedController.abort();
-        await forceKillExactTestProcessIdentities(detachedToolIdentities);
+        await fixture.requestCooperativeExit();
+        await observer.dispose();
         if (anchor) await forceKillRetainedTestGroup(anchor);
-        observer.dispose();
+        await observer.dispose();
       }
     },
     15_000,
@@ -1915,7 +2040,7 @@ describe("LocalManagedAgentProcessObserver", () => {
       expect(Date.now() - shortConfirmationStartedAt).toBeLessThan(150);
 
       controller.abort();
-      expect(signals).toEqual([[child.pid!, "SIGSTOP"]]);
+      expect(signals).toEqual([]);
     } finally {
       await forceKillRetainedTestGroup(child);
       controller.abort();
@@ -2015,7 +2140,7 @@ describe("LocalManagedAgentProcessObserver", () => {
         signals.push([groupId, signal]);
         return "sent";
       },
-      now: () => now,
+      monotonicNow: () => now,
       delay: async (milliseconds) => {
         now += Math.max(1, milliseconds);
       },
@@ -2091,7 +2216,7 @@ describe("LocalManagedAgentProcessObserver", () => {
         signals.push([groupId, signal]);
         return "sent";
       },
-      now: () => now,
+      monotonicNow: () => now,
       delay: async (milliseconds) => {
         now += Math.max(1, milliseconds);
       },
@@ -2194,7 +2319,7 @@ describe("LocalManagedAgentProcessObserver", () => {
         signals.push([groupId, signal]);
         return "sent";
       },
-      now: () => now,
+      monotonicNow: () => now,
       delay: async (milliseconds) => {
         now += Math.max(1, milliseconds);
       },
@@ -2223,11 +2348,6 @@ describe("LocalManagedAgentProcessObserver", () => {
 
       stage = "exiting";
       await observer.observeProcessTree();
-      await expect(observer.waitForQuiescence(0)).resolves.toMatchObject({
-        quiescent: false,
-        containmentSupported: true,
-        alivePidsAtDeadline: expect.arrayContaining([rootPid + 100]),
-      });
 
       stage = "gone";
       await observer.observeProcessTree();
@@ -2295,6 +2415,7 @@ describe("LocalManagedAgentProcessObserver", () => {
 
   it("allows normal quiescence only after a still-descended unauthenticated subgroup is positively dead", async () => {
     let rootPid = 0;
+    let rootAlive = true;
     let subgroupAlive = true;
     const subgroupPid = () => rootPid + 100;
     const signals: Array<readonly [number, string]> = [];
@@ -2302,9 +2423,9 @@ describe("LocalManagedAgentProcessObserver", () => {
       platform: "darwin",
       readProcessTable: async () => {
         await Promise.resolve();
-        return available(
-          subgroupAlive
-            ? [
+        return available([
+          ...(rootAlive
+            ? ([
                 [
                   rootPid,
                   {
@@ -2314,6 +2435,10 @@ describe("LocalManagedAgentProcessObserver", () => {
                     startedAt: "root",
                   },
                 ],
+              ] as const)
+            : []),
+          ...(subgroupAlive
+            ? ([
                 [
                   subgroupPid(),
                   {
@@ -2323,11 +2448,18 @@ describe("LocalManagedAgentProcessObserver", () => {
                     startedAt: "short-lived-subgroup",
                   },
                 ],
-              ]
-            : [],
-        );
+              ] as const)
+            : []),
+        ]);
       },
-      processGroupLiveness: () => (subgroupAlive ? "alive" : "gone"),
+      processGroupLiveness: (processGroupId) =>
+        processGroupId === rootPid
+          ? rootAlive
+            ? "alive"
+            : "gone"
+          : subgroupAlive
+            ? "alive"
+            : "gone",
       signalProcessGroup: (groupId, signal) => {
         signals.push([groupId, signal]);
         return "sent";
@@ -2345,19 +2477,17 @@ describe("LocalManagedAgentProcessObserver", () => {
     rootPid = anchor.pid!;
     try {
       await observer.observeProcessTree();
-      await expect(observer.waitForQuiescence(0)).resolves.toMatchObject({
-        quiescent: false,
-        containmentSupported: false,
-        alivePidsAtDeadline: expect.arrayContaining([subgroupPid()]),
-      });
       await expect(observer.prepareCancellation()).resolves.toMatchObject({
         supported: false,
         reason: "containment_escaped",
         ownershipProven: false,
+        observedPids: expect.arrayContaining([subgroupPid()]),
       });
       expect(signals).toEqual([]);
 
       subgroupAlive = false;
+      await observer.observeProcessTree();
+      rootAlive = false;
       await observer.observeProcessTree();
       await expect(observer.waitForQuiescence(0)).resolves.toMatchObject({
         quiescent: true,
@@ -2499,6 +2629,105 @@ describe("LocalManagedAgentProcessObserver", () => {
     } finally {
       await forceKillRetainedTestGroup(anchor);
       controller.abort();
+      observer.dispose();
+    }
+  });
+
+  it("retains a same-PGID subgroup child when its leader exits and the survivor reparents between samples", async () => {
+    let rootPid = 0;
+    const subgroupLeaderPid = () => rootPid + 100;
+    const subgroupChildPid = () => rootPid + 101;
+    let stage: "complete" | "leader_gone" | "all_gone" = "complete";
+    const signals: Array<readonly [number, string]> = [];
+    const observer = new LocalManagedAgentProcessObserver({
+      platform: "darwin",
+      readProcessTable: async () =>
+        available([
+          [
+            rootPid,
+            {
+              parentPid: process.pid,
+              processGroupId: rootPid,
+              sessionId: rootPid,
+              state: "S",
+              startedAt: "pending-root",
+            },
+          ],
+          ...(stage === "complete"
+            ? ([
+                [
+                  subgroupLeaderPid(),
+                  {
+                    parentPid: rootPid,
+                    processGroupId: subgroupLeaderPid(),
+                    sessionId: subgroupLeaderPid(),
+                    state: "S",
+                    startedAt: "pending-leader",
+                  },
+                ],
+              ] as const)
+            : []),
+          ...(stage !== "all_gone"
+            ? ([
+                [
+                  subgroupChildPid(),
+                  {
+                    parentPid:
+                      stage === "complete" ? subgroupLeaderPid() : process.pid,
+                    processGroupId: subgroupLeaderPid(),
+                    sessionId: subgroupLeaderPid(),
+                    state: "S",
+                    startedAt: "pending-child",
+                  },
+                ],
+              ] as const)
+            : []),
+        ]),
+      signalProcessGroup: (groupId, signal) => {
+        signals.push([groupId, signal]);
+        return "sent";
+      },
+    });
+    const forwardedController = new AbortController();
+    const anchor = asChildProcess(
+      observer.spawn({
+        ...activeNodeCommand(),
+        cwd: process.cwd(),
+        env: { ...process.env },
+        signal: forwardedController.signal,
+      }),
+    );
+    rootPid = anchor.pid!;
+    try {
+      await expect(observer.prepareCancellation()).resolves.toMatchObject({
+        supported: false,
+        reason: "containment_escaped",
+        observedPids: expect.arrayContaining([
+          subgroupLeaderPid(),
+          subgroupChildPid(),
+        ]),
+      });
+
+      stage = "leader_gone";
+      await observer.observeProcessTree();
+      await expect(observer.prepareCancellation()).resolves.toMatchObject({
+        supported: false,
+        reason: "containment_escaped",
+        observedPids: expect.arrayContaining([subgroupChildPid()]),
+      });
+      forwardedController.abort();
+      expect(signals).toEqual([]);
+
+      stage = "all_gone";
+      await observer.observeProcessTree();
+      await expect(observer.prepareCancellation()).resolves.toMatchObject({
+        supported: false,
+        reason: "containment_escaped",
+      });
+      expect(signals).toEqual([]);
+    } finally {
+      await forceKillRetainedTestGroup(anchor);
+      forwardedController.abort();
       observer.dispose();
     }
   });
@@ -2788,7 +3017,7 @@ describe("LocalManagedAgentProcessObserver", () => {
     10_000,
   );
 
-  it("makes raw and forwarded aborts idempotent after ownership preparation", async () => {
+  it("makes repeated SDK-forwarded abort delivery idempotent after ownership preparation", async () => {
     let rootPid = 0;
     const signals: Array<readonly [number, string]> = [];
     const observer = new LocalManagedAgentProcessObserver({
@@ -2800,6 +3029,9 @@ describe("LocalManagedAgentProcessObserver", () => {
             {
               parentPid: process.pid,
               processGroupId: rootPid,
+              state: signals.some(([, signal]) => signal === "SIGSTOP")
+                ? "T"
+                : "S",
               startedAt: "root",
             },
           ],
@@ -2808,6 +3040,9 @@ describe("LocalManagedAgentProcessObserver", () => {
             {
               parentPid: rootPid,
               processGroupId: rootPid,
+              state: signals.some(([, signal]) => signal === "SIGSTOP")
+                ? "T"
+                : "S",
               startedAt: "child",
             },
           ],
@@ -2817,9 +3052,7 @@ describe("LocalManagedAgentProcessObserver", () => {
         return "sent";
       },
     });
-    const rawController = new AbortController();
     const forwardedController = new AbortController();
-    observer.bindAbortSignal(rawController.signal);
     const child = asChildProcess(
       observer.spawn({
         ...activeNodeCommand(),
@@ -2831,7 +3064,7 @@ describe("LocalManagedAgentProcessObserver", () => {
     rootPid = child.pid!;
     try {
       await observer.prepareCancellation();
-      rawController.abort();
+      forwardedController.abort();
       forwardedController.abort();
       expect(signals).toEqual([[rootPid, "SIGSTOP"]]);
       await observer.observeProcessTree();
@@ -2847,32 +3080,40 @@ describe("LocalManagedAgentProcessObserver", () => {
     }
   });
 
-  it("retries a transient failed SIGKILL while the trusted stopped root still anchors the group", async () => {
+  it("retries transient root stop and kill failures only after fresh authority samples", async () => {
     let rootPid = 0;
+    let processTableReads = 0;
+    let stopAttempts = 0;
     let killAttempts = 0;
     const signals: Array<readonly [number, string]> = [];
+    const signalReadCounts: number[] = [];
     const observer = new LocalManagedAgentProcessObserver({
       platform: "darwin",
-      readProcessTable: async () =>
-        available([
+      readProcessTable: async () => {
+        processTableReads += 1;
+        return available([
           [
             rootPid,
             {
               parentPid: process.pid,
               processGroupId: rootPid,
+              state: signals.some(([, signal]) => signal === "SIGSTOP")
+                ? "T"
+                : "S",
               startedAt: "root",
             },
           ],
-        ]),
+        ]);
+      },
       signalProcessGroup: (groupId, signal) => {
         signals.push([groupId, signal]);
+        signalReadCounts.push(processTableReads);
+        if (signal === "SIGSTOP" && stopAttempts++ === 0) return "failure";
         if (signal === "SIGKILL" && killAttempts++ === 0) return "failure";
         return "sent";
       },
     });
-    const rawController = new AbortController();
     const forwardedController = new AbortController();
-    observer.bindAbortSignal(rawController.signal);
     const child = asChildProcess(
       observer.spawn({
         ...activeNodeCommand(),
@@ -2884,14 +3125,20 @@ describe("LocalManagedAgentProcessObserver", () => {
     rootPid = child.pid!;
     try {
       await observer.prepareCancellation();
-      rawController.abort();
-      await observer.emergencyCleanup(0);
+      await observer.emergencyCleanup(100);
 
       expect(signals).toEqual([
+        [rootPid, "SIGSTOP"],
         [rootPid, "SIGSTOP"],
         [rootPid, "SIGKILL"],
         [rootPid, "SIGKILL"],
       ]);
+      expect(
+        signalReadCounts.every(
+          (readCount, index) =>
+            index === 0 || readCount > signalReadCounts[index - 1]!,
+        ),
+      ).toBe(true);
       await expect(observer.waitForQuiescence(0)).resolves.toMatchObject({
         containmentSupported: true,
         forceKillIssued: true,
@@ -2991,7 +3238,7 @@ describe("LocalManagedAgentProcessObserver", () => {
         if (measureOverrun) now = 2;
         return available([]);
       },
-      now: () => now,
+      monotonicNow: () => now,
     });
     const controller = new AbortController();
     const child = asChildProcess(
@@ -3065,4 +3312,272 @@ describe("LocalManagedAgentProcessObserver", () => {
       observer.dispose();
     }
   });
+
+  it("does not let a process-table read started before a signal authorize the next signal", async () => {
+    let rootPid = 0;
+    const reads: Array<
+      (observation: ManagedAgentProcessTableObservation) => void
+    > = [];
+    const signals: Array<readonly [number, "SIGSTOP" | "SIGKILL"]> = [];
+    const observer = new LocalManagedAgentProcessObserver({
+      platform: "darwin",
+      readProcessTable: () =>
+        new Promise<ManagedAgentProcessTableObservation>((resolveRead) => {
+          reads.push(resolveRead);
+        }),
+      processGroupLiveness: () => "alive",
+      signalProcessGroup: (groupId, signal) => {
+        signals.push([groupId, signal]);
+        return "sent";
+      },
+    });
+    const forwardedController = new AbortController();
+    const anchor = asChildProcess(
+      observer.spawn({
+        ...activeNodeCommand(),
+        cwd: process.cwd(),
+        env: { ...process.env },
+        signal: forwardedController.signal,
+      }),
+    );
+    rootPid = anchor.pid!;
+    const rootTable = () =>
+      available([
+        [
+          rootPid,
+          {
+            parentPid: process.pid,
+            processGroupId: rootPid,
+            sessionId: rootPid,
+            state: signals.some(([, signal]) => signal === "SIGSTOP")
+              ? "T"
+              : "S",
+            startedAt: "epoch-root",
+          },
+        ],
+      ]);
+
+    try {
+      await vi.waitFor(() => expect(reads).toHaveLength(1));
+      const initialSample = observer.observeProcessTree();
+      reads.shift()!(rootTable());
+      await initialSample;
+
+      const readinessTask = observer.prepareCancellation();
+      await vi.waitFor(() => expect(reads).toHaveLength(1));
+      reads.shift()!(rootTable());
+      await expect(readinessTask).resolves.toMatchObject({
+        supported: true,
+        reason: "ready",
+      });
+
+      const preSignalSample = observer.observeProcessTree();
+      await vi.waitFor(() => expect(reads).toHaveLength(1));
+      forwardedController.abort();
+      expect(signals).toEqual([[rootPid, "SIGSTOP"]]);
+
+      reads.shift()!(rootTable());
+      await preSignalSample;
+      expect(signals).toEqual([[rootPid, "SIGSTOP"]]);
+
+      const postSignalSample = observer.observeProcessTree();
+      await vi.waitFor(() => expect(reads).toHaveLength(1));
+      reads.shift()!(rootTable());
+      await postSignalSample;
+      expect(signals).toEqual([
+        [rootPid, "SIGSTOP"],
+        [rootPid, "SIGKILL"],
+      ]);
+    } finally {
+      await forceKillRetainedTestGroup(anchor);
+      forwardedController.abort();
+      observer.dispose();
+    }
+  });
+
+  it.each(["deadline", "dispose"] as const)(
+    "seals held process-table reads after %s so late completion cannot mutate or signal",
+    async (sealKind) => {
+      let rootPid = 0;
+      let monotonicTime = 0;
+      let resolveRead!: (
+        observation: ManagedAgentProcessTableObservation,
+      ) => void;
+      const signals: Array<readonly [number, "SIGSTOP" | "SIGKILL"]> = [];
+      const observer = new LocalManagedAgentProcessObserver({
+        platform: "darwin",
+        monotonicNow: () => monotonicTime,
+        readProcessTable: () =>
+          new Promise<ManagedAgentProcessTableObservation>((resolve) => {
+            resolveRead = resolve;
+          }),
+        signalProcessGroup: (groupId, signal) => {
+          signals.push([groupId, signal]);
+          return "sent";
+        },
+      });
+      const forwardedController = new AbortController();
+      const anchor = asChildProcess(
+        observer.spawn({
+          ...activeNodeCommand(),
+          cwd: process.cwd(),
+          env: { ...process.env },
+          signal: forwardedController.signal,
+        }),
+      );
+      rootPid = anchor.pid!;
+      const deadline = Object.freeze({ startedAtMs: 0, deadlineAtMs: 10 });
+      try {
+        await vi.waitFor(() => expect(resolveRead).toBeTypeOf("function"));
+        if (sealKind === "deadline") {
+          monotonicTime = 11;
+          await observer.waitForQuiescence(deadline);
+        } else {
+          await observer.dispose();
+        }
+        const signalsAtSeal = [...signals];
+        resolveRead(
+          available([
+            [
+              rootPid,
+              {
+                parentPid: process.pid,
+                processGroupId: rootPid,
+                sessionId: rootPid,
+                state: "T",
+                startedAt: "late-root",
+              },
+            ],
+          ]),
+        );
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        forwardedController.abort();
+        await new Promise<void>((resolve) => setImmediate(resolve));
+
+        expect(signals).toEqual(signalsAtSeal);
+        expect(await observer.observeProcessTree(deadline)).toBe(false);
+      } finally {
+        await forceKillRetainedTestGroup(anchor);
+        forwardedController.abort();
+        await observer.dispose();
+      }
+    },
+  );
+
+  it("discards an in-flight background sample that completes after a newly adopted deadline", async () => {
+    let monotonicTime = 0;
+    let resolveRead!: (
+      observation: ManagedAgentProcessTableObservation,
+    ) => void;
+    const signals: Array<readonly [number, "SIGSTOP" | "SIGKILL"]> = [];
+    const observer = new LocalManagedAgentProcessObserver({
+      platform: "darwin",
+      monotonicNow: () => monotonicTime,
+      readProcessTable: () =>
+        new Promise<ManagedAgentProcessTableObservation>((resolve) => {
+          resolveRead = resolve;
+        }),
+      processGroupLiveness: () => "gone",
+      signalProcessGroup: (groupId, signal) => {
+        signals.push([groupId, signal]);
+        return "sent";
+      },
+    });
+    const forwardedController = new AbortController();
+    const anchor = asChildProcess(
+      observer.spawn({
+        ...activeNodeCommand(),
+        cwd: process.cwd(),
+        env: { ...process.env },
+        signal: forwardedController.signal,
+      }),
+    );
+    const deadline = Object.freeze({ startedAtMs: 0, deadlineAtMs: 10 });
+    try {
+      await vi.waitFor(() => expect(resolveRead).toBeTypeOf("function"));
+      const observationTask = observer.waitForQuiescence(deadline);
+      monotonicTime = 11;
+      resolveRead(available([]));
+
+      await expect(observationTask).resolves.toMatchObject({
+        quiescent: false,
+        deadlineMet: false,
+        processTableAvailable: false,
+      });
+      expect(signals).toEqual([]);
+      expect(await observer.observeProcessTree(deadline)).toBe(false);
+    } finally {
+      await forceKillRetainedTestGroup(anchor);
+      forwardedController.abort();
+      await observer.dispose();
+    }
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "rejects tool-registration data delivered after the adopted deadline",
+    async () => {
+      const fixture = await createManagedAgentFixture(
+        () => "late-tool-registration",
+      );
+      fixtures.push(fixture);
+      let monotonicTime = 0;
+      const credentialFile = join(fixture.root, "late-control.json");
+      const observer = new LocalManagedAgentProcessObserver({
+        monotonicNow: () => monotonicTime,
+        readProcessTable: () => new Promise(() => undefined),
+      });
+      observer.armToolProcessContainment();
+      const forwardedController = new AbortController();
+      const anchor = asChildProcess(
+        observer.spawn({
+          command: process.execPath,
+          args: [
+            "--input-type=module",
+            "--eval",
+            EXPORT_TOOL_CONTROL_SCRIPT,
+            credentialFile,
+          ],
+          cwd: fixture.workspaceRoot,
+          env: { ...process.env },
+          signal: forwardedController.signal,
+        }),
+      );
+      let socket: NetSocket | undefined;
+      const deadline = Object.freeze({ startedAtMs: 0, deadlineAtMs: 10 });
+      try {
+        const credentials = await waitForToolControlCredentials(credentialFile);
+        socket = createConnection(credentials.socketPath);
+        socket.on("error", () => undefined);
+        await once(socket, "connect");
+        const closed = once(socket, "close").then(() => true);
+        const observationTask = observer.waitForQuiescence(deadline);
+        monotonicTime = 11;
+        socket.write(
+          `${JSON.stringify({
+            capability: credentials.capability,
+            role: "parent",
+            pid: process.pid,
+          })}\n`,
+        );
+
+        await expect(
+          Promise.race([
+            closed,
+            new Promise<false>((resolveTimeout) =>
+              setTimeout(() => resolveTimeout(false), 50),
+            ),
+          ]),
+        ).resolves.toBe(true);
+        await expect(observationTask).resolves.toMatchObject({
+          quiescent: false,
+          deadlineMet: false,
+        });
+      } finally {
+        socket?.destroy();
+        forwardedController.abort();
+        await observer.dispose();
+        await forceKillRetainedTestGroup(anchor);
+      }
+    },
+  );
 });

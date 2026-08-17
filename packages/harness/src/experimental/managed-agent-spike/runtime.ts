@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { performance } from "node:perf_hooks";
 
 import {
   createSdkMcpServer,
@@ -40,6 +41,7 @@ import type {
   ManagedAgentQuery,
   ManagedAgentQueryExecutionOutcome,
   ManagedAgentTeardownObservation,
+  ManagedAgentTeardownDeadline,
   ManagedAgentTerminalClassification,
   ManagedAgentToolEvidence,
 } from "./types.js";
@@ -279,7 +281,8 @@ function buildManagedAgentPolicyDiagnostics(
 async function closeQueryBounded(
   query: ManagedAgentQuery,
   iterator: AsyncIterator<unknown> | undefined,
-  timeoutMs = QUERY_CLOSE_TIMEOUT_MS,
+  deadline: ManagedAgentTeardownDeadline,
+  monotonicNow: () => number,
 ): Promise<boolean> {
   let timeout: NodeJS.Timeout | undefined;
   let closeResult: void | Promise<void>;
@@ -317,6 +320,12 @@ async function closeQueryBounded(
   const close = Promise.all([closeSettled, cleanupSettled]).then((settled) =>
     settled.every(Boolean),
   );
+  const timeoutMs = Math.max(
+    0,
+    deadline.deadlineAtMs -
+      monotonicNow() -
+      FORCE_CLEANUP_CONFIRMATION_RESERVE_MS,
+  );
   if (timeoutMs <= 0) {
     void close;
     return false;
@@ -340,8 +349,10 @@ async function closeQueryBounded(
 
 async function waitForTaskBounded(
   task: Promise<void>,
-  timeoutMs: number,
+  deadline: ManagedAgentTeardownDeadline,
+  monotonicNow: () => number,
 ): Promise<boolean> {
+  const timeoutMs = Math.max(0, deadline.deadlineAtMs - monotonicNow());
   if (timeoutMs <= 0) return false;
   let timeout: NodeJS.Timeout | undefined;
   try {
@@ -406,6 +417,17 @@ function classifyTerminal(input: {
   return "incomplete";
 }
 
+function deepFreezeEvidence<T>(value: T, seen = new WeakSet<object>()): T {
+  if (typeof value !== "object" || value === null || seen.has(value)) {
+    return value;
+  }
+  seen.add(value);
+  for (const nested of Object.values(value)) {
+    deepFreezeEvidence(nested, seen);
+  }
+  return Object.freeze(value);
+}
+
 export async function runManagedAgentProbe(
   config: ManagedAgentProbeConfig,
   dependencies: ManagedAgentProbeDependencies = {},
@@ -434,12 +456,22 @@ export async function runManagedAgentProbe(
   const mcpRuntime = createManagedAgentMcpRuntime(config.expectedMcpNonce);
   const abortController = new AbortController();
   const triggerController = new AbortController();
+  const monotonicNow = dependencies.monotonicNow ?? (() => performance.now());
   const before = await captureManagedAgentWorkspaceSnapshot(
     validated.canonicalWorkspaceRoot,
   );
   let cancellationRequested = false;
-  let cancellationRequestedAt: number | undefined;
-  let abortStartedAt: number | undefined;
+  let teardownDeadline: ManagedAgentTeardownDeadline | undefined;
+  const ensureTeardownDeadline = (): ManagedAgentTeardownDeadline => {
+    if (!teardownDeadline) {
+      const startedAtMs = monotonicNow();
+      teardownDeadline = Object.freeze({
+        startedAtMs,
+        deadlineAtMs: startedAtMs + MANAGED_AGENT_TEARDOWN_TIMEOUT_MS,
+      });
+    }
+    return teardownDeadline;
+  };
   let query: ManagedAgentQuery | undefined;
   let iterator: AsyncIterator<unknown> | undefined;
   let queryFailed = false;
@@ -464,7 +496,8 @@ export async function runManagedAgentProbe(
     executionId,
   });
   const processObserver =
-    dependencies.processObserver ?? createLocalManagedAgentProcessObserver();
+    dependencies.processObserver ??
+    createLocalManagedAgentProcessObserver({ monotonicNow });
   const policyBoundary = createManagedAgentPolicyBoundary({
     canonicalWorkspaceRoot: validated.canonicalWorkspaceRoot,
     allowedBuiltinTools:
@@ -559,6 +592,7 @@ export async function runManagedAgentProbe(
       policyPreflightFailed = true;
       recorder.recordLifecycle("policy_preflight_failed");
       triggerController.abort();
+      ensureTeardownDeadline();
       abortController.abort();
     }
     const cancellationTask =
@@ -570,16 +604,15 @@ export async function runManagedAgentProbe(
               cancellationSignalReady = true;
               if (queryIterationSettled) return;
               cancellationRequested = true;
-              cancellationRequestedAt = (dependencies.now ?? Date.now)();
-              abortStartedAt = cancellationRequestedAt;
               recorder.recordLifecycle("cancellation_requested");
+              ensureTeardownDeadline();
               abortController.abort();
             })
             .catch(() => {
               if (!triggerController.signal.aborted) {
                 cancellationTriggerFailed = true;
                 if (!queryIterationSettled) {
-                  abortStartedAt = (dependencies.now ?? Date.now)();
+                  ensureTeardownDeadline();
                   abortController.abort();
                 }
               }
@@ -640,21 +673,17 @@ export async function runManagedAgentProbe(
         if (!abortController.signal.aborted) queryFailed = true;
       } finally {
         queryIterationSettled = true;
-        const now = dependencies.now ?? Date.now;
         const armedEarlyQuerySettlement =
           toolProcessContainmentArmed &&
           Boolean(cancellationTask) &&
           !abortController.signal.aborted &&
           !cancellationSignalReady;
         if (armedEarlyQuerySettlement) {
-          abortStartedAt ??= now();
-          const readinessBudget = Math.max(
-            0,
-            MANAGED_AGENT_TEARDOWN_TIMEOUT_MS - (now() - abortStartedAt),
-          );
+          const deadline = ensureTeardownDeadline();
           const taskSettled = await waitForTaskBounded(
             cancellationTask!,
-            readinessBudget,
+            deadline,
+            monotonicNow,
           );
           if (!taskSettled || !cancellationSignalReady) {
             cancellationTriggerFailed = true;
@@ -672,43 +701,37 @@ export async function runManagedAgentProbe(
           (queryFailed || armedEarlyQuerySettlement) &&
           !abortController.signal.aborted
         ) {
-          abortStartedAt ??= (dependencies.now ?? Date.now)();
+          ensureTeardownDeadline();
           abortController.abort();
         }
         if (query) {
-          const closeBudgetMs =
-            abortStartedAt === undefined
-              ? QUERY_CLOSE_TIMEOUT_MS
-              : Math.max(
-                  0,
-                  MANAGED_AGENT_TEARDOWN_TIMEOUT_MS -
-                    (now() - abortStartedAt) -
-                    FORCE_CLEANUP_CONFIRMATION_RESERVE_MS,
-                );
-          queryClosed = await closeQueryBounded(query, iterator, closeBudgetMs);
+          // Establish the one deadline before close() or iterator.return() can
+          // begin. Natural completion is teardown-relevant too.
+          const deadline = ensureTeardownDeadline();
+          queryClosed = await closeQueryBounded(
+            query,
+            iterator,
+            deadline,
+            monotonicNow,
+          );
         }
-        if ((query && !queryClosed) || queryFailed) abortController.abort();
+        if ((query && !queryClosed) || queryFailed) {
+          ensureTeardownDeadline();
+          abortController.abort();
+        }
       }
     }
 
-    const now = dependencies.now ?? Date.now;
-    const teardownStartedAt = abortStartedAt ?? now();
-    const remainingBudget = (): number =>
-      Math.max(
-        0,
-        MANAGED_AGENT_TEARDOWN_TIMEOUT_MS - (now() - teardownStartedAt),
-      );
+    const deadline = ensureTeardownDeadline();
     if (abortController.signal.aborted) {
-      teardown = await processObserver.emergencyCleanup(remainingBudget());
+      teardown = await processObserver.emergencyCleanup(deadline);
     } else {
-      teardown = await processObserver.waitForQuiescence(
-        Math.max(0, remainingBudget() - FORCE_CLEANUP_CONFIRMATION_RESERVE_MS),
-      );
+      teardown = await processObserver.waitForQuiescence(deadline);
       if (!teardown.quiescent) {
-        teardown = await processObserver.emergencyCleanup(remainingBudget());
+        teardown = await processObserver.emergencyCleanup(deadline);
       }
     }
-    const totalElapsedMs = now() - teardownStartedAt;
+    const totalElapsedMs = Math.max(0, monotonicNow() - deadline.startedAtMs);
     teardown = {
       ...teardown,
       elapsedMs: totalElapsedMs,
@@ -716,7 +739,7 @@ export async function runManagedAgentProbe(
         teardown.quiescent &&
         teardown.processTableAvailable &&
         teardown.containmentSupported &&
-        totalElapsedMs <= MANAGED_AGENT_TEARDOWN_TIMEOUT_MS,
+        monotonicNow() <= deadline.deadlineAtMs,
     };
     const beforePolicyOverride = classifyTerminal({
       teardown,
@@ -762,7 +785,7 @@ export async function runManagedAgentProbe(
       ...(eventNormalizationFailure ? { eventNormalizationFailure } : {}),
     };
   } finally {
-    processObserver.dispose();
+    await processObserver.dispose();
   }
 
   const after = await captureManagedAgentWorkspaceSnapshot(
@@ -773,7 +796,7 @@ export async function runManagedAgentProbe(
     recorder.permissionEvidence,
     guardRejections,
   );
-  return {
+  return deepFreezeEvidence({
     contractVersion: 1,
     runId,
     scenario: config.scenario,
@@ -821,5 +844,5 @@ export async function runManagedAgentProbe(
         }
       : {}),
     ...(recorder.usage ? { sdkUsage: recorder.usage } : {}),
-  };
+  });
 }

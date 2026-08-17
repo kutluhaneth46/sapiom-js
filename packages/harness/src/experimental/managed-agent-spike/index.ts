@@ -53,6 +53,7 @@ export {
 } from "./permissions.js";
 export {
   LocalManagedAgentProcessObserver,
+  MANAGED_AGENT_LOGICAL_KILL_SHIM_SDK_VERSION,
   createLocalManagedAgentProcessObserver,
 } from "./process-observer.js";
 export {
@@ -103,6 +104,7 @@ export type {
   ManagedAgentQueryExecutionOutcome,
   ManagedAgentQueryFactory,
   ManagedAgentSdkUsageEstimate,
+  ManagedAgentTeardownDeadline,
   ManagedAgentTeardownObservation,
   ManagedAgentTerminalClassification,
   ManagedAgentTerminationEvidence,
