@@ -71,6 +71,8 @@ export {
 export type {
   ManagedAgentModelTarget,
   ManagedAgentModelTargetId,
+  ManagedAgentCancellationReadiness,
+  ManagedAgentCancellationReadinessReason,
   ManagedAgentEventNormalizationFailureReason,
   ManagedAgentPermissionDecision,
   ManagedAgentPermissionEvidence,

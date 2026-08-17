@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   ManagedAgentProbeCliError,
+  assertManagedAgentCancellationHostPlatform,
   assertManagedAgentCertificationNodeVersion,
   evaluateManagedAgentProbe,
   executeManagedAgentProbeCli,
@@ -81,6 +82,10 @@ function passingL1Result(): ManagedAgentProbeResult {
     teardown: {
       quiescent: true,
       deadlineMet: true,
+      processTableAvailable: true,
+      containmentSupported: true,
+      ownershipProven: false,
+      forceKillIssued: false,
       elapsedMs: 5,
       observedPids: [],
       alivePidsAtDeadline: [],
@@ -117,6 +122,8 @@ function passingL2Result(): ManagedAgentProbeResult {
     cancellationRequested: true,
     teardown: {
       ...base.teardown,
+      ownershipProven: true,
+      forceKillIssued: true,
       observedPids: [12_345, 12_346],
     },
   };
@@ -257,6 +264,38 @@ describe("managed-agent probe CLI", () => {
     );
   });
 
+  it("limits live L2 certification to the reviewed POSIX host model", () => {
+    expect(() =>
+      assertManagedAgentCancellationHostPlatform("darwin"),
+    ).not.toThrow();
+    expect(() =>
+      assertManagedAgentCancellationHostPlatform("linux"),
+    ).not.toThrow();
+    expect(() => assertManagedAgentCancellationHostPlatform("win32")).toThrow(
+      "detached POSIX fixture containment model",
+    );
+  });
+
+  it("rejects Windows L2 before reading gateway or credential environment", async () => {
+    const environment = new Proxy<Record<string, string | undefined>>(
+      {},
+      {
+        get() {
+          throw new Error("environment was read");
+        },
+      },
+    );
+
+    await expect(
+      executeManagedAgentProbeCli(
+        ["--live", "--scenario", "L2", "--target", "sonnet-5"],
+        environment,
+        "22.23.2",
+        "win32",
+      ),
+    ).rejects.toThrow("detached POSIX fixture containment model");
+  });
+
   it("requires successful results from every built-in tool for L1", () => {
     const passing = passingL1Result();
     const result: ManagedAgentProbeResult = {
@@ -281,6 +320,7 @@ describe("managed-agent probe CLI", () => {
       outcome: "pass",
       checks: expect.arrayContaining([
         { id: "exact_l2_bash_only_trace", passed: true },
+        { id: "l2_containment_prepared", passed: true },
       ]),
     });
 

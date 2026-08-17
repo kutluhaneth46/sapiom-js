@@ -74,18 +74,19 @@ import { writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 const pidFile = resolve(process.argv[2]);
-const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
-  stdio: "ignore",
+process.on("SIGTERM", () => {});
+const childProgram = [
+  'process.on("SIGTERM", () => {});',
+  'if (process.send) process.send("ready");',
+  'setInterval(() => {}, 1000);',
+].join("");
+const child = spawn(process.execPath, ["-e", childProgram], {
+  stdio: ["ignore", "ignore", "ignore", "ipc"],
   windowsHide: true,
 });
-writeFileSync(pidFile, JSON.stringify({ parentPid: process.pid, childPid: child.pid }));
-
-function stop() {
-  try { child.kill("SIGTERM"); } catch {}
-  setTimeout(() => process.exit(0), 25).unref();
-}
-process.once("SIGTERM", stop);
-process.once("SIGINT", stop);
+child.once("message", () => {
+  writeFileSync(pidFile, JSON.stringify({ parentPid: process.pid, childPid: child.pid }));
+});
 setInterval(() => {}, 1000);
 `.trimStart();
 

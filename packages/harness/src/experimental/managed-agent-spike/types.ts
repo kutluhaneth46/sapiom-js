@@ -165,6 +165,14 @@ export interface ManagedAgentTerminationEvidence {
 export interface ManagedAgentTeardownObservation {
   readonly quiescent: boolean;
   readonly deadlineMet: boolean;
+  /** False means ps/CIM observation was unknown, never an empty table. */
+  readonly processTableAvailable: boolean;
+  /** False means the owned E0 containment model was escaped or unproven. */
+  readonly containmentSupported: boolean;
+  /** True only after an active POSIX root was observed as its PGID leader. */
+  readonly ownershipProven: boolean;
+  /** True only when the bound raw abort synchronously issued SIGSTOP+SIGKILL. */
+  readonly forceKillIssued: boolean;
   readonly elapsedMs: number;
   readonly observedPids: readonly number[];
   readonly alivePidsAtDeadline: readonly number[];
@@ -219,7 +227,7 @@ export interface ManagedAgentProbeResult {
  * Query.mcpCall bypasses permission checks and is outside this host boundary.
  */
 export interface ManagedAgentQuery extends AsyncIterable<unknown> {
-  close(): void;
+  close(): void | Promise<void>;
 }
 
 export type ManagedAgentQueryFactory = (input: {
@@ -229,14 +237,36 @@ export type ManagedAgentQueryFactory = (input: {
 
 export interface ManagedAgentProcessObserver {
   spawn(options: SpawnOptions): SpawnedProcess;
+  /** Bind the raw per-run Options.abortController signal before SDK startup. */
+  bindAbortSignal(signal: AbortSignal): void;
+  /** Prove the narrow POSIX ownership model before allowing L2 to cancel. */
+  prepareCancellation(): Promise<ManagedAgentCancellationReadiness>;
   /** Sample only descendants of the host-observed SDK process roots. */
-  observeProcessTree(): Promise<void>;
+  observeProcessTree(timeoutMs?: number): Promise<boolean>;
   waitForQuiescence(
     timeoutMs: number,
   ): Promise<ManagedAgentTeardownObservation>;
-  /** Signal only process groups rooted in an SDK process spawned above. */
-  emergencyCleanup(): Promise<void>;
+  /** Idempotently force a proven active group and confirm within this budget. */
+  emergencyCleanup(timeoutMs: number): Promise<ManagedAgentTeardownObservation>;
   dispose(): void;
+}
+
+export type ManagedAgentCancellationReadinessReason =
+  | "ready"
+  | "platform_unsupported"
+  | "process_table_unavailable"
+  | "root_count_invalid"
+  | "root_not_active"
+  | "root_not_group_leader"
+  | "containment_escaped";
+
+export interface ManagedAgentCancellationReadiness {
+  readonly supported: boolean;
+  readonly reason: ManagedAgentCancellationReadinessReason;
+  readonly processTableAvailable: boolean;
+  readonly containmentSupported: boolean;
+  readonly ownershipProven: boolean;
+  readonly observedPids: readonly number[];
 }
 
 export interface ManagedAgentProbeDependencies {

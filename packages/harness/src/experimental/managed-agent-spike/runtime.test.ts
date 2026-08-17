@@ -42,6 +42,10 @@ function quiescentTeardown(): ManagedAgentTeardownObservation {
   return {
     quiescent: true,
     deadlineMet: true,
+    processTableAvailable: true,
+    containmentSupported: true,
+    ownershipProven: true,
+    forceKillIssued: true,
     elapsedMs: 12,
     observedPids: [],
     alivePidsAtDeadline: [],
@@ -60,9 +64,21 @@ function fakeObserver(
     spawn: vi.fn(() => {
       throw new Error("fake query must not spawn");
     }),
-    observeProcessTree: vi.fn(async () => undefined),
+    bindAbortSignal: vi.fn(),
+    prepareCancellation: vi.fn(async () => ({
+      supported: true,
+      reason: "ready" as const,
+      processTableAvailable: true,
+      containmentSupported: true,
+      ownershipProven: true,
+      observedPids: [],
+    })),
+    observeProcessTree: vi.fn(async () => true),
     waitForQuiescence: vi.fn(async () => teardown),
-    emergencyCleanup: vi.fn(async () => undefined),
+    emergencyCleanup: vi.fn(async () => ({
+      ...teardown,
+      emergencyCleanupAttempted: true,
+    })),
     dispose: vi.fn(),
   };
 }
@@ -477,6 +493,10 @@ describe("runManagedAgentProbe", () => {
     const observer = fakeObserver({
       quiescent: false,
       deadlineMet: false,
+      processTableAvailable: true,
+      containmentSupported: true,
+      ownershipProven: false,
+      forceKillIssued: false,
       elapsedMs: 5_001,
       observedPids: [8001],
       alivePidsAtDeadline: [8001],
@@ -496,7 +516,7 @@ describe("runManagedAgentProbe", () => {
       type: "terminal",
       terminal: "teardown_timeout",
     });
-    expect(observer.emergencyCleanup).toHaveBeenCalledWith();
+    expect(observer.emergencyCleanup).toHaveBeenCalledOnce();
   });
 
   it("rejects a successful stream when a requested tool has no primary hook decision", async () => {
@@ -860,11 +880,80 @@ describe("runManagedAgentProbe", () => {
     ).toHaveLength(1);
   });
 
+  it("abandons a never-resolving iterator next immediately after raw cancellation", async () => {
+    const { config } = await probeConfig("L2");
+    const observer = fakeObserver();
+    const close = vi.fn();
+    const resultPromise = runManagedAgentProbe(config, {
+      hermeticGatewayOrigin: config.gatewayOrigin,
+      processObserver: observer,
+      waitForCancellationSignal: async () => undefined,
+      queryFactory: () => ({
+        [Symbol.asyncIterator]() {
+          return {
+            next: () => new Promise<IteratorResult<unknown>>(() => undefined),
+          };
+        },
+        close,
+      }),
+    });
+
+    const result = await Promise.race([
+      resultPromise,
+      new Promise<never>((_, reject) =>
+        setTimeout(
+          () => reject(new Error("probe stayed blocked on iterator.next()")),
+          500,
+        ),
+      ),
+    ]);
+
+    expect(result.terminal).toBe("cancelled");
+    expect(result.terminationEvidence.queryExecution).toBe("iteration_aborted");
+    expect(close).toHaveBeenCalledOnce();
+    expect(observer.bindAbortSignal).toHaveBeenCalledOnce();
+  });
+
+  it("includes iterator abandonment and close in the one cancellation deadline", async () => {
+    const { config } = await probeConfig("L2");
+    let now = 1_000;
+    const observer = fakeObserver();
+    const close = vi.fn(async () => {
+      now = 3_250;
+    });
+    const result = await runManagedAgentProbe(config, {
+      hermeticGatewayOrigin: config.gatewayOrigin,
+      processObserver: observer,
+      now: () => now,
+      waitForCancellationSignal: async () => undefined,
+      queryFactory: () => ({
+        [Symbol.asyncIterator]() {
+          return {
+            next: () => new Promise<IteratorResult<unknown>>(() => undefined),
+          };
+        },
+        close,
+      }),
+    });
+
+    expect(observer.emergencyCleanup).toHaveBeenCalledWith(2_750);
+    expect(result.teardown).toMatchObject({
+      quiescent: true,
+      deadlineMet: true,
+      elapsedMs: 2_250,
+    });
+    expect(result.terminal).toBe("cancelled");
+  });
+
   it("records teardown failure before attempting emergency cleanup", async () => {
     const { config } = await probeConfig();
     const observer = fakeObserver({
       quiescent: false,
       deadlineMet: false,
+      processTableAvailable: true,
+      containmentSupported: true,
+      ownershipProven: false,
+      forceKillIssued: false,
       elapsedMs: 5_001,
       observedPids: [9001],
       alivePidsAtDeadline: [9001],
@@ -886,7 +975,7 @@ describe("runManagedAgentProbe", () => {
 
     expect(result.terminal).toBe("teardown_timeout");
     expect(result.teardown.emergencyCleanupAttempted).toBe(true);
-    expect(observer.emergencyCleanup).toHaveBeenCalledWith();
+    expect(observer.emergencyCleanup).toHaveBeenCalledOnce();
     expect(result.events.at(-1)).toMatchObject({
       type: "terminal",
       terminal: "teardown_timeout",

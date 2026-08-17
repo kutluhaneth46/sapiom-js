@@ -64,6 +64,34 @@ real in-process `echo_nonce` MCP turn. It requires one primary `PreToolUse`
 decision for each request and separately verifies the MCP handler invocation
 and SDK tool-result event.
 
+## L2 cancellation containment boundary
+
+E0.4 certifies one deliberately narrow host model: the exact non-cooperative
+fixture command running under the active Agent SDK root in a detached macOS or
+Linux process group. Before cancellation may fire, a bounded host `ps` sample
+must prove that the trusted SDK `ChildProcess` is still active and is the group
+leader, and both PIDs read from the fixture file must already be present in the
+independently host-observed group. The file is comparison evidence only; its
+contents are never passed into the observer or used as signal targets.
+
+The runtime binds the observer directly to the per-run `Options.abortController`
+signal. On abort it synchronously and idempotently sends `SIGSTOP` followed by
+`SIGKILL` to the observer-created group while the trusted root handle remains
+active. The fixture parent and child intentionally ignore `SIGTERM`, making the
+forced path load-bearing. Iterator abandonment, query close, bounded process
+enumeration, and group-death confirmation share one absolute five-second
+process-termination deadline. Workspace snapshots and result assembly occur
+afterward.
+
+An unavailable or timed-out process table is explicit unknown evidence, never
+an empty process table. The active detached root still authorizes safe cleanup
+of its owned group, but the run fails certification. A fast root exit before
+preparation, an observed `setsid`/group escape, unknown group liveness, failed
+signals, and Windows all fail closed. Windows live L2 is rejected before the
+query or credential is opened. Universal containment, POSIX group escape,
+Windows Job Objects, and production recovery belong to later epics; this probe
+does not claim those guarantees.
+
 ## Pre-fix live evidence
 
 The first Sonnet 5 L1 attempt reached an SDK success result and clean teardown,

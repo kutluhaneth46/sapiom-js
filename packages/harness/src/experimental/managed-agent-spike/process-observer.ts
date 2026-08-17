@@ -11,6 +11,7 @@ import type {
 } from "@anthropic-ai/claude-agent-sdk";
 
 import type {
+  ManagedAgentCancellationReadiness,
   ManagedAgentProcessObserver,
   ManagedAgentTeardownObservation,
 } from "./types.js";
@@ -18,28 +19,70 @@ import type {
 const execFileAsync = promisify(execFile);
 const SAMPLE_INTERVAL_MS = 100;
 const QUIESCENCE_POLL_MS = 25;
+export const MANAGED_AGENT_PROCESS_HELPER_TIMEOUT_MS = 200;
 
-interface ProcessRecord {
+export interface ManagedAgentKernelProcessRecord {
   readonly parentPid: number;
   readonly processGroupId?: number;
-  /** Kernel-reported creation time, used to reject PID reuse. */
+  /** Kernel-reported creation time used for evidence, never POSIX authority. */
   readonly startedAt: string;
 }
 
-type ProcessTable = ReadonlyMap<number, ProcessRecord>;
+export type ManagedAgentKernelProcessTable = ReadonlyMap<
+  number,
+  ManagedAgentKernelProcessRecord
+>;
 
-function delay(milliseconds: number): Promise<void> {
+export type ManagedAgentProcessTableObservation =
+  | {
+      readonly available: true;
+      readonly processes: ManagedAgentKernelProcessTable;
+    }
+  | { readonly available: false };
+
+export type ManagedAgentProcessGroupLiveness = "alive" | "gone" | "unknown";
+export type ManagedAgentProcessSignalOutcome = "sent" | "gone" | "failure";
+
+export interface LocalManagedAgentProcessObserverOptions {
+  readonly platform?: NodeJS.Platform;
+  readonly readProcessTable?: () => Promise<ManagedAgentProcessTableObservation>;
+  readonly processGroupLiveness?: (
+    processGroupId: number,
+  ) => ManagedAgentProcessGroupLiveness;
+  readonly signalProcessGroup?: (
+    processGroupId: number,
+    signal: "SIGSTOP" | "SIGKILL",
+  ) => ManagedAgentProcessSignalOutcome;
+  readonly now?: () => number;
+  readonly delay?: (milliseconds: number) => Promise<void>;
+}
+
+interface OwnedRoot {
+  readonly pid: number;
+  readonly child: ChildProcessWithoutNullStreams;
+  containmentSupported: boolean;
+  ownershipProven: boolean;
+  stopIssued: boolean;
+  forceKillIssued: boolean;
+}
+
+interface ObservedIdentity {
+  readonly rootPid: number;
+  readonly record: ManagedAgentKernelProcessRecord;
+}
+
+function defaultDelay(milliseconds: number): Promise<void> {
   return new Promise((resolveDelay) => setTimeout(resolveDelay, milliseconds));
 }
 
 function sameProcess(
-  left: ProcessRecord | undefined,
-  right: ProcessRecord | undefined,
+  left: ManagedAgentKernelProcessRecord | undefined,
+  right: ManagedAgentKernelProcessRecord | undefined,
 ): boolean {
   return Boolean(left && right && left.startedAt === right.startedAt);
 }
 
-async function windowsProcessTable(): Promise<ProcessTable> {
+async function windowsProcessTable(): Promise<ManagedAgentKernelProcessTable> {
   const { stdout } = await execFileAsync(
     "powershell.exe",
     [
@@ -48,7 +91,13 @@ async function windowsProcessTable(): Promise<ProcessTable> {
       "-Command",
       "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CreationDate | ConvertTo-Json -Compress",
     ],
-    { windowsHide: true, maxBuffer: 4 * 1024 * 1024 },
+    {
+      encoding: "utf8",
+      windowsHide: true,
+      maxBuffer: 4 * 1024 * 1024,
+      timeout: MANAGED_AGENT_PROCESS_HELPER_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+    },
   );
   const parsed = JSON.parse(stdout) as
     | {
@@ -81,16 +130,19 @@ async function windowsProcessTable(): Promise<ProcessTable> {
   );
 }
 
-async function posixProcessTable(): Promise<ProcessTable> {
+async function posixProcessTable(): Promise<ManagedAgentKernelProcessTable> {
   const { stdout } = await execFileAsync(
     "/bin/ps",
     ["-axo", "pid=,ppid=,pgid=,lstart="],
     {
+      encoding: "utf8",
       windowsHide: true,
       maxBuffer: 4 * 1024 * 1024,
+      timeout: MANAGED_AGENT_PROCESS_HELPER_TIMEOUT_MS,
+      killSignal: "SIGKILL",
     },
   );
-  const entries: Array<readonly [number, ProcessRecord]> = [];
+  const entries: Array<readonly [number, ManagedAgentKernelProcessRecord]> = [];
   for (const line of stdout.split("\n")) {
     const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(.+?)\s*$/.exec(line);
     if (!match) continue;
@@ -106,19 +158,56 @@ async function posixProcessTable(): Promise<ProcessTable> {
   return new Map(entries);
 }
 
-async function readProcessTable(): Promise<ProcessTable> {
+async function defaultReadProcessTable(
+  platform: NodeJS.Platform,
+): Promise<ManagedAgentProcessTableObservation> {
   try {
-    return process.platform === "win32"
-      ? await windowsProcessTable()
-      : await posixProcessTable();
+    return {
+      available: true,
+      processes:
+        platform === "win32"
+          ? await windowsProcessTable()
+          : await posixProcessTable(),
+    };
   } catch {
-    return new Map();
+    return { available: false };
   }
+}
+
+function defaultProcessGroupLiveness(
+  processGroupId: number,
+): ManagedAgentProcessGroupLiveness {
+  try {
+    process.kill(-processGroupId, 0);
+    return "alive";
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ESRCH") return "gone";
+    if (code === "EPERM") return "alive";
+    return "unknown";
+  }
+}
+
+function defaultSignalProcessGroup(
+  processGroupId: number,
+  signal: "SIGSTOP" | "SIGKILL",
+): ManagedAgentProcessSignalOutcome {
+  try {
+    process.kill(-processGroupId, signal);
+    return "sent";
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    return code === "ESRCH" ? "gone" : "failure";
+  }
+}
+
+function childActive(child: ChildProcessWithoutNullStreams): boolean {
+  return child.exitCode === null && child.signalCode === null;
 }
 
 function descendantsOf(
   roots: ReadonlySet<number>,
-  table: ProcessTable,
+  table: ManagedAgentKernelProcessTable,
 ): Set<number> {
   const descendants = new Set<number>();
   let changed = true;
@@ -137,37 +226,53 @@ function descendantsOf(
   return descendants;
 }
 
-async function taskkill(pid: number, force: boolean): Promise<void> {
-  try {
-    await execFileAsync(
-      "taskkill.exe",
-      ["/PID", String(pid), "/T", ...(force ? ["/F"] : [])],
-      { windowsHide: true },
-    );
-  } catch {
-    // A process that exited between validation and cleanup is already safe.
-  }
-}
-
 /**
- * Tracks only SDK roots created by this observer and descendants discovered
- * from the host kernel. PID-file contents are deliberately outside this API:
- * model-writable fixture evidence must never become signal authority.
+ * E0.4 deliberately certifies one narrow containment model: the exact local
+ * L2 fixture running inside a detached POSIX SDK process group. Before abort,
+ * bounded host enumeration must observe an active trusted ChildProcess as its
+ * PGID leader and observe the fixture PIDs in that group. Independently, the
+ * detached spawn plus an active trusted root handle are safe signal authority,
+ * so even a failed evidence preflight can synchronously stop and kill the
+ * owned group without leaking it. Such a run still fails certification.
  *
- * POSIX children are placed in their own process group. Before group cleanup,
- * the observer revalidates a kernel creation timestamp for the root or a known
- * group member, preventing a recycled numeric PID from becoming a kill target.
+ * This is not a universal sandbox or process-tree killer. Windows, a fast root
+ * that exits before preparation, unavailable enumeration, and an observed
+ * setsid/group escape all fail certification closed. POSIX `lstart` is evidence
+ * only and never authorizes an individual or group signal. Workspace PID-file
+ * contents never enter this class and can never become signal authority.
  */
 export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObserver {
-  readonly #rootPids = new Set<number>();
-  readonly #rootIdentities = new Map<number, ProcessRecord>();
-  readonly #observedIdentities = new Map<number, ProcessRecord>();
+  readonly #platform: NodeJS.Platform;
+  readonly #readProcessTable: () => Promise<ManagedAgentProcessTableObservation>;
+  readonly #processGroupLiveness: (
+    processGroupId: number,
+  ) => ManagedAgentProcessGroupLiveness;
+  readonly #signalProcessGroup: (
+    processGroupId: number,
+    signal: "SIGSTOP" | "SIGKILL",
+  ) => ManagedAgentProcessSignalOutcome;
+  readonly #now: () => number;
+  readonly #delay: (milliseconds: number) => Promise<void>;
+  readonly #roots = new Map<number, OwnedRoot>();
+  readonly #observedIdentities = new Map<number, ObservedIdentity>();
   readonly #observedPids = new Set<number>();
-  readonly #children = new Map<number, ChildProcessWithoutNullStreams>();
   readonly #sampler: NodeJS.Timeout;
-  #sampleTask: Promise<void> | undefined;
+  readonly #boundSignals = new WeakSet<AbortSignal>();
+  #lastTable: ManagedAgentKernelProcessTable | undefined;
+  #processTableAvailable = false;
+  #sampleTask: Promise<boolean> | undefined;
 
-  public constructor() {
+  public constructor(options: LocalManagedAgentProcessObserverOptions = {}) {
+    this.#platform = options.platform ?? process.platform;
+    this.#readProcessTable =
+      options.readProcessTable ??
+      (() => defaultReadProcessTable(this.#platform));
+    this.#processGroupLiveness =
+      options.processGroupLiveness ?? defaultProcessGroupLiveness;
+    this.#signalProcessGroup =
+      options.signalProcessGroup ?? defaultSignalProcessGroup;
+    this.#now = options.now ?? Date.now;
+    this.#delay = options.delay ?? defaultDelay;
     this.#sampler = setInterval(
       () => void this.observeProcessTree(),
       SAMPLE_INTERVAL_MS,
@@ -175,163 +280,352 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
     this.#sampler.unref();
   }
 
+  public bindAbortSignal(signal: AbortSignal): void {
+    if (this.#boundSignals.has(signal)) return;
+    this.#boundSignals.add(signal);
+    signal.addEventListener("abort", () => this.#forceStopKillSynchronously(), {
+      once: true,
+    });
+    if (signal.aborted) this.#forceStopKillSynchronously();
+  }
+
   public spawn(options: SpawnOptions): SpawnedProcess {
     const child = spawnChild(options.command, options.args, {
       cwd: options.cwd,
       env: options.env,
-      detached: process.platform !== "win32",
+      detached: this.#platform !== "win32",
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
     });
     if (typeof child.pid === "number") {
       const pid = child.pid;
-      this.#rootPids.add(pid);
-      this.#observedPids.add(pid);
-      this.#children.set(pid, child);
-      const terminateTree = (): void => {
-        void this.#terminateRoot(pid, false);
-      };
-      options.signal.addEventListener("abort", terminateTree, { once: true });
-      child.once("exit", () => {
-        options.signal.removeEventListener("abort", terminateTree);
-        this.#children.delete(pid);
+      this.#roots.set(pid, {
+        pid,
+        child,
+        containmentSupported: true,
+        ownershipProven: false,
+        stopIssued: false,
+        forceKillIssued: false,
       });
+      this.#observedPids.add(pid);
+      // The SDK's forwarded SpawnOptions.signal arrives only after its own
+      // graceful close. Keep it as an idempotent fallback; runtime binds the
+      // raw Options.abortController signal before query construction.
+      this.bindAbortSignal(options.signal);
       void this.observeProcessTree();
     }
     return child;
   }
 
-  public observeProcessTree(): Promise<void> {
-    if (this.#sampleTask) return this.#sampleTask;
-    if (this.#rootPids.size === 0) return Promise.resolve();
-    this.#sampleTask = (async () => {
-      const table = await readProcessTable();
-      const validatedRoots = new Set<number>();
-      for (const pid of this.#rootPids) {
-        const current = table.get(pid);
-        const known = this.#rootIdentities.get(pid);
-        const child = this.#children.get(pid);
-        const childActive =
-          child !== undefined &&
-          child.exitCode === null &&
-          child.signalCode === null;
-        if (!current || (known ? !sameProcess(known, current) : !childActive)) {
-          continue;
+  async #boundedProcessTableRead(
+    timeoutMs: number,
+  ): Promise<ManagedAgentProcessTableObservation> {
+    let timeout: NodeJS.Timeout | undefined;
+    const read = Promise.resolve()
+      .then(() => this.#readProcessTable())
+      .catch(
+        (): ManagedAgentProcessTableObservation => ({
+          available: false,
+        }),
+      );
+    try {
+      return await Promise.race([
+        read,
+        new Promise<ManagedAgentProcessTableObservation>((resolveTimeout) => {
+          timeout = setTimeout(
+            () => resolveTimeout({ available: false }),
+            Math.max(0, timeoutMs),
+          );
+        }),
+      ]);
+    } finally {
+      if (timeout) clearTimeout(timeout);
+    }
+  }
+
+  public async observeProcessTree(
+    timeoutMs = MANAGED_AGENT_PROCESS_HELPER_TIMEOUT_MS,
+  ): Promise<boolean> {
+    if (this.#roots.size === 0) {
+      this.#lastTable = new Map();
+      this.#processTableAvailable = true;
+      return true;
+    }
+    const boundedTimeoutMs = Math.max(
+      0,
+      Math.min(MANAGED_AGENT_PROCESS_HELPER_TIMEOUT_MS, timeoutMs),
+    );
+    if (!this.#sampleTask) {
+      this.#sampleTask = (async () => {
+        const observation =
+          await this.#boundedProcessTableRead(boundedTimeoutMs);
+        if (!observation.available) {
+          this.#lastTable = undefined;
+          this.#processTableAvailable = false;
+          return false;
         }
-        if (!known) this.#rootIdentities.set(pid, current);
-        this.#observedIdentities.set(pid, current);
-        this.#observedPids.add(pid);
-        validatedRoots.add(pid);
-      }
-      for (const pid of descendantsOf(validatedRoots, table)) {
-        const current = table.get(pid);
-        if (!current) continue;
-        this.#observedIdentities.set(pid, current);
-        this.#observedPids.add(pid);
-      }
-    })().finally(() => {
-      this.#sampleTask = undefined;
-    });
-    return this.#sampleTask;
+
+        const table = observation.processes;
+        this.#lastTable = table;
+        this.#processTableAvailable = true;
+        for (const root of this.#roots.values()) {
+          if (this.#platform !== "win32") {
+            for (const [pid, observed] of this.#observedIdentities) {
+              if (observed.rootPid !== root.pid) continue;
+              const current = table.get(pid);
+              if (
+                sameProcess(observed.record, current) &&
+                current?.processGroupId !== root.pid
+              ) {
+                root.containmentSupported = false;
+              }
+            }
+            const currentRoot = table.get(root.pid);
+            if (
+              currentRoot &&
+              childActive(root.child) &&
+              currentRoot.processGroupId !== root.pid
+            ) {
+              root.containmentSupported = false;
+            }
+            for (const [pid, record] of table) {
+              if (record.processGroupId !== root.pid) continue;
+              this.#observedIdentities.set(pid, {
+                rootPid: root.pid,
+                record,
+              });
+              this.#observedPids.add(pid);
+            }
+            continue;
+          }
+
+          const currentRoot = table.get(root.pid);
+          const seeds = new Set<number>();
+          if (currentRoot && childActive(root.child)) {
+            seeds.add(root.pid);
+            this.#observedIdentities.set(root.pid, {
+              rootPid: root.pid,
+              record: currentRoot,
+            });
+            this.#observedPids.add(root.pid);
+          }
+          for (const [pid, observed] of this.#observedIdentities) {
+            if (
+              observed.rootPid === root.pid &&
+              sameProcess(observed.record, table.get(pid))
+            ) {
+              seeds.add(pid);
+            }
+          }
+          for (const pid of descendantsOf(seeds, table)) {
+            const current = table.get(pid);
+            if (!current) continue;
+            this.#observedIdentities.set(pid, {
+              rootPid: root.pid,
+              record: current,
+            });
+            this.#observedPids.add(pid);
+          }
+        }
+        return true;
+      })().finally(() => {
+        this.#sampleTask = undefined;
+      });
+    }
+
+    const sample = this.#sampleTask;
+    let timeout: NodeJS.Timeout | undefined;
+    const available = await Promise.race([
+      sample,
+      new Promise<false>((resolveTimeout) => {
+        timeout = setTimeout(() => resolveTimeout(false), boundedTimeoutMs);
+      }),
+    ]);
+    if (timeout) clearTimeout(timeout);
+    if (!available) {
+      // A caller with a shorter absolute deadline must not reuse a stale table
+      // while a longer background sample is still pending.
+      this.#lastTable = undefined;
+      this.#processTableAvailable = false;
+    }
+    return available;
   }
 
-  async #aliveObservedPids(): Promise<number[]> {
-    const table = await readProcessTable();
-    const alive = new Set(
-      [...this.#observedIdentities].flatMap(([pid, identity]) =>
-        sameProcess(identity, table.get(pid)) ? [pid] : [],
+  public async prepareCancellation(): Promise<ManagedAgentCancellationReadiness> {
+    const observedPids = (): number[] =>
+      [...this.#observedPids].sort((left, right) => left - right);
+    const unsupported = (
+      reason: Exclude<ManagedAgentCancellationReadiness["reason"], "ready">,
+    ): ManagedAgentCancellationReadiness => ({
+      supported: false,
+      reason,
+      processTableAvailable: this.#processTableAvailable,
+      containmentSupported: [...this.#roots.values()].every(
+        ({ containmentSupported }) => containmentSupported,
       ),
-    );
-    // If kernel enumeration is unavailable, a still-active ChildProcess handle
-    // must keep teardown fail-closed instead of producing false quiescence.
-    for (const [pid, child] of this.#children) {
-      if (child.exitCode === null && child.signalCode === null) alive.add(pid);
+      ownershipProven: false,
+      observedPids: observedPids(),
+    });
+
+    if (this.#platform !== "darwin" && this.#platform !== "linux") {
+      for (const root of this.#roots.values()) {
+        root.containmentSupported = false;
+      }
+      return unsupported("platform_unsupported");
     }
-    return [...alive].sort((left, right) => left - right);
+    if (!(await this.observeProcessTree())) {
+      return unsupported("process_table_unavailable");
+    }
+    if (this.#roots.size !== 1) return unsupported("root_count_invalid");
+    const root = [...this.#roots.values()][0]!;
+    if (!childActive(root.child)) {
+      root.containmentSupported = false;
+      return unsupported("root_not_active");
+    }
+    if (!root.containmentSupported) {
+      return unsupported("containment_escaped");
+    }
+    const currentRoot = this.#lastTable!.get(root.pid);
+    if (!currentRoot || currentRoot.processGroupId !== root.pid) {
+      root.containmentSupported = false;
+      return unsupported("root_not_group_leader");
+    }
+
+    root.ownershipProven = true;
+    return {
+      supported: true,
+      reason: "ready",
+      processTableAvailable: true,
+      containmentSupported: true,
+      ownershipProven: true,
+      observedPids: observedPids(),
+    };
   }
 
-  async #terminateRoot(rootPid: number, force: boolean): Promise<void> {
-    await this.observeProcessTree();
-    const table = await readProcessTable();
-    const rootIdentity = this.#rootIdentities.get(rootPid);
-    const rootMatches = sameProcess(rootIdentity, table.get(rootPid));
-    const child = this.#children.get(rootPid);
-    const childActive =
-      child !== undefined &&
-      child.exitCode === null &&
-      child.signalCode === null;
-
-    if (process.platform === "win32") {
-      if (rootMatches) {
-        await taskkill(rootPid, force);
-      } else if (!rootIdentity && childActive) {
-        child.kill(force ? "SIGKILL" : "SIGTERM");
+  #forceStopKillSynchronously(): void {
+    if (this.#platform !== "darwin" && this.#platform !== "linux") return;
+    for (const root of this.#roots.values()) {
+      if (root.forceKillIssued || !childActive(root.child)) {
+        continue;
       }
-      return;
+      // detached:true plus the still-active trusted ChildProcess handle are
+      // sufficient signal authority even when ps evidence is unavailable.
+      // Certification readiness remains false in that case. Second-resolution
+      // lstart and workspace PIDs are never signal authority.
+      if (!root.stopIssued) {
+        const stopOutcome = this.#signalProcessGroup(root.pid, "SIGSTOP");
+        root.stopIssued = stopOutcome === "sent";
+        if (stopOutcome === "failure") {
+          root.containmentSupported = false;
+        }
+      }
+      const killOutcome = this.#signalProcessGroup(root.pid, "SIGKILL");
+      root.forceKillIssued = killOutcome === "sent";
+      if (killOutcome === "failure") {
+        // Keep the active/stopped group anchored so emergencyCleanup can retry
+        // SIGKILL safely, but certification evidence remains failed.
+        root.containmentSupported = false;
+      }
+    }
+  }
+
+  async #currentObservation(
+    startedAt: number,
+    emergencyCleanupAttempted: boolean,
+  ): Promise<ManagedAgentTeardownObservation> {
+    const roots = [...this.#roots.values()];
+    const alive = new Set<number>();
+    for (const root of roots) {
+      if (childActive(root.child)) alive.add(root.pid);
+      if (!this.#processTableAvailable) continue;
+      const table = this.#lastTable!;
+      if (this.#platform !== "win32") {
+        for (const [pid, record] of table) {
+          if (record.processGroupId === root.pid) alive.add(pid);
+        }
+        const groupLiveness = this.#processGroupLiveness(root.pid);
+        if (groupLiveness === "alive") alive.add(root.pid);
+        if (groupLiveness === "unknown") {
+          root.containmentSupported = false;
+        }
+      } else {
+        for (const [pid, observed] of this.#observedIdentities) {
+          if (
+            observed.rootPid === root.pid &&
+            sameProcess(observed.record, table.get(pid))
+          ) {
+            alive.add(pid);
+          }
+        }
+      }
     }
 
-    const hasValidatedGroupMember = [...this.#observedIdentities].some(
-      ([pid, identity]) => {
-        const current = table.get(pid);
-        return (
-          current?.processGroupId === rootPid && sameProcess(identity, current)
-        );
-      },
+    const processTableAvailable =
+      roots.length === 0 || this.#processTableAvailable;
+    const containmentSupported = roots.every(
+      ({ containmentSupported: supported }) => supported,
     );
-    if (rootMatches || hasValidatedGroupMember) {
-      try {
-        process.kill(-rootPid, force ? "SIGKILL" : "SIGTERM");
-      } catch {
-        // A validated group that exited before the signal is already safe.
-      }
-    } else if (!rootIdentity && childActive) {
-      // The kernel sampler can be unavailable. The trusted ChildProcess handle
-      // remains safe for root-only termination, but we never guess descendants.
-      child.kill(force ? "SIGKILL" : "SIGTERM");
-    }
+    const ownershipProven =
+      roots.length > 0 && roots.every(({ ownershipProven }) => ownershipProven);
+    const forceKillIssued =
+      roots.length > 0 && roots.every(({ forceKillIssued }) => forceKillIssued);
+    const elapsedMs = Math.max(0, this.#now() - startedAt);
+    const quiescent =
+      processTableAvailable && containmentSupported && alive.size === 0;
+    return {
+      quiescent,
+      deadlineMet: quiescent,
+      processTableAvailable,
+      containmentSupported,
+      ownershipProven,
+      forceKillIssued,
+      elapsedMs,
+      observedPids: [...this.#observedPids].sort((left, right) => left - right),
+      alivePidsAtDeadline: [...alive].sort((left, right) => left - right),
+      emergencyCleanupAttempted,
+    };
   }
 
   public async waitForQuiescence(
     timeoutMs: number,
   ): Promise<ManagedAgentTeardownObservation> {
-    const startedAt = Date.now();
-    let alivePids: number[] = [];
-    do {
-      await this.observeProcessTree();
-      alivePids = await this.#aliveObservedPids();
-      if (alivePids.length === 0) {
+    const startedAt = this.#now();
+    const boundedTimeoutMs = Math.max(0, timeoutMs);
+    for (;;) {
+      const elapsedBeforeSample = Math.max(0, this.#now() - startedAt);
+      await this.observeProcessTree(
+        Math.max(0, boundedTimeoutMs - elapsedBeforeSample),
+      );
+      const observation = await this.#currentObservation(startedAt, false);
+      if (observation.quiescent) {
         return {
-          quiescent: true,
-          deadlineMet: true,
-          elapsedMs: Date.now() - startedAt,
-          observedPids: [...this.#observedPids].sort(
-            (left, right) => left - right,
-          ),
-          alivePidsAtDeadline: [],
-          emergencyCleanupAttempted: false,
+          ...observation,
+          deadlineMet: observation.elapsedMs <= boundedTimeoutMs,
         };
       }
-      if (Date.now() - startedAt >= timeoutMs) break;
-      await delay(QUIESCENCE_POLL_MS);
-    } while (Date.now() - startedAt < timeoutMs);
-
-    await this.observeProcessTree();
-    alivePids = await this.#aliveObservedPids();
-    return {
-      quiescent: alivePids.length === 0,
-      deadlineMet: alivePids.length === 0,
-      elapsedMs: Date.now() - startedAt,
-      observedPids: [...this.#observedPids].sort((left, right) => left - right),
-      alivePidsAtDeadline: alivePids,
-      emergencyCleanupAttempted: false,
-    };
+      if (observation.elapsedMs >= boundedTimeoutMs) {
+        return { ...observation, deadlineMet: false };
+      }
+      await this.#delay(
+        Math.min(QUIESCENCE_POLL_MS, boundedTimeoutMs - observation.elapsedMs),
+      );
+    }
   }
 
-  public async emergencyCleanup(): Promise<void> {
-    await this.observeProcessTree();
-    await Promise.all(
-      [...this.#rootPids].map((pid) => this.#terminateRoot(pid, true)),
-    );
+  public async emergencyCleanup(
+    timeoutMs: number,
+  ): Promise<ManagedAgentTeardownObservation> {
+    const startedAt = this.#now();
+    const boundedTimeoutMs = Math.max(0, timeoutMs);
+    this.#forceStopKillSynchronously();
+    const confirmation = await this.waitForQuiescence(boundedTimeoutMs);
+    const elapsedMs = Math.max(0, this.#now() - startedAt);
+    return {
+      ...confirmation,
+      elapsedMs,
+      deadlineMet: confirmation.quiescent && elapsedMs <= boundedTimeoutMs,
+      emergencyCleanupAttempted: true,
+    };
   }
 
   public dispose(): void {

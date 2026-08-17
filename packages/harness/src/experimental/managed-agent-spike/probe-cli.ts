@@ -293,6 +293,16 @@ export function assertManagedAgentCertificationNodeVersion(
   }
 }
 
+export function assertManagedAgentCancellationHostPlatform(
+  platform: NodeJS.Platform,
+): void {
+  if (platform !== "darwin" && platform !== "linux") {
+    throw new ManagedAgentProbeCliError(
+      "L2 certification supports only the reviewed detached POSIX fixture containment model",
+    );
+  }
+}
+
 export function evaluateManagedAgentProbe(
   result: ManagedAgentProbeResult,
   fixturePids: readonly number[] = [],
@@ -446,6 +456,14 @@ export function evaluateManagedAgentProbe(
         passed: result.teardown.quiescent && result.teardown.deadlineMet,
       },
       {
+        id: "l2_containment_prepared",
+        passed:
+          result.teardown.processTableAvailable &&
+          result.teardown.containmentSupported &&
+          result.teardown.ownershipProven &&
+          result.teardown.forceKillIssued,
+      },
+      {
         id: "fixture_processes_observed",
         passed:
           fixturePids.length === 2 &&
@@ -473,6 +491,7 @@ export async function executeManagedAgentProbeCli(
   argv: readonly string[],
   environment: Environment = process.env,
   runtimeNodeVersion = process.versions.node,
+  runtimePlatform: NodeJS.Platform = process.platform,
 ): Promise<
   ManagedAgentProbeReport | { readonly help: true; readonly usage: string }
 > {
@@ -481,6 +500,9 @@ export async function executeManagedAgentProbeCli(
 
   // Validate the immutable runtime before reading the dedicated credential.
   assertManagedAgentCertificationNodeVersion(runtimeNodeVersion);
+  if (args.scenario === "L2") {
+    assertManagedAgentCancellationHostPlatform(runtimePlatform);
+  }
   const gatewayOrigin = assertManagedAgentDirectGatewayOrigin(
     requiredEnvironmentValue(environment, "LLM_GATEWAY_BASE_URL"),
   );
@@ -523,10 +545,25 @@ export async function executeManagedAgentProbeCli(
                   15_000,
                   signal,
                 );
-                // The model-writable PID file is evidence only. Signal targets
-                // come exclusively from the SDK process tree sampled by the
-                // host observer; these values are never handed to it.
-                await observer.observeProcessTree();
+                // The model-writable PID file is evidence only. Readiness is
+                // derived first from the trusted root handle and bounded host
+                // process table. These IDs are compared outside the observer
+                // and never become signal targets.
+                const readiness = await observer.prepareCancellation();
+                if (!readiness.supported) {
+                  throw new ManagedAgentProbeCliError(
+                    `L2 containment preparation failed: ${readiness.reason}`,
+                  );
+                }
+                if (
+                  !fixturePids.every((pid) =>
+                    readiness.observedPids.includes(pid),
+                  )
+                ) {
+                  throw new ManagedAgentProbeCliError(
+                    "L2 fixture PIDs were not both present in the host-observed owned process group",
+                  );
+                }
               },
             }
           : {}),
