@@ -91,6 +91,78 @@ function preToolUseInput(
 }
 
 describe("managed-agent universal policy boundary", () => {
+  it("can enforce an L2 Bash-only boundary before evaluating model-authored inputs", async () => {
+    const evidence: ManagedAgentPermissionEvidence[] = [];
+    const boundary = createManagedAgentPolicyBoundary({
+      canonicalWorkspaceRoot: workspace,
+      allowedBuiltinTools: ["Bash"],
+      allowedBashCommands: ["node .managed-agent-probe/long-running.mjs"],
+      allowedMcpTools: [],
+      onDecision: (decision) => evidence.push(decision),
+    });
+    const signal = new AbortController().signal;
+    const invoke = (toolName: string, input: unknown, toolUseId: string) =>
+      boundary.preToolUseHook(
+        preToolUseInput(toolName, input, toolUseId),
+        toolUseId,
+        { signal },
+      );
+
+    await expect(
+      invoke(
+        "Write",
+        {
+          file_path: ".managed-agent-probe/processes.json",
+          content: JSON.stringify({
+            parentPid: process.pid,
+            childPid: 2_147_483_646,
+          }),
+        },
+        "l2-write",
+      ),
+    ).resolves.toMatchObject({
+      hookSpecificOutput: { permissionDecision: "deny" },
+    });
+    await expect(
+      invoke(
+        "mcp__sapiom-managed-agent-spike__echo_nonce",
+        { nonce: "x" },
+        "l2-mcp",
+      ),
+    ).resolves.toMatchObject({
+      hookSpecificOutput: { permissionDecision: "deny" },
+    });
+    await expect(
+      invoke(
+        "Bash",
+        { command: "node .managed-agent-probe/long-running.mjs" },
+        "l2-bash",
+      ),
+    ).resolves.toMatchObject({
+      hookSpecificOutput: { permissionDecision: "allow" },
+    });
+
+    expect(
+      evidence.map(({ toolName, decision, reason }) => ({
+        toolName,
+        decision,
+        reason,
+      })),
+    ).toEqual([
+      { toolName: "Write", decision: "deny", reason: "tool_not_allowed" },
+      {
+        toolName: "mcp__sapiom-managed-agent-spike__echo_nonce",
+        decision: "deny",
+        reason: "tool_not_allowed",
+      },
+      {
+        toolName: "Bash",
+        decision: "allow",
+        reason: "exact_bash_command",
+      },
+    ]);
+  });
+
   it("uses exact Bash equality and emits content-free decisions", async () => {
     const evidence: ManagedAgentPermissionEvidence[] = [];
     const boundary = createManagedAgentPolicyBoundary({

@@ -60,7 +60,7 @@ function fakeObserver(
     spawn: vi.fn(() => {
       throw new Error("fake query must not spawn");
     }),
-    trackPids: vi.fn(),
+    observeProcessTree: vi.fn(async () => undefined),
     waitForQuiescence: vi.fn(async () => teardown),
     emergencyCleanup: vi.fn(async () => undefined),
     dispose: vi.fn(),
@@ -496,7 +496,7 @@ describe("runManagedAgentProbe", () => {
       type: "terminal",
       terminal: "teardown_timeout",
     });
-    expect(observer.emergencyCleanup).toHaveBeenCalledWith([8001]);
+    expect(observer.emergencyCleanup).toHaveBeenCalledWith();
   });
 
   it("rejects a successful stream when a requested tool has no primary hook decision", async () => {
@@ -819,12 +819,14 @@ describe("runManagedAgentProbe", () => {
     const { config } = await probeConfig("L2");
     const observer = fakeObserver();
     const close = vi.fn();
+    let capturedOptions: Options | undefined;
     const result = await runManagedAgentProbe(config, {
       hermeticGatewayOrigin: config.gatewayOrigin,
       processObserver: observer,
       waitForCancellationSignal: async () => undefined,
       queryFactory: ({ options }) => ({
         async *[Symbol.asyncIterator]() {
+          capturedOptions = options;
           yield {
             type: "system",
             subtype: "init",
@@ -848,6 +850,11 @@ describe("runManagedAgentProbe", () => {
     expect(result.terminal).toBe("cancelled");
     expect(result.cancellationRequested).toBe(true);
     expect(result.queryClosed).toBe(true);
+    expect(capturedOptions?.tools).toEqual(["Bash"]);
+    expect(capturedOptions?.disallowedTools).toEqual(
+      expect.arrayContaining(["Read", "Edit", "Write"]),
+    );
+    expect(capturedOptions?.mcpServers).toEqual({});
     expect(
       result.events.filter(({ type }) => type === "terminal"),
     ).toHaveLength(1);
@@ -879,7 +886,7 @@ describe("runManagedAgentProbe", () => {
 
     expect(result.terminal).toBe("teardown_timeout");
     expect(result.teardown.emergencyCleanupAttempted).toBe(true);
-    expect(observer.emergencyCleanup).toHaveBeenCalledWith([9001]);
+    expect(observer.emergencyCleanup).toHaveBeenCalledWith();
     expect(result.events.at(-1)).toMatchObject({
       type: "terminal",
       terminal: "teardown_timeout",

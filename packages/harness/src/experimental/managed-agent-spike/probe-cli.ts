@@ -51,6 +51,168 @@ export class ManagedAgentProbeCliError extends Error {
   }
 }
 
+interface ManagedAgentExpectedL1ToolStep {
+  readonly toolName: string;
+  readonly completion: "success" | "error";
+  readonly decision: "allow" | "deny";
+  readonly reason: ManagedAgentPermissionReason;
+}
+
+const MANAGED_AGENT_EXPECTED_L1_TOOL_TRACE = [
+  {
+    toolName: "Read",
+    completion: "success",
+    decision: "allow",
+    reason: "fixture_path",
+  },
+  {
+    toolName: "Read",
+    completion: "success",
+    decision: "allow",
+    reason: "fixture_path",
+  },
+  {
+    toolName: "Read",
+    completion: "success",
+    decision: "allow",
+    reason: "fixture_path",
+  },
+  {
+    toolName: "Read",
+    completion: "error",
+    decision: "deny",
+    reason: "path_outside_workspace",
+  },
+  {
+    toolName: "Read",
+    completion: "error",
+    decision: "deny",
+    reason: "path_symlink_escape",
+  },
+  {
+    toolName: "Edit",
+    completion: "success",
+    decision: "allow",
+    reason: "fixture_path",
+  },
+  {
+    toolName: "Write",
+    completion: "success",
+    decision: "allow",
+    reason: "fixture_path",
+  },
+  {
+    toolName: qualifiedManagedAgentMcpToolName("echo_nonce"),
+    completion: "success",
+    decision: "allow",
+    reason: "managed_mcp_tool",
+  },
+  {
+    toolName: qualifiedManagedAgentMcpToolName("fail_once"),
+    completion: "error",
+    decision: "allow",
+    reason: "managed_mcp_tool",
+  },
+  {
+    toolName: qualifiedManagedAgentMcpToolName("fail_once"),
+    completion: "success",
+    decision: "allow",
+    reason: "managed_mcp_tool",
+  },
+  {
+    toolName: "Bash",
+    completion: "success",
+    decision: "allow",
+    reason: "exact_bash_command",
+  },
+] as const satisfies readonly ManagedAgentExpectedL1ToolStep[];
+
+function hasExactManagedAgentL1ToolTrace(
+  result: ManagedAgentProbeResult,
+): boolean {
+  const requested = result.toolEvidence.filter(
+    ({ status }) => status === "requested",
+  );
+  const completed = result.toolEvidence.filter(
+    ({ status }) => status !== "requested",
+  );
+  const primaryDecisions = result.permissionEvidence.filter(
+    ({ source }) => source === "pre_tool_use",
+  );
+  if (
+    requested.length !== MANAGED_AGENT_EXPECTED_L1_TOOL_TRACE.length ||
+    completed.length !== MANAGED_AGENT_EXPECTED_L1_TOOL_TRACE.length ||
+    primaryDecisions.length !== MANAGED_AGENT_EXPECTED_L1_TOOL_TRACE.length ||
+    result.permissionEvidence.length !== primaryDecisions.length
+  ) {
+    return false;
+  }
+  const requestedIds = requested.flatMap(({ toolUseId }) =>
+    toolUseId ? [toolUseId] : [],
+  );
+  if (
+    requestedIds.length !== requested.length ||
+    new Set(requestedIds).size !== requestedIds.length
+  ) {
+    return false;
+  }
+
+  return MANAGED_AGENT_EXPECTED_L1_TOOL_TRACE.every((expected, index) => {
+    const request = requested[index];
+    if (!request?.toolUseId || request.toolName !== expected.toolName) {
+      return false;
+    }
+    const completions = completed.filter(
+      ({ toolUseId }) => toolUseId === request.toolUseId,
+    );
+    const decisions = primaryDecisions.filter(
+      ({ toolUseId }) => toolUseId === request.toolUseId,
+    );
+    return (
+      completions.length === 1 &&
+      completions[0]?.toolName === expected.toolName &&
+      completions[0]?.status === expected.completion &&
+      decisions.length === 1 &&
+      decisions[0]?.toolName === expected.toolName &&
+      decisions[0]?.decision === expected.decision &&
+      decisions[0]?.reason === expected.reason
+    );
+  });
+}
+
+function hasExactManagedAgentL2BashTrace(
+  result: ManagedAgentProbeResult,
+): boolean {
+  const requested = result.toolEvidence.filter(
+    ({ status }) => status === "requested",
+  );
+  const completed = result.toolEvidence.filter(
+    ({ status }) => status !== "requested",
+  );
+  const primaryDecisions = result.permissionEvidence.filter(
+    ({ source }) => source === "pre_tool_use",
+  );
+  const request = requested[0];
+  return Boolean(
+    requested.length === 1 &&
+    request?.toolUseId &&
+    request.toolName === "Bash" &&
+    completed.length <= 1 &&
+    completed.every(
+      (evidence) =>
+        evidence.toolUseId === request.toolUseId &&
+        evidence.toolName === "Bash" &&
+        evidence.status === "error",
+    ) &&
+    primaryDecisions.length === 1 &&
+    result.permissionEvidence.length === 1 &&
+    primaryDecisions[0]?.toolUseId === request.toolUseId &&
+    primaryDecisions[0]?.toolName === "Bash" &&
+    primaryDecisions[0]?.decision === "allow" &&
+    primaryDecisions[0]?.reason === "exact_bash_command",
+  );
+}
+
 export function managedAgentProbeUsage(): string {
   return [
     "Usage:",
@@ -210,6 +372,10 @@ export function evaluateManagedAgentProbe(
     checks.push(
       { id: "terminal_success", passed: result.terminal === "success" },
       {
+        id: "exact_l1_tool_trace",
+        passed: hasExactManagedAgentL1ToolTrace(result),
+      },
+      {
         id: "clean_target_modified",
         passed: result.workspaceChanges.some(
           ({ path, change }) =>
@@ -270,6 +436,10 @@ export function evaluateManagedAgentProbe(
   } else {
     checks.push(
       { id: "terminal_cancelled", passed: result.terminal === "cancelled" },
+      {
+        id: "exact_l2_bash_only_trace",
+        passed: hasExactManagedAgentL2BashTrace(result),
+      },
       { id: "cancellation_requested", passed: result.cancellationRequested },
       {
         id: "teardown_within_five_seconds",
@@ -353,7 +523,10 @@ export async function executeManagedAgentProbeCli(
                   15_000,
                   signal,
                 );
-                observer.trackPids(fixturePids);
+                // The model-writable PID file is evidence only. Signal targets
+                // come exclusively from the SDK process tree sampled by the
+                // host observer; these values are never handed to it.
+                await observer.observeProcessTree();
               },
             }
           : {}),

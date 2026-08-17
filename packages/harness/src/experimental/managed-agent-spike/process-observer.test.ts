@@ -1,4 +1,8 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { spawn } from "node:child_process";
+import { writeFile } from "node:fs/promises";
+import { join } from "node:path";
+
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   FIXTURE_PATHS,
@@ -30,7 +34,7 @@ describe("LocalManagedAgentProcessObserver", () => {
         signal: controller.signal,
       });
       const pids = await waitForManagedAgentFixturePids(fixture);
-      observer.trackPids(pids);
+      await observer.observeProcessTree();
       controller.abort();
       const teardown = await observer.waitForQuiescence(5_000);
       aliveAtFailure = teardown.alivePidsAtDeadline;
@@ -42,9 +46,50 @@ describe("LocalManagedAgentProcessObserver", () => {
       );
       expect(teardown.alivePidsAtDeadline).toEqual([]);
     } finally {
-      if (aliveAtFailure.length > 0)
-        await observer.emergencyCleanup(aliveAtFailure);
+      controller.abort();
+      if (aliveAtFailure.length > 0) await observer.emergencyCleanup();
       observer.dispose();
     }
   }, 10_000);
+
+  it("never tracks or signals PIDs injected through the model-writable fixture file", async () => {
+    const fixture = await createManagedAgentFixture(() => "forged-pids");
+    fixtures.push(fixture);
+    const unrelated = spawn(
+      process.execPath,
+      ["-e", "setInterval(() => {}, 1000)"],
+      { stdio: "ignore", windowsHide: true },
+    );
+    if (typeof unrelated.pid !== "number") {
+      unrelated.kill("SIGKILL");
+      throw new Error("unrelated test process did not expose a PID");
+    }
+    const forgedPids = [process.pid, unrelated.pid] as const;
+    await writeFile(
+      join(fixture.workspaceRoot, FIXTURE_PATHS.processPidFile),
+      JSON.stringify({
+        parentPid: forgedPids[0],
+        childPid: forgedPids[1],
+      }),
+    );
+    const observer = new LocalManagedAgentProcessObserver();
+    const signalSpy = vi.spyOn(process, "kill");
+    try {
+      await expect(waitForManagedAgentFixturePids(fixture)).resolves.toEqual(
+        forgedPids,
+      );
+      await observer.observeProcessTree();
+      const teardown = await observer.waitForQuiescence(0);
+      await observer.emergencyCleanup();
+
+      expect(teardown.observedPids).not.toContain(forgedPids[0]);
+      expect(teardown.observedPids).not.toContain(forgedPids[1]);
+      expect(signalSpy).not.toHaveBeenCalled();
+      expect(unrelated.exitCode).toBeNull();
+    } finally {
+      signalSpy.mockRestore();
+      unrelated.kill("SIGKILL");
+      observer.dispose();
+    }
+  });
 });

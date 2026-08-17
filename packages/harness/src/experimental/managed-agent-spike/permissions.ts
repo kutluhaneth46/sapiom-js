@@ -136,6 +136,8 @@ export async function resolveManagedAgentToolPath(
 
 export interface ManagedAgentPolicyBoundaryOptions {
   readonly canonicalWorkspaceRoot: string;
+  /** Scenario-specific built-ins; L2 deliberately exposes only exact Bash. */
+  readonly allowedBuiltinTools?: readonly string[];
   readonly allowedBashCommands: readonly string[];
   readonly allowedMcpTools: readonly string[];
   readonly onDecision: (evidence: ManagedAgentPermissionEvidence) => void;
@@ -230,6 +232,7 @@ function denied(
 
 async function evaluateManagedAgentPolicy(
   options: ManagedAgentPolicyBoundaryOptions,
+  allowedBuiltinTools: ReadonlySet<string>,
   allowedCommands: ReadonlySet<string>,
   allowedMcpTools: ReadonlySet<string>,
   toolName: string,
@@ -237,6 +240,9 @@ async function evaluateManagedAgentPolicy(
   signal: AbortSignal,
 ): Promise<ManagedAgentPolicyDecision> {
   if (signal.aborted) return denied("policy_aborted");
+  if (!allowedBuiltinTools.has(toolName) && !allowedMcpTools.has(toolName)) {
+    return denied("tool_not_allowed");
+  }
   const input = asRecord(rawInput);
   if (!input) return denied("invalid_input");
 
@@ -295,6 +301,9 @@ async function evaluateManagedAgentPolicy(
 export function createManagedAgentPolicyBoundary(
   options: ManagedAgentPolicyBoundaryOptions,
 ): ManagedAgentPolicyBoundary {
+  const allowedBuiltinTools = new Set(
+    options.allowedBuiltinTools ?? MANAGED_AGENT_BUILTIN_TOOLS,
+  );
   const allowedCommands = new Set(options.allowedBashCommands);
   const allowedMcpTools = new Set(options.allowedMcpTools);
   const decisions = new Map<
@@ -343,6 +352,7 @@ export function createManagedAgentPolicyBoundary(
     }
     const pending = evaluateManagedAgentPolicy(
       options,
+      allowedBuiltinTools,
       allowedCommands,
       allowedMcpTools,
       toolName,

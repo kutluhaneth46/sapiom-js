@@ -229,11 +229,13 @@ export type ManagedAgentQueryFactory = (input: {
 
 export interface ManagedAgentProcessObserver {
   spawn(options: SpawnOptions): SpawnedProcess;
-  trackPids(pids: readonly number[]): void;
+  /** Sample only descendants of the host-observed SDK process roots. */
+  observeProcessTree(): Promise<void>;
   waitForQuiescence(
     timeoutMs: number,
   ): Promise<ManagedAgentTeardownObservation>;
-  emergencyCleanup(pids: readonly number[]): Promise<void>;
+  /** Signal only process groups rooted in an SDK process spawned above. */
+  emergencyCleanup(): Promise<void>;
   dispose(): void;
 }
 

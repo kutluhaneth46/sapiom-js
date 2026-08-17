@@ -45,6 +45,13 @@ export const MANAGED_AGENT_TEARDOWN_TIMEOUT_MS = 5_000;
 export const MANAGED_AGENT_CORRELATION_MARKER_VERSION =
   "SAPIOM_CERTIFICATION_CORRELATION_V1";
 const QUERY_CLOSE_TIMEOUT_MS = 2_000;
+const MANAGED_AGENT_L2_BUILTIN_TOOLS = ["Bash"] as const;
+const MANAGED_AGENT_L2_DISALLOWED_TOOLS = [
+  ...MANAGED_AGENT_DISALLOWED_TOOLS,
+  "Read",
+  "Edit",
+  "Write",
+] as const;
 
 type McpToolName = "echo_nonce" | "fail_once";
 
@@ -360,8 +367,13 @@ export async function runManagedAgentProbe(
   });
   const policyBoundary = createManagedAgentPolicyBoundary({
     canonicalWorkspaceRoot: validated.canonicalWorkspaceRoot,
+    allowedBuiltinTools:
+      config.scenario === "L2"
+        ? MANAGED_AGENT_L2_BUILTIN_TOOLS
+        : MANAGED_AGENT_BUILTIN_TOOLS,
     allowedBashCommands: config.allowedBashCommands,
-    allowedMcpTools: mcpRuntime.qualifiedToolNames,
+    allowedMcpTools:
+      config.scenario === "L1" ? mcpRuntime.qualifiedToolNames : [],
     onDecision: (evidence) => recorder.recordPermission(evidence),
     onGuardRejection: (diagnostic) => guardRejections.push(diagnostic),
   });
@@ -375,7 +387,10 @@ export async function runManagedAgentProbe(
     // deduplicates its evidence by tool-use ID.
     canUseTool: policyBoundary.canUseToolFallback,
     cwd: validated.canonicalWorkspaceRoot,
-    disallowedTools: [...MANAGED_AGENT_DISALLOWED_TOOLS],
+    disallowedTools:
+      config.scenario === "L2"
+        ? [...MANAGED_AGENT_L2_DISALLOWED_TOOLS]
+        : [...MANAGED_AGENT_DISALLOWED_TOOLS],
     env: childEnvironment,
     includePartialMessages: false,
     hooks: {
@@ -388,7 +403,10 @@ export async function runManagedAgentProbe(
     },
     maxBudgetUsd: config.maxBudgetUsd,
     maxTurns: config.maxTurns,
-    mcpServers: { [MANAGED_AGENT_MCP_SERVER_NAME]: mcpRuntime.server },
+    mcpServers:
+      config.scenario === "L1"
+        ? { [MANAGED_AGENT_MCP_SERVER_NAME]: mcpRuntime.server }
+        : {},
     model: validated.model.alias,
     permissionMode: "default",
     persistSession: false,
@@ -401,9 +419,14 @@ export async function runManagedAgentProbe(
     },
     strictMcpConfig: true,
     systemPrompt:
-      "You are a deterministic local managed-agent feasibility probe. Follow the ordered instructions exactly, continue after expected permission denials and planned MCP errors, and use only the tools named in the prompt.",
+      config.scenario === "L2"
+        ? "You are a deterministic local cancellation probe. Use only the one exact Bash call named in the prompt."
+        : "You are a deterministic local managed-agent feasibility probe. Follow the ordered instructions exactly, continue after expected permission denials and planned MCP errors, and use only the tools named in the prompt.",
     thinking: { type: "disabled" },
-    tools: [...MANAGED_AGENT_BUILTIN_TOOLS],
+    tools:
+      config.scenario === "L2"
+        ? [...MANAGED_AGENT_L2_BUILTIN_TOOLS]
+        : [...MANAGED_AGENT_BUILTIN_TOOLS],
   };
 
   let teardown!: ManagedAgentTeardownObservation;
@@ -547,7 +570,7 @@ export async function runManagedAgentProbe(
     recorder.recordTerminal(terminal);
 
     if (!teardown.quiescent) {
-      await processObserver.emergencyCleanup(teardown.alivePidsAtDeadline);
+      await processObserver.emergencyCleanup();
       teardown = { ...teardown, emergencyCleanupAttempted: true };
       terminal = "teardown_timeout";
     }
@@ -590,7 +613,7 @@ export async function runManagedAgentProbe(
     terminal,
     terminationEvidence,
     events: [...recorder.events],
-    toolEvidence: [...recorder.toolEvidence, ...mcpRuntime.invocations],
+    toolEvidence: [...recorder.toolEvidence],
     permissionEvidence: [...recorder.permissionEvidence],
     policyDiagnostics,
     workspaceChanges: diffManagedAgentWorkspaceSnapshots(before, after),

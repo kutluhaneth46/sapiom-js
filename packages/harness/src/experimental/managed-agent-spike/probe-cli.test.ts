@@ -13,15 +13,24 @@ import { qualifiedManagedAgentMcpToolName } from "./runtime.js";
 import type { ManagedAgentProbeResult } from "./types.js";
 
 function passingL1Result(): ManagedAgentProbeResult {
-  const builtins = ["Read", "Edit", "Write", "Bash"];
-  const builtinIds = [
-    `tool_${"1".repeat(64)}`,
-    `tool_${"2".repeat(64)}`,
-    `tool_${"3".repeat(64)}`,
-    `tool_${"b".repeat(64)}`,
-  ];
   const echoTool = qualifiedManagedAgentMcpToolName("echo_nonce");
   const failOnceTool = qualifiedManagedAgentMcpToolName("fail_once");
+  const steps = [
+    ["Read", "success", "allow", "fixture_path"],
+    ["Read", "success", "allow", "fixture_path"],
+    ["Read", "success", "allow", "fixture_path"],
+    ["Read", "error", "deny", "path_outside_workspace"],
+    ["Read", "error", "deny", "path_symlink_escape"],
+    ["Edit", "success", "allow", "fixture_path"],
+    ["Write", "success", "allow", "fixture_path"],
+    [echoTool, "success", "allow", "managed_mcp_tool"],
+    [failOnceTool, "error", "allow", "managed_mcp_tool"],
+    [failOnceTool, "success", "allow", "managed_mcp_tool"],
+    ["Bash", "success", "allow", "exact_bash_command"],
+  ] as const;
+  const ids = steps.map(
+    (_, index) => `tool_${(index + 1).toString(16).padStart(64, "0")}`,
+  );
   return {
     contractVersion: 1,
     runId: "run-1",
@@ -39,67 +48,25 @@ function passingL1Result(): ManagedAgentProbeResult {
       sdkResult: "success",
     },
     events: [],
-    toolEvidence: [
-      ...builtins.flatMap((toolName, index) => [
-        {
-          toolUseId: builtinIds[index],
-          toolName,
-          status: "requested" as const,
-        },
-        {
-          toolUseId: builtinIds[index],
-          toolName,
-          status: "success" as const,
-        },
-      ]),
-      { toolName: echoTool, status: "success" },
-      { toolName: failOnceTool, status: "error" },
-      { toolName: failOnceTool, status: "success" },
-    ],
-    permissionEvidence: [
-      ...["Read", "Edit", "Write"].map((toolName, index) => ({
-        toolUseId: `tool_${String(index + 1).repeat(64)}`,
+    toolEvidence: steps.flatMap(([toolName, completion], index) => [
+      {
+        toolUseId: ids[index],
         toolName,
-        decision: "allow" as const,
-        reason: "fixture_path" as const,
-        source: "pre_tool_use" as const,
-      })),
-      {
-        toolUseId: `tool_${"b".repeat(64)}`,
-        toolName: "Bash",
-        decision: "allow",
-        reason: "exact_bash_command",
-        source: "pre_tool_use",
+        status: "requested" as const,
       },
       {
-        toolUseId: `tool_${"c".repeat(64)}`,
-        toolName: echoTool,
-        decision: "allow",
-        reason: "managed_mcp_tool",
-        source: "pre_tool_use",
+        toolUseId: ids[index],
+        toolName,
+        status: completion,
       },
-      {
-        toolUseId: `tool_${"d".repeat(64)}`,
-        toolName: failOnceTool,
-        decision: "allow",
-        reason: "managed_mcp_tool",
-        source: "pre_tool_use",
-      },
-      {
-        toolUseId: `tool_${"e".repeat(64)}`,
-        toolName: "Read",
-        decision: "deny",
-        reason: "path_outside_workspace",
-        source: "pre_tool_use",
-      },
-      {
-        toolUseId: `tool_${"f".repeat(64)}`,
-        toolName: "Read",
-        decision: "deny",
-        reason: "path_symlink_escape",
-        source: "pre_tool_use",
-      },
-    ],
+    ]),
+    permissionEvidence: steps.map(([toolName, , decision, reason], index) => ({
+      toolUseId: ids[index]!,
+      toolName,
+      decision,
+      reason,
+      source: "pre_tool_use" as const,
+    })),
     policyDiagnostics: [],
     workspaceChanges: [
       { path: FIXTURE_PATHS.cleanTarget, change: "modified" },
@@ -125,6 +92,43 @@ function passingL1Result(): ManagedAgentProbeResult {
       promptEmbedded: true,
     },
   };
+}
+
+function passingL2Result(): ManagedAgentProbeResult {
+  const base = passingL1Result();
+  const toolUseId = `tool_${"c".repeat(64)}`;
+  return {
+    ...base,
+    scenario: "L2",
+    inferenceTurns: 1,
+    sdkNumTurns: 1,
+    terminal: "cancelled",
+    toolEvidence: [{ toolUseId, toolName: "Bash", status: "requested" }],
+    permissionEvidence: [
+      {
+        toolUseId,
+        toolName: "Bash",
+        decision: "allow",
+        reason: "exact_bash_command",
+        source: "pre_tool_use",
+      },
+    ],
+    workspaceChanges: [],
+    cancellationRequested: true,
+    teardown: {
+      ...base.teardown,
+      observedPids: [12_345, 12_346],
+    },
+  };
+}
+
+function evidenceForToolId(
+  result: ManagedAgentProbeResult,
+  toolUseId: string,
+): ManagedAgentProbeResult["toolEvidence"] {
+  return result.toolEvidence.filter(
+    (evidence) => evidence.toolUseId === toolUseId,
+  );
 }
 
 describe("managed-agent probe CLI", () => {
@@ -269,6 +273,160 @@ describe("managed-agent probe CLI", () => {
         ({ id }) => id === "builtin_tools_succeeded",
       ),
     ).toEqual({ id: "builtin_tools_succeeded", passed: false });
+  });
+
+  it("accepts exactly one permitted Bash request for L2 and rejects any extra tool call", () => {
+    const passing = passingL2Result();
+    expect(evaluateManagedAgentProbe(passing, [12_345, 12_346])).toMatchObject({
+      outcome: "pass",
+      checks: expect.arrayContaining([
+        { id: "exact_l2_bash_only_trace", passed: true },
+      ]),
+    });
+
+    const writeId = `tool_${"d".repeat(64)}`;
+    const invalid: ManagedAgentProbeResult = {
+      ...passing,
+      toolEvidence: [
+        ...passing.toolEvidence,
+        { toolUseId: writeId, toolName: "Write", status: "requested" },
+        { toolUseId: writeId, toolName: "Write", status: "success" },
+      ],
+      permissionEvidence: [
+        ...passing.permissionEvidence,
+        {
+          toolUseId: writeId,
+          toolName: "Write",
+          decision: "allow",
+          reason: "fixture_path",
+          source: "pre_tool_use",
+        },
+      ],
+    };
+
+    expect(
+      evaluateManagedAgentProbe(invalid, [12_345, 12_346]).checks,
+    ).toContainEqual({
+      id: "exact_l2_bash_only_trace",
+      passed: false,
+    });
+  });
+
+  it.each([
+    [
+      "omitted",
+      (passing: ManagedAgentProbeResult) => {
+        const omittedId = passing.toolEvidence.find(
+          (evidence) =>
+            evidence.status === "requested" && evidence.toolName === "Read",
+        )!.toolUseId!;
+        return {
+          ...passing,
+          toolEvidence: passing.toolEvidence.filter(
+            (evidence) => evidence.toolUseId !== omittedId,
+          ),
+          permissionEvidence: passing.permissionEvidence.filter(
+            (evidence) => evidence.toolUseId !== omittedId,
+          ),
+        };
+      },
+    ],
+    [
+      "reordered",
+      (passing: ManagedAgentProbeResult) => {
+        const requested = passing.toolEvidence.filter(
+          ({ status }) => status === "requested",
+        );
+        const editId = requested[5]!.toolUseId!;
+        const writeId = requested[6]!.toolUseId!;
+        const editEvidence = evidenceForToolId(passing, editId);
+        const writeEvidence = evidenceForToolId(passing, writeId);
+        const reordered = passing.toolEvidence.filter(
+          ({ toolUseId }) => toolUseId !== editId && toolUseId !== writeId,
+        );
+        reordered.splice(10, 0, ...writeEvidence, ...editEvidence);
+        return { ...passing, toolEvidence: reordered };
+      },
+    ],
+    [
+      "extra",
+      (passing: ManagedAgentProbeResult) => {
+        const toolUseId = `tool_${"a".repeat(64)}`;
+        return {
+          ...passing,
+          toolEvidence: [
+            ...passing.toolEvidence,
+            { toolUseId, toolName: "Read", status: "requested" as const },
+            { toolUseId, toolName: "Read", status: "success" as const },
+          ],
+          permissionEvidence: [
+            ...passing.permissionEvidence,
+            {
+              toolUseId,
+              toolName: "Read",
+              decision: "allow" as const,
+              reason: "fixture_path" as const,
+              source: "pre_tool_use" as const,
+            },
+          ],
+        };
+      },
+    ],
+    [
+      "duplicate retry",
+      (passing: ManagedAgentProbeResult) => {
+        const toolUseId = `tool_${"b".repeat(64)}`;
+        return {
+          ...passing,
+          toolEvidence: [
+            ...passing.toolEvidence,
+            { toolUseId, toolName: "Bash", status: "requested" as const },
+            { toolUseId, toolName: "Bash", status: "success" as const },
+          ],
+          permissionEvidence: [
+            ...passing.permissionEvidence,
+            {
+              toolUseId,
+              toolName: "Bash",
+              decision: "allow" as const,
+              reason: "exact_bash_command" as const,
+              source: "pre_tool_use" as const,
+            },
+          ],
+        };
+      },
+    ],
+  ])("rejects an %s L1 tool trace", (_name, mutate) => {
+    const report = evaluateManagedAgentProbe(mutate(passingL1Result()));
+
+    expect(report.outcome).toBe("fail");
+    expect(report.checks).toContainEqual({
+      id: "exact_l1_tool_trace",
+      passed: false,
+    });
+  });
+
+  it("requires one completion and primary decision per L1 request, including fail_once error then success", () => {
+    const passing = passingL1Result();
+    const failOnceRequests = passing.toolEvidence.filter(
+      ({ status, toolName }) =>
+        status === "requested" &&
+        toolName === qualifiedManagedAgentMcpToolName("fail_once"),
+    );
+    const firstFailOnceId = failOnceRequests[0]!.toolUseId!;
+    const invalid: ManagedAgentProbeResult = {
+      ...passing,
+      toolEvidence: passing.toolEvidence.map((evidence) =>
+        evidence.toolUseId === firstFailOnceId && evidence.status === "error"
+          ? { ...evidence, status: "success" }
+          : evidence,
+      ),
+    };
+
+    expect(evaluateManagedAgentProbe(invalid).checks).toContainEqual({
+      id: "exact_l1_tool_trace",
+      passed: false,
+    });
   });
 
   it("requires positive permission evidence and distinct lexical and symlink denials", () => {

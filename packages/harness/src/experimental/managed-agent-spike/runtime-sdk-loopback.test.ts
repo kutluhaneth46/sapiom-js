@@ -401,7 +401,7 @@ it("enforces real-SDK built-in and in-process MCP calls with exact loopback corr
         ({ toolName, toolUseId }) =>
           toolName === ECHO_NONCE_TOOL && toolUseId === undefined,
       ),
-    ).toEqual([{ toolName: ECHO_NONCE_TOOL, status: "success" }]);
+    ).toEqual([]);
     expect(result.policyHookCoverage).toBe(true);
     expect(
       await fixturePathExists(
