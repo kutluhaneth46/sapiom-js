@@ -396,11 +396,11 @@ export async function runManagedAgentProbe(
           evalSource,
           executionId,
         });
+        promptEmbedded = true;
         query = (dependencies.queryFactory ?? defaultQueryFactory)({
           prompt,
           options,
         });
-        promptEmbedded = true;
         for await (const event of query) {
           try {
             recorder.observeSdkEvent(event);

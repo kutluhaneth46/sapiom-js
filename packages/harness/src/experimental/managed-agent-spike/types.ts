@@ -155,7 +155,7 @@ export interface ManagedAgentProbeResult {
   readonly correlation: {
     readonly executionId: string;
     readonly evalSource: string;
-    /** True only after the query factory accepts the marked prompt. */
+    /** True only after the marked prompt is handed to the query factory. */
     readonly promptEmbedded: boolean;
   };
   readonly sdkUsage?: ManagedAgentSdkUsageEstimate;

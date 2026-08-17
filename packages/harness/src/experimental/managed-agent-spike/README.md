@@ -46,9 +46,9 @@ the same non-secret values in the initial prompt as:
 SAPIOM_CERTIFICATION_CORRELATION_V1;eval_source=<value>;execution_id=<value>
 ```
 
-`correlation.promptEmbedded` records whether that marked prompt reached query
-construction. It remains false when the settings preflight prevents query
-creation.
+`correlation.promptEmbedded` records whether that marked prompt was handed to
+the query factory. It remains false when the settings preflight prevents the
+factory invocation.
 
 The production gateway consumes both headers, but its current BigQuery
 projection persists neither `polsia_eval_source` nor `sapiom_execution_id`.

@@ -392,7 +392,7 @@ describe("runManagedAgentProbe", () => {
     ).toHaveLength(1);
   });
 
-  it("does not claim prompt embedding when query construction fails", async () => {
+  it("records prompt delivery when the query factory receives it and throws", async () => {
     const { config } = await probeConfig();
     const result = await runManagedAgentProbe(config, {
       hermeticGatewayOrigin: config.gatewayOrigin,
@@ -403,7 +403,7 @@ describe("runManagedAgentProbe", () => {
       },
     });
 
-    expect(result.correlation.promptEmbedded).toBe(false);
+    expect(result.correlation.promptEmbedded).toBe(true);
     expect(result.queryClosed).toBe(false);
     expect(result.terminal).toBe("query_error");
   });
