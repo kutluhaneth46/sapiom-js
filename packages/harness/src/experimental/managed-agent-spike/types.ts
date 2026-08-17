@@ -297,8 +297,14 @@ export type ManagedAgentQueryFactory = (input: {
 
 export interface ManagedAgentProcessObserver {
   spawn(options: SpawnOptions): SpawnedProcess;
-  /** Bind the raw per-run Options.abortController signal before SDK startup. */
+  /** Bind only the SDK-forwarded post-grace SpawnOptions signal. */
   bindAbortSignal(signal: AbortSignal): void;
+  /**
+   * Arm the one-shot, host-authenticated process registration used only by
+   * the exact E0.4 L2 fixture. Unregistered built-in Bash processes are not
+   * granted signal authority by this experimental observer.
+   */
+  armToolProcessContainment(): void;
   /** Prove the narrow POSIX ownership model before allowing L2 to cancel. */
   prepareCancellation(): Promise<ManagedAgentCancellationReadiness>;
   /** Sample only members owned by the host-observed process anchors. */
@@ -318,6 +324,8 @@ export type ManagedAgentCancellationReadinessReason =
   | "root_count_invalid"
   | "root_not_active"
   | "root_not_group_leader"
+  | "tool_process_not_registered"
+  | "tool_process_identity_invalid"
   | "containment_escaped";
 
 export interface ManagedAgentCancellationReadiness {

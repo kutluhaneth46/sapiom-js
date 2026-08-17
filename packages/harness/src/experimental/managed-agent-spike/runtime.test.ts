@@ -68,6 +68,7 @@ function fakeObserver(
       throw new Error("fake query must not spawn");
     }),
     bindAbortSignal: vi.fn(),
+    armToolProcessContainment: vi.fn(),
     prepareCancellation: vi.fn(async () => ({
       supported: true,
       reason: "ready" as const,
@@ -458,11 +459,17 @@ describe("runManagedAgentProbe", () => {
 
   it("distinguishes query iteration failure from construction failure", async () => {
     const { config } = await probeConfig();
+    const observer = fakeObserver();
+    const shutdownOrder: string[] = [];
+    observer.emergencyCleanup.mockImplementation(async () => {
+      shutdownOrder.push("host_fallback");
+      return { ...quiescentTeardown(), emergencyCleanupAttempted: true };
+    });
     const result = await runManagedAgentProbe(config, {
       hermeticGatewayOrigin: config.gatewayOrigin,
-      processObserver: fakeObserver(),
+      processObserver: observer,
       policySettingsGuard: async () => undefined,
-      queryFactory: () => ({
+      queryFactory: ({ options }) => ({
         async *[Symbol.asyncIterator]() {
           yield {
             type: "system",
@@ -471,7 +478,10 @@ describe("runManagedAgentProbe", () => {
           };
           throw new Error("synthetic private iteration failure");
         },
-        close: vi.fn(),
+        close: vi.fn(() => {
+          expect(options.abortController?.signal.aborted).toBe(true);
+          shutdownOrder.push("sdk_query_close");
+        }),
       }),
     });
 
@@ -484,6 +494,8 @@ describe("runManagedAgentProbe", () => {
     expect(JSON.stringify(result)).not.toContain(
       "synthetic private iteration failure",
     );
+    expect(observer.bindAbortSignal).not.toHaveBeenCalled();
+    expect(shutdownOrder).toEqual(["sdk_query_close", "host_fallback"]);
   });
 
   it("reports a completed iteration that emitted no SDK result", async () => {
@@ -926,7 +938,7 @@ describe("runManagedAgentProbe", () => {
     expect(result.terminal).toBe("cancelled");
     expect(result.terminationEvidence.queryExecution).toBe("iteration_aborted");
     expect(close).toHaveBeenCalledOnce();
-    expect(observer.bindAbortSignal).toHaveBeenCalledOnce();
+    expect(observer.bindAbortSignal).not.toHaveBeenCalled();
   });
 
   it("keeps a CLI-shaped process alive until bounded close and cleanup complete", async () => {
@@ -952,6 +964,7 @@ const teardown = {
 const observer = {
   spawn() { throw new Error("fake query must not spawn"); },
   bindAbortSignal() {},
+  armToolProcessContainment() {},
   async prepareCancellation() {
     return {
       supported: true,

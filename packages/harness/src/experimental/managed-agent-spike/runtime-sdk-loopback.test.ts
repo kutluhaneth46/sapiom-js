@@ -1,3 +1,5 @@
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { readFile } from "node:fs/promises";
 import { createServer, type ServerResponse } from "node:http";
 import { createRequire } from "node:module";
@@ -11,8 +13,10 @@ import {
   FIXTURE_PATHS,
   createManagedAgentFixture,
   fixturePathExists,
+  waitForManagedAgentFixturePids,
 } from "./fixture.js";
 import { MANAGED_AGENT_CONTRACT } from "./contract.js";
+import { LocalManagedAgentProcessObserver } from "./process-observer.js";
 import {
   qualifiedManagedAgentMcpToolName,
   runManagedAgentProbe,
@@ -28,6 +32,36 @@ const ALLOWED_BASH_COMMAND = "git status --short";
 const DENIED_BASH_COMMAND = "touch denied-side-effect.txt";
 const ECHO_NONCE_TOOL = qualifiedManagedAgentMcpToolName("echo_nonce");
 const require = createRequire(import.meta.url);
+
+function processExists(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+async function waitForProcessDeath(
+  pid: number,
+  timeoutMs = 1_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (processExists(pid) && Date.now() < deadline) {
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
+  }
+  if (processExists(pid))
+    throw new Error(`Test process ${pid} survived cleanup`);
+}
+
+async function forceKillTestProcess(pid: number): Promise<void> {
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+  }
+  await waitForProcessDeath(pid);
+}
 
 interface LoopbackObservation {
   readonly headerNames: readonly string[];
@@ -418,6 +452,254 @@ it("enforces real-SDK built-in and in-process MCP calls with exact loopback corr
     await fixture.cleanup();
   }
 }, 45_000);
+
+it.skipIf(
+  process.platform === "win32" ||
+    process.versions.node !== MANAGED_AGENT_CONTRACT.certificationNodeVersion,
+)(
+  "cancels the real SDK L2 Bash fixture without leaving its detached process group",
+  async () => {
+    const fixture = await createManagedAgentFixture(
+      () => "loopback-l2-cancellation",
+    );
+    const observer = new LocalManagedAgentProcessObserver();
+    const unrelated = spawn(
+      process.execPath,
+      ["-e", "setInterval(() => {}, 1000)"],
+      { stdio: "ignore", windowsHide: true },
+    );
+    await once(unrelated, "spawn");
+    let fixturePids: readonly number[] = [];
+    let inferenceTurn = 0;
+    const server = createServer((request, response) => {
+      if (request.method === "HEAD" && request.url === "/api/hello") {
+        response.writeHead(200).end();
+        return;
+      }
+      if (
+        request.method !== "POST" ||
+        request.url?.split("?")[0] !== "/v1/messages"
+      ) {
+        response.writeHead(404).end();
+        return;
+      }
+      request.resume();
+      request.once("end", () => {
+        inferenceTurn += 1;
+        writeToolUseResponse(response, inferenceTurn, {
+          id: "toolu_loopback_l2_bash",
+          name: "Bash",
+          input: { command: fixture.l2BashCommand },
+        });
+      });
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    try {
+      const address = server.address() as AddressInfo;
+      const ids = [RUN_ID, EXECUTION_ID];
+      const result = await runManagedAgentProbe(
+        {
+          scenario: "L2",
+          workspaceRoot: fixture.workspaceRoot,
+          configRoot: fixture.configRoot,
+          target: "sonnet-5",
+          gatewayOrigin: `http://127.0.0.1:${address.port}`,
+          gatewayCredential: "sk-ant-api03-local-loopback-only",
+          prompt: fixture.prompt("L2"),
+          maxTurns: 4,
+          maxBudgetUsd: 0.25,
+          allowedBashCommands: [fixture.l2BashCommand],
+          pathRoleBindings: [],
+          expectedL1FinalBytes: [],
+          preservePaths: [
+            FIXTURE_PATHS.dirtySentinel,
+            FIXTURE_PATHS.untrackedSentinel,
+          ],
+        },
+        {
+          hermeticGatewayOrigin: `http://127.0.0.1:${address.port}`,
+          processObserver: observer,
+          queryFactory: ({ prompt, options }) =>
+            agentSdkQuery({ prompt, options }),
+          waitForCancellationSignal: async (signal) => {
+            fixturePids = await waitForManagedAgentFixturePids(
+              fixture,
+              10_000,
+              signal,
+            );
+            const readiness = await observer.prepareCancellation();
+            expect(readiness).toMatchObject({
+              supported: true,
+              reason: "ready",
+              containmentSupported: true,
+              ownershipProven: true,
+            });
+            expect(
+              fixturePids.every((pid) => readiness.observedPids.includes(pid)),
+            ).toBe(true);
+          },
+          uuid: () => {
+            const id = ids.shift();
+            if (!id) throw new Error("unexpected UUID request");
+            return id;
+          },
+        },
+      );
+
+      expect(inferenceTurn).toBe(1);
+      expect(result.terminal).toBe("cancelled");
+      expect(result.cancellationRequested).toBe(true);
+      expect(result.queryClosed).toBe(true);
+      expect(result.teardown).toMatchObject({
+        quiescent: true,
+        deadlineMet: true,
+        processTableAvailable: true,
+        containmentSupported: true,
+        ownershipProven: true,
+        forceKillIssued: true,
+        alivePidsAtDeadline: [],
+      });
+      expect(fixturePids).toHaveLength(2);
+      expect(fixturePids.every((pid) => !processExists(pid))).toBe(true);
+      expect(processExists(unrelated.pid!)).toBe(true);
+    } finally {
+      await observer.emergencyCleanup(1_000);
+      observer.dispose();
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      for (const pid of fixturePids) {
+        if (!processExists(pid)) continue;
+        await forceKillTestProcess(pid);
+      }
+      if (typeof unrelated.pid === "number" && processExists(unrelated.pid)) {
+        unrelated.kill("SIGKILL");
+        await waitForProcessDeath(unrelated.pid);
+      }
+      await fixture.cleanup();
+    }
+  },
+  20_000,
+);
+
+it.skipIf(
+  process.platform === "win32" ||
+    process.versions.node !== MANAGED_AGENT_CONTRACT.certificationNodeVersion,
+)(
+  "contains the real SDK L2 Bash group when readiness fails before cancellation",
+  async () => {
+    const fixture = await createManagedAgentFixture(
+      () => "loopback-l2-early-error",
+    );
+    const observer = new LocalManagedAgentProcessObserver();
+    let fixturePids: readonly number[] = [];
+    let inferenceTurn = 0;
+    const server = createServer((request, response) => {
+      if (request.method === "HEAD" && request.url === "/api/hello") {
+        response.writeHead(200).end();
+        return;
+      }
+      if (
+        request.method !== "POST" ||
+        request.url?.split("?")[0] !== "/v1/messages"
+      ) {
+        response.writeHead(404).end();
+        return;
+      }
+      request.resume();
+      request.once("end", () => {
+        inferenceTurn += 1;
+        writeToolUseResponse(response, inferenceTurn, {
+          id: "toolu_loopback_l2_early_error",
+          name: "Bash",
+          input: { command: fixture.l2BashCommand },
+        });
+      });
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    try {
+      const address = server.address() as AddressInfo;
+      const ids = [RUN_ID, EXECUTION_ID];
+      const result = await runManagedAgentProbe(
+        {
+          scenario: "L2",
+          workspaceRoot: fixture.workspaceRoot,
+          configRoot: fixture.configRoot,
+          target: "sonnet-5",
+          gatewayOrigin: `http://127.0.0.1:${address.port}`,
+          gatewayCredential: "sk-ant-api03-local-loopback-only",
+          prompt: fixture.prompt("L2"),
+          maxTurns: 4,
+          maxBudgetUsd: 0.25,
+          allowedBashCommands: [fixture.l2BashCommand],
+          pathRoleBindings: [],
+          expectedL1FinalBytes: [],
+          preservePaths: [
+            FIXTURE_PATHS.dirtySentinel,
+            FIXTURE_PATHS.untrackedSentinel,
+          ],
+        },
+        {
+          hermeticGatewayOrigin: `http://127.0.0.1:${address.port}`,
+          processObserver: observer,
+          queryFactory: ({ prompt, options }) =>
+            agentSdkQuery({ prompt, options }),
+          waitForCancellationSignal: async (signal) => {
+            fixturePids = await waitForManagedAgentFixturePids(
+              fixture,
+              10_000,
+              signal,
+            );
+            throw new Error("synthetic readiness failure");
+          },
+          uuid: () => {
+            const id = ids.shift();
+            if (!id) throw new Error("unexpected UUID request");
+            return id;
+          },
+        },
+      );
+
+      expect(inferenceTurn).toBe(1);
+      expect(result.terminal).toBe("query_error");
+      expect(result.cancellationRequested).toBe(false);
+      expect(result.terminationEvidence).toEqual({
+        beforePolicyOverride: "query_error",
+        queryExecution: "iteration_aborted",
+        sdkResult: "not_observed",
+      });
+      expect(result.queryClosed).toBe(true);
+      expect(result.teardown).toMatchObject({
+        quiescent: true,
+        deadlineMet: true,
+        processTableAvailable: true,
+        containmentSupported: true,
+        forceKillIssued: true,
+        alivePidsAtDeadline: [],
+      });
+      expect(fixturePids).toHaveLength(2);
+      expect(fixturePids.every((pid) => !processExists(pid))).toBe(true);
+    } finally {
+      await observer.emergencyCleanup(1_000);
+      observer.dispose();
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      for (const pid of fixturePids) {
+        if (!processExists(pid)) continue;
+        await forceKillTestProcess(pid);
+      }
+      await fixture.cleanup();
+    }
+  },
+  20_000,
+);
 
 it.skipIf(
   process.versions.node !== MANAGED_AGENT_CONTRACT.certificationNodeVersion,

@@ -411,6 +411,8 @@ export async function runManagedAgentProbe(
     evalSource,
     executionId,
   });
+  const processObserver =
+    dependencies.processObserver ?? createLocalManagedAgentProcessObserver();
   const policyBoundary = createManagedAgentPolicyBoundary({
     canonicalWorkspaceRoot: validated.canonicalWorkspaceRoot,
     allowedBuiltinTools:
@@ -422,14 +424,20 @@ export async function runManagedAgentProbe(
       config.scenario === "L1" ? mcpRuntime.qualifiedToolNames : [],
     pathRoleBindings: config.pathRoleBindings,
     requireRegisteredFilePaths: config.scenario === "L1",
-    onDecision: (evidence) => recorder.recordPermission(evidence),
+    onDecision: (evidence) => {
+      recorder.recordPermission(evidence);
+      if (
+        config.scenario === "L2" &&
+        evidence.source === "pre_tool_use" &&
+        evidence.toolName === "Bash" &&
+        evidence.decision === "allow" &&
+        evidence.reason === "exact_bash_command"
+      ) {
+        processObserver.armToolProcessContainment();
+      }
+    },
     onGuardRejection: (diagnostic) => guardRejections.push(diagnostic),
   });
-  const processObserver =
-    dependencies.processObserver ?? createLocalManagedAgentProcessObserver();
-  // SpawnOptions.signal is forwarded only after the SDK's graceful close.
-  // Bind the raw per-run abort signal so L2 containment starts synchronously.
-  processObserver.bindAbortSignal(abortController.signal);
 
   const options: Options = {
     abortController,
@@ -577,6 +585,13 @@ export async function runManagedAgentProbe(
         triggerController.abort();
         if (cancellationTask) await cancellationTask;
         queryFailed ||= cancellationTriggerFailed;
+        // Give the SDK its documented graceful-shutdown path before host
+        // fallback containment. The observer binds only SpawnOptions.signal,
+        // which the SDK forwards after stdin EOF and its bounded grace period.
+        if (queryFailed && !abortController.signal.aborted) {
+          abortStartedAt = (dependencies.now ?? Date.now)();
+          abortController.abort();
+        }
         if (query) {
           const now = dependencies.now ?? Date.now;
           const closeBudgetMs =

@@ -4,7 +4,7 @@ import {
   type ChildProcess,
   type ChildProcessWithoutNullStreams,
 } from "node:child_process";
-import { writeFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import type { SpawnedProcess } from "@anthropic-ai/claude-agent-sdk";
@@ -72,6 +72,34 @@ child.once("message", () => {
 });
 `;
 
+const LATE_REGISTERED_TOOL_SCRIPT = String.raw`
+import { spawn } from "node:child_process";
+import { writeFileSync } from "node:fs";
+
+const [toolScript, pidFile, launchFile] = process.argv.slice(1);
+const tool = spawn(
+  "/bin/bash",
+  [
+    "--noprofile",
+    "--norc",
+    "-c",
+    'sleep 0.25; exec "$1" "$2" "$3" --register-control',
+    "managed-agent-tool",
+    process.execPath,
+    toolScript,
+    pidFile,
+  ],
+  {
+    detached: true,
+    env: process.env,
+    stdio: "ignore",
+    windowsHide: true,
+  },
+);
+writeFileSync(launchFile, JSON.stringify({ processGroupId: tool.pid }));
+tool.unref();
+`;
+
 function asChildProcess(
   spawned: SpawnedProcess,
 ): ChildProcessWithoutNullStreams {
@@ -108,6 +136,33 @@ async function waitForTestProcessDeath(
   if (isAlive()) throw new Error(`${description} survived test cleanup`);
 }
 
+async function waitForLaunchedGroupId(
+  path: string,
+  timeoutMs = 1_000,
+): Promise<number> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      const payload = JSON.parse(await readFile(path, "utf8")) as {
+        processGroupId?: unknown;
+      };
+      if (
+        typeof payload.processGroupId === "number" &&
+        Number.isSafeInteger(payload.processGroupId) &&
+        payload.processGroupId > 1
+      ) {
+        return payload.processGroupId;
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    if (Date.now() >= deadline) {
+      throw new Error("Timed out waiting for detached tool launch evidence");
+    }
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
+  }
+}
+
 async function forceKillExactTestGroup(
   processGroupId: number,
   root: ChildProcess,
@@ -132,6 +187,20 @@ async function forceKillExactTestGroup(
       ),
     ]);
   }
+}
+
+async function forceKillExactTestGroupId(
+  processGroupId: number,
+): Promise<void> {
+  try {
+    process.kill(-processGroupId, "SIGKILL");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+  }
+  await waitForTestProcessDeath(
+    () => processGroupExists(processGroupId),
+    `Owned process group ${processGroupId}`,
+  );
 }
 
 async function forceKillExactTestProcess(child: ChildProcess): Promise<void> {
@@ -488,6 +557,123 @@ describe("LocalManagedAgentProcessObserver", () => {
     "retains owned group authority when the SDK root exits after readiness while its child survives",
     () => proveRetainedGroupAuthority("after-readiness"),
     10_000,
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "contains a detached tool group that authenticates after the SDK group has exited",
+    async () => {
+      const fixture = await createManagedAgentFixture(
+        () => "late-tool-registration",
+      );
+      fixtures.push(fixture);
+      const observer = new LocalManagedAgentProcessObserver();
+      const forwardedController = new AbortController();
+      const unrelated = spawnChild(
+        process.execPath,
+        ["-e", "setInterval(() => {}, 1000)"],
+        { stdio: "ignore", windowsHide: true },
+      );
+      await once(unrelated, "spawn");
+      const launchFile = join(
+        fixture.workspaceRoot,
+        FIXTURE_PATHS.processDirectory,
+        "late-tool-launch.json",
+      );
+      let anchor: ChildProcessWithoutNullStreams | undefined;
+      let detachedToolGroupId: number | undefined;
+      try {
+        observer.armToolProcessContainment();
+        anchor = asChildProcess(
+          observer.spawn({
+            command: process.execPath,
+            args: [
+              "--input-type=module",
+              "--eval",
+              LATE_REGISTERED_TOOL_SCRIPT,
+              join(fixture.workspaceRoot, FIXTURE_PATHS.processScript),
+              join(fixture.workspaceRoot, FIXTURE_PATHS.processPidFile),
+              launchFile,
+            ],
+            cwd: fixture.workspaceRoot,
+            env: { ...process.env },
+            signal: forwardedController.signal,
+          }),
+        );
+        detachedToolGroupId = await waitForLaunchedGroupId(launchFile);
+        if (anchor.exitCode === null && anchor.signalCode === null) {
+          await once(anchor, "exit");
+        }
+        expect(processGroupExists(detachedToolGroupId)).toBe(true);
+
+        const teardown = await observer.emergencyCleanup(1_000);
+
+        expect(teardown).toMatchObject({
+          quiescent: true,
+          deadlineMet: true,
+          processTableAvailable: true,
+          containmentSupported: true,
+          emergencyCleanupAttempted: true,
+          alivePidsAtDeadline: [],
+        });
+        expect(teardown.observedPids).toContain(detachedToolGroupId);
+        expect(processGroupExists(detachedToolGroupId)).toBe(false);
+        expect(processExists(unrelated.pid!)).toBe(true);
+      } finally {
+        forwardedController.abort();
+        if (
+          typeof detachedToolGroupId === "number" &&
+          processGroupExists(detachedToolGroupId)
+        ) {
+          await forceKillExactTestGroupId(detachedToolGroupId);
+        }
+        if (anchor && typeof anchor.pid === "number") {
+          await forceKillExactTestGroup(anchor.pid, anchor);
+        }
+        observer.dispose();
+        await forceKillExactTestProcess(unrelated);
+      }
+    },
+    10_000,
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "never reports an armed but unregistered tool scope as quiescent",
+    async () => {
+      const observer = new LocalManagedAgentProcessObserver();
+      const controller = new AbortController();
+      observer.armToolProcessContainment();
+      const anchor = asChildProcess(
+        observer.spawn({
+          command: process.execPath,
+          args: ["-e", "process.exit(0)"],
+          cwd: process.cwd(),
+          env: { ...process.env },
+          signal: controller.signal,
+        }),
+      );
+      try {
+        if (anchor.exitCode === null && anchor.signalCode === null) {
+          await once(anchor, "exit");
+        }
+        await expect(observer.waitForQuiescence(50)).resolves.toMatchObject({
+          quiescent: false,
+          deadlineMet: false,
+          containmentSupported: false,
+        });
+        await expect(observer.emergencyCleanup(50)).resolves.toMatchObject({
+          quiescent: false,
+          deadlineMet: false,
+          containmentSupported: false,
+        });
+      } finally {
+        controller.abort();
+        if (typeof anchor.pid === "number") {
+          await forceKillExactTestGroup(anchor.pid, anchor);
+        }
+        observer.dispose();
+      }
+    },
+    5_000,
   );
 
   it("bounds a hanging process-table read and never turns unknown observation into quiescence", async () => {

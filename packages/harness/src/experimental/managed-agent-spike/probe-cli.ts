@@ -834,9 +834,11 @@ export function evaluateManagedAgentProbe(
       },
       {
         id: "no_fixture_process_alive",
-        passed: fixturePids.every(
-          (pid) => !result.teardown.alivePidsAtDeadline.includes(pid),
-        ),
+        passed:
+          fixturePids.length === 2 &&
+          fixturePids.every(
+            (pid) => !result.teardown.alivePidsAtDeadline.includes(pid),
+          ),
       },
     );
   }

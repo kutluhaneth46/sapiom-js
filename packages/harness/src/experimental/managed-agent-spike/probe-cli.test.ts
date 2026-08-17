@@ -1071,6 +1071,11 @@ describe("managed-agent probe CLI", () => {
         { id: "l2_containment_prepared", passed: true },
       ]),
     });
+    expect(
+      evaluateManagedAgentProbe(passing).checks.find(
+        ({ id }) => id === "no_fixture_process_alive",
+      ),
+    ).toEqual({ id: "no_fixture_process_alive", passed: false });
 
     const writeId = `tool_${"d".repeat(64)}`;
     const invalid: ManagedAgentProbeResult = {

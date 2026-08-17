@@ -16,6 +16,10 @@ import { tmpdir } from "node:os";
 import { basename, join, relative, resolve } from "node:path";
 
 import { MANAGED_AGENT_L1_CERTIFICATION_CONTRACT } from "./contract.js";
+import {
+  MANAGED_AGENT_TOOL_CONTROL_CAPABILITY_ENV,
+  MANAGED_AGENT_TOOL_CONTROL_SOCKET_ENV,
+} from "./process-observer.js";
 import type {
   ManagedAgentL1ExpectedFileHash,
   ManagedAgentL1FinalByteObservation,
@@ -77,9 +81,18 @@ function shellQuote(value: string): string {
 const LONG_RUNNING_SCRIPT = `
 import { spawn } from "node:child_process";
 import { writeFileSync } from "node:fs";
+import { createConnection } from "node:net";
 import { resolve } from "node:path";
 
 const pidFile = resolve(process.argv[2]);
+const requireControlRegistration = process.argv[3] === "--register-control";
+const controlSocket = process.env[${JSON.stringify(MANAGED_AGENT_TOOL_CONTROL_SOCKET_ENV)}];
+const controlCapability = process.env[${JSON.stringify(MANAGED_AGENT_TOOL_CONTROL_CAPABILITY_ENV)}];
+delete process.env[${JSON.stringify(MANAGED_AGENT_TOOL_CONTROL_SOCKET_ENV)}];
+delete process.env[${JSON.stringify(MANAGED_AGENT_TOOL_CONTROL_CAPABILITY_ENV)}];
+if (requireControlRegistration && (!controlSocket || !controlCapability)) {
+  throw new Error("managed-agent tool control capability missing");
+}
 process.on("SIGTERM", () => {});
 const childProgram = [
   'process.on("SIGTERM", () => {});',
@@ -90,9 +103,39 @@ const child = spawn(process.execPath, ["-e", childProgram], {
   stdio: ["ignore", "ignore", "ignore", "ipc"],
   windowsHide: true,
 });
-child.once("message", () => {
+let childReady = false;
+let controlReady = !requireControlRegistration;
+const publishReadiness = () => {
+  if (!childReady || !controlReady) return;
   writeFileSync(pidFile, JSON.stringify({ parentPid: process.pid, childPid: child.pid }));
+};
+child.once("message", () => {
+  childReady = true;
+  publishReadiness();
 });
+const connectControl = () => {
+  if (!controlSocket || !controlCapability) return;
+  const socket = createConnection(controlSocket);
+  socket.unref();
+  socket.setEncoding("utf8");
+  let response = "";
+  socket.once("connect", () => {
+    socket.write(JSON.stringify({ capability: controlCapability, pid: process.pid }) + "\\n");
+  });
+  socket.on("data", (chunk) => {
+    response += chunk;
+    if (!response.includes("\\n")) return;
+    if (!response.includes('"registered":true')) {
+      throw new Error("managed-agent tool registration rejected");
+    }
+    controlReady = true;
+    publishReadiness();
+  });
+  socket.once("error", () => {
+    if (!controlReady) setTimeout(connectControl, 10);
+  });
+};
+if (requireControlRegistration) connectControl();
 setInterval(() => {}, 1000);
 `.trimStart();
 
@@ -271,6 +314,7 @@ export async function createManagedAgentFixture(
     shellQuote(process.execPath),
     shellQuote(FIXTURE_PATHS.processScript),
     shellQuote(FIXTURE_PATHS.processPidFile),
+    shellQuote("--register-control"),
   ].join(" ");
   const pathRoleBindings = [
     { path: FIXTURE_PATHS.cleanTarget, role: "clean_target" },

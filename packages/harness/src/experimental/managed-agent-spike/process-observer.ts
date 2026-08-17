@@ -3,6 +3,15 @@ import {
   spawn as spawnChild,
   type ChildProcessWithoutNullStreams,
 } from "node:child_process";
+import { randomBytes, timingSafeEqual } from "node:crypto";
+import { chmodSync, mkdtempSync, rmSync } from "node:fs";
+import {
+  createServer,
+  type Server as NetServer,
+  type Socket as NetSocket,
+} from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { promisify } from "node:util";
 
 import type {
@@ -22,6 +31,11 @@ const QUIESCENCE_POLL_MS = 25;
 export const MANAGED_AGENT_PROCESS_HELPER_TIMEOUT_MS = 200;
 const MANAGED_AGENT_SUPERVISOR_PAYLOAD_ENV =
   "SAPIOM_MANAGED_AGENT_SUPERVISOR_PAYLOAD";
+export const MANAGED_AGENT_TOOL_CONTROL_SOCKET_ENV =
+  "SAPIOM_MANAGED_AGENT_TOOL_CONTROL_SOCKET";
+export const MANAGED_AGENT_TOOL_CONTROL_CAPABILITY_ENV =
+  "SAPIOM_MANAGED_AGENT_TOOL_CONTROL_CAPABILITY";
+const TOOL_REGISTRATION_MAX_BYTES = 1_024;
 
 /**
  * The POSIX supervisor is the observer-owned process-group leader. The real
@@ -255,6 +269,22 @@ interface OwnedRoot {
   forceKillIssued: boolean;
 }
 
+interface PendingToolRegistration {
+  readonly pid: number;
+  readonly socket: NetSocket;
+}
+
+interface OwnedToolGroup {
+  readonly registeredPid: number;
+  readonly registeredIdentity: ManagedAgentKernelProcessRecord;
+  readonly processGroupId: number;
+  readonly groupLeaderIdentity?: ManagedAgentKernelProcessRecord;
+  containmentSupported: boolean;
+  ownershipProven: boolean;
+  stopIssued: boolean;
+  forceKillIssued: boolean;
+}
+
 interface ObservedIdentity {
   readonly rootPid: number;
   readonly record: ManagedAgentKernelProcessRecord;
@@ -269,6 +299,15 @@ function sameProcess(
   right: ManagedAgentKernelProcessRecord | undefined,
 ): boolean {
   return Boolean(left && right && left.startedAt === right.startedAt);
+}
+
+function sameCapability(left: string, right: string): boolean {
+  const leftBytes = Buffer.from(left, "utf8");
+  const rightBytes = Buffer.from(right, "utf8");
+  return (
+    leftBytes.byteLength === rightBytes.byteLength &&
+    timingSafeEqual(leftBytes, rightBytes)
+  );
 }
 
 async function windowsProcessTable(): Promise<ManagedAgentKernelProcessTable> {
@@ -416,21 +455,20 @@ function descendantsOf(
 }
 
 /**
- * E0.4 deliberately certifies one narrow containment model: the exact local
- * L2 fixture running inside an observer-owned detached POSIX process group.
- * Before abort, bounded host enumeration must observe the persistent trusted
- * supervisor ChildProcess as its PGID leader and observe the fixture PIDs in
- * that group. The supervisor remains the group anchor if the inner SDK root
- * exits while a descendant survives. Independently, the detached spawn plus
- * the active supervisor handle are safe signal authority, so even a failed
- * evidence preflight can synchronously stop and kill the owned group without
- * leaking it. Such a run still fails certification.
+ * E0.4 deliberately certifies one narrow containment model. The SDK command
+ * runs in an observer-owned POSIX process group. The exact host-created L2
+ * fixture additionally authenticates over a private one-shot Unix socket
+ * outside the workspace and keeps that connection open. A random capability,
+ * a primary exact-Bash policy latch, and a fresh kernel table jointly grant
+ * fallback signal authority for the fixture's distinct PGID. The capability
+ * remains sufficient if SDK cleanup has already reparented the live fixture;
+ * this exception is safe only because L2 permits one immutable trusted command.
  *
- * This is not a universal sandbox or process-tree killer. Windows, an inactive
- * or invalid supervisor anchor, unavailable enumeration, and an observed
- * setsid/group escape all fail certification closed. POSIX `lstart` is
- * evidence only and never authorizes an individual or group signal. Workspace
- * PID-file contents never enter this class and can never become authority.
+ * This is not universal built-in Bash containment or a process-tree killer.
+ * Windows, an unavailable process table, an unauthenticated tool process, or
+ * identity drift fail certification closed. POSIX `lstart` remains evidence,
+ * not authority. Workspace PID-file contents never enter this class and can
+ * never become signal authority.
  */
 export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObserver {
   readonly #platform: NodeJS.Platform;
@@ -449,6 +487,17 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
   readonly #observedPids = new Set<number>();
   readonly #sampler: NodeJS.Timeout;
   readonly #boundSignals = new WeakSet<AbortSignal>();
+  readonly #toolControlCapability = randomBytes(32).toString("base64url");
+  readonly #toolControlSockets = new Set<NetSocket>();
+  #toolControlDirectory: string | undefined;
+  #toolControlSocketPath: string | undefined;
+  #toolControlServer: NetServer | undefined;
+  #toolControlAvailable = false;
+  #toolControlFailed = false;
+  #toolProcessContainmentArmed = false;
+  #pendingToolRegistration: PendingToolRegistration | undefined;
+  #ownedToolGroup: OwnedToolGroup | undefined;
+  #fallbackCleanupRequested = false;
   #lastTable: ManagedAgentKernelProcessTable | undefined;
   #processTableAvailable = false;
   #sampleTask: Promise<boolean> | undefined;
@@ -464,6 +513,9 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
       options.signalProcessGroup ?? defaultSignalProcessGroup;
     this.#now = options.now ?? Date.now;
     this.#delay = options.delay ?? defaultDelay;
+    if (this.#platform === "darwin" || this.#platform === "linux") {
+      this.#startToolControlServer();
+    }
     this.#sampler = setInterval(
       () => void this.observeProcessTree(),
       SAMPLE_INTERVAL_MS,
@@ -471,13 +523,104 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
     this.#sampler.unref();
   }
 
+  #startToolControlServer(): void {
+    try {
+      const directory = mkdtempSync(
+        join(tmpdir(), "sapiom-managed-agent-control-"),
+      );
+      chmodSync(directory, 0o700);
+      const socketPath = join(directory, "tool.sock");
+      const server = createServer((socket) =>
+        this.#receiveToolRegistration(socket),
+      );
+      this.#toolControlDirectory = directory;
+      this.#toolControlSocketPath = socketPath;
+      this.#toolControlServer = server;
+      server.once("listening", () => {
+        this.#toolControlAvailable = true;
+      });
+      server.on("error", () => {
+        this.#toolControlAvailable = false;
+        this.#toolControlFailed = true;
+      });
+      server.listen(socketPath);
+      server.unref();
+    } catch {
+      this.#toolControlAvailable = false;
+      this.#toolControlFailed = true;
+    }
+  }
+
+  #receiveToolRegistration(socket: NetSocket): void {
+    this.#toolControlSockets.add(socket);
+    socket.on("error", () => undefined);
+    socket.once("close", () => this.#toolControlSockets.delete(socket));
+    let body = "";
+    let handled = false;
+    const reject = (): void => {
+      handled = true;
+      socket.destroy();
+    };
+    socket.on("data", (chunk: Buffer) => {
+      if (handled) return;
+      body += chunk.toString("utf8");
+      if (Buffer.byteLength(body, "utf8") > TOOL_REGISTRATION_MAX_BYTES) {
+        reject();
+        return;
+      }
+      const newline = body.indexOf("\n");
+      if (newline < 0) return;
+      handled = true;
+      let payload: { capability?: unknown; pid?: unknown };
+      try {
+        payload = JSON.parse(body.slice(0, newline)) as typeof payload;
+      } catch {
+        socket.destroy();
+        return;
+      }
+      if (
+        !this.#toolProcessContainmentArmed ||
+        this.#pendingToolRegistration ||
+        this.#ownedToolGroup ||
+        typeof payload.capability !== "string" ||
+        !sameCapability(payload.capability, this.#toolControlCapability) ||
+        typeof payload.pid !== "number" ||
+        !Number.isSafeInteger(payload.pid) ||
+        payload.pid <= 1
+      ) {
+        socket.destroy();
+        return;
+      }
+      this.#pendingToolRegistration = { pid: payload.pid, socket };
+      void this.observeProcessTree();
+    });
+  }
+
   public bindAbortSignal(signal: AbortSignal): void {
     if (this.#boundSignals.has(signal)) return;
     this.#boundSignals.add(signal);
-    signal.addEventListener("abort", () => this.#forceStopKillSynchronously(), {
-      once: true,
-    });
-    if (signal.aborted) this.#forceStopKillSynchronously();
+    signal.addEventListener(
+      "abort",
+      () => {
+        this.#fallbackCleanupRequested = true;
+        this.#forceStopKillSynchronously();
+      },
+      { once: true },
+    );
+    if (signal.aborted) {
+      this.#fallbackCleanupRequested = true;
+      this.#forceStopKillSynchronously();
+    }
+  }
+
+  public armToolProcessContainment(): void {
+    if (this.#toolProcessContainmentArmed) return;
+    this.#toolProcessContainmentArmed = true;
+    if (this.#toolControlFailed) {
+      for (const root of this.#roots.values()) {
+        root.containmentSupported = false;
+      }
+    }
   }
 
   public spawn(options: SpawnOptions): SpawnedProcess {
@@ -503,6 +646,14 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
                   }),
                   "utf8",
                 ).toString("base64url"),
+                ...(this.#toolControlSocketPath
+                  ? {
+                      [MANAGED_AGENT_TOOL_CONTROL_SOCKET_ENV]:
+                        this.#toolControlSocketPath,
+                      [MANAGED_AGENT_TOOL_CONTROL_CAPABILITY_ENV]:
+                        this.#toolControlCapability,
+                    }
+                  : {}),
               },
               detached: true,
               stdio: ["pipe", "pipe", "pipe", "ipc"],
@@ -554,8 +705,8 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
       });
       this.#observedPids.add(pid);
       // The SDK's forwarded SpawnOptions.signal arrives only after its own
-      // graceful close. Keep it as an idempotent fallback; runtime binds the
-      // raw Options.abortController signal before query construction.
+      // graceful close. Keep it as an idempotent fallback; runtime deliberately
+      // does not bind the raw Options.abortController to host process signals.
       this.bindAbortSignal(options.signal);
       void this.observeProcessTree();
     }
@@ -586,6 +737,68 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
     } finally {
       if (timeout) clearTimeout(timeout);
     }
+  }
+
+  #observeToolProcessContainment(table: ManagedAgentKernelProcessTable): void {
+    const pending = this.#pendingToolRegistration;
+    if (pending && !pending.socket.destroyed && !this.#ownedToolGroup) {
+      const registeredIdentity = table.get(pending.pid);
+      const processGroupId = registeredIdentity?.processGroupId;
+      const hostProcessGroupId = table.get(process.pid)?.processGroupId;
+      if (
+        registeredIdentity &&
+        typeof processGroupId === "number" &&
+        typeof hostProcessGroupId === "number" &&
+        processGroupId > 1 &&
+        processGroupId !== hostProcessGroupId &&
+        !this.#roots.has(processGroupId)
+      ) {
+        const groupLeaderIdentity = table.get(processGroupId);
+        if (
+          !groupLeaderIdentity ||
+          groupLeaderIdentity.processGroupId === processGroupId
+        ) {
+          this.#ownedToolGroup = {
+            registeredPid: pending.pid,
+            registeredIdentity,
+            processGroupId,
+            ...(groupLeaderIdentity ? { groupLeaderIdentity } : {}),
+            containmentSupported: true,
+            ownershipProven: true,
+            stopIssued: false,
+            forceKillIssued: false,
+          };
+          this.#pendingToolRegistration = undefined;
+          pending.socket.write('{"registered":true}\n');
+        }
+      }
+    }
+
+    const owned = this.#ownedToolGroup;
+    if (!owned) return;
+    const currentRegistered = table.get(owned.registeredPid);
+    if (
+      currentRegistered &&
+      (!sameProcess(owned.registeredIdentity, currentRegistered) ||
+        currentRegistered.processGroupId !== owned.processGroupId)
+    ) {
+      owned.containmentSupported = false;
+    }
+    if (owned.groupLeaderIdentity) {
+      const currentLeader = table.get(owned.processGroupId);
+      if (
+        currentLeader &&
+        !sameProcess(owned.groupLeaderIdentity, currentLeader)
+      ) {
+        owned.containmentSupported = false;
+      }
+    }
+    for (const [pid, record] of table) {
+      if (record.processGroupId === owned.processGroupId) {
+        this.#observedPids.add(pid);
+      }
+    }
+    if (this.#fallbackCleanupRequested) this.#forceStopKillSynchronously();
   }
 
   public async observeProcessTree(
@@ -672,6 +885,7 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
             this.#observedPids.add(pid);
           }
         }
+        this.#observeToolProcessContainment(table);
         return true;
       })().finally(() => {
         this.#sampleTask = undefined;
@@ -705,9 +919,12 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
       supported: false,
       reason,
       processTableAvailable: this.#processTableAvailable,
-      containmentSupported: [...this.#roots.values()].every(
-        ({ containmentSupported }) => containmentSupported,
-      ),
+      containmentSupported:
+        [...this.#roots.values()].every(
+          ({ containmentSupported }) => containmentSupported,
+        ) &&
+        (!this.#toolProcessContainmentArmed ||
+          Boolean(this.#ownedToolGroup?.containmentSupported)),
       ownershipProven: false,
       observedPids: observedPids(),
     });
@@ -735,6 +952,18 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
       root.containmentSupported = false;
       return unsupported("root_not_group_leader");
     }
+    if (this.#toolProcessContainmentArmed) {
+      if (
+        !this.#toolControlAvailable ||
+        !this.#ownedToolGroup ||
+        !this.#ownedToolGroup.ownershipProven
+      ) {
+        return unsupported("tool_process_not_registered");
+      }
+      if (!this.#ownedToolGroup.containmentSupported) {
+        return unsupported("tool_process_identity_invalid");
+      }
+    }
 
     root.ownershipProven = true;
     return {
@@ -749,16 +978,9 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
 
   #forceStopKillSynchronously(): void {
     if (this.#platform !== "darwin" && this.#platform !== "linux") return;
+    this.#fallbackCleanupRequested = true;
     for (const root of this.#roots.values()) {
-      if (root.forceKillIssued || !childActive(root.child)) {
-        continue;
-      }
-      // The detached observer-owned supervisor plus its still-active trusted
-      // ChildProcess handle are sufficient signal authority even when ps
-      // evidence is unavailable. The supervisor remains active across a fast
-      // inner SDK-root exit while any same-group descendant survives.
-      // Certification readiness remains false in that case. Second-resolution
-      // lstart and workspace PIDs are never signal authority.
+      if (root.forceKillIssued || !childActive(root.child)) continue;
       if (!root.stopIssued) {
         const stopOutcome = this.#signalProcessGroup(root.pid, "SIGSTOP");
         root.stopIssued = stopOutcome === "sent";
@@ -766,13 +988,42 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
           root.containmentSupported = false;
         }
       }
+    }
+    const toolGroup = this.#ownedToolGroup;
+    if (
+      toolGroup &&
+      toolGroup.containmentSupported &&
+      !toolGroup.forceKillIssued &&
+      !toolGroup.stopIssued
+    ) {
+      const stopOutcome = this.#signalProcessGroup(
+        toolGroup.processGroupId,
+        "SIGSTOP",
+      );
+      toolGroup.stopIssued = stopOutcome === "sent";
+      if (stopOutcome === "failure") {
+        toolGroup.containmentSupported = false;
+      }
+    }
+    if (
+      toolGroup &&
+      toolGroup.containmentSupported &&
+      !toolGroup.forceKillIssued
+    ) {
+      const killOutcome = this.#signalProcessGroup(
+        toolGroup.processGroupId,
+        "SIGKILL",
+      );
+      toolGroup.forceKillIssued = killOutcome === "sent";
+      if (killOutcome === "failure") {
+        toolGroup.containmentSupported = false;
+      }
+    }
+    for (const root of this.#roots.values()) {
+      if (root.forceKillIssued || !childActive(root.child)) continue;
       const killOutcome = this.#signalProcessGroup(root.pid, "SIGKILL");
       root.forceKillIssued = killOutcome === "sent";
-      if (killOutcome === "failure") {
-        // Keep the active/stopped group anchored so emergencyCleanup can retry
-        // SIGKILL safely, but certification evidence remains failed.
-        root.containmentSupported = false;
-      }
+      if (killOutcome === "failure") root.containmentSupported = false;
     }
   }
 
@@ -806,16 +1057,45 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
         }
       }
     }
+    const toolGroup = this.#ownedToolGroup;
+    if (this.#processTableAvailable) {
+      const table = this.#lastTable!;
+      if (toolGroup) {
+        for (const [pid, record] of table) {
+          if (record.processGroupId === toolGroup.processGroupId)
+            alive.add(pid);
+        }
+        const groupLiveness = this.#processGroupLiveness(
+          toolGroup.processGroupId,
+        );
+        if (groupLiveness === "alive") alive.add(toolGroup.processGroupId);
+        if (groupLiveness === "unknown") {
+          toolGroup.containmentSupported = false;
+        }
+      } else if (this.#pendingToolRegistration) {
+        if (table.has(this.#pendingToolRegistration.pid)) {
+          alive.add(this.#pendingToolRegistration.pid);
+        }
+      }
+    }
 
     const processTableAvailable =
       roots.length === 0 || this.#processTableAvailable;
-    const containmentSupported = roots.every(
-      ({ containmentSupported: supported }) => supported,
-    );
+    const containmentSupported =
+      roots.every(({ containmentSupported: supported }) => supported) &&
+      (!this.#toolProcessContainmentArmed ||
+        (this.#toolControlAvailable &&
+          Boolean(toolGroup?.containmentSupported)));
     const ownershipProven =
-      roots.length > 0 && roots.every(({ ownershipProven }) => ownershipProven);
+      roots.length > 0 &&
+      roots.every(({ ownershipProven }) => ownershipProven) &&
+      (!this.#toolProcessContainmentArmed ||
+        Boolean(toolGroup?.ownershipProven));
     const forceKillIssued =
-      roots.length > 0 && roots.every(({ forceKillIssued }) => forceKillIssued);
+      roots.length > 0 &&
+      roots.every(({ forceKillIssued }) => forceKillIssued) &&
+      (!this.#toolProcessContainmentArmed ||
+        Boolean(toolGroup?.forceKillIssued));
     const elapsedMs = Math.max(0, this.#now() - startedAt);
     const quiescent =
       processTableAvailable && containmentSupported && alive.size === 0;
@@ -877,6 +1157,16 @@ export class LocalManagedAgentProcessObserver implements ManagedAgentProcessObse
 
   public dispose(): void {
     clearInterval(this.#sampler);
+    for (const socket of this.#toolControlSockets) socket.destroy();
+    this.#toolControlSockets.clear();
+    this.#toolControlServer?.close();
+    if (this.#toolControlDirectory) {
+      try {
+        rmSync(this.#toolControlDirectory, { recursive: true, force: true });
+      } catch {
+        // Best-effort removal after the private listener and clients close.
+      }
+    }
   }
 }
 
