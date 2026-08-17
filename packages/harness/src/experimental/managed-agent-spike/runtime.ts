@@ -11,7 +11,7 @@ import { z } from "zod";
 
 import { validateManagedAgentProbeConfig } from "./contract.js";
 import { buildManagedAgentChildEnvironment } from "./environment.js";
-import { ManagedAgentEventRecorder } from "./events.js";
+import { ManagedAgentEventError, ManagedAgentEventRecorder } from "./events.js";
 import {
   captureManagedAgentWorkspaceSnapshot,
   diffManagedAgentWorkspaceSnapshots,
@@ -292,6 +292,8 @@ export async function runManagedAgentProbe(
   let queryClosed = false;
   let cancellationTriggerFailed = false;
   let policyPreflightFailed = false;
+  let promptEmbedded = false;
+  let eventNormalizationFailed = false;
 
   const childEnvironment = buildManagedAgentChildEnvironment({
     ambient: process.env,
@@ -389,15 +391,24 @@ export async function runManagedAgentProbe(
 
     if (!policyPreflightFailed) {
       try {
+        const prompt = buildManagedAgentCorrelationPrompt({
+          prompt: config.prompt,
+          evalSource,
+          executionId,
+        });
         query = (dependencies.queryFactory ?? defaultQueryFactory)({
-          prompt: buildManagedAgentCorrelationPrompt({
-            prompt: config.prompt,
-            evalSource,
-            executionId,
-          }),
+          prompt,
           options,
         });
-        for await (const event of query) recorder.observeSdkEvent(event);
+        promptEmbedded = true;
+        for await (const event of query) {
+          try {
+            recorder.observeSdkEvent(event);
+          } catch (error) {
+            eventNormalizationFailed = error instanceof ManagedAgentEventError;
+            throw error;
+          }
+        }
       } catch {
         if (!abortController.signal.aborted) queryFailed = true;
       } finally {
@@ -446,6 +457,7 @@ export async function runManagedAgentProbe(
     }
     policyHookCoverage =
       !policyPreflightFailed &&
+      !eventNormalizationFailed &&
       hasUniversalPolicyHookCoverage(
         recorder.toolEvidence,
         recorder.permissionEvidence,
@@ -496,7 +508,7 @@ export async function runManagedAgentProbe(
     cancellationRequested,
     queryClosed,
     teardown,
-    correlation: { executionId, evalSource, promptEmbedded: true },
+    correlation: { executionId, evalSource, promptEmbedded },
     ...(recorder.usage ? { sdkUsage: recorder.usage } : {}),
   };
 }

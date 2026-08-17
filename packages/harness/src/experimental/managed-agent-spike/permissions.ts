@@ -13,6 +13,7 @@ import type {
   ManagedAgentPermissionSource,
 } from "./types.js";
 import {
+  isBoundedManagedAgentToolUseId,
   normalizeManagedAgentToolUseId,
   sanitizeManagedAgentToolName,
 } from "./events.js";
@@ -321,14 +322,33 @@ export function createManagedAgentPolicyBoundary(
   ) => {
     const isPreToolUse = input.hook_event_name === "PreToolUse";
     const inputToolUseID = isPreToolUse ? input.tool_use_id : undefined;
-    const identifiersMatch =
-      !callbackToolUseID || callbackToolUseID === inputToolUseID;
-    const toolUseID =
-      callbackToolUseID ?? inputToolUseID ?? "invalid-tool-use-id";
+    if (!isPreToolUse || !isBoundedManagedAgentToolUseId(inputToolUseID)) {
+      return {
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "deny",
+          permissionDecisionReason: "Managed-agent policy: invalid_input",
+        },
+      };
+    }
+    if (
+      callbackToolUseID !== undefined &&
+      (!isBoundedManagedAgentToolUseId(callbackToolUseID) ||
+        callbackToolUseID !== inputToolUseID)
+    ) {
+      return {
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "deny",
+          permissionDecisionReason: "Managed-agent policy: invalid_input",
+        },
+      };
+    }
+    const toolUseID = inputToolUseID;
     const policy = await decide(
       toolUseID,
-      isPreToolUse ? input.tool_name : "unknown",
-      isPreToolUse && identifiersMatch ? input.tool_input : undefined,
+      input.tool_name,
+      input.tool_input,
       signal,
       "pre_tool_use",
     );
@@ -344,8 +364,15 @@ export function createManagedAgentPolicyBoundary(
     };
   };
 
-  const canUseToolFallback: CanUseTool = async (toolName, input, permission) =>
-    permissionResult(
+  const canUseToolFallback: CanUseTool = async (
+    toolName,
+    input,
+    permission,
+  ) => {
+    if (!isBoundedManagedAgentToolUseId(permission.toolUseID)) {
+      return permissionResult(denied("invalid_input"), permission.toolUseID);
+    }
+    return permissionResult(
       await decide(
         permission.toolUseID,
         toolName,
@@ -355,6 +382,7 @@ export function createManagedAgentPolicyBoundary(
       ),
       permission.toolUseID,
     );
+  };
 
   return { preToolUseHook, canUseToolFallback };
 }

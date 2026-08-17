@@ -10,7 +10,10 @@ import {
   createManagedAgentFixture,
   fixturePathExists,
 } from "./fixture.js";
-import { runManagedAgentProbe } from "./runtime.js";
+import {
+  qualifiedManagedAgentMcpToolName,
+  runManagedAgentProbe,
+} from "./runtime.js";
 
 const RUN_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const EXECUTION_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
@@ -20,12 +23,49 @@ const EVAL_SOURCE =
 const CORRELATION_MARKER = `SAPIOM_CERTIFICATION_CORRELATION_V1;eval_source=${EVAL_SOURCE};execution_id=${EXECUTION_ID}`;
 const ALLOWED_BASH_COMMAND = "git status --short";
 const DENIED_BASH_COMMAND = "touch denied-side-effect.txt";
+const ECHO_NONCE_TOOL = qualifiedManagedAgentMcpToolName("echo_nonce");
 
 interface LoopbackObservation {
   readonly headerNames: readonly string[];
   readonly evalSourceMatches: boolean;
   readonly executionIdMatches: boolean;
   readonly promptMarkerPresent: boolean;
+  readonly mcpResultMatches: boolean;
+}
+
+function containsExactText(value: unknown, expected: string): boolean {
+  if (value === expected) return true;
+  if (Array.isArray(value)) {
+    return value.some((entry) => containsExactText(entry, expected));
+  }
+  if (typeof value !== "object" || value === null) return false;
+  return Object.values(value).some((entry) =>
+    containsExactText(entry, expected),
+  );
+}
+
+function hasSuccessfulMcpResult(body: string, expectedNonce: string): boolean {
+  try {
+    const payload = JSON.parse(body) as { messages?: unknown };
+    if (!Array.isArray(payload.messages)) return false;
+    return payload.messages.some((message) => {
+      if (typeof message !== "object" || message === null) return false;
+      const content = (message as { content?: unknown }).content;
+      if (!Array.isArray(content)) return false;
+      return content.some((block) => {
+        if (typeof block !== "object" || block === null) return false;
+        const result = block as Record<string, unknown>;
+        return (
+          result.type === "tool_result" &&
+          result.tool_use_id === "toolu_loopback_mcp_echo" &&
+          result.is_error !== true &&
+          containsExactText(result.content, expectedNonce)
+        );
+      });
+    });
+  } catch {
+    return false;
+  }
 }
 
 function writeSseEvent(
@@ -136,7 +176,7 @@ function writeFinalResponse(response: ServerResponse, turn: number): void {
   response.end();
 }
 
-it("enforces every real-SDK Read/Bash call and carries exact correlation through loopback", async () => {
+it("enforces real-SDK built-in and in-process MCP calls with exact loopback correlation", async () => {
   const fixture = await createManagedAgentFixture(() => "loopback-nonce");
   const observations: LoopbackObservation[] = [];
   let helloCount = 0;
@@ -171,6 +211,7 @@ it("enforces every real-SDK Read/Bash call and carries exact correlation through
         executionIdMatches:
           request.headers["x-sapiom-execution-id"] === EXECUTION_ID,
         promptMarkerPresent: body.includes(CORRELATION_MARKER),
+        mcpResultMatches: hasSuccessfulMcpResult(body, fixture.nonce),
       });
       if (inferenceTurn === 1) {
         writeToolUseResponse(response, inferenceTurn, {
@@ -189,6 +230,12 @@ it("enforces every real-SDK Read/Bash call and carries exact correlation through
           id: "toolu_loopback_bash_deny",
           name: "Bash",
           input: { command: DENIED_BASH_COMMAND },
+        });
+      } else if (inferenceTurn === 4) {
+        writeToolUseResponse(response, inferenceTurn, {
+          id: "toolu_loopback_mcp_echo",
+          name: ECHO_NONCE_TOOL,
+          input: { nonce: fixture.nonce },
         });
       } else {
         writeFinalResponse(response, inferenceTurn);
@@ -234,7 +281,7 @@ it("enforces every real-SDK Read/Bash call and carries exact correlation through
     );
 
     expect(helloCount).toBeGreaterThanOrEqual(1);
-    expect(observations).toHaveLength(4);
+    expect(observations).toHaveLength(5);
     expect(
       observations.every(
         ({ headerNames, evalSourceMatches, executionIdMatches }) =>
@@ -247,6 +294,9 @@ it("enforces every real-SDK Read/Bash call and carries exact correlation through
     expect(
       observations.every(({ promptMarkerPresent }) => promptMarkerPresent),
     ).toBe(true);
+    expect(
+      observations.map(({ mcpResultMatches }) => mcpResultMatches),
+    ).toEqual([false, false, false, false, true]);
     expect(result.terminal).toBe("success");
 
     const requested = result.toolEvidence.filter(
@@ -256,6 +306,7 @@ it("enforces every real-SDK Read/Bash call and carries exact correlation through
       "Read",
       "Bash",
       "Bash",
+      ECHO_NONCE_TOOL,
     ]);
     for (const tool of requested) {
       expect(
@@ -285,6 +336,12 @@ it("enforces every real-SDK Read/Bash call and carries exact correlation through
           reason: "bash_command_not_allowed",
           source: "pre_tool_use",
         }),
+        expect.objectContaining({
+          toolName: ECHO_NONCE_TOOL,
+          decision: "allow",
+          reason: "managed_mcp_tool",
+          source: "pre_tool_use",
+        }),
       ]),
     );
     expect(result.toolEvidence).toEqual(
@@ -294,6 +351,25 @@ it("enforces every real-SDK Read/Bash call and carries exact correlation through
         expect.objectContaining({ toolName: "Bash", status: "error" }),
       ]),
     );
+    const requestedMcp = requested.find(
+      ({ toolName }) => toolName === ECHO_NONCE_TOOL,
+    );
+    expect(requestedMcp?.toolUseId).toBeDefined();
+    expect(
+      result.toolEvidence.filter(
+        ({ toolName, toolUseId, status }) =>
+          toolName === ECHO_NONCE_TOOL &&
+          toolUseId === requestedMcp?.toolUseId &&
+          status === "success",
+      ),
+    ).toHaveLength(1);
+    expect(
+      result.toolEvidence.filter(
+        ({ toolName, toolUseId }) =>
+          toolName === ECHO_NONCE_TOOL && toolUseId === undefined,
+      ),
+    ).toEqual([{ toolName: ECHO_NONCE_TOOL, status: "success" }]);
+    expect(result.policyHookCoverage).toBe(true);
     expect(
       await fixturePathExists(
         join(fixture.workspaceRoot, "denied-side-effect.txt"),

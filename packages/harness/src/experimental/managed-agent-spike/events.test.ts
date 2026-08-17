@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  MANAGED_AGENT_TOOL_USE_ID_MAX_LENGTH,
   ManagedAgentEventError,
   ManagedAgentEventRecorder,
   normalizeManagedAgentToolUseId,
@@ -186,6 +187,56 @@ describe("ManagedAgentEventRecorder", () => {
       "private-result",
     ]) {
       expect(serialized).not.toContain(secret);
+    }
+  });
+
+  it("rejects missing, empty, and overlong tool-use identifiers instead of normalizing sentinels", () => {
+    const invalidIds = [
+      undefined,
+      "",
+      "   ",
+      "x".repeat(MANAGED_AGENT_TOOL_USE_ID_MAX_LENGTH + 1),
+    ];
+    for (const invalidId of invalidIds) {
+      expect(() => normalizeManagedAgentToolUseId(invalidId)).toThrow(
+        ManagedAgentEventError,
+      );
+
+      const requested = new ManagedAgentEventRecorder("invalid-requested");
+      expect(() =>
+        requested.observeSdkEvent({
+          type: "assistant",
+          message: {
+            id: "bounded-message-id",
+            content: [
+              {
+                type: "tool_use",
+                id: invalidId,
+                name: "Read",
+                input: { file_path: "private-path" },
+              },
+            ],
+          },
+        }),
+      ).toThrow(ManagedAgentEventError);
+      expect(requested.toolEvidence).toEqual([]);
+
+      const completed = new ManagedAgentEventRecorder("invalid-completed");
+      expect(() =>
+        completed.observeSdkEvent({
+          type: "user",
+          message: {
+            content: [
+              {
+                type: "tool_result",
+                tool_use_id: invalidId,
+                content: "private-result",
+              },
+            ],
+          },
+        }),
+      ).toThrow(ManagedAgentEventError);
+      expect(completed.toolEvidence).toEqual([]);
     }
   });
 

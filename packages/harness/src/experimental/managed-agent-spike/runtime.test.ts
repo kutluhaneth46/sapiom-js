@@ -385,10 +385,27 @@ describe("runManagedAgentProbe", () => {
     expect(result.terminal).toBe("policy_violation");
     expect(result.policyHookCoverage).toBe(false);
     expect(result.queryClosed).toBe(false);
+    expect(result.correlation.promptEmbedded).toBe(false);
     expect(result.workspaceChanges).toEqual([]);
     expect(
       result.events.filter(({ type }) => type === "terminal"),
     ).toHaveLength(1);
+  });
+
+  it("does not claim prompt embedding when query construction fails", async () => {
+    const { config } = await probeConfig();
+    const result = await runManagedAgentProbe(config, {
+      hermeticGatewayOrigin: config.gatewayOrigin,
+      processObserver: fakeObserver(),
+      policySettingsGuard: async () => undefined,
+      queryFactory: () => {
+        throw new Error("synthetic query construction failure");
+      },
+    });
+
+    expect(result.correlation.promptEmbedded).toBe(false);
+    expect(result.queryClosed).toBe(false);
+    expect(result.terminal).toBe("query_error");
   });
 
   it("preserves teardown failure priority when policy preflight fails", async () => {
@@ -452,6 +469,43 @@ describe("runManagedAgentProbe", () => {
     expect(result.policyHookCoverage).toBe(false);
     expect(result.terminal).toBe("policy_violation");
     expect(result.permissionEvidence).toEqual([]);
+  });
+
+  it("cannot certify a malformed SDK tool-use identifier as policy-covered evidence", async () => {
+    const { config } = await probeConfig();
+    const result = await runManagedAgentProbe(config, {
+      hermeticGatewayOrigin: config.gatewayOrigin,
+      processObserver: fakeObserver(),
+      policySettingsGuard: async () => undefined,
+      queryFactory: () =>
+        queryFromEvents([
+          {
+            type: "assistant",
+            message: {
+              id: "message-with-missing-tool-id",
+              content: [
+                {
+                  type: "tool_use",
+                  name: "Read",
+                  input: { file_path: FIXTURE_PATHS.cleanTarget },
+                },
+              ],
+            },
+          },
+          {
+            type: "result",
+            subtype: "success",
+            is_error: false,
+            num_turns: 1,
+          },
+        ]),
+    });
+
+    expect(result.correlation.promptEmbedded).toBe(true);
+    expect(result.toolEvidence).toEqual([]);
+    expect(result.permissionEvidence).toEqual([]);
+    expect(result.policyHookCoverage).toBe(false);
+    expect(result.terminal).toBe("policy_violation");
   });
 
   it("rejects duplicate requested tool ids instead of reusing one policy decision", async () => {

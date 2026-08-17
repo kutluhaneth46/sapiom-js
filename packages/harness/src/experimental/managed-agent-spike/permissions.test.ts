@@ -12,6 +12,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { PreToolUseHookInput } from "@anthropic-ai/claude-agent-sdk";
 
+import { MANAGED_AGENT_TOOL_USE_ID_MAX_LENGTH } from "./events.js";
 import {
   createManagedAgentPolicyBoundary,
   resolveManagedAgentToolPath,
@@ -185,6 +186,131 @@ describe("managed-agent universal policy boundary", () => {
     expect(readInput).toEqual({
       file_path: "inside.txt",
       preserve: "metadata",
+    });
+  });
+
+  it("rejects malformed hook identifiers before policy evaluation", async () => {
+    const evidence: ManagedAgentPermissionEvidence[] = [];
+    const resolveToolPath = vi.fn(async () => join(workspace, "inside.txt"));
+    const boundary = createManagedAgentPolicyBoundary({
+      canonicalWorkspaceRoot: workspace,
+      allowedBashCommands: [],
+      allowedMcpTools: [],
+      onDecision: (decision) => evidence.push(decision),
+      resolveToolPath,
+    });
+    const signal = new AbortController().signal;
+    const overlong = "x".repeat(MANAGED_AGENT_TOOL_USE_ID_MAX_LENGTH + 1);
+    const invalidIdentifiers: ReadonlyArray<
+      readonly [inputToolUseId: unknown, callbackToolUseId: unknown]
+    > = [
+      [undefined, undefined],
+      ["", undefined],
+      ["   ", undefined],
+      [overlong, undefined],
+      ["valid-input-id", ""],
+      ["valid-input-id", "   "],
+      ["valid-input-id", overlong],
+      ["valid-input-id", "mismatched-callback-id"],
+    ];
+
+    for (const [inputToolUseId, callbackToolUseId] of invalidIdentifiers) {
+      const malformedInput = {
+        ...preToolUseInput("Read", { file_path: "inside.txt" }, "placeholder"),
+        tool_use_id: inputToolUseId,
+      } as unknown as PreToolUseHookInput;
+      await expect(
+        boundary.preToolUseHook(
+          malformedInput,
+          callbackToolUseId as string | undefined,
+          { signal },
+        ),
+      ).resolves.toMatchObject({
+        hookSpecificOutput: {
+          permissionDecision: "deny",
+          permissionDecisionReason: expect.stringContaining("invalid_input"),
+        },
+      });
+    }
+
+    await expect(
+      boundary.canUseToolFallback(
+        "Read",
+        { file_path: "inside.txt" },
+        { signal, toolUseID: "", requestId: "invalid-fallback" },
+      ),
+    ).resolves.toMatchObject({
+      behavior: "deny",
+      message: expect.stringContaining("invalid_input"),
+    });
+    expect(resolveToolPath).not.toHaveBeenCalled();
+    expect(evidence).toEqual([]);
+
+    await expect(
+      boundary.preToolUseHook(
+        preToolUseInput("Read", { file_path: "inside.txt" }, "valid-input-id"),
+        undefined,
+        { signal },
+      ),
+    ).resolves.toMatchObject({
+      hookSpecificOutput: { permissionDecision: "allow" },
+    });
+    expect(resolveToolPath).toHaveBeenCalledOnce();
+    expect(evidence).toHaveLength(1);
+  });
+
+  it("denies a concurrent duplicate primary identifier without sharing its pending allow", async () => {
+    const evidence: ManagedAgentPermissionEvidence[] = [];
+    let releasePathResolution: (() => void) | undefined;
+    let reportPathResolutionStarted: (() => void) | undefined;
+    const pathResolutionStarted = new Promise<void>((resolveStarted) => {
+      reportPathResolutionStarted = resolveStarted;
+    });
+    const releasePath = new Promise<void>((resolvePath) => {
+      releasePathResolution = resolvePath;
+    });
+    const resolveToolPath = vi.fn(async () => {
+      reportPathResolutionStarted?.();
+      await releasePath;
+      return join(workspace, "inside.txt");
+    });
+    const boundary = createManagedAgentPolicyBoundary({
+      canonicalWorkspaceRoot: workspace,
+      allowedBashCommands: [],
+      allowedMcpTools: [],
+      onDecision: (decision) => evidence.push(decision),
+      resolveToolPath,
+    });
+    const signal = new AbortController().signal;
+    const toolUseId = "concurrent-tool-use-id";
+    const first = boundary.preToolUseHook(
+      preToolUseInput("Read", { file_path: "inside.txt" }, toolUseId),
+      toolUseId,
+      { signal },
+    );
+    await pathResolutionStarted;
+    const duplicate = boundary.preToolUseHook(
+      preToolUseInput("Read", { file_path: "inside.txt" }, toolUseId),
+      toolUseId,
+      { signal },
+    );
+    releasePathResolution?.();
+
+    await expect(first).resolves.toMatchObject({
+      hookSpecificOutput: { permissionDecision: "allow" },
+    });
+    await expect(duplicate).resolves.toMatchObject({
+      hookSpecificOutput: {
+        permissionDecision: "deny",
+        permissionDecisionReason: expect.stringContaining("invalid_input"),
+      },
+    });
+    expect(resolveToolPath).toHaveBeenCalledOnce();
+    expect(evidence).toHaveLength(1);
+    expect(evidence[0]).toMatchObject({
+      decision: "allow",
+      reason: "fixture_path",
+      source: "pre_tool_use",
     });
   });
 

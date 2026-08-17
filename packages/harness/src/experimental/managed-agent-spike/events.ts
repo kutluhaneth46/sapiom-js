@@ -44,6 +44,7 @@ const NORMALIZED_TOOL_USE_ID_PATTERN = /^tool_[0-9a-f]{64}$/;
 const SDK_SESSION_ID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const MAX_ASSISTANT_MESSAGE_ID_LENGTH = 512;
+export const MANAGED_AGENT_TOOL_USE_ID_MAX_LENGTH = 512;
 
 export class ManagedAgentEventError extends Error {
   public constructor(message: string) {
@@ -57,14 +58,28 @@ export function sanitizeManagedAgentToolName(value: unknown): string {
   return toolName && SAFE_TOOL_NAMES.has(toolName) ? toolName : "unknown";
 }
 
+export function isBoundedManagedAgentToolUseId(
+  value: unknown,
+): value is string {
+  return (
+    typeof value === "string" &&
+    value.trim().length > 0 &&
+    value.length <= MANAGED_AGENT_TOOL_USE_ID_MAX_LENGTH
+  );
+}
+
 export function normalizeManagedAgentToolUseId(value: unknown): string {
-  if (typeof value === "string" && NORMALIZED_TOOL_USE_ID_PATTERN.test(value)) {
+  if (!isBoundedManagedAgentToolUseId(value)) {
+    throw new ManagedAgentEventError(
+      "Managed-agent event has no bounded string tool-use id",
+    );
+  }
+  if (NORMALIZED_TOOL_USE_ID_PATTERN.test(value)) {
     return value;
   }
-  const raw = typeof value === "string" ? value : "invalid-tool-use-id";
   return `tool_${createHash("sha256")
     .update("sapiom-managed-agent-tool-use-id\0")
-    .update(raw)
+    .update(value)
     .digest("hex")}`;
 }
 

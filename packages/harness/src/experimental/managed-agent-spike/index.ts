@@ -18,7 +18,12 @@ export {
   type ManagedAgentChildEnvironmentInput,
   type ManagedAgentIsolatedDirectories,
 } from "./environment.js";
-export { ManagedAgentEventError, ManagedAgentEventRecorder } from "./events.js";
+export {
+  MANAGED_AGENT_TOOL_USE_ID_MAX_LENGTH,
+  ManagedAgentEventError,
+  ManagedAgentEventRecorder,
+  isBoundedManagedAgentToolUseId,
+} from "./events.js";
 export {
   FIXTURE_PATHS,
   captureManagedAgentWorkspaceSnapshot,

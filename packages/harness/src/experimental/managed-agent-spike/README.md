@@ -12,6 +12,11 @@ runs before the SDK's permission evaluation, applies canonical-path containment,
 exact Bash equality, and an MCP allowlist, and returns a complete fresh input
 object only when allowing the call. Unknown tools fail closed.
 
+The hook also requires a non-empty, bounded `tool_use_id` from the event. When
+the SDK supplies the optional callback ID, it must be independently bounded and
+exactly match the event ID. Invalid identifiers are denied before policy
+evaluation and never become normalized permission evidence.
+
 `canUseTool` remains only as defense in depth for calls the SDK leaves
 unresolved. It shares the same evaluator and deduplicates by tool-use ID, so it
 cannot create a second evidence record. A live result is rejected when any
@@ -41,6 +46,10 @@ the same non-secret values in the initial prompt as:
 SAPIOM_CERTIFICATION_CORRELATION_V1;eval_source=<value>;execution_id=<value>
 ```
 
+`correlation.promptEmbedded` records whether that marked prompt reached query
+construction. It remains false when the settings preflight prevents query
+creation.
+
 The production gateway consumes both headers, but its current BigQuery
 projection persists neither `polsia_eval_source` nor `sapiom_execution_id`.
 Reconciliation therefore follows the existing E0.2 contract and searches the
@@ -49,6 +58,11 @@ the number of distinct assistant message IDs. IDs are hashed and counted only
 in memory; raw or hashed IDs are not emitted. SDK `result.num_turns` is retained
 separately as bounded informational evidence and is not used as the BigQuery
 call-count key.
+
+The hermetic pinned-SDK loopback exercises Read, allowed and denied Bash, and a
+real in-process `echo_nonce` MCP turn. It requires one primary `PreToolUse`
+decision for each request and separately verifies the MCP handler invocation
+and SDK tool-result event.
 
 ## Pre-fix live evidence
 
