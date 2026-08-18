@@ -1067,9 +1067,13 @@ export function createStubClient(opts: StubClientOptions = {}): Sapiom {
           ),
         launch: (input) => {
           const requestId = `stub-image-${++launchSeq}`;
-          const result = r(
+          const resolved = r(
             dispatchedKeys("contentGeneration.images"),
             [input],
+            // SAP-2576: the routed backend always echoes a resolvedModel; mirror that in the stub.
+            // Set it INSIDE the fallback factory — not by post-mutating the resolved result — so a
+            // caller-supplied override wins and a frozen override is never mutated (same contract
+            // as the sync `create` path above).
             () => ({
               images: [
                 {
@@ -1086,10 +1090,17 @@ export function createStubClient(opts: StubClientOptions = {}): Sapiom {
                     : {}),
                 },
               ],
+              resolvedModel: input.model ?? "stub-model",
             }),
           ) as ImageGenerationResult;
-          // SAP-2576: the routed backend always echoes a resolvedModel; mirror that in the stub.
-          result.resolvedModel = input.model ?? "stub-model";
+          // Mirror the real client's `withDispatchCost`: stamp the resolvedModel onto a COPY, so
+          // the handle, `wait()`, and the resume payload all carry the same value — an invariant
+          // the routed path guarantees — while the caller's override object is never touched and
+          // its own resolvedModel wins when present.
+          const result: ImageGenerationResult = {
+            ...resolved,
+            resolvedModel: resolved.resolvedModel ?? input.model ?? "stub-model",
+          };
 
           const handle: ImageLaunchHandle = {
             requestId,
@@ -1132,9 +1143,13 @@ export function createStubClient(opts: StubClientOptions = {}): Sapiom {
           ),
         launch: (input) => {
           const requestId = `stub-video-${++launchSeq}`;
-          const result = r(
+          const resolved = r(
             dispatchedKeys("contentGeneration.video"),
             [input],
+            // SAP-2576: the routed backend always echoes a resolvedModel; mirror that in the stub.
+            // Set it INSIDE the fallback factory — not by post-mutating the resolved result — so a
+            // caller-supplied override wins and a frozen override is never mutated (same contract
+            // as the sync `create` path above).
             () => ({
               video: {
                 url: "https://content.local/stub-video.mp4",
@@ -1147,10 +1162,17 @@ export function createStubClient(opts: StubClientOptions = {}): Sapiom {
                     }
                   : {}),
               },
+              resolvedModel: input.model ?? "stub-model",
             }),
           ) as VideoGenerationResult;
-          // SAP-2576: the routed backend always echoes a resolvedModel; mirror that in the stub.
-          result.resolvedModel = input.model ?? "stub-model";
+          // Mirror the real client's `withDispatchCost`: stamp the resolvedModel onto a COPY, so
+          // the handle, `wait()`, and the resume payload all carry the same value — an invariant
+          // the routed path guarantees — while the caller's override object is never touched and
+          // its own resolvedModel wins when present.
+          const result: VideoGenerationResult = {
+            ...resolved,
+            resolvedModel: resolved.resolvedModel ?? input.model ?? "stub-model",
+          };
 
           const handle: VideoLaunchHandle = {
             requestId,

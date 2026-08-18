@@ -461,9 +461,9 @@ export interface ImageLaunchHandle extends DispatchHandle {
  */
 /**
  * The SAP-2576 generation metadata a resumed step needs alongside its `outputs`. Carried on the
- * durable pause/resume payload so a workflow step that bills AFTER the generation (the Polsia
- * rebilling case) can still read `cost.reference` / `resolvedModel` — the launch handle is gone
- * by then (`pauseUntilSignal` reduces it to its signal + `correlationId`).
+ * durable pause/resume payload so a workflow step that bills AFTER the generation (a reseller
+ * re-billing its own customers) can still read `cost.reference` / `resolvedModel` — the launch
+ * handle is gone by then (`pauseUntilSignal` reduces it to its signal + `correlationId`).
  */
 export interface MediaResumeFields {
   /**
@@ -510,7 +510,11 @@ export function toImageResumePayload(
   return {
     // SAP-2576: preserve the generation metadata across the durable pause/resume boundary, so a
     // resumed step (which never sees the launch handle) can still bill against `cost.reference`.
-    resolvedModel: result.resolvedModel,
+    // Both spreads are conditional (omit-don't-fabricate): a real webhook resume omits an absent
+    // field rather than carrying an `undefined`-valued key, and this mapper matches that wire shape.
+    ...(result.resolvedModel !== undefined && {
+      resolvedModel: result.resolvedModel,
+    }),
     ...(result.cost !== undefined && { cost: result.cost }),
     outputs: (result.images ?? []).map((img) => ({
       ...(img.fileId !== undefined && { fileId: img.fileId }),
@@ -994,8 +998,12 @@ export function toVideoResumePayload(
 ): VideoResultPayload {
   // SAP-2576: preserve the generation metadata across the durable pause/resume boundary, so a
   // resumed step (which never sees the launch handle) can still bill against `cost.reference`.
+  // Both spreads are conditional (omit-don't-fabricate): a real webhook resume omits an absent
+  // field rather than carrying an `undefined`-valued key, and this mapper matches that wire shape.
   const metadata = {
-    resolvedModel: result.resolvedModel,
+    ...(result.resolvedModel !== undefined && {
+      resolvedModel: result.resolvedModel,
+    }),
     ...(result.cost !== undefined && { cost: result.cost }),
   };
   if (!result.video) return { outputs: [], ...metadata };
