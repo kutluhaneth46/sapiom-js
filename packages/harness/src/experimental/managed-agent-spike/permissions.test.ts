@@ -238,11 +238,19 @@ describe("managed-agent universal policy boundary", () => {
     await expect(
       invoke(
         "Bash",
-        { command: "node .managed-agent-probe/long-running.mjs" },
+        {
+          command: "node .managed-agent-probe/long-running.mjs",
+          description: "Run the cancellation fixture",
+        },
         "l2-bash",
       ),
     ).resolves.toMatchObject({
-      hookSpecificOutput: { permissionDecision: "allow" },
+      hookSpecificOutput: {
+        permissionDecision: "allow",
+        updatedInput: {
+          command: "node .managed-agent-probe/long-running.mjs",
+        },
+      },
     });
 
     expect(
@@ -264,6 +272,109 @@ describe("managed-agent universal policy boundary", () => {
         reason: "exact_bash_command",
       },
     ]);
+  });
+
+  it("accepts pinned SDK Bash metadata but strips it before execution", async () => {
+    const command = "git status --short";
+    const descriptionMarker = "sdk-description-must-not-persist";
+    const unknownMarker = "unknown-field-must-not-persist";
+    const evidence: ManagedAgentPermissionEvidence[] = [];
+    const boundary = createManagedAgentPolicyBoundary({
+      canonicalWorkspaceRoot: workspace,
+      allowedBashCommands: [command],
+      allowedMcpTools: [],
+      onDecision: (decision) => evidence.push(decision),
+    });
+    const signal = new AbortController().signal;
+    let sequence = 0;
+    const invoke = (input: unknown) => {
+      const toolUseId = `bash-shape-${++sequence}`;
+      return boundary.preToolUseHook(
+        preToolUseInput("Bash", input, toolUseId),
+        toolUseId,
+        { signal },
+      );
+    };
+    const acceptedInputs: Array<Record<string, unknown>> = [
+      { command },
+      { command, description: descriptionMarker },
+      { command, timeout: 1 },
+      {
+        command,
+        description: descriptionMarker,
+        timeout: 600_000,
+        run_in_background: false,
+        dangerouslyDisableSandbox: false,
+      },
+    ];
+
+    for (const input of acceptedInputs) {
+      const originalInput = { ...input };
+      await expect(invoke(input)).resolves.toEqual({
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "allow",
+          permissionDecisionReason: "Managed-agent policy: exact_bash_command",
+          updatedInput: { command },
+        },
+      });
+      expect(input).toEqual(originalInput);
+    }
+
+    const deniedInputs: Array<Record<string, unknown>> = [
+      { command, unexpected: unknownMarker },
+      { command, description: 123 },
+      { command, timeout: "10" },
+      { command, timeout: 0 },
+      { command, timeout: 1.5 },
+      { command, timeout: 600_001 },
+      { command, run_in_background: "false" },
+      { command, run_in_background: true },
+      { command, dangerouslyDisableSandbox: "false" },
+      { command, dangerouslyDisableSandbox: true },
+    ];
+    for (const input of deniedInputs) {
+      await expect(invoke(input)).resolves.toMatchObject({
+        hookSpecificOutput: {
+          permissionDecision: "deny",
+          permissionDecisionReason: expect.stringContaining("invalid_input"),
+        },
+      });
+    }
+
+    expect(
+      evidence
+        .slice(0, acceptedInputs.length)
+        .map(({ decision, reason, operationId }) => ({
+          decision,
+          reason,
+          operationId,
+        })),
+    ).toEqual(
+      acceptedInputs.map(() => ({
+        decision: "allow",
+        reason: "exact_bash_command",
+        operationId: "bash:exact_command",
+      })),
+    );
+    expect(
+      evidence
+        .slice(acceptedInputs.length)
+        .map(({ decision, reason, operationId }) => ({
+          decision,
+          reason,
+          operationId,
+        })),
+    ).toEqual(
+      deniedInputs.map(() => ({
+        decision: "deny",
+        reason: "invalid_input",
+        operationId: "bash:unregistered",
+      })),
+    );
+    const serializedEvidence = JSON.stringify(evidence);
+    expect(serializedEvidence).not.toContain(descriptionMarker);
+    expect(serializedEvidence).not.toContain(unknownMarker);
   });
 
   it("uses exact Bash equality and emits content-free decisions", async () => {
@@ -316,7 +427,10 @@ describe("managed-agent universal policy boundary", () => {
       },
     });
     await expect(
-      invoke("Bash", { command: "git status --short", timeout: 10 }),
+      invoke("Bash", {
+        command: "git status --short",
+        dangerouslyDisableSandbox: true,
+      }),
     ).resolves.toMatchObject({
       hookSpecificOutput: {
         permissionDecision: "deny",
@@ -623,26 +737,63 @@ describe("managed-agent universal policy boundary", () => {
     });
     expect(evidence).toHaveLength(1);
 
+    const fallbackInput = {
+      command: "git status --short",
+      description: "Show working tree status",
+      timeout: 10_000,
+      run_in_background: false,
+      dangerouslyDisableSandbox: false,
+    };
     await expect(
-      boundary.canUseToolFallback(
-        "Bash",
-        { command: "git status --short" },
-        { signal, toolUseID: "fallback-only", requestId: "request-2" },
-      ),
-    ).resolves.toMatchObject({ behavior: "allow" });
+      boundary.canUseToolFallback("Bash", fallbackInput, {
+        signal,
+        toolUseID: "fallback-only",
+        requestId: "request-2",
+      }),
+    ).resolves.toEqual({
+      behavior: "allow",
+      toolUseID: "fallback-only",
+      updatedInput: { command: "git status --short" },
+    });
+    expect(fallbackInput).toEqual({
+      command: "git status --short",
+      description: "Show working tree status",
+      timeout: 10_000,
+      run_in_background: false,
+      dangerouslyDisableSandbox: false,
+    });
     expect(evidence).toHaveLength(2);
     expect(evidence[1]?.source).toBe("can_use_tool_fallback");
 
-    await expect(
-      boundary.canUseToolFallback(
-        "Bash",
-        { command: "git status --short", run_in_background: true },
-        { signal, toolUseID: "fallback-extra", requestId: "request-3" },
-      ),
-    ).resolves.toMatchObject({
-      behavior: "deny",
-      message: expect.stringContaining("invalid_input"),
-    });
+    const deniedFallbackInputs = [
+      {
+        toolUseID: "fallback-background",
+        input: { command: "git status --short", run_in_background: true },
+      },
+      {
+        toolUseID: "fallback-sandbox",
+        input: {
+          command: "git status --short",
+          dangerouslyDisableSandbox: true,
+        },
+      },
+      {
+        toolUseID: "fallback-unknown",
+        input: { command: "git status --short", unsupported: true },
+      },
+    ];
+    for (const { toolUseID: deniedToolUseID, input } of deniedFallbackInputs) {
+      await expect(
+        boundary.canUseToolFallback("Bash", input, {
+          signal,
+          toolUseID: deniedToolUseID,
+          requestId: `request-${deniedToolUseID}`,
+        }),
+      ).resolves.toMatchObject({
+        behavior: "deny",
+        message: expect.stringContaining("invalid_input"),
+      });
+    }
   });
 
   it("fails closed when aborted before or during asynchronous path validation", async () => {

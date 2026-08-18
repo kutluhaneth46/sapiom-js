@@ -232,17 +232,66 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
-function hasExactKeys(
-  value: Record<string, unknown>,
-  expectedKeys: readonly string[],
-): boolean {
-  const actualKeys = Object.keys(value);
-  return (
-    actualKeys.length === expectedKeys.length &&
-    expectedKeys.every((key) =>
-      Object.prototype.hasOwnProperty.call(value, key),
+const MANAGED_AGENT_BASH_INPUT_KEYS = new Set([
+  "command",
+  "timeout",
+  "description",
+  "run_in_background",
+  "dangerouslyDisableSandbox",
+]);
+const MANAGED_AGENT_BASH_TIMEOUT_MAX_MS = 600_000;
+
+interface ManagedAgentNormalizedBashInput {
+  readonly command: string;
+}
+
+/**
+ * Accept the pinned SDK's Bash input shape, but retain only the exact command
+ * that the host authorizes and executes. Model-authored execution controls are
+ * either harmless metadata that is stripped or unsafe values that fail closed.
+ */
+function normalizeManagedAgentBashInput(
+  rawInput: unknown,
+): ManagedAgentNormalizedBashInput | undefined {
+  const input = asRecord(rawInput);
+  if (
+    !input ||
+    !Object.prototype.hasOwnProperty.call(input, "command") ||
+    Reflect.ownKeys(input).some(
+      (key) =>
+        typeof key !== "string" || !MANAGED_AGENT_BASH_INPUT_KEYS.has(key),
     )
-  );
+  ) {
+    return undefined;
+  }
+
+  const command = input.command;
+  if (typeof command !== "string" || command.length === 0) return undefined;
+  if (
+    input.description !== undefined &&
+    typeof input.description !== "string"
+  ) {
+    return undefined;
+  }
+  if (
+    input.timeout !== undefined &&
+    (typeof input.timeout !== "number" ||
+      !Number.isInteger(input.timeout) ||
+      input.timeout <= 0 ||
+      input.timeout > MANAGED_AGENT_BASH_TIMEOUT_MAX_MS)
+  ) {
+    return undefined;
+  }
+  if (
+    (input.run_in_background !== undefined &&
+      input.run_in_background !== false) ||
+    (input.dangerouslyDisableSandbox !== undefined &&
+      input.dangerouslyDisableSandbox !== false)
+  ) {
+    return undefined;
+  }
+
+  return { command };
 }
 
 function denied(
@@ -275,10 +324,8 @@ function classifyManagedAgentOperation(
 ): ManagedAgentOperationId {
   const input = asRecord(rawInput);
   if (toolName === "Bash") {
-    return input &&
-      hasExactKeys(input, ["command"]) &&
-      typeof input.command === "string" &&
-      allowedCommands.has(input.command)
+    const normalizedInput = normalizeManagedAgentBashInput(rawInput);
+    return normalizedInput && allowedCommands.has(normalizedInput.command)
       ? "bash:exact_command"
       : "bash:unregistered";
   }
@@ -332,13 +379,9 @@ async function evaluateManagedAgentPolicy(
         };
   }
   if (toolName === "Bash") {
-    if (!hasExactKeys(input, ["command"])) {
-      return denied("invalid_input", operationId);
-    }
-    const command =
-      typeof input.command === "string" ? input.command : undefined;
-    if (!command) return denied("invalid_input", operationId);
-    if (!allowedCommands.has(command)) {
+    const normalizedInput = normalizeManagedAgentBashInput(input);
+    if (!normalizedInput) return denied("invalid_input", operationId);
+    if (!allowedCommands.has(normalizedInput.command)) {
       return denied("bash_command_not_allowed", operationId);
     }
     return signal.aborted
@@ -347,7 +390,7 @@ async function evaluateManagedAgentPolicy(
           decision: "allow",
           reason: "exact_bash_command",
           operationId,
-          updatedInput: { ...input },
+          updatedInput: { command: normalizedInput.command },
         };
   }
   if (toolName === "Read" || toolName === "Edit" || toolName === "Write") {

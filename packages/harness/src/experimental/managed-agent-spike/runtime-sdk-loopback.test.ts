@@ -425,7 +425,10 @@ it("enforces real-SDK built-in and in-process MCP calls with exact loopback corr
         writeToolUseResponse(response, inferenceTurn, {
           id: "toolu_loopback_bash_allow",
           name: "Bash",
-          input: { command: ALLOWED_BASH_COMMAND },
+          input: {
+            command: ALLOWED_BASH_COMMAND,
+            description: "Show working tree status",
+          },
         });
       } else if (inferenceTurn === 3) {
         writeToolUseResponse(response, inferenceTurn, {

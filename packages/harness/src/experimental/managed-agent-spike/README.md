@@ -9,9 +9,10 @@ Codex flows.
 Every model-requested Read, Edit, Write, Bash, and in-process MCP call is gated
 by one programmatic `PreToolUse` hook registered without a matcher. The hook
 runs before the SDK's permission evaluation, applies canonical-path containment,
-exact Bash equality, an exact Bash input shape of `{ command: string }`, and an
-MCP allowlist, and returns a complete fresh input object only when allowing the
-call. Extra SDK fields such as background execution or timeout controls fail
+exact Bash equality, a pinned SDK-compatible Bash input shape, and an MCP
+allowlist, and returns a complete fresh input object only when allowing the
+call. Valid description and timeout metadata are stripped before execution;
+background execution, sandbox bypass, malformed values, and unknown fields fail
 closed even when the command string itself matches. Unknown tools fail closed.
 
 The hook also requires a non-empty, bounded `tool_use_id` from the event. When
