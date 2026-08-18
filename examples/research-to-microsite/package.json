@@ -12,11 +12,12 @@
   },
   "dependencies": {
     "@sapiom/agent": "^0.9.3",
-    "@sapiom/tools": "^0.26.0",
+    "@sapiom/tools": "^0.28.0",
     "zod": "^3.25.76 || ^4.0.0"
   },
   "devDependencies": {
     "@types/node": "^20.11.30",
+    "tsx": "^4.23.0",
     "typescript": "^5.4.2"
   }
 }

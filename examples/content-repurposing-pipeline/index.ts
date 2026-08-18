@@ -513,7 +513,7 @@ const graphics = defineStep({
     });
     const handle = await ctx.sapiom.contentGeneration.images.launch({
       prompt: quote.imagePrompt,
-      numImages: 1,
+      count: 1,
       // Public: quote graphics are linked from the emailed pack below, so they
       // need a durable permalink rather than a presigned URL that expires in ~15min.
       storage: { visibility: "public" },
@@ -583,16 +583,19 @@ const clip = defineStep({
     const model = ctx.shared.get("model") ?? DEFAULT_VIDEO_MODEL;
 
     ctx.logger.info("animating teaser clip", { from: frame.quote });
-    // Animate the first quote graphic into a short teaser. A fixed seed + the
-    // shared aspect ratio keep it consistent with the graphics.
+    // Animate the first quote graphic into a short teaser. The shared aspect
+    // ratio keeps it consistent with the graphics.
     const handle = await ctx.sapiom.contentGeneration.video.launch({
       model,
       prompt: pack.videoScript,
-      params: {
+      // Kling 2.1 Pro image-to-video isn't in the semantic catalog, so pass the raw provider
+      // keys via `passthrough` (the escape hatch) rather than the deprecated `params`.
+      passthrough: {
         image_url: imageUrl,
-        duration: CLIP_SECONDS,
+        // Kling 2.1 Pro takes duration only as the string enum "5"/"10" and accepts no seed —
+        // matching scene-to-video's handling of the same model.
+        duration: String(CLIP_SECONDS),
         aspect_ratio: must(ctx.shared.get("aspectRatio"), "aspectRatio"),
-        seed: 42,
       },
       // Public: the teaser clip is linked from the emailed pack below, so it
       // needs a durable permalink rather than a presigned URL that expires in ~15min.
