@@ -90,8 +90,13 @@ export interface CodingRunOutcome {
    * Null/absent = not disclosed (coding has no server-priced cost signal yet).
    */
   costUsd?: number | null;
-  /** Reserved: structured degradation annotation (server-defined shape; absent on a clean run). */
-  degradation?: Record<string, unknown>;
+  /**
+   * Reserved: structured degradation annotation — absent on a clean run.
+   * Typed `unknown` on purpose: the shape is server-defined and not yet
+   * stable, so consumers must narrow before reading; a future concrete type
+   * is then purely additive (nothing can have indexed into it).
+   */
+  degradation?: unknown;
   durationMs: number;
   toolCallCount: number;
   usage: CodingRunUsage;
@@ -284,7 +289,7 @@ interface WireResult {
   model_used: string | null;
   served_model?: string | null;
   cost_usd?: number | null;
-  degradation?: Record<string, unknown>;
+  degradation?: unknown;
   duration_ms: number;
   tool_call_count: number;
   usage?: {
@@ -490,8 +495,13 @@ export interface ModelRunOutcome {
   durationMs: number;
   /** USD cost of the run as reported by the server. */
   costUsd: number;
-  /** Reserved: structured degradation annotation (server-defined shape; absent on a clean run). */
-  degradation?: Record<string, unknown>;
+  /**
+   * Reserved: structured degradation annotation — absent on a clean run.
+   * Typed `unknown` on purpose: the shape is server-defined and not yet
+   * stable, so consumers must narrow before reading; a future concrete type
+   * is then purely additive (nothing can have indexed into it).
+   */
+  degradation?: unknown;
   usage: CodingRunUsage;
 }
 
@@ -556,7 +566,7 @@ interface ModelWireResult {
   turns: number;
   model_used: string | null;
   served_model?: string | null;
-  degradation?: Record<string, unknown>;
+  degradation?: unknown;
   duration_ms: number;
   cost_usd: number;
   usage?: {

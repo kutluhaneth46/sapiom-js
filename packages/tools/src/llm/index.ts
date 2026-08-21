@@ -317,8 +317,13 @@ export interface LlmDisclosure {
   served_model?: string;
   /** USD cost of the call as computed by the server. */
   cost_usd?: number;
-  /** Reserved: structured degradation annotation (server-defined shape; absent on a clean call). */
-  degradation?: Record<string, unknown>;
+  /**
+   * Reserved: structured degradation annotation — absent on a clean call.
+   * Typed `unknown` on purpose: the shape is server-defined and not yet
+   * stable, so consumers must narrow before reading; a future concrete type
+   * is then purely additive.
+   */
+  degradation?: unknown;
 }
 
 /** Camel-cased view of {@link LlmDisclosure}; null = the server did not disclose. */
