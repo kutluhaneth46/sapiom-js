@@ -118,7 +118,7 @@ export class Repository {
       .catch(() => undefined);
   }
 
-  /** Adopt a known repo without a round-trip (e.g. one returned from another step). */
+  /** Rehydrate a Sapiom repository handle returned by `create`, `get`, or `list`. */
   static attach(
     slug: string,
     cloneUrl: string,

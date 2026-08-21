@@ -264,6 +264,36 @@ types are the source of truth.** The full surface is the `Sapiom` interface in `
 `ctx.sapiom.` autocompletes what exists, `npm run typecheck` rejects what doesn't, and the full
 catalog with pricing lives at [docs.sapiom.ai/capabilities](https://docs.sapiom.ai/capabilities).
 
+### Coding Repository Errors
+
+Use a repository returned by `repositories.create()`, `repositories.get()`, or
+`repositories.list()`. `repositories.attach()` rehydrates one of those handles; it does not import
+an external Git repository.
+
+Coding requests throw `CodingRunHttpError` for HTTP failures. A step with `canFail: true` can handle
+`repository_not_found` with `fail()` and rethrow other errors:
+
+```typescript
+import { fail, pauseUntilSignal } from "@sapiom/agent";
+import { CodingRunHttpError } from "@sapiom/tools";
+
+try {
+  const handle = await ctx.sapiom.models.coding.launch({
+    task,
+    gitRepository: repo,
+  });
+  return pauseUntilSignal(handle, { resumeStep: "finalize" });
+} catch (error) {
+  if (
+    error instanceof CodingRunHttpError &&
+    error.code === "repository_not_found"
+  ) {
+    return fail(error.message);
+  }
+  throw error;
+}
+```
+
 ## Failure Handling & Retries
 
 There is no automatic per-step retry. Express it explicitly — this keeps the graph readable.

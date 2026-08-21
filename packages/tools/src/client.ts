@@ -181,6 +181,7 @@ export interface Sapiom {
     get(slug: string): Promise<Repository>;
     list(): Promise<Repository[]>;
     delete(slug: string): Promise<void>;
+    /** Rehydrate a Sapiom repository handle returned by `create`, `get`, or `list`. */
     attach(slug: string, cloneUrl: string): Repository;
   };
   readonly models: {
