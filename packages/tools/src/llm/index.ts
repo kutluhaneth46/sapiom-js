@@ -304,6 +304,39 @@ function submitHeaders(spec: LlmSubmitSpec, resumeToken: string | undefined) {
 }
 
 /**
+ * SAP-2764 DisclosureFields as they appear on raw `/v2` non-streaming response
+ * bodies (snake_case, injected top-level by the gateway next to `model`). The
+ * response `model` field keeps echoing the requested LABEL; these dedicated
+ * fields are the honest disclosure of what actually served and what it cost.
+ * Absent = unknown (older gateway, resolution failure) — never fabricated.
+ * Contract: `plans/model-execution-surface/interfaces.md` (Sapiom repo).
+ */
+export interface LlmDisclosure {
+  /** The gateway deployment that actually served (e.g. `m2.7-fireworks-sapiom`). */
+  served_model?: string;
+  /** Real USD cost of the call, priced at the served deployment. */
+  cost_usd?: number;
+  /** RESERVED (SAP-2768): present iff the call internally degraded/fell back. */
+  degradation?: Record<string, unknown>;
+}
+
+/**
+ * Read the SAP-2764 disclosure off a raw `/v2` response body ({@link run} /
+ * {@link redeem} / {@link callSession} results), camelCased. Missing/malformed
+ * fields come back null (unknown) — safe on responses from older gateways.
+ */
+export function readDisclosure(result: unknown): {
+  servedModel: string | null;
+  costUsd: number | null;
+} {
+  const body = (result ?? {}) as LlmDisclosure;
+  return {
+    servedModel: typeof body.served_model === "string" && body.served_model ? body.served_model : null,
+    costUsd: typeof body.cost_usd === "number" && Number.isFinite(body.cost_usd) ? body.cost_usd : null,
+  };
+}
+
+/**
  * Synchronous routed call: `POST /v2/anthropic/v1/messages` on the x402 edge (Surface A —
  * the PATH is the wire shape; this client speaks Anthropic Messages). The gateway
  * selects the deployment (the label via `spec.model`, else the default label), admits it
@@ -311,6 +344,10 @@ function submitHeaders(spec: LlmSubmitSpec, resumeToken: string | undefined) {
  * and returns the completion inline. Billing settles against the caller's
  * Sapiom API key at the edge (identity mode; the default `x-sapiom-api-key`
  * header is exactly what the edge's identity guard reads).
+ *
+ * The response `model` echoes the user-facing label; the body additionally
+ * carries the SAP-2764 disclosure ({@link LlmDisclosure}: `served_model` +
+ * `cost_usd`) — read it with {@link readDisclosure}.
  */
 export async function run<T = Record<string, unknown>>(
   spec: LlmRunSpec,
@@ -386,8 +423,9 @@ export async function submit(
  * edge settles it against the caller's account ("payment at redemption",
  * SAP-1496), and the gateway routes it to the exact deployment the grant
  * reserved (single-use, consumed atomically; the response `model` carries the
- * user-facing label). `request.model` may be anything — the reserved deployment
- * wins. Returns the parsed LLM response.
+ * user-facing label, and the body carries the SAP-2764 disclosure —
+ * {@link LlmDisclosure}, read with {@link readDisclosure}). `request.model` may
+ * be anything — the reserved deployment wins. Returns the parsed LLM response.
  */
 export async function redeem<T = Record<string, unknown>>(
   link: LlmGrantLink,
@@ -615,7 +653,8 @@ export async function getSession(
  * terminals return 410 (`session_expired` / `session_exhausted`); each call is
  * billed individually against the caller's Sapiom key, exactly like `run`.
  * `request.model` may be anything — the session's reserved deployment wins,
- * and the response `model` carries the user-facing label.
+ * and the response `model` carries the user-facing label (the body also carries
+ * the SAP-2764 disclosure — {@link LlmDisclosure}, read with {@link readDisclosure}).
  */
 export async function callSession<T = Record<string, unknown>>(
   session: LlmSessionHandle | LlmSession | string,

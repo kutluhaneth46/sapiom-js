@@ -26,6 +26,7 @@ function fakeFetch(opts: {
             stop_reason: "end_turn",
             turns: 1,
             model_used: "claude-sonnet-4-6",
+            served_model: "m2.7-fireworks-sapiom",
             duration_ms: 1200,
             cost_usd: 0.001,
             usage: { input_tokens: 10, output_tokens: 5 },
@@ -73,6 +74,11 @@ describe("agent.run — terminal result mapping", () => {
     expect(result.result?.stopReason).toBe("end_turn");
     expect(result.result?.costUsd).toBe(0.001);
     expect(result.result?.usage.inputTokens).toBe(10);
+    // SAP-2764 DisclosureFields: served_model → servedModel; the label stays on modelUsed.
+    expect(result.result?.servedModel).toBe("m2.7-fireworks-sapiom");
+    expect(result.result?.modelUsed).toBe("claude-sonnet-4-6");
+    // Reserved (SAP-2768): absent unless the run recorded a degradation.
+    expect(result.result).not.toHaveProperty("degradation");
   });
 });
 
