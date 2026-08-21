@@ -78,19 +78,19 @@ export interface CodingRunOutcome {
   turns: number;
   modelUsed: string | null;
   /**
-   * SAP-2764 DisclosureFields (wire: `served_model`): the deployment that
-   * ACTUALLY served — distinct from `modelUsed`, which stays the requested
-   * label/model. Null/absent = unknown (coding cannot observe it yet); never
-   * fabricated. Optional so results from older servers stay type-compatible.
+   * Wire `served_model`: server-reported identifier of the deployment that
+   * actually served — distinct from `modelUsed`, which remains the requested
+   * label/model. Null/absent = the server did not disclose (older server; and
+   * coding runs cannot observe it yet) — treat as unknown, never as the label.
+   * Optional so results from older servers stay type-compatible.
    */
   servedModel?: string | null;
   /**
-   * SAP-2764 DisclosureFields (wire: `cost_usd`): real USD cost priced at the
-   * SERVED deployment. Null/absent = unknown (coding has no served-priced cost
-   * signal yet).
+   * Wire `cost_usd`: USD cost of the run as reported by the server.
+   * Null/absent = not disclosed (coding has no server-priced cost signal yet).
    */
   costUsd?: number | null;
-  /** RESERVED (SAP-2768, wire: `degradation`): present iff the run internally degraded/fell back. */
+  /** Reserved: structured degradation annotation (server-defined shape; absent on a clean run). */
   degradation?: Record<string, unknown>;
   durationMs: number;
   toolCallCount: number;
@@ -315,7 +315,7 @@ function mapResult(r: WireResult | null | undefined): CodingRunOutcome | null {
     success: r.success,
     turns: r.turns,
     modelUsed: r.model_used ?? null,
-    // SAP-2764: absent on older servers ⇒ null (unknown), never fabricated.
+    // Disclosure fields: absent on older servers ⇒ null (unknown), never fabricated.
     servedModel: r.served_model ?? null,
     costUsd: r.cost_usd ?? null,
     ...(r.degradation ? { degradation: r.degradation } : {}),
@@ -480,20 +480,17 @@ export interface ModelRunOutcome {
   turns: number;
   modelUsed: string | null;
   /**
-   * SAP-2764 DisclosureFields (wire: `served_model`): the deployment that
-   * ACTUALLY served the final turn — distinct from `modelUsed`, which stays the
-   * requested label/model. Null/absent = unknown (older server, legacy path);
-   * never fabricated. Optional so results from older servers stay
-   * type-compatible.
+   * Wire `served_model`: server-reported identifier of the deployment that
+   * actually served the final turn — distinct from `modelUsed`, which remains
+   * the requested label/model. Null/absent = the server did not disclose
+   * (older server, legacy path) — treat as unknown, never as the label.
+   * Optional so results from older servers stay type-compatible.
    */
   servedModel?: string | null;
   durationMs: number;
-  /**
-   * Real USD cost (SAP-2764): served tokens × the SERVED deployment's price
-   * when the gateway disclosed it; the host's estimate as fallback.
-   */
+  /** USD cost of the run as reported by the server. */
   costUsd: number;
-  /** RESERVED (SAP-2768, wire: `degradation`): present iff the run internally degraded/fell back. */
+  /** Reserved: structured degradation annotation (server-defined shape; absent on a clean run). */
   degradation?: Record<string, unknown>;
   usage: CodingRunUsage;
 }
@@ -590,7 +587,7 @@ function mapModelResult(r: ModelWireResult | null | undefined): ModelRunOutcome 
     stopReason: r.stop_reason,
     turns: r.turns,
     modelUsed: r.model_used ?? null,
-    // SAP-2764: absent on older servers ⇒ null (unknown), never fabricated.
+    // Disclosure fields: absent on older servers ⇒ null (unknown), never fabricated.
     servedModel: r.served_model ?? null,
     ...(r.degradation ? { degradation: r.degradation } : {}),
     durationMs: r.duration_ms,

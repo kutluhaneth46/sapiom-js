@@ -304,31 +304,35 @@ function submitHeaders(spec: LlmSubmitSpec, resumeToken: string | undefined) {
 }
 
 /**
- * SAP-2764 DisclosureFields as they appear on raw `/v2` non-streaming response
- * bodies (snake_case, injected top-level by the gateway next to `model`). The
- * response `model` field keeps echoing the requested LABEL; these dedicated
- * fields are the honest disclosure of what actually served and what it cost.
- * Absent = unknown (older gateway, resolution failure) — never fabricated.
- * Contract: `plans/model-execution-surface/interfaces.md` (Sapiom repo).
+ * Serving-disclosure fields as they appear on raw `/v2` non-streaming response
+ * bodies — snake_case, injected top-level by the server next to `model`, in
+ * the same casing as the rest of the raw body {@link run} returns. The
+ * response `model` field keeps echoing the requested label; these dedicated
+ * fields report, as observed by the server, which deployment actually served
+ * the call and what it cost. Absent = the server did not disclose (older
+ * server, resolution failure) — treat as unknown, never assume a value.
  */
 export interface LlmDisclosure {
-  /** The gateway deployment that actually served (e.g. `m2.7-fireworks-sapiom`). */
+  /** Server-assigned identifier of the deployment that actually served the call. */
   served_model?: string;
-  /** Real USD cost of the call, priced at the served deployment. */
+  /** USD cost of the call as computed by the server. */
   cost_usd?: number;
-  /** RESERVED (SAP-2768): present iff the call internally degraded/fell back. */
+  /** Reserved: structured degradation annotation (server-defined shape; absent on a clean call). */
   degradation?: Record<string, unknown>;
 }
 
-/**
- * Read the SAP-2764 disclosure off a raw `/v2` response body ({@link run} /
- * {@link redeem} / {@link callSession} results), camelCased. Missing/malformed
- * fields come back null (unknown) — safe on responses from older gateways.
- */
-export function readDisclosure(result: unknown): {
+/** Camel-cased view of {@link LlmDisclosure}; null = the server did not disclose. */
+export interface LlmDisclosureResult {
   servedModel: string | null;
   costUsd: number | null;
-} {
+}
+
+/**
+ * Read the serving disclosure off a raw `/v2` response body ({@link run} /
+ * {@link redeem} / {@link callSession} results), camelCased. Missing/malformed
+ * fields come back null (unknown) — safe on responses from older servers.
+ */
+export function readDisclosure(result: unknown): LlmDisclosureResult {
   const body = (result ?? {}) as LlmDisclosure;
   return {
     servedModel: typeof body.served_model === "string" && body.served_model ? body.served_model : null,
@@ -346,7 +350,7 @@ export function readDisclosure(result: unknown): {
  * header is exactly what the edge's identity guard reads).
  *
  * The response `model` echoes the user-facing label; the body additionally
- * carries the SAP-2764 disclosure ({@link LlmDisclosure}: `served_model` +
+ * carries the serving disclosure ({@link LlmDisclosure}: `served_model` +
  * `cost_usd`) — read it with {@link readDisclosure}.
  */
 export async function run<T = Record<string, unknown>>(
@@ -423,7 +427,7 @@ export async function submit(
  * edge settles it against the caller's account ("payment at redemption",
  * SAP-1496), and the gateway routes it to the exact deployment the grant
  * reserved (single-use, consumed atomically; the response `model` carries the
- * user-facing label, and the body carries the SAP-2764 disclosure —
+ * user-facing label, and the body carries the serving disclosure —
  * {@link LlmDisclosure}, read with {@link readDisclosure}). `request.model` may
  * be anything — the reserved deployment wins. Returns the parsed LLM response.
  */
@@ -654,7 +658,7 @@ export async function getSession(
  * billed individually against the caller's Sapiom key, exactly like `run`.
  * `request.model` may be anything — the session's reserved deployment wins,
  * and the response `model` carries the user-facing label (the body also carries
- * the SAP-2764 disclosure — {@link LlmDisclosure}, read with {@link readDisclosure}).
+ * the serving disclosure — {@link LlmDisclosure}, read with {@link readDisclosure}).
  */
 export async function callSession<T = Record<string, unknown>>(
   session: LlmSessionHandle | LlmSession | string,

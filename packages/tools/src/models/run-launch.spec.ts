@@ -26,7 +26,7 @@ function fakeFetch(opts: {
             stop_reason: "end_turn",
             turns: 1,
             model_used: "claude-sonnet-4-6",
-            served_model: "m2.7-fireworks-sapiom",
+            served_model: "deployment-a",
             duration_ms: 1200,
             cost_usd: 0.001,
             usage: { input_tokens: 10, output_tokens: 5 },
@@ -74,11 +74,46 @@ describe("agent.run — terminal result mapping", () => {
     expect(result.result?.stopReason).toBe("end_turn");
     expect(result.result?.costUsd).toBe(0.001);
     expect(result.result?.usage.inputTokens).toBe(10);
-    // SAP-2764 DisclosureFields: served_model → servedModel; the label stays on modelUsed.
-    expect(result.result?.servedModel).toBe("m2.7-fireworks-sapiom");
+    // Serving disclosure: served_model → servedModel; the label stays on modelUsed.
+    expect(result.result?.servedModel).toBe("deployment-a");
     expect(result.result?.modelUsed).toBe("claude-sonnet-4-6");
-    // Reserved (SAP-2768): absent unless the run recorded a degradation.
+    // Reserved: degradation is absent unless the run recorded one.
     expect(result.result).not.toHaveProperty("degradation");
+  });
+
+  it("maps a result from an older server (no disclosure fields) to null, not a fabricated value", async () => {
+    // Same wire doc minus served_model/degradation — the shape older servers emit.
+    const oldServerFetch = (async (_url: string, init: RequestInit = {}) => {
+      const isPost = (init.method ?? "GET") === "POST";
+      const attributes = isPost
+        ? { status: "pending" }
+        : {
+            status: "completed",
+            output: "OK",
+            result: {
+              success: true,
+              stop_reason: "end_turn",
+              turns: 1,
+              model_used: "claude-sonnet-4-6",
+              duration_ms: 1200,
+              cost_usd: 0.001,
+              usage: { input_tokens: 10, output_tokens: 5 },
+            },
+            error: null,
+          };
+      return {
+        ok: true,
+        status: isPost ? 202 : 200,
+        json: async () => ({ data: { id: "run-abc", attributes } }),
+        text: async () => "",
+      } as unknown as Response;
+    }) as unknown as typeof globalThis.fetch;
+
+    const sapiom = createClient({ apiKey: "k", fetch: oldServerFetch });
+    const result = await sapiom.models.run({ prompt: "say OK" });
+    expect(result.result?.servedModel).toBeNull();
+    expect(result.result).not.toHaveProperty("degradation");
+    expect(result.result?.costUsd).toBe(0.001); // existing field untouched
   });
 });
 

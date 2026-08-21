@@ -1,6 +1,6 @@
 import { readDisclosure } from "./index.js";
 
-// SAP-2764 DisclosureFields on raw /v2 non-streaming bodies: `served_model` +
+// Serving disclosure on raw /v2 non-streaming bodies: `served_model` +
 // `cost_usd` are injected top-level by the gateway; `readDisclosure` camelCases
 // them and treats anything missing/malformed as unknown (null) — old-server safe.
 describe("llm.readDisclosure", () => {
@@ -8,11 +8,11 @@ describe("llm.readDisclosure", () => {
     const body = {
       type: "message",
       model: "smart", // the echo stays the label
-      served_model: "m2.7-fireworks-sapiom",
+      served_model: "deployment-a",
       cost_usd: 0.000123,
     };
     expect(readDisclosure(body)).toEqual({
-      servedModel: "m2.7-fireworks-sapiom",
+      servedModel: "deployment-a",
       costUsd: 0.000123,
     });
   });
