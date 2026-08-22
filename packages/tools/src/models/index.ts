@@ -78,16 +78,19 @@ export interface CodingRunOutcome {
   turns: number;
   modelUsed: string | null;
   /**
-   * Wire `served_model`: server-reported identifier of the deployment that
-   * actually served — distinct from `modelUsed`, which remains the requested
-   * label/model. Null/absent = the server did not disclose (older server; and
-   * coding runs cannot observe it yet) — treat as unknown, never as the label.
-   * Optional so results from older servers stay type-compatible.
+   * Wire `served_class`: the billing class (size) the run resolved to, in the
+   * SKU vocabulary the platform bills in — never a model or provider id.
+   * Null/absent = the server did not disclose (older server; and coding runs
+   * cannot observe it yet) — treat as unknown, never as the label's nominal
+   * class. Optional so results from older servers stay type-compatible.
    */
-  servedModel?: string | null;
+  servedClass?: string | null;
+  /** Wire `lane`: the billing lane the run executed in; null/absent = not disclosed. */
+  lane?: string | null;
   /**
-   * Wire `cost_usd`: USD cost of the run as reported by the server.
-   * Null/absent = not disclosed (coding has no server-priced cost signal yet).
+   * @deprecated Wire `cost_usd` — servers now report null: the customer dollar
+   * amount is the metering pipeline's (run views sum settled charges), not a
+   * synchronous edge-computed figure. Kept for wire stability.
    */
   costUsd?: number | null;
   /**
@@ -287,7 +290,8 @@ interface WireResult {
   success: boolean;
   turns: number;
   model_used: string | null;
-  served_model?: string | null;
+  served_class?: string | null;
+  lane?: string | null;
   cost_usd?: number | null;
   degradation?: unknown;
   duration_ms: number;
@@ -321,7 +325,8 @@ function mapResult(r: WireResult | null | undefined): CodingRunOutcome | null {
     turns: r.turns,
     modelUsed: r.model_used ?? null,
     // Disclosure fields: absent on older servers ⇒ null (unknown), never fabricated.
-    servedModel: r.served_model ?? null,
+    servedClass: r.served_class ?? null,
+    lane: r.lane ?? null,
     costUsd: r.cost_usd ?? null,
     ...(r.degradation ? { degradation: r.degradation } : {}),
     durationMs: r.duration_ms,
@@ -485,16 +490,22 @@ export interface ModelRunOutcome {
   turns: number;
   modelUsed: string | null;
   /**
-   * Wire `served_model`: server-reported identifier of the deployment that
-   * actually served the final turn — distinct from `modelUsed`, which remains
-   * the requested label/model. Null/absent = the server did not disclose
-   * (older server, legacy path) — treat as unknown, never as the label.
-   * Optional so results from older servers stay type-compatible.
+   * Wire `served_class`: the billing class (size) the run's label resolved to
+   * (final turn), in the SKU vocabulary the platform bills in — never a model
+   * or provider id. Null/absent = the server did not disclose (older server,
+   * legacy path) — treat as unknown. Optional so results from older servers
+   * stay type-compatible.
    */
-  servedModel?: string | null;
+  servedClass?: string | null;
+  /** Wire `lane`: the billing lane the run executed in; null/absent = not disclosed. */
+  lane?: string | null;
   durationMs: number;
-  /** USD cost of the run as reported by the server. */
-  costUsd: number;
+  /**
+   * @deprecated Servers now report null: the customer dollar amount is the
+   * metering pipeline's (run views sum settled charges), not a synchronous
+   * edge-computed figure. Older servers may still send a number.
+   */
+  costUsd: number | null;
   /**
    * Reserved: structured degradation annotation — absent on a clean run.
    * Typed `unknown` on purpose: the shape is server-defined and not yet
@@ -565,10 +576,11 @@ interface ModelWireResult {
   stop_reason: string;
   turns: number;
   model_used: string | null;
-  served_model?: string | null;
+  served_class?: string | null;
+  lane?: string | null;
   degradation?: unknown;
   duration_ms: number;
-  cost_usd: number;
+  cost_usd: number | null;
   usage?: {
     input_tokens?: number;
     output_tokens?: number;
@@ -598,10 +610,11 @@ function mapModelResult(r: ModelWireResult | null | undefined): ModelRunOutcome 
     turns: r.turns,
     modelUsed: r.model_used ?? null,
     // Disclosure fields: absent on older servers ⇒ null (unknown), never fabricated.
-    servedModel: r.served_model ?? null,
+    servedClass: r.served_class ?? null,
+    lane: r.lane ?? null,
     ...(r.degradation ? { degradation: r.degradation } : {}),
     durationMs: r.duration_ms,
-    costUsd: r.cost_usd,
+    costUsd: r.cost_usd ?? null,
     usage: {
       inputTokens: r.usage?.input_tokens ?? 0,
       outputTokens: r.usage?.output_tokens ?? 0,

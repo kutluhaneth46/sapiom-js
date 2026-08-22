@@ -26,7 +26,8 @@ function fakeFetch(opts: {
             stop_reason: "end_turn",
             turns: 1,
             model_used: "claude-sonnet-4-6",
-            served_model: "deployment-a",
+            served_class: "medium",
+            lane: "run_now",
             duration_ms: 1200,
             cost_usd: 0.001,
             usage: { input_tokens: 10, output_tokens: 5 },
@@ -74,8 +75,9 @@ describe("agent.run — terminal result mapping", () => {
     expect(result.result?.stopReason).toBe("end_turn");
     expect(result.result?.costUsd).toBe(0.001);
     expect(result.result?.usage.inputTokens).toBe(10);
-    // Serving disclosure: served_model → servedModel; the label stays on modelUsed.
-    expect(result.result?.servedModel).toBe("deployment-a");
+    // Serving disclosure: served_class/lane (SKU vocabulary); the label stays on modelUsed.
+    expect(result.result?.servedClass).toBe("medium");
+    expect(result.result?.lane).toBe("run_now");
     expect(result.result?.modelUsed).toBe("claude-sonnet-4-6");
     // Reserved: degradation is absent unless the run recorded one.
     expect(result.result).not.toHaveProperty("degradation");
@@ -111,9 +113,10 @@ describe("agent.run — terminal result mapping", () => {
 
     const sapiom = createClient({ apiKey: "k", fetch: oldServerFetch });
     const result = await sapiom.models.run({ prompt: "say OK" });
-    expect(result.result?.servedModel).toBeNull();
+    expect(result.result?.servedClass).toBeNull();
+    expect(result.result?.lane).toBeNull();
     expect(result.result).not.toHaveProperty("degradation");
-    expect(result.result?.costUsd).toBe(0.001); // existing field untouched
+    expect(result.result?.costUsd).toBe(0.001); // an old server's number still maps through
   });
 });
 

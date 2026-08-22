@@ -308,15 +308,18 @@ function submitHeaders(spec: LlmSubmitSpec, resumeToken: string | undefined) {
  * bodies — snake_case, injected top-level by the server next to `model`, in
  * the same casing as the rest of the raw body {@link run} returns. The
  * response `model` field keeps echoing the requested label; these dedicated
- * fields report, as observed by the server, which deployment actually served
- * the call and what it cost. Absent = the server did not disclose (older
+ * fields report what the request RESOLVED to, in the SKU vocabulary the
+ * platform bills in (billing class/size × lane) — never a model or provider
+ * id, and never a provider price. Absent = the server did not disclose (older
  * server, resolution failure) — treat as unknown, never assume a value.
+ * (Streaming responses carry the same data as the `x-sapiom-served-class` /
+ * `x-sapiom-lane` response headers instead.)
  */
 export interface LlmDisclosure {
-  /** Server-assigned identifier of the deployment that actually served the call. */
-  served_model?: string;
-  /** USD cost of the call as computed by the server. */
-  cost_usd?: number;
+  /** The billing class (size) the request's label resolved to. */
+  served_class?: string;
+  /** The billing lane the call executed in (e.g. `run_now`). */
+  lane?: string;
   /**
    * Reserved: structured degradation annotation — absent on a clean call.
    * Typed `unknown` on purpose: the shape is server-defined and not yet
@@ -328,8 +331,8 @@ export interface LlmDisclosure {
 
 /** Camel-cased view of {@link LlmDisclosure}; null = the server did not disclose. */
 export interface LlmDisclosureResult {
-  servedModel: string | null;
-  costUsd: number | null;
+  servedClass: string | null;
+  lane: string | null;
 }
 
 /**
@@ -340,8 +343,8 @@ export interface LlmDisclosureResult {
 export function readDisclosure(result: unknown): LlmDisclosureResult {
   const body = (result ?? {}) as LlmDisclosure;
   return {
-    servedModel: typeof body.served_model === "string" && body.served_model ? body.served_model : null,
-    costUsd: typeof body.cost_usd === "number" && Number.isFinite(body.cost_usd) ? body.cost_usd : null,
+    servedClass: typeof body.served_class === "string" && body.served_class ? body.served_class : null,
+    lane: typeof body.lane === "string" && body.lane ? body.lane : null,
   };
 }
 
@@ -355,8 +358,8 @@ export function readDisclosure(result: unknown): LlmDisclosureResult {
  * header is exactly what the edge's identity guard reads).
  *
  * The response `model` echoes the user-facing label; the body additionally
- * carries the serving disclosure ({@link LlmDisclosure}: `served_model` +
- * `cost_usd`) — read it with {@link readDisclosure}.
+ * carries the serving disclosure ({@link LlmDisclosure}: `served_class` +
+ * `lane`) — read it with {@link readDisclosure}.
  */
 export async function run<T = Record<string, unknown>>(
   spec: LlmRunSpec,
