@@ -21,6 +21,7 @@ import {
   type StepDispatchRequest,
   type AgentRunnerCore,
   parseCorrelationId,
+  serializeStepCompletionError,
   STEP_COMPLETION_OUTCOME,
 } from "@sapiom/agent-runtime";
 import { createStubClient, type StubCallRecord } from "@sapiom/tools/stub";
@@ -215,7 +216,7 @@ export class LocalStubDispatcher implements StepDispatcher {
           protocol: 1,
           correlationId: request.correlationId,
           outcome: STEP_COMPLETION_OUTCOME.THREW,
-          error: { name: e.name, message: e.message, stack: e.stack },
+          error: serializeStepCompletionError(e),
           shared: sharedStore.snapshot(),
         },
         parsed,

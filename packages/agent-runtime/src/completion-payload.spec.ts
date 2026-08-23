@@ -1,11 +1,14 @@
 import {
   CTX_SHARED_QUOTA_CONTRACT,
   MAX_SHARED_SNAPSHOT_BYTES as CANONICAL_MAX_SHARED_SNAPSHOT_BYTES,
+  STEP_INPUT_VALIDATION_ERROR_CONTRACT,
+  StepInputValidationError,
   ctxSharedSizeLimitExceededPayloadSchema,
 } from '@sapiom/agent';
 
 import {
   MAX_SHARED_SNAPSHOT_BYTES,
+  serializeStepCompletionError,
   STEP_COMPLETION_OUTCOME,
   stepCompletionPayloadSchema,
 } from './completion-payload.js';
@@ -66,5 +69,70 @@ describe('step completion error compatibility', () => {
       stack: 'stack trace',
     };
     expect(stepCompletionPayloadSchema.parse(threwPayload(error)).error).toEqual(error);
+  });
+
+  it('exports the dispatcher boundary serializer that preserves recognized platform fields', () => {
+    const error = new StepInputValidationError('validate', [
+      {
+        code: 'custom',
+        path: ['email'],
+        message: 'required',
+        input: undefined,
+      },
+    ]);
+
+    expect(serializeStepCompletionError(error)).toEqual(error.toStepErrorPayload());
+
+    const authorError = Object.assign(new Error('ordinary failure'), { retryable: false });
+    expect(serializeStepCompletionError(authorError)).toEqual({
+      name: 'Error',
+      message: 'ordinary failure',
+      stack: authorError.stack,
+    });
+  });
+
+  it('round-trips the platform input-validation payload and strips raw issues', () => {
+    const error = {
+      name: 'StepInputValidationError',
+      message: 'input is invalid',
+      code: STEP_INPUT_VALIDATION_ERROR_CONTRACT.errorCode,
+      version: STEP_INPUT_VALIDATION_ERROR_CONTRACT.version,
+      stepName: 'validate',
+      retryable: false,
+      issues: [{ path: ['secret'], message: 'not a wire field' }],
+    };
+
+    expect(stepCompletionPayloadSchema.parse(threwPayload(error)).error).toEqual({
+      name: 'StepInputValidationError',
+      message: 'input is invalid',
+      code: 'STEP_INPUT_VALIDATION_FAILED',
+      version: 1,
+      stepName: 'validate',
+      retryable: false,
+    });
+  });
+
+  it.each([
+    { name: 'Error', message: 'ordinary failure', retryable: false },
+    {
+      name: 'CustomError',
+      message: 'unknown code',
+      code: 'UNKNOWN_CODE',
+      version: 1,
+      retryable: false,
+    },
+    {
+      name: 'StepInputValidationError',
+      message: 'wrong disposition',
+      code: 'STEP_INPUT_VALIDATION_FAILED',
+      version: 1,
+      stepName: 'validate',
+      retryable: true,
+    },
+  ])('falls back to the retryable legacy shape for unrecognized payload %#', (error) => {
+    expect(stepCompletionPayloadSchema.parse(threwPayload(error)).error).toEqual({
+      name: error.name,
+      message: error.message,
+    });
   });
 });
