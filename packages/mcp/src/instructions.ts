@@ -86,9 +86,9 @@ and returns a live URL; a \`failed\` status carries the build/start logs — fix
 - **Dispatch a deployed agent by slug → \`ctx.sapiom.agents.run\`** — compose systems from
   small deployed agents rather than one monolithic workflow.
 - **You never pick a model.** Say how long you can wait (\`deadlineMinutes\` where supported)
-  — the platform picks the model and reports the served class and lane on the result. You may
-  pin a class label (\`small\` / \`medium\` / \`large\` / \`smart\`); raw provider model ids
-  (e.g. Anthropic ids) are not honored.
+  — the platform picks the model and reports the served class and lane on the result.
+  **Omit \`model\` entirely (recommended)** — the platform routes it. If you must pin, use
+  the \`smart\` label. Raw provider model ids are never honored.
 - **Debugging a run:** run detail → find the suspicious step row id →
   \`GET /v1/workflows/executions/:id/steps/:stepId/io\` returns that attempt's full-fidelity
   input/output/error/logs.
