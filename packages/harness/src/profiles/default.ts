@@ -28,8 +28,8 @@ one-shot — it overthinks); dispatching a deployed agent by slug →
 \`ctx.sapiom.agents.run\`. Structured output = tool-use/schema output, read
 only \`type === 'text'\` blocks — never "reply with only JSON". Omit \`model\`
 (recommended) or pin the \`smart\` label; raw provider ids are never
-honored. Results disclose the served class + lane. Debugging a run: run
-detail → step row id → the per-step \`/io\` endpoint or the Run Inspector.
+honored. Results disclose the served class + lane. Debugging a run: the
+Run Inspector, or the per-step I/O endpoint documented below.
 Guide: https://docs.sapiom.ai/guides/choose-a-call-surface.
 
 **When something about Sapiom is wrong, send it upstream.** If the user hits a
