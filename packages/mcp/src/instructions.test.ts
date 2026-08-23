@@ -60,9 +60,11 @@ describe("server instructions", () => {
     expect(AUTHORING_INSTRUCTIONS).toContain("models.coding.run");
     expect(AUTHORING_INSTRUCTIONS).toContain("ctx.sapiom.agents.run");
     expect(AUTHORING_INSTRUCTIONS).toContain("You never pick a model");
-    expect(AUTHORING_INSTRUCTIONS).toContain(
-      "GET /v1/workflows/executions/:id/steps/:stepId/io",
-    );
+    // The internal `workflows`-service naming must never reach this customer-facing
+    // primer — the per-step debugging endpoint lives in the docs guide, not spelled
+    // out here verbatim (matches this package's own scaffold terminology guard).
+    expect(AUTHORING_INSTRUCTIONS).toContain("Run Inspector");
+    expect(AUTHORING_INSTRUCTIONS).not.toContain("/v1/workflows/");
   });
 
   it("documents the complete ctx.shared quota contract", () => {

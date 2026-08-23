@@ -84,14 +84,13 @@ and returns a live URL; a \`failed\` status carries the build/start logs — fix
   tool-calling task (minutes, not seconds). \`models.coding.run\` for sandboxed coding tasks.
   Never use this for a one-shot completion — it will loop and overthink.
 - **Dispatch a deployed agent by slug → \`ctx.sapiom.agents.run\`** — compose systems from
-  small deployed agents rather than one monolithic workflow.
+  small deployed agents rather than one large monolith.
 - **You never pick a model.** Say how long you can wait (\`deadlineMinutes\` where supported)
   — the platform picks the model and reports the served class and lane on the result.
   **Omit \`model\` entirely (recommended)** — the platform routes it. If you must pin, use
   the \`smart\` label. Raw provider model ids are never honored.
-- **Debugging a run:** run detail → find the suspicious step row id →
-  \`GET /v1/workflows/executions/:id/steps/:stepId/io\` returns that attempt's full-fidelity
-  input/output/error/logs.
+- **Debugging a run:** open the Run Inspector, or fetch a step's full input/output via
+  the per-step endpoint documented in the guide.
 
 Full reference: https://docs.sapiom.ai/agents/quick-start (authoring · capabilities ·
 reference · examples), plus the \`AGENTS.md\` and \`sapiom-agent-authoring\` skill inside
