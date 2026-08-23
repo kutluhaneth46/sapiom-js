@@ -54,6 +54,17 @@ describe("server instructions", () => {
     );
   });
 
+  it("teaches the LLM call-surface rule (SAP-2775) — kept byte-identical to the backend copy", () => {
+    expect(AUTHORING_INSTRUCTIONS).toContain("ctx.sapiom.llm.run");
+    expect(AUTHORING_INSTRUCTIONS).toContain("ctx.sapiom.models.run");
+    expect(AUTHORING_INSTRUCTIONS).toContain("models.coding.run");
+    expect(AUTHORING_INSTRUCTIONS).toContain("ctx.sapiom.agents.run");
+    expect(AUTHORING_INSTRUCTIONS).toContain("You never pick a model");
+    expect(AUTHORING_INSTRUCTIONS).toContain(
+      "GET /v1/workflows/executions/:id/steps/:stepId/io",
+    );
+  });
+
   it("documents the complete ctx.shared quota contract", () => {
     expect(AUTHORING_INSTRUCTIONS).toContain(
       "inclusive 256 KiB (262,144-byte) quota",

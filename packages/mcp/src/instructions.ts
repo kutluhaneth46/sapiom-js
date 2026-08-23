@@ -75,6 +75,24 @@ and returns a live URL; a \`failed\` status carries the build/start logs — fix
   don't memorize the catalog; use autocomplete/typecheck. Schedules (cron triggers) are
   a top-level \`@sapiom/tools\` import, not under \`ctx.sapiom\`.
 
+## Calling LLMs and running agent loops (from agent code)
+- **One LLM call → \`ctx.sapiom.llm.run\`** — summarize, extract, classify, one-shot generate.
+  For structured/JSON output, request tool-use/schema output and read only
+  \`type === 'text'\` content blocks (a \`thinking\` block may be present); never
+  "reply with only JSON" + string parsing.
+- **Platform-driven agent loop → \`ctx.sapiom.models.run\`** — a multi-turn reasoning +
+  tool-calling task (minutes, not seconds). \`models.coding.run\` for sandboxed coding tasks.
+  Never use this for a one-shot completion — it will loop and overthink.
+- **Dispatch a deployed agent by slug → \`ctx.sapiom.agents.run\`** — compose systems from
+  small deployed agents rather than one monolithic workflow.
+- **You never pick a model.** Say how long you can wait (\`deadlineMinutes\` where supported)
+  — the platform picks the model and reports the served class and lane on the result. You may
+  pin a class label (\`small\` / \`medium\` / \`large\` / \`smart\`); raw provider model ids
+  (e.g. Anthropic ids) are not honored.
+- **Debugging a run:** run detail → find the suspicious step row id →
+  \`GET /v1/workflows/executions/:id/steps/:stepId/io\` returns that attempt's full-fidelity
+  input/output/error/logs.
+
 Full reference: https://docs.sapiom.ai/agents/quick-start (authoring · capabilities ·
 reference · examples), plus the \`AGENTS.md\` and \`sapiom-agent-authoring\` skill inside
 your scaffolded project.`;
