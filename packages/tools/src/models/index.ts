@@ -481,8 +481,10 @@ export interface ModelRunSpec {
   /**
    * Routing label for the run's LLM calls (e.g. `"smart"`). The platform
    * resolves it against its configured label set — a raw provider model id
-   * is never honored. Omit to let the platform choose (the recommended
-   * default); pass `"smart"` if you need to pin explicitly.
+   * is never honored. An unrecognized value is never silently dropped: the
+   * run routes via the platform default and the platform reports it in the
+   * result's `warnings` (SAP-2765). Omit to let the platform choose (the
+   * recommended default); pass `"smart"` if you need to pin explicitly.
    */
   model?: ModelLabel;
   /** Max output tokens per turn. */
@@ -509,6 +511,13 @@ export interface ModelRunOutcome {
    * `undefined`/`null` means not disclosed — same caveats as `servedClass`.
    */
   lane?: string | null;
+  /**
+   * Routing/honesty warnings reported by the platform (SAP-2765) — e.g. a
+   * supplied `model` the platform didn't recognize (the run then routed via
+   * the platform default). Treat `undefined` as none on any path: the wire
+   * omits the key on a clean run and the stub never sets it.
+   */
+  warnings?: string[];
   durationMs: number;
   costUsd: number;
   usage: CodingRunUsage;
@@ -549,6 +558,18 @@ export type ModelRunResultPayload = ModelRunResult;
 /** Thrown by {@link modelRunResultSchema}.parse on a malformed resume payload. */
 export class ModelRunResultSchemaError extends Error {}
 
+/**
+ * Guarded `warnings` normalization — enforces the ONE encoding of "no
+ * warnings" (`undefined`) on every path that hands a {@link ModelRunOutcome}
+ * to a consumer: only string elements survive; an empty/absent/malformed value
+ * becomes `undefined`, never a present-but-empty array a consumer's
+ * `if (outcome.warnings)` would misread.
+ */
+function normalizeWarnings(value: unknown): string[] | undefined {
+  const warnings = Array.isArray(value) ? value.filter((w): w is string => typeof w === "string") : [];
+  return warnings.length ? warnings : undefined;
+}
+
 /** Runtime validator for {@link ModelRunResultPayload}. */
 export const modelRunResultSchema = {
   parse(value: unknown): ModelRunResultPayload {
@@ -563,6 +584,15 @@ export const modelRunResultSchema = {
     if (v.output !== null && typeof v.output !== "string") fail("output must be a string or null");
     if (v.result !== null && (typeof v.result !== "object" || !v.result)) fail("result must be an object or null");
     if (v.error !== null && (typeof v.error !== "object" || !v.error)) fail("error must be an object or null");
+    if (v.result) {
+      // Same warnings encoding as the polled path (mapModelResult): the resume
+      // payload is server-serialized, so a wire `[]` would otherwise reach the
+      // resumed step present-but-empty.
+      const r = v.result as Record<string, unknown>;
+      const warnings = normalizeWarnings(r.warnings);
+      if (warnings) r.warnings = warnings;
+      else delete r.warnings;
+    }
     return value as ModelRunResultPayload;
   },
 };
@@ -576,6 +606,8 @@ interface ModelWireResult {
   model_used: string | null;
   served_class?: string | null;
   lane?: string | null;
+  /** Present only when the run has warnings (e.g. an unhonored `model` pin); guarded at map time. */
+  warnings?: string[];
   duration_ms: number;
   cost_usd: number;
   usage?: {
@@ -611,6 +643,14 @@ function mapModelResult(r: ModelWireResult | null | undefined): ModelRunOutcome 
     lane: r.lane ?? null,
     durationMs: r.duration_ms,
     costUsd: r.cost_usd,
+    // Passthrough via the shared guard (`normalizeWarnings`): the key is
+    // absent unless at least one string warning survives — a wire `[]`, a
+    // non-array, or an all-junk array maps to absent, matching the documented
+    // "treat undefined as none".
+    ...(() => {
+      const warnings = normalizeWarnings(r.warnings);
+      return warnings ? { warnings } : {};
+    })(),
     usage: {
       inputTokens: r.usage?.input_tokens ?? 0,
       outputTokens: r.usage?.output_tokens ?? 0,
