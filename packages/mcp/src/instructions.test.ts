@@ -90,10 +90,19 @@ describe("server instructions", () => {
       "IDs/references here instead of bulk state",
     );
     expect(AUTHORING_INSTRUCTIONS).toContain(
-      "does not make `ctx.shared.set()` a synchronous size gate by itself",
+      "`ctx.shared.set()` validates the complete candidate synchronously",
     );
     expect(AUTHORING_INSTRUCTIONS).toContain(
-      "older hosts may temporarily enforce a smaller",
+      "construct this SDK version's `InMemoryContextStore`",
+    );
+    expect(AUTHORING_INSTRUCTIONS).toContain(
+      "snapshot unchanged after an oversized or unserializable write",
+    );
+    expect(AUTHORING_INSTRUCTIONS).toContain("structural payload guards");
+    expect(AUTHORING_INSTRUCTIONS).toContain("than `instanceof`");
+    expect(AUTHORING_INSTRUCTIONS).toContain("Hosts that have not adopted");
+    expect(AUTHORING_INSTRUCTIONS).toContain(
+      "There is no `delete()` operation",
     );
   });
 });
