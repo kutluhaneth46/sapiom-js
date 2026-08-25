@@ -1155,8 +1155,8 @@ function ProfileRow({
         open={settingsOpen}
         anchorRef={triggerRef}
         onDismiss={closeSettings}
-        placement="up-start"
-        matchWidth
+        placement="right-end"
+        besideRef={railRef}
         className="settings-popover"
         testid="settings-popover"
       >
@@ -1178,9 +1178,9 @@ function ProfileRow({
         />
       </AnchoredPopover>
 
-      {/* The profile menu opens BESIDE the rail, bottom edges aligned: a panel
-          that floats over the rail on the rail's own footprint reads as nothing
-          having happened. Clearing the rail gives it its own ground. */}
+      {/* Like the settings panel above: BESIDE the rail, bottom edges aligned.
+          A panel that floats over the rail on the rail's own footprint reads as
+          nothing having happened; clearing the rail gives it its own ground. */}
       <AnchoredPopover
         open={menuOpen}
         anchorRef={triggerRef}

@@ -3114,11 +3114,14 @@ button.rail-footer-card:hover {
    subtle shadow, and — in light mode — a solid accent fill on hover (the
    product's `hover:bg-accent`); dark mode keeps the more restrained neutral
    hover the outline variant uses there. */
-/* Portaled off the rail's profile row (AnchoredPopover, matchWidth): the
-   surface comes from the ONE popover recipe; only the roomier content
-   padding is its own. */
+/* Portaled off the rail's profile row and opened beside the rail: the surface
+   comes from the ONE popover recipe; only the roomier content padding and its
+   own readable width — the rail's width is the user's to drag, not this
+   panel's — are its own. Mirrors the studio rail reference. */
 .settings-popover {
   padding: var(--sp4);
+  width: min(320px, calc(100vw - var(--sp4)));
+  min-width: 280px;
 }
 
 .settings-identity {

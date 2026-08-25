@@ -107,10 +107,18 @@ test("profile menu rows stay single-line at the rail's minimum width", async ({ 
   await expectUncropped(page, menu);
 });
 
-test("settings popover opens uncropped off the rail footer", async ({ page }) => {
+test("settings popover opens beside the rail, uncropped", async ({ page }) => {
   await page.getByTestId("brand-identity").click();
   await page.getByTestId("settings-trigger").click();
-  await expectUncropped(page, page.getByTestId("settings-popover"));
+  const popover = page.getByTestId("settings-popover");
+  await expectUncropped(page, popover);
+
+  const popoverBox = await popover.boundingBox();
+  expect(popoverBox!.width, "popover holds its readable floor").toBeGreaterThanOrEqual(280);
+  const railBox = await page.locator(".rail-workflows").boundingBox();
+  expect(popoverBox!.x, "popover clears the rail's right edge").toBeGreaterThanOrEqual(
+    railBox!.x + railBox!.width,
+  );
 });
 
 test("session bar menu opens uncropped at the header's right cluster", async ({ page }) => {
