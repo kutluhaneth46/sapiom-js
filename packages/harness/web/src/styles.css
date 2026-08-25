@@ -43,6 +43,10 @@
      read as their own surface, so they take this width rather than the width
      of whatever row opened them. Mirrors the studio rail reference. */
   --menu-w: min(var(--col-w), calc(100vw - var(--sp4)));
+  /* A menu's own horizontal inset, the --pane-pad-x of a floating surface: its
+     rows bleed by --row-bleed inside it, so the well is inset by the
+     difference and the glyphs still land on one line. */
+  --menu-pad-x: var(--sp3);
   --font-sans: var(--font);
   --font-mono: var(--mono);
 
@@ -1486,6 +1490,7 @@ button.rail-footer-card:hover {
 .profile-menu {
   width: var(--menu-w);
   min-width: 240px;
+  padding: var(--sp2) calc(var(--menu-pad-x) - var(--row-bleed));
 }
 
 @media (prefers-reduced-motion: reduce) {

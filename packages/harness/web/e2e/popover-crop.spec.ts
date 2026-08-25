@@ -100,6 +100,10 @@ test("profile menu rows stay single-line at the rail's minimum width", async ({ 
   const menuBox = await menu.boundingBox();
   expect(menuBox!.width).toBeGreaterThan(triggerBox!.width);
   expect(menuBox!.width, "menu holds its readable floor").toBeGreaterThanOrEqual(240);
+  // And it opens beside the rail rather than over it: on the rail's own
+  // footprint a panel this shape reads as nothing having happened.
+  const railBox = await page.locator(".rail-workflows").boundingBox();
+  expect(menuBox!.x, "menu clears the rail's right edge").toBeGreaterThanOrEqual(railBox!.x + railBox!.width);
   await expectUncropped(page, menu);
 });
 
