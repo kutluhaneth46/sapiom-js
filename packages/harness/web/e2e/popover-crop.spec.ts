@@ -64,6 +64,44 @@ test("profile menu opens uncropped off the rail footer", async ({ page }) => {
   await expectUncropped(page, page.getByTestId("profile-menu"));
 });
 
+/* matchWidth pins the profile menu to the rail's width, so the narrowest rail
+   is the case where its labels wrap and rows overlap each other. */
+test("profile menu rows stay single-line at the rail's minimum width", async ({ page }) => {
+  await page.evaluate(() => {
+    localStorage.setItem("sapiom-harness-pane-widths", JSON.stringify({ rail: 180 }));
+  });
+  await page.reload();
+  await expect(page.locator(".rail-workflows")).toBeVisible();
+
+  const trigger = page.getByTestId("brand-identity");
+  await trigger.click();
+  const menu = page.getByTestId("profile-menu");
+  await expect(menu).toBeVisible();
+
+  const rows = await menu.locator(".profile-menu-item").evaluateAll((els) =>
+    els.map((el) => {
+      const rect = el.getBoundingClientRect();
+      return { top: rect.top, bottom: rect.bottom, height: rect.height, overflow: el.scrollHeight - el.clientHeight };
+    }),
+  );
+  expect(rows.length).toBeGreaterThan(2);
+  for (const row of rows) {
+    // --tree-row-h is 30px; a wrapped label would double this.
+    expect(row.height, "row is one line tall").toBeLessThanOrEqual(31);
+    // A wrapped label spilling past a fixed-height row is what reads as
+    // "overlapping menu items" on screen while the boxes still look fine.
+    expect(row.overflow, "label fits inside its row").toBeLessThanOrEqual(1);
+  }
+  for (let i = 1; i < rows.length; i += 1) {
+    expect(rows[i].top, "row starts below the one before it").toBeGreaterThanOrEqual(rows[i - 1].bottom - 0.5);
+  }
+  // The panel outgrows the narrow rail rather than squeezing its labels.
+  const triggerBox = await trigger.boundingBox();
+  const menuBox = await menu.boundingBox();
+  expect(menuBox!.width).toBeGreaterThan(triggerBox!.width);
+  await expectUncropped(page, menu);
+});
+
 test("settings popover opens uncropped off the rail footer", async ({ page }) => {
   await page.getByTestId("brand-identity").click();
   await page.getByTestId("settings-trigger").click();

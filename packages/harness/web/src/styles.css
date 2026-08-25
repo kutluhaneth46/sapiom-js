@@ -1474,6 +1474,14 @@ button.rail-footer-card:hover {
   min-width: 12rem;
 }
 
+/* AnchoredPopover's matchWidth pins this panel to the rail's own width, which
+   the user can drag narrow — narrower than "Open Sapiom dashboard". min-width
+   beats that inline width, so rows stay on one line instead of wrapping into
+   each other; the popover's measured pass shifts the wider panel into view. */
+.profile-menu {
+  min-width: max-content;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .canvas-detail-menu,
   .canvas-run-menu,
@@ -1493,7 +1501,9 @@ button.rail-footer-card:hover {
   align-items: center;
   gap: var(--sp2);
   width: 100%;
-  height: var(--tree-row-h);
+  /* A floor, not a fixed height: a row that does wrap (a long session name in
+     a narrow menu) grows instead of spilling over its neighbours. */
+  min-height: var(--tree-row-h);
   padding: 0 var(--sp2);
   border: 0;
   background: transparent;
