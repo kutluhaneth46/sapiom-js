@@ -249,6 +249,16 @@ describe("CodexAdapter", () => {
       expect(adapter.detectBlockingPrompt(composer)).toBe(false);
     });
 
+    it("does not treat MCP startup authentication warnings as blocking prompts", () => {
+      const adapter = new CodexAdapter();
+      expect(
+        adapter.detectBlockingPrompt(
+          "MCP client for `notion` failed to start: Auth error: OAuth authorization required\r\n" +
+            "MCP startup incomplete (failed: notion, render)",
+        ),
+      ).toBe(false);
+    });
+
     it("does not treat one isolated onboarding label in ordinary output as a whole blocking screen", () => {
       const adapter = new CodexAdapter();
       expect(
@@ -305,6 +315,47 @@ describe("CodexAdapter", () => {
             "\x1b[12;19Hanything\x1b[?2026l",
         ),
       ).toBe(true);
+    });
+
+    it("recognizes the Codex 0.143 empty-composer copy", () => {
+      const adapter = new CodexAdapter();
+      expect(
+        adapter.detectReadyPrompt(
+          "\x1b[?2026h\x1b[12;3HUse\x1b[12;7H/skills\x1b[12;15Hto" +
+            "\x1b[12;18Hlist\x1b[12;23Havailable\x1b[12;33Hskills\x1b[?2026l",
+        ),
+      ).toBe(true);
+    });
+
+    it("recognizes a future composer copy from its input marker and cwd footer", () => {
+      const adapter = new CodexAdapter();
+      expect(
+        adapter.detectReadyPrompt(
+          "\x1b[?2026h\x1b[12;3H› A future placeholder\r\n" +
+            "\x1b[14;3Hgpt-next medium · C:\\work\\project\x1b[?2026l",
+        ),
+      ).toBe(true);
+    });
+
+    it("does not treat a selection marker without the cwd footer as a composer", () => {
+      const adapter = new CodexAdapter();
+      expect(
+        adapter.detectReadyPrompt(
+          "\x1b[?2026h\x1b[6;3H› 1. Yes, continue\r\n" +
+            "\x1b[7;3H2. No, quit\x1b[?2026l",
+        ),
+      ).toBe(false);
+    });
+
+    it("vetoes a partial trust repaint even when the underlying cwd footer is visible", () => {
+      const adapter = new CodexAdapter();
+      expect(
+        adapter.detectReadyPrompt(
+          "\x1b[?2026h\x1b[6;3H  1. Yes, continue\r\n" +
+            "\x1b[7;3H› 2. No, quit\r\n" +
+            "\x1b[14;3Hgpt-5.5 default · /tmp/proj\x1b[?2026l",
+        ),
+      ).toBe(false);
     });
 
     it("does not mistake an onboarding screen for the empty composer", () => {

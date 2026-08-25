@@ -107,10 +107,42 @@ const BLOCKING_PROMPT_SIGNATURES: readonly (readonly RegExp[])[] = [
   [tuiPhrase("Select Syntax Theme"), tuiPhrase("Type to filter themes")],
 ];
 
-/** Stable empty-composer copy from codex-cli 0.147.0. This is not required
- * for the ordinary already-trusted path; SessionManager uses it to prove that
- * a previously detected onboarding screen has actually been replaced. */
-const READY_PROMPT_PATTERNS = [tuiPhrase("Ask Codex to do anything")];
+/**
+ * Stable empty-composer copy across supported Codex CLI releases. This is not
+ * required for the ordinary already-trusted path; SessionManager uses it to
+ * prove that a previously detected onboarding screen has actually been
+ * replaced. Keep older copy here as well as newer copy: a real 0.143.0 startup
+ * renders "Use /skills to list available skills", while 0.147.0 renders "Ask
+ * Codex to do anything". Without both, accepting a trust prompt on 0.143.0
+ * leaves the safety latch closed even though the composer is visible.
+ */
+const READY_PROMPT_PATTERNS = [
+  tuiPhrase("Ask Codex to do anything"),
+  tuiPhrase("Use /skills to list available skills"),
+];
+
+/**
+ * Copy-independent composer proof. Codex's empty input row carries the `›`
+ * marker and its footer separates the mode from the cwd with `·`; onboarding
+ * selectors can use the same marker, but do not render that cwd footer. The
+ * blocker check in SessionManager still wins when a known modal and the
+ * underlying composer are present in the same diff-rendered frame.
+ */
+const COMPOSER_INPUT_MARKER = /›/u;
+const COMPOSER_CWD_FOOTER = /·\s*(?:~[\\/]|\/|[A-Za-z]:[\\/])/u;
+
+/**
+ * A modal can repaint only its moved selection row while leaving Codex's
+ * underlying footer visible. Full blocker detection deliberately requires a
+ * whole multi-phrase signature, but clearing an already-latched blocker is
+ * stricter: any one known modal fragment vetoes composer readiness until a
+ * clean frame arrives.
+ */
+function hasBlockingPromptFragment(rendered: string): boolean {
+  return BLOCKING_PROMPT_SIGNATURES.some((signature) =>
+    signature.some((pattern) => pattern.test(rendered)),
+  );
+}
 
 export interface CodexAdapterOptions {
   /** Overridable for tests. */
@@ -308,7 +340,12 @@ export class CodexAdapter implements HarnessAdapter {
 
   detectReadyPrompt(terminalOutput: string): boolean {
     const rendered = stripAnsi(terminalOutput);
-    return READY_PROMPT_PATTERNS.some((pattern) => pattern.test(rendered));
+    if (hasBlockingPromptFragment(rendered)) return false;
+    return (
+      READY_PROMPT_PATTERNS.some((pattern) => pattern.test(rendered)) ||
+      (COMPOSER_INPUT_MARKER.test(rendered) &&
+        COMPOSER_CWD_FOOTER.test(rendered))
+    );
   }
 
   /**
