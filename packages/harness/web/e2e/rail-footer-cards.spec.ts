@@ -27,7 +27,9 @@ test.describe("plan card", () => {
     await expect(page.locator(".rail-workflows")).toBeVisible();
   });
 
-  test("renders the mock plan with the spend-vs-limit readout", async ({ page }) => {
+  test("renders the mock plan with the spend-vs-limit readout", async ({
+    page,
+  }) => {
     const card = page.getByTestId("plan-card");
     await expect(card).toBeVisible();
     await expect(card).toContainText("Free plan");
@@ -46,7 +48,9 @@ test.describe("plan card", () => {
     await expect(upgrade).toHaveAttribute("target", "_blank");
   });
 
-  test("the overflow menu offers the two billing links and dismisses", async ({ page }) => {
+  test("the overflow menu offers the two billing links and dismisses", async ({
+    page,
+  }) => {
     await page.getByTestId("plan-menu-trigger").click();
     const menu = page.getByTestId("plan-menu");
     await expect(menu).toBeVisible();
@@ -57,14 +61,48 @@ test.describe("plan card", () => {
     await expect(menu).not.toBeVisible();
   });
 
-  test("sits above the account row inside one footer block", async ({ page }) => {
+  test("keeps the readout clear of the Upgrade pill at the rail's minimum width", async ({
+    page,
+  }) => {
+    await page.evaluate(() => {
+      localStorage.setItem(
+        "sapiom-harness-pane-widths",
+        JSON.stringify({ rail: 180 }),
+      );
+    });
+    await page.reload();
+    await expect(page.getByTestId("plan-card")).toBeVisible();
+
+    const readout = page.getByTestId("plan-balance");
+    // The copy column shrinks with the rail, so the money line has to CLIP:
+    // painted at full length it runs straight under the CTA beside it.
+    const clipped = await readout.evaluate(
+      (el) => el.scrollWidth > el.clientWidth,
+    );
+    const readoutBox = (await readout.boundingBox())!;
+    const upgradeBox = (await page.getByTestId("plan-upgrade").boundingBox())!;
+    expect(
+      readoutBox.x + readoutBox.width,
+      "readout ends before the Upgrade pill",
+    ).toBeLessThanOrEqual(upgradeBox.x + 0.5);
+    expect(
+      clipped,
+      "a value with nowhere to go is ellipsised, not overflowing",
+    ).toBe(true);
+  });
+
+  test("sits above the account row inside one footer block", async ({
+    page,
+  }) => {
     const footer = page.locator(".rail-footer");
     await expect(footer.getByTestId("plan-card")).toBeVisible();
     await expect(footer.getByTestId("brand-identity")).toBeVisible();
     const cardBox = await footer.getByTestId("plan-card").boundingBox();
     const accountBox = await footer.getByTestId("brand-identity").boundingBox();
     expect(cardBox && accountBox && cardBox.y < accountBox.y).toBe(true);
-    await footer.screenshot({ path: "web/e2e/screenshots/rail-footer-plan-card.png" });
+    await footer.screenshot({
+      path: "web/e2e/screenshots/rail-footer-plan-card.png",
+    });
   });
 });
 
@@ -101,7 +139,9 @@ test.describe("update card", () => {
           // can't see and doesn't need to.
           return Promise.resolve({ kind: "downloaded", version: "0.4.2" });
         },
-        onUpdateState: (cb: (state: { kind: string; version?: string }) => void) => {
+        onUpdateState: (
+          cb: (state: { kind: string; version?: string }) => void,
+        ) => {
           window.__pushUpdateState = cb;
           return () => {};
         },
@@ -132,9 +172,7 @@ test.describe("update card", () => {
     // Click → exactly one checkForUpdates() round-trip, and the card STAYS
     // (it outlives "Later"; only a state push removes it).
     await card.click();
-    await expect
-      .poll(() => page.evaluate(() => window.__updateChecks))
-      .toBe(1);
+    await expect.poll(() => page.evaluate(() => window.__updateChecks)).toBe(1);
     await expect(card).toBeVisible();
 
     // A `none` push (failed apply cleared pending) retracts the card.

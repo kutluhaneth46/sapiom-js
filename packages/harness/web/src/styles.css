@@ -1306,6 +1306,10 @@ input {
   font-size: var(--type-meta);
   color: var(--text-dim);
   white-space: nowrap;
+  /* Clips like the name above it: the copy column shrinks with the rail, and a
+     value with nowhere left to go must end rather than run under the CTA. */
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* The Upgrade CTA rides the shared .pill surface but at a clickable height —
