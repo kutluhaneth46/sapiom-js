@@ -186,12 +186,16 @@ export interface HarnessSession {
    * directory?") that isn't accepting real input yet. `ready` is the
    * stronger signal: this pty is actually interactive. Reset to `false` on
    * every fresh spawn (including resume) and only ever set by
-   * `SessionManager.setReady()` — see there for what flips it. Injecting
-   * input (macros, `/sessions/:id/input`) against a not-ready session
-   * queues briefly then fails loudly (`SessionNotReadyError`) rather than
-   * silently writing into a TUI that isn't listening; raw terminal
-   * keystrokes (`write()`) are deliberately never gated on this, since a
-   * human must always be able to answer the blocking prompt themselves.
+   * `SessionManager.setReady()` — either from the harness's real lifecycle
+   * signal or an explicitly-declared adapter fallback. A fallback may publish
+   * readiness before the harness has created its first transcript/rollout;
+   * `ready` describes whether the TUI can receive input, not whether durable
+   * conversation metadata already exists. Injecting input (macros,
+   * `/sessions/:id/input`) against a not-ready session queues briefly then
+   * fails loudly (`SessionNotReadyError`) rather than silently writing into a
+   * TUI that isn't listening; raw terminal keystrokes (`write()`) are
+   * deliberately never gated on this, since a human must always be able to
+   * answer the blocking prompt themselves.
    */
   ready: boolean;
 }
@@ -377,30 +381,42 @@ export interface HarnessAdapter {
    */
   canResume(agentSessionId: string, cwd: string): Promise<boolean>;
   /**
-   * Best-effort scrollback check for this harness's own known blocking
-   * prompts (e.g. "trust this directory?"), for harnesses whose real
-   * readiness signal (SessionStart-equivalent) can't be trusted to arrive
-   * before the very first input is worth injecting — see CodexAdapter's
-   * implementation for why. Optional: a harness whose readiness signal IS
-   * trustworthy standalone (Claude Code's SessionStart hook) should leave
-   * this unimplemented rather than have SessionManager fall back to a
-   * scrollback heuristic it doesn't need.
+   * Best-effort check of recent content-bearing terminal output for this
+   * harness's own known blocking prompts (e.g. trust, login, or onboarding
+   * screens). Used by declared readiness fallbacks to avoid input while a
+   * screen the adapter recognizes is visible; it is not a generic terminal-
+   * state guarantee, so adapters are responsible for tracking stable copy
+   * from their startup flows. See CodexAdapter for the immediate-fallback
+   * case. Optional for adapters that never declare a fallback.
    */
-  detectBlockingPrompt?(scrollback: string): boolean;
+  detectBlockingPrompt?(terminalOutput: string): boolean;
   /**
-   * How SessionManager may mark this harness ready WITHOUT its real readiness
-   * signal (SessionStart hook / tailer equivalent). Absent = never.
+   * Best-effort positive match for this harness's empty interactive composer.
+   * Immediate fallbacks use it only after they previously recognized a
+   * blocking screen: a partial TUI repaint cannot erase that blocker latch;
+   * a positively identified composer can. Optional when the adapter's output
+   * is not diff-rendered or it never declares an immediate fallback.
+   */
+  detectReadyPrompt?(terminalOutput: string): boolean;
+  /**
+   * How SessionManager may proactively mark this harness ready WITHOUT its
+   * real readiness signal (SessionStart hook / tailer equivalent). Absent =
+   * never publish fallback readiness; detect-only legacy adapters retain only
+   * their request-time `isReadyEnough` compatibility path.
    *
-   *  - `"immediate"` (Codex): `isReadyEnough` trusts a settled scrollback with
-   *    no blocking prompt right away — Codex's real signal cannot arrive
+   *  - `"immediate"` (Codex): after the pty has produced output and settled
+   *    (or reached a bounded liveness ceiling), SessionManager proactively
+   *    publishes `ready` when no recognized blocking prompt is visible,
+   *    releasing a held first prompt. `isReadyEnough` applies the same rule
+   *    as a request-time race safeguard. Codex's real signal cannot arrive
    *    before the first injection needs it (see CodexAdapter).
    *  - `"hook-timeout"` (Claude Code): the hook is the primary signal, but a
    *    generously-timed fallback flips `ready` when it never arrives — the
    *    hook chain runs `node` through whatever shell Claude uses for hooks,
    *    and on Windows machines where that resolution breaks, the alternative
-   *    was a held first prompt silently dropped. Requires
-   *    `detectBlockingPrompt` so the fallback never types into an unanswered
-   *    trust dialog.
+   *    was a held first prompt silently dropped. When supplied,
+   *    `detectBlockingPrompt` keeps this fallback waiting on blocking screens
+   *    the adapter recognizes.
    */
   readyFallback?: "immediate" | "hook-timeout";
   /**
