@@ -64,8 +64,8 @@ test("profile menu opens uncropped off the rail footer", async ({ page }) => {
   await expectUncropped(page, page.getByTestId("profile-menu"));
 });
 
-/* matchWidth pins the profile menu to the rail's width, so the narrowest rail
-   is the case where its labels wrap and rows overlap each other. */
+/* The profile menu carries its own readable width; the narrowest rail is where
+   inheriting the trigger's width used to wrap labels over each other. */
 test("profile menu rows stay single-line at the rail's minimum width", async ({ page }) => {
   await page.evaluate(() => {
     localStorage.setItem("sapiom-harness-pane-widths", JSON.stringify({ rail: 180 }));
@@ -95,10 +95,11 @@ test("profile menu rows stay single-line at the rail's minimum width", async ({ 
   for (let i = 1; i < rows.length; i += 1) {
     expect(rows[i].top, "row starts below the one before it").toBeGreaterThanOrEqual(rows[i - 1].bottom - 0.5);
   }
-  // The panel outgrows the narrow rail rather than squeezing its labels.
+  // The panel keeps its own width rather than squeezing into the narrow rail.
   const triggerBox = await trigger.boundingBox();
   const menuBox = await menu.boundingBox();
   expect(menuBox!.width).toBeGreaterThan(triggerBox!.width);
+  expect(menuBox!.width, "menu holds its readable floor").toBeGreaterThanOrEqual(240);
   await expectUncropped(page, menu);
 });
 

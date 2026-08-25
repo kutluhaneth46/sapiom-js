@@ -39,6 +39,10 @@
      its glyphs land on the pane inset while the hover shape breathes around
      them. Mirrors the studio rail reference. */
   --row-bleed: var(--sp2);
+  /* ONE readable width for floating menus, capped to the viewport. Menus are
+     read as their own surface, so they take this width rather than the width
+     of whatever row opened them. Mirrors the studio rail reference. */
+  --menu-w: min(var(--col-w), calc(100vw - var(--sp4)));
   --font-sans: var(--font);
   --font-mono: var(--mono);
 
@@ -1474,12 +1478,14 @@ button.rail-footer-card:hover {
   min-width: 12rem;
 }
 
-/* AnchoredPopover's matchWidth pins this panel to the rail's own width, which
-   the user can drag narrow — narrower than "Open Sapiom dashboard". min-width
-   beats that inline width, so rows stay on one line instead of wrapping into
-   each other; the popover's measured pass shifts the wider panel into view. */
+/* Footer / profile menus: fixed readable width — never match the rail trigger,
+   whose width the user can drag down to the rail minimum, narrower than "Open
+   Sapiom dashboard". A menu is its own surface, so it is sized by what it has
+   to say, not by the row that opened it; the popover's measured pass shifts the
+   wider panel back into view. Mirrors the studio rail reference. */
 .profile-menu {
-  min-width: max-content;
+  width: var(--menu-w);
+  min-width: 240px;
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -1501,9 +1507,13 @@ button.rail-footer-card:hover {
   align-items: center;
   gap: var(--sp2);
   width: 100%;
-  /* A floor, not a fixed height: a row that does wrap (a long session name in
-     a narrow menu) grows instead of spilling over its neighbours. */
+  /* A floor, not a fixed height, and one line: at the fixed menu width a label
+     clips rather than wrapping on top of the row below it. */
+  height: auto;
   min-height: var(--tree-row-h);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   padding: 0 var(--sp2);
   border: 0;
   background: transparent;

@@ -1179,7 +1179,6 @@ function ProfileRow({
         anchorRef={triggerRef}
         onDismiss={closeMenu}
         placement="up-start"
-        matchWidth
         className="profile-menu"
         role="menu"
         testid="profile-menu"
