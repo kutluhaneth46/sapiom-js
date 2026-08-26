@@ -197,6 +197,67 @@ describe("StaticSystemGraphBuilder", () => {
     expect(JSON.stringify(graph)).not.toContain(FIXTURE);
   });
 
+  it("reasserts safe unique node identities for an arbitrary inventory provider", async () => {
+    const inventory: AgentInventoryProvider = {
+      listAgents: vi.fn(async () => ({
+        agents: [
+          {
+            agentKey: "shared",
+            definitionId: null,
+            definitionSlug: "shared",
+            label: "/private/first",
+            resolutionAliases: ["shared"],
+            sourceRoot: path.join(FIXTURE, "growth"),
+          },
+          {
+            agentKey: "shared",
+            definitionId: null,
+            definitionSlug: "shared",
+            label: "C:\\Users\\Demo\\second",
+            resolutionAliases: ["shared"],
+            sourceRoot: path.join(FIXTURE, "research"),
+          },
+          {
+            agentKey: "/private/leaked-key",
+            definitionId: null,
+            definitionSlug: null,
+            label: "/private/leaked-label",
+            resolutionAliases: ["/private/leaked-alias"],
+            sourceRoot: "/outside/private-agent",
+          },
+        ],
+        warnings: [],
+      })),
+    };
+
+    const graph = await new StaticSystemGraphBuilder(
+      inventory,
+      vi.fn(async () => []),
+    ).build(scope);
+
+    expect(graph.nodes).toHaveLength(3);
+    expect(new Set(graph.nodes.map((node) => node.id)).size).toBe(3);
+    expect(graph.nodes.map((node) => node.agentKey)).toEqual([
+      expect.stringMatching(/^local:[a-f0-9]{16}$/),
+      "local:growth",
+      "local:research",
+    ]);
+    expect(graph.nodes.map((node) => node.label)).toEqual([
+      expect.stringMatching(/^[a-f0-9]{16}$/),
+      "growth",
+      "research",
+    ]);
+    expect(graph.warnings).toEqual([
+      {
+        code: "duplicate-agent-key",
+        agentKey: "shared",
+        message: "Multiple agents use shared; kept each with a local identity.",
+      },
+    ]);
+    expect(JSON.stringify(graph)).not.toContain("/private/");
+    expect(JSON.stringify(graph)).not.toContain("C:\\Users");
+  });
+
   it("degrades a scanner failure into a path-free warning", async () => {
     const inventory: AgentInventoryProvider = {
       listAgents: vi.fn(async () => ({
@@ -241,7 +302,10 @@ describe("StaticSystemGraphBuilder", () => {
       listWorkspaceScopes: () => [
         { workspaceKey: scope.workspaceKey, cwd: scope.root },
       ],
-      resolveManifestName: vi.fn(async () => FIXTURE),
+      inspectManifestName: vi.fn(async () => ({
+        status: "found" as const,
+        name: FIXTURE,
+      })),
     });
 
     const graph = await new StaticSystemGraphBuilder(
@@ -253,16 +317,10 @@ describe("StaticSystemGraphBuilder", () => {
       {
         id: "agent:local:reporting",
         agentKey: "local:reporting",
-        label: "Local agent",
+        label: "reporting",
       },
     ]);
-    expect(graph.warnings).toEqual([
-      {
-        code: "inventory-extraction-failed",
-        agentKey: "local:reporting",
-        message: "Could not inspect Local agent; using its local identity.",
-      },
-    ]);
+    expect(graph.warnings).toEqual([]);
     expect(JSON.stringify(graph)).not.toContain(FIXTURE);
   });
 

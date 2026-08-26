@@ -8,6 +8,7 @@ import type {
   WorkspaceScopeSummary,
 } from "../shared/system-graph.js";
 import type { WorkflowInfo } from "../shared/types.js";
+import type { ManifestNameInspection } from "./definition-name.js";
 
 export interface WorkspaceScope {
   workspaceKey: WorkspaceKey;
@@ -16,6 +17,7 @@ export interface WorkspaceScope {
 
 export interface AgentInventoryItem {
   agentKey: AgentKey;
+  /** Internal deployment provenance. Never serialize this into SystemGraph. */
   definitionId: number | null;
   definitionSlug: string | null;
   label: string;
@@ -43,7 +45,9 @@ export interface AgentInventoryProvider {
   listAgents(scope: WorkspaceScope): Promise<AgentInventoryResult>;
 }
 
-type ManifestNameResolver = (sourceRoot: string) => Promise<string | null>;
+type ManifestNameInspector = (
+  sourceRoot: string,
+) => Promise<ManifestNameInspection>;
 
 export interface HarnessRegistryInventoryProviderOptions {
   listWorkflows: () =>
@@ -52,7 +56,31 @@ export interface HarnessRegistryInventoryProviderOptions {
   listWorkspaceScopes: () =>
     | readonly WorkspaceScopeSummary[]
     | Promise<readonly WorkspaceScopeSummary[]>;
-  resolveManifestName?: ManifestNameResolver;
+  inspectManifestName?: ManifestNameInspector;
+}
+
+const MANIFEST_INSPECTION_CONCURRENCY = 4;
+
+async function mapWithConcurrency<Input, Output>(
+  values: readonly Input[],
+  concurrency: number,
+  map: (value: Input) => Promise<Output>,
+): Promise<Output[]> {
+  const results = new Array<Output>(values.length);
+  let nextIndex = 0;
+  const worker = async (): Promise<void> => {
+    while (nextIndex < values.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await map(values[index]!);
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, values.length) }, async () =>
+      worker(),
+    ),
+  );
+  return results;
 }
 
 function isWindowsAbsolute(input: string): boolean {
@@ -102,7 +130,7 @@ function pathDepth(input: string): number {
   return input.split(/[\\/]/).filter(Boolean).length;
 }
 
-function workspaceRelativeLocalKey(
+export function workspaceRelativeLocalKey(
   scopeRoot: string,
   sourceRoot: string,
 ): AgentKey {
@@ -187,8 +215,9 @@ function warningOrder(
 
 /**
  * V0 inventory adapter. WorkflowRegistry's scan/connect flows remain the only
- * writers; this provider receives snapshots and performs no discovery or I/O
- * beyond the injected, cached manifest-name lookup.
+ * writers; this provider receives snapshots and performs no discovery. The
+ * injected manifest-name inspection may run cached extraction, so enrichment
+ * is bounded to avoid unbounded child-process fan-out on a cold graph open.
  */
 export class HarnessRegistryInventoryProvider implements AgentInventoryProvider {
   constructor(
@@ -216,10 +245,11 @@ export class HarnessRegistryInventoryProvider implements AgentInventoryProvider 
       });
 
     const prepared = (
-      await Promise.all(
-        owned.map(({ workflow, sourceRoot }) =>
+      await mapWithConcurrency(
+        owned,
+        MANIFEST_INSPECTION_CONCURRENCY,
+        ({ workflow, sourceRoot }) =>
           this.prepareAgent(selectedScope, workflow, sourceRoot),
-        ),
       )
     ).sort(preparedOrder);
 
@@ -336,12 +366,14 @@ export class HarnessRegistryInventoryProvider implements AgentInventoryProvider 
     const definitionSlug = normalizedAlias(workflow.definitionSlug);
     let manifestName: string | null = null;
     let extractionFailed = false;
-    if (!definitionSlug && this.options.resolveManifestName) {
+    if (!definitionSlug && this.options.inspectManifestName) {
       try {
-        manifestName = normalizedAlias(
-          await this.options.resolveManifestName(sourceRoot),
-        );
-        extractionFailed = manifestName === null;
+        const inspected = await this.options.inspectManifestName(sourceRoot);
+        if (inspected.status === "found") {
+          manifestName = normalizedAlias(inspected.name);
+        } else {
+          extractionFailed = inspected.status === "failed";
+        }
       } catch {
         extractionFailed = true;
       }
@@ -365,7 +397,9 @@ export class HarnessRegistryInventoryProvider implements AgentInventoryProvider 
       extractionFailed,
       label: safeLabel(
         workflow.name,
-        definitionSlug ?? manifestName ?? "Local agent",
+        definitionSlug ??
+          manifestName ??
+          (fallbackKey.slice("local:".length) || "Local agent"),
       ),
       resolutionAliases,
       sourceRoot,

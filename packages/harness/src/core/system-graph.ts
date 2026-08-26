@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
+import * as path from "node:path";
 
 import type {
+  AgentKey,
   GraphWarning,
   SystemGraph,
   SystemGraphEdge,
@@ -10,9 +12,11 @@ import type {
 import { detectWorkflowLaunches } from "./canvas-interconnections.js";
 import {
   canonicalGraphPath,
+  isWithinGraphPath,
   type AgentInventoryItem,
   type AgentInventoryProvider,
   type WorkspaceScope,
+  workspaceRelativeLocalKey,
 } from "./system-graph-inventory.js";
 
 export { HarnessRegistryInventoryProvider } from "./system-graph-inventory.js";
@@ -86,6 +90,140 @@ function warningOrder(left: GraphWarning, right: GraphWarning): number {
   );
 }
 
+function fallbackAgentKey(scope: WorkspaceScope, sourceRoot: string): AgentKey {
+  const canonicalScope = canonicalGraphPath(scope.root);
+  const canonicalSource = canonicalGraphPath(sourceRoot);
+  if (isWithinGraphPath(canonicalScope, canonicalSource)) {
+    return workspaceRelativeLocalKey(canonicalScope, canonicalSource);
+  }
+  return `local:${createHash("sha256")
+    .update(canonicalSource)
+    .digest("hex")
+    .slice(0, 16)}`;
+}
+
+function safeAgentKey(value: string): AgentKey | null {
+  const key = value.trim();
+  if (
+    key === "" ||
+    /[\0\r\n]/.test(key) ||
+    path.posix.isAbsolute(key) ||
+    path.win32.isAbsolute(key) ||
+    key.includes("\\")
+  ) {
+    return null;
+  }
+  if (!key.startsWith("local:")) return key.includes("/") ? null : key;
+
+  const relative = key.slice("local:".length);
+  if (
+    relative === "" ||
+    path.posix.isAbsolute(relative) ||
+    path.win32.isAbsolute(relative) ||
+    relative
+      .split("/")
+      .some((segment) => segment === "" || segment === "." || segment === "..")
+  ) {
+    return null;
+  }
+  return key;
+}
+
+function safeLabel(value: string, agentKey: AgentKey): string {
+  const label = value.trim();
+  if (
+    label !== "" &&
+    !/[\0\r\n]/.test(label) &&
+    !path.posix.isAbsolute(label) &&
+    !path.win32.isAbsolute(label)
+  ) {
+    return label;
+  }
+  if (agentKey.startsWith("local:")) {
+    return agentKey.slice("local:".length) || "Local agent";
+  }
+  return agentKey;
+}
+
+interface PreparedInventoryItem {
+  agent: AgentInventoryItem;
+  candidateKey: AgentKey;
+  fallbackKey: AgentKey;
+}
+
+/**
+ * The provider contract promises safe unique keys, but projection is the last
+ * server-side boundary before serialization. Re-assert that invariant here so
+ * a future provider cannot make the browser reject the whole graph payload.
+ */
+function normalizeInventory(
+  scope: WorkspaceScope,
+  inventory: readonly AgentInventoryItem[],
+): { agents: AgentInventoryItem[]; warnings: GraphWarning[] } {
+  const prepared: PreparedInventoryItem[] = inventory
+    .map((agent) => {
+      const fallbackKey = fallbackAgentKey(scope, agent.sourceRoot);
+      return {
+        agent,
+        candidateKey: safeAgentKey(agent.agentKey) ?? fallbackKey,
+        fallbackKey,
+      };
+    })
+    .sort(
+      (left, right) =>
+        left.candidateKey.localeCompare(right.candidateKey) ||
+        left.agent.sourceRoot.localeCompare(right.agent.sourceRoot) ||
+        left.agent.label.localeCompare(right.agent.label),
+    );
+  const counts = new Map<AgentKey, number>();
+  for (const item of prepared) {
+    counts.set(item.candidateKey, (counts.get(item.candidateKey) ?? 0) + 1);
+  }
+
+  const used = new Set<AgentKey>();
+  const agents = prepared.map(({ agent, candidateKey, fallbackKey }) => {
+    const duplicate = (counts.get(candidateKey) ?? 0) > 1;
+    let agentKey = duplicate ? fallbackKey : candidateKey;
+    const base = agentKey;
+    let suffix = 2;
+    while (used.has(agentKey)) {
+      agentKey = `${base}~${suffix}`;
+      suffix += 1;
+    }
+    used.add(agentKey);
+
+    const resolutionAliases = [
+      ...new Set(
+        [...(duplicate ? [candidateKey] : []), ...agent.resolutionAliases]
+          .map(safeAgentKey)
+          .filter((alias): alias is AgentKey => alias !== null),
+      ),
+    ];
+    return {
+      ...agent,
+      agentKey,
+      label: safeLabel(agent.label, agentKey),
+      resolutionAliases,
+    };
+  });
+  agents.sort(
+    (left, right) =>
+      left.agentKey.localeCompare(right.agentKey) ||
+      left.sourceRoot.localeCompare(right.sourceRoot),
+  );
+
+  const warnings: GraphWarning[] = [];
+  for (const candidateKey of [...counts.keys()].sort()) {
+    if ((counts.get(candidateKey) ?? 0) < 2) continue;
+    warnings.push({
+      code: "duplicate-agent-key",
+      agentKey: candidateKey,
+      message: `Multiple agents use ${candidateKey}; kept each with a local identity.`,
+    });
+  }
+  return { agents, warnings };
+}
+
 export class StaticSystemGraphBuilder implements SystemGraphBuilder {
   constructor(
     private readonly inventory: AgentInventoryProvider,
@@ -94,11 +232,8 @@ export class StaticSystemGraphBuilder implements SystemGraphBuilder {
 
   async build(scope: WorkspaceScope): Promise<SystemGraph> {
     const inventory = await this.inventory.listAgents(scope);
-    const agents = [...inventory.agents].sort(
-      (left, right) =>
-        left.agentKey.localeCompare(right.agentKey) ||
-        left.sourceRoot.localeCompare(right.sourceRoot),
-    );
+    const normalized = normalizeInventory(scope, inventory.agents);
+    const agents = normalized.agents;
     const nodes = agents.map((agent) => ({
       id: `agent:${agent.agentKey}`,
       agentKey: agent.agentKey,
@@ -122,7 +257,10 @@ export class StaticSystemGraphBuilder implements SystemGraphBuilder {
     }
 
     const edges: SystemGraphEdge[] = [];
-    const warnings: GraphWarning[] = [...inventory.warnings];
+    const warnings: GraphWarning[] = [
+      ...inventory.warnings,
+      ...normalized.warnings,
+    ];
     const seenEdges = new Set<string>();
 
     // Source walks are independent. Run them together so first-open latency is
@@ -197,14 +335,21 @@ export class StaticSystemGraphBuilder implements SystemGraphBuilder {
       (left, right) =>
         left.from.localeCompare(right.from) || left.to.localeCompare(right.to),
     );
-    warnings.sort(warningOrder);
+    const uniqueWarnings = [
+      ...new Map(
+        warnings.map((warning) => [
+          `${warning.code}\0${warning.agentKey ?? ""}\0${warning.message}`,
+          warning,
+        ]),
+      ).values(),
+    ].sort(warningOrder);
 
     return {
       kind: "system",
       scope: { kind: "working-tree", workspaceKey: scope.workspaceKey },
       nodes,
       edges,
-      warnings,
+      warnings: uniqueWarnings,
     };
   }
 }

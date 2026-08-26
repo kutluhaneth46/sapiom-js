@@ -5,6 +5,7 @@ import {
   HarnessRegistryInventoryProvider,
   type WorkspaceScope,
 } from "./system-graph-inventory.js";
+import type { ManifestNameInspection } from "./definition-name.js";
 
 const WORKSPACE = "/private/workspaces/acme";
 const SCOPE: WorkspaceScope = {
@@ -32,24 +33,28 @@ function provider(
   workflows: readonly WorkflowInfo[],
   options: {
     scopes?: { workspaceKey: string; cwd: string }[];
-    resolveManifestName?: (sourceRoot: string) => Promise<string | null>;
+    inspectManifestName?: (
+      sourceRoot: string,
+    ) => Promise<ManifestNameInspection>;
   } = {},
 ): HarnessRegistryInventoryProvider {
   return new HarnessRegistryInventoryProvider({
     listWorkflows: () => workflows,
     listWorkspaceScopes: () =>
       options.scopes ?? [{ workspaceKey: SCOPE.workspaceKey, cwd: SCOPE.root }],
-    ...(options.resolveManifestName
-      ? { resolveManifestName: options.resolveManifestName }
+    ...(options.inspectManifestName
+      ? { inspectManifestName: options.inspectManifestName }
       : {}),
   });
 }
 
 describe("HarnessRegistryInventoryProvider", () => {
   it("returns every registry-known agent regardless of deployment, source, or relationships", async () => {
-    const resolveManifestName = vi.fn(async (sourceRoot: string) => {
-      if (sourceRoot.endsWith("/growth")) return "growth-manifest";
-      return null;
+    const inspectManifestName = vi.fn(async (sourceRoot: string) => {
+      if (sourceRoot.endsWith("/growth")) {
+        return { status: "found" as const, name: "growth-manifest" };
+      }
+      return { status: "absent" as const };
     });
     const inventory = provider(
       [
@@ -63,7 +68,7 @@ describe("HarnessRegistryInventoryProvider", () => {
           path: `${WORKSPACE}-archive/outside`,
         },
       ],
-      { resolveManifestName },
+      { inspectManifestName },
     );
 
     await expect(inventory.listAgents(SCOPE)).resolves.toEqual({
@@ -93,52 +98,58 @@ describe("HarnessRegistryInventoryProvider", () => {
           sourceRoot: `${WORKSPACE}/research`,
         },
       ],
-      warnings: [
-        {
-          code: "inventory-extraction-failed",
-          agentKey: "local:reporting",
-          message:
-            "Could not inspect Reporting package; using its local identity.",
-        },
-      ],
+      warnings: [],
     });
-    expect(resolveManifestName).toHaveBeenCalledTimes(2);
-    expect(resolveManifestName).not.toHaveBeenCalledWith(
+    expect(inspectManifestName).toHaveBeenCalledTimes(2);
+    expect(inspectManifestName).not.toHaveBeenCalledWith(
       `${WORKSPACE}/research`,
     );
   });
 
-  it("resolves missing declared names concurrently and keeps partial results", async () => {
+  it("bounds manifest inspection concurrency and keeps partial results", async () => {
     let release!: () => void;
     const gate = new Promise<void>((resolve) => {
       release = resolve;
     });
     const started: string[] = [];
-    const resolveManifestName = vi.fn(async (sourceRoot: string) => {
+    const inspectManifestName = vi.fn(async (sourceRoot: string) => {
       started.push(sourceRoot);
       await gate;
       if (sourceRoot.endsWith("/broken")) {
+        return { status: "failed" as const };
+      }
+      if (sourceRoot.endsWith("/thrown")) {
         throw new Error(`unreadable ${sourceRoot}`);
       }
-      return sourceRoot.endsWith("/named") ? "declared-name" : null;
+      return sourceRoot.endsWith("/named")
+        ? { status: "found" as const, name: "declared-name" }
+        : { status: "absent" as const };
     });
     const inventoryPromise = provider(
       [
         workflow("Named", "named", null),
         workflow("Broken", "broken", null),
+        workflow("Thrown", "thrown", null),
         workflow("Fallback", "fallback", null),
+        workflow("Extra A", "extra-a", null),
+        workflow("Extra B", "extra-b", null),
       ],
-      { resolveManifestName },
+      { inspectManifestName },
     ).listAgents(SCOPE);
 
-    await vi.waitFor(() => expect(started).toHaveLength(3));
+    await vi.waitFor(() => expect(started).toHaveLength(4));
+    await Promise.resolve();
+    expect(started).toHaveLength(4);
     release();
     const result = await inventoryPromise;
 
     expect(result.agents.map((agent) => agent.agentKey)).toEqual([
       "declared-name",
       "local:broken",
+      "local:extra-a",
+      "local:extra-b",
       "local:fallback",
+      "local:thrown",
     ]);
     expect(result.warnings).toEqual([
       {
@@ -148,10 +159,11 @@ describe("HarnessRegistryInventoryProvider", () => {
       },
       {
         code: "inventory-extraction-failed",
-        agentKey: "local:fallback",
-        message: "Could not inspect Fallback; using its local identity.",
+        agentKey: "local:thrown",
+        message: "Could not inspect Thrown; using its local identity.",
       },
     ]);
+    expect(inspectManifestName).toHaveBeenCalledTimes(6);
     expect(JSON.stringify(result.warnings)).not.toContain(WORKSPACE);
   });
 

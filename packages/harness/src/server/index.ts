@@ -107,7 +107,7 @@ import {
   createDefinitionSlugResolver,
   resolveAgentsBaseUrl,
 } from "../core/definition-slug-resolver.js";
-import { resolveManifestName } from "../core/definition-name.js";
+import { inspectManifestName, resolveManifestName } from "../core/definition-name.js";
 import { createBootTokenMiddleware } from "./auth.js";
 import { createApiKeyProvider } from "../core/api-key-provider.js";
 import { createRestRouter } from "./rest.js";
@@ -748,7 +748,7 @@ export const startServer = async (
       new HarnessRegistryInventoryProvider({
         listWorkflows: () => workflowsCache,
         listWorkspaceScopes: () => workspaceScopeCatalog.list(),
-        resolveManifestName,
+        inspectManifestName,
       }),
     ),
   );
