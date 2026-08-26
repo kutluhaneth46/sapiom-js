@@ -138,6 +138,60 @@ function warningOrder(left: GraphWarning, right: GraphWarning): number {
   );
 }
 
+function fallbackAgentKey(scope: WorkspaceScope, sourceRoot: string): AgentKey {
+  const relative = path.relative(scope.root, sourceRoot);
+  if (
+    relative !== "" &&
+    !relative.startsWith("..") &&
+    !path.isAbsolute(relative)
+  ) {
+    return `local:${relative.split(path.sep).join("/")}`;
+  }
+  // Injected inventory adapters may supply a root outside the selected scope.
+  // Keep the fallback path-free while still making its identity deterministic.
+  return `local:${createHash("sha256")
+    .update(sourceRoot)
+    .digest("hex")
+    .slice(0, 16)}`;
+}
+
+/**
+ * A copied agent can retain another folder's definition slug. Keep both nodes
+ * visible with stable local identities instead of emitting a wire payload the
+ * browser must reject for duplicate node ids.
+ */
+function disambiguateAgentKeys(
+  scope: WorkspaceScope,
+  inventory: readonly LocalAgentInventoryItem[],
+): LocalAgentInventoryItem[] {
+  const counts = new Map<AgentKey, number>();
+  for (const agent of inventory) {
+    counts.set(agent.agentKey, (counts.get(agent.agentKey) ?? 0) + 1);
+  }
+
+  const used = new Set<AgentKey>();
+  return [...inventory]
+    .sort(
+      (left, right) =>
+        left.agentKey.localeCompare(right.agentKey) ||
+        left.sourceRoot.localeCompare(right.sourceRoot),
+    )
+    .map((agent) => {
+      const localKey = fallbackAgentKey(scope, agent.sourceRoot);
+      const preferred = (counts.get(agent.agentKey) ?? 0) > 1
+        ? localKey
+        : agent.agentKey;
+      let agentKey = preferred;
+      let suffix = 2;
+      while (used.has(agentKey)) {
+        agentKey = `${localKey}~${suffix}`;
+        suffix += 1;
+      }
+      used.add(agentKey);
+      return agentKey === agent.agentKey ? agent : { ...agent, agentKey };
+    });
+}
+
 export class StaticSystemGraphBuilder implements SystemGraphBuilder {
   constructor(
     private readonly inventory: LocalAgentInventoryReader,
@@ -145,16 +199,29 @@ export class StaticSystemGraphBuilder implements SystemGraphBuilder {
   ) {}
 
   async build(scope: WorkspaceScope): Promise<SystemGraph> {
-    const agents = await this.inventory.list(scope);
+    const agents = disambiguateAgentKeys(
+      scope,
+      await this.inventory.list(scope),
+    );
     const nodes = agents.map((agent) => ({
       id: `agent:${agent.agentKey}`,
       agentKey: agent.agentKey,
       label: agent.label,
     }));
-    const byTarget = new Map<string, LocalAgentInventoryItem>();
+    const byTarget = new Map<string, LocalAgentInventoryItem[]>();
+    const registerTarget = (
+      key: string,
+      agent: LocalAgentInventoryItem,
+    ): void => {
+      const candidates = byTarget.get(key) ?? [];
+      if (!candidates.some((candidate) => candidate.agentKey === agent.agentKey)) {
+        candidates.push(agent);
+        byTarget.set(key, candidates);
+      }
+    };
     for (const agent of agents) {
-      byTarget.set(agent.agentKey, agent);
-      if (agent.definitionSlug) byTarget.set(agent.definitionSlug, agent);
+      registerTarget(agent.agentKey, agent);
+      if (agent.definitionSlug) registerTarget(agent.definitionSlug, agent);
     }
 
     const edges: SystemGraphEdge[] = [];
@@ -188,15 +255,19 @@ export class StaticSystemGraphBuilder implements SystemGraphBuilder {
       }
 
       for (const launch of launches) {
-        const target = byTarget.get(launch.slug);
-        if (!target) {
+        const candidates = byTarget.get(launch.slug) ?? [];
+        if (candidates.length !== 1) {
           warnings.push({
             code: "unresolved-target",
             agentKey: caller.agentKey,
-            message: `${caller.label} invokes unknown agent ${launch.slug}.`,
+            message:
+              candidates.length === 0
+                ? `${caller.label} invokes unknown agent ${launch.slug}.`
+                : `${caller.label} invokes ambiguous agent ${launch.slug}.`,
           });
           continue;
         }
+        const target = candidates[0]!;
         if (target.agentKey === caller.agentKey) continue;
         const from = `agent:${caller.agentKey}`;
         const to = `agent:${target.agentKey}`;

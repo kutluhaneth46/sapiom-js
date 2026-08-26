@@ -175,6 +175,56 @@ describe("StaticSystemGraphBuilder", () => {
     expect(JSON.stringify(graph)).not.toContain("/private/");
   });
 
+  it("keeps duplicate definition slugs as unique nodes and reports ambiguous launches", async () => {
+    const inventory: LocalAgentInventoryReader = {
+      list: vi.fn(async () => [
+        {
+          agentKey: "caller",
+          definitionSlug: "caller",
+          label: "Caller",
+          sourceRoot: path.join(FIXTURE, "caller"),
+        },
+        {
+          agentKey: "shared",
+          definitionSlug: "shared",
+          label: "First copy",
+          sourceRoot: path.join(FIXTURE, "growth"),
+        },
+        {
+          agentKey: "shared",
+          definitionSlug: "shared",
+          label: "Second copy",
+          sourceRoot: path.join(FIXTURE, "research"),
+        },
+      ]),
+    };
+    const detect = vi.fn(async (root: string) =>
+      root.endsWith("caller")
+        ? [{ slug: "shared", fromStepId: null }]
+        : [],
+    );
+
+    const graph = await new StaticSystemGraphBuilder(inventory, detect).build(
+      scope,
+    );
+
+    expect(graph.nodes.map((node) => node.id)).toEqual([
+      "agent:caller",
+      "agent:local:growth",
+      "agent:local:research",
+    ]);
+    expect(new Set(graph.nodes.map((node) => node.id)).size).toBe(3);
+    expect(graph.edges).toEqual([]);
+    expect(graph.warnings).toEqual([
+      {
+        code: "unresolved-target",
+        agentKey: "caller",
+        message: "Caller invokes ambiguous agent shared.",
+      },
+    ]);
+    expect(JSON.stringify(graph)).not.toContain(FIXTURE);
+  });
+
   it("degrades a scanner failure into a path-free warning", async () => {
     const inventory: LocalAgentInventoryReader = {
       list: vi.fn(async () => [
