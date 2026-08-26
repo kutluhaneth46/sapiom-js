@@ -27,7 +27,12 @@ export interface SystemGraphEdge {
 }
 
 export interface GraphWarning {
-  code: "unresolved-target" | "duplicate-edge" | "projection-failed";
+  code:
+    | "unresolved-target"
+    | "duplicate-edge"
+    | "projection-failed"
+    | "duplicate-agent-key"
+    | "inventory-extraction-failed";
   message: string;
   agentKey?: AgentKey;
 }

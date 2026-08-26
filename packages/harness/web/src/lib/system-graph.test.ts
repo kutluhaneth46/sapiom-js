@@ -26,6 +26,23 @@ describe("parseSystemGraph", () => {
     expect(parseSystemGraph(valid)).toEqual(valid);
   });
 
+  it("accepts typed duplicate and partial-inventory warnings", () => {
+    const warnings = [
+      {
+        code: "duplicate-agent-key",
+        agentKey: "shared",
+        message: "Multiple agents use shared.",
+      },
+      {
+        code: "inventory-extraction-failed",
+        agentKey: "local:reporting",
+        message: "Could not inspect Reporting; using its local identity.",
+      },
+    ];
+
+    expect(parseSystemGraph({ ...valid, warnings }).warnings).toEqual(warnings);
+  });
+
   it("rejects an edge whose endpoint is absent", () => {
     expect(() =>
       parseSystemGraph({
@@ -40,6 +57,15 @@ describe("parseSystemGraph", () => {
       parseSystemGraph({ ...valid, root: "/private/workspace" }),
     ).toThrow();
     expect(() => parseSystemGraph({ ...valid, kind: "canvas" })).toThrow();
+  });
+
+  it("rejects unknown warning codes", () => {
+    expect(() =>
+      parseSystemGraph({
+        ...valid,
+        warnings: [{ code: "inventory-broken", message: "Nope" }],
+      }),
+    ).toThrow("Invalid system graph response");
   });
 });
 

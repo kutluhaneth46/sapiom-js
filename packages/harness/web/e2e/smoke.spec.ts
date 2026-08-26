@@ -373,6 +373,10 @@ test.describe("three-zone IA (rail explorer, tab strip, right pane)", () => {
     await expect(page.getByTestId("system-graph-node-growth")).toContainText(
       "Growth",
     );
+    // Inventory nodes do not need an incoming or outgoing relationship.
+    await expect(page.getByTestId("system-graph-node-reporting")).toContainText(
+      "Reporting",
+    );
     await expect(
       page.getByTestId("system-graph-edge-agent:research-agent:growth"),
     ).toContainText("invokes · static · async");

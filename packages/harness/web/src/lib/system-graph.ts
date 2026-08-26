@@ -58,6 +58,8 @@ const WARNING_CODES = new Set<GraphWarning["code"]>([
   "unresolved-target",
   "duplicate-edge",
   "projection-failed",
+  "duplicate-agent-key",
+  "inventory-extraction-failed",
 ]);
 
 function parseWarning(value: unknown): GraphWarning | null {

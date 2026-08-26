@@ -97,9 +97,9 @@ import { ensureCanvasTemplate } from "../core/canvas-template.js";
 import { renderCanvasForSession } from "../core/canvas-render.js";
 import { invalidateExtractionCache } from "../core/canvas-cache.js";
 import {
+  HarnessRegistryInventoryProvider,
   LocalWorkspaceScopeCatalog,
   StaticSystemGraphBuilder,
-  WorkflowRegistryInventoryReader,
 } from "../core/system-graph.js";
 import { SystemGraphStore } from "../core/system-graph-store.js";
 import { sweepNdjson } from "../core/collector/store-retention.js";
@@ -745,7 +745,11 @@ export const startServer = async (
   ]);
   const systemGraphStore = new SystemGraphStore(
     new StaticSystemGraphBuilder(
-      new WorkflowRegistryInventoryReader(() => workflowsCache),
+      new HarnessRegistryInventoryProvider({
+        listWorkflows: () => workflowsCache,
+        listWorkspaceScopes: () => workspaceScopeCatalog.list(),
+        resolveManifestName,
+      }),
     ),
   );
 

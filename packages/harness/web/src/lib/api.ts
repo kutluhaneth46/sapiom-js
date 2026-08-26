@@ -1081,6 +1081,11 @@ class MockApi implements HarnessApi {
       nodes: [
         { id: "agent:growth", agentKey: "growth", label: "Growth" },
         {
+          id: "agent:reporting",
+          agentKey: "reporting",
+          label: "Reporting",
+        },
+        {
           id: "agent:research",
           agentKey: "research",
           label: "Research",

@@ -1,29 +1,28 @@
 import { createHash } from "node:crypto";
-import { realpathSync } from "node:fs";
-import * as path from "node:path";
 
 import type {
-  AgentKey,
   GraphWarning,
   SystemGraph,
   SystemGraphEdge,
   WorkspaceKey,
   WorkspaceScopeSummary,
 } from "../shared/system-graph.js";
-import type { WorkflowInfo } from "../shared/types.js";
 import { detectWorkflowLaunches } from "./canvas-interconnections.js";
+import {
+  canonicalGraphPath,
+  type AgentInventoryItem,
+  type AgentInventoryProvider,
+  type WorkspaceScope,
+} from "./system-graph-inventory.js";
 
-export interface WorkspaceScope {
-  workspaceKey: WorkspaceKey;
-  root: string;
-}
-
-export interface LocalAgentInventoryItem {
-  agentKey: AgentKey;
-  definitionSlug: string | null;
-  label: string;
-  sourceRoot: string;
-}
+export { HarnessRegistryInventoryProvider } from "./system-graph-inventory.js";
+export type {
+  AgentInventoryItem,
+  AgentInventoryProvider,
+  AgentInventoryResult,
+  AgentInventoryWarning,
+  WorkspaceScope,
+} from "./system-graph-inventory.js";
 
 export interface WorkspaceScopeResolver {
   resolve(workspaceKey: WorkspaceKey): Promise<WorkspaceScope | null>;
@@ -33,35 +32,14 @@ export interface WorkspaceScopeCatalog extends WorkspaceScopeResolver {
   list(): Promise<WorkspaceScopeSummary[]>;
 }
 
-export interface LocalAgentInventoryReader {
-  list(scope: WorkspaceScope): Promise<LocalAgentInventoryItem[]>;
-}
-
 export interface SystemGraphBuilder {
   build(scope: WorkspaceScope): Promise<SystemGraph>;
 }
 
 type LaunchDetector = typeof detectWorkflowLaunches;
 
-function canonicalRoot(root: string): string {
-  const resolved = path.resolve(root);
-  try {
-    return realpathSync.native(resolved);
-  } catch {
-    return resolved;
-  }
-}
-
 function workspaceKeyForRoot(root: string): WorkspaceKey {
   return `workspace-${createHash("sha256").update(root).digest("hex").slice(0, 16)}`;
-}
-
-function isWithin(root: string, candidate: string): boolean {
-  const relative = path.relative(root, candidate);
-  return (
-    relative === "" ||
-    (!relative.startsWith("..") && !path.isAbsolute(relative))
-  );
 }
 
 /**
@@ -78,7 +56,7 @@ export class LocalWorkspaceScopeCatalog implements WorkspaceScopeCatalog {
   async list(): Promise<WorkspaceScopeSummary[]> {
     const byRoot = new Map<string, WorkspaceScopeSummary>();
     for (const root of await this.listRoots()) {
-      const canonical = canonicalRoot(root);
+      const canonical = canonicalGraphPath(root);
       byRoot.set(canonical, {
         workspaceKey: workspaceKeyForRoot(canonical),
         cwd: root,
@@ -91,42 +69,12 @@ export class LocalWorkspaceScopeCatalog implements WorkspaceScopeCatalog {
 
   async resolve(workspaceKey: WorkspaceKey): Promise<WorkspaceScope | null> {
     for (const root of await this.listRoots()) {
-      const canonical = canonicalRoot(root);
+      const canonical = canonicalGraphPath(root);
       if (workspaceKeyForRoot(canonical) === workspaceKey) {
         return { workspaceKey, root: canonical };
       }
     }
     return null;
-  }
-}
-
-export class WorkflowRegistryInventoryReader implements LocalAgentInventoryReader {
-  constructor(private readonly listWorkflows: () => readonly WorkflowInfo[]) {}
-
-  async list(scope: WorkspaceScope): Promise<LocalAgentInventoryItem[]> {
-    const items = this.listWorkflows()
-      .map((workflow): LocalAgentInventoryItem | null => {
-        const sourceRoot = canonicalRoot(workflow.path);
-        if (!isWithin(scope.root, sourceRoot)) return null;
-        const relative = path
-          .relative(scope.root, sourceRoot)
-          .split(path.sep)
-          .join("/");
-        const localKey = relative || path.basename(sourceRoot) || "root";
-        return {
-          agentKey: workflow.definitionSlug ?? `local:${localKey}`,
-          definitionSlug: workflow.definitionSlug,
-          label: workflow.name,
-          sourceRoot,
-        };
-      })
-      .filter((item): item is LocalAgentInventoryItem => item !== null);
-
-    return items.sort(
-      (left, right) =>
-        left.agentKey.localeCompare(right.agentKey) ||
-        left.sourceRoot.localeCompare(right.sourceRoot),
-    );
   }
 }
 
@@ -138,94 +86,43 @@ function warningOrder(left: GraphWarning, right: GraphWarning): number {
   );
 }
 
-function fallbackAgentKey(scope: WorkspaceScope, sourceRoot: string): AgentKey {
-  const relative = path.relative(scope.root, sourceRoot);
-  if (
-    relative !== "" &&
-    !relative.startsWith("..") &&
-    !path.isAbsolute(relative)
-  ) {
-    return `local:${relative.split(path.sep).join("/")}`;
-  }
-  // Injected inventory adapters may supply a root outside the selected scope.
-  // Keep the fallback path-free while still making its identity deterministic.
-  return `local:${createHash("sha256")
-    .update(sourceRoot)
-    .digest("hex")
-    .slice(0, 16)}`;
-}
-
-/**
- * A copied agent can retain another folder's definition slug. Keep both nodes
- * visible with stable local identities instead of emitting a wire payload the
- * browser must reject for duplicate node ids.
- */
-function disambiguateAgentKeys(
-  scope: WorkspaceScope,
-  inventory: readonly LocalAgentInventoryItem[],
-): LocalAgentInventoryItem[] {
-  const counts = new Map<AgentKey, number>();
-  for (const agent of inventory) {
-    counts.set(agent.agentKey, (counts.get(agent.agentKey) ?? 0) + 1);
-  }
-
-  const used = new Set<AgentKey>();
-  return [...inventory]
-    .sort(
-      (left, right) =>
-        left.agentKey.localeCompare(right.agentKey) ||
-        left.sourceRoot.localeCompare(right.sourceRoot),
-    )
-    .map((agent) => {
-      const localKey = fallbackAgentKey(scope, agent.sourceRoot);
-      const preferred = (counts.get(agent.agentKey) ?? 0) > 1
-        ? localKey
-        : agent.agentKey;
-      let agentKey = preferred;
-      let suffix = 2;
-      while (used.has(agentKey)) {
-        agentKey = `${localKey}~${suffix}`;
-        suffix += 1;
-      }
-      used.add(agentKey);
-      return agentKey === agent.agentKey ? agent : { ...agent, agentKey };
-    });
-}
-
 export class StaticSystemGraphBuilder implements SystemGraphBuilder {
   constructor(
-    private readonly inventory: LocalAgentInventoryReader,
+    private readonly inventory: AgentInventoryProvider,
     private readonly detectLaunches: LaunchDetector = detectWorkflowLaunches,
   ) {}
 
   async build(scope: WorkspaceScope): Promise<SystemGraph> {
-    const agents = disambiguateAgentKeys(
-      scope,
-      await this.inventory.list(scope),
+    const inventory = await this.inventory.listAgents(scope);
+    const agents = [...inventory.agents].sort(
+      (left, right) =>
+        left.agentKey.localeCompare(right.agentKey) ||
+        left.sourceRoot.localeCompare(right.sourceRoot),
     );
     const nodes = agents.map((agent) => ({
       id: `agent:${agent.agentKey}`,
       agentKey: agent.agentKey,
       label: agent.label,
     }));
-    const byTarget = new Map<string, LocalAgentInventoryItem[]>();
-    const registerTarget = (
-      key: string,
-      agent: LocalAgentInventoryItem,
-    ): void => {
+    const byTarget = new Map<string, AgentInventoryItem[]>();
+    const registerTarget = (key: string, agent: AgentInventoryItem): void => {
       const candidates = byTarget.get(key) ?? [];
-      if (!candidates.some((candidate) => candidate.agentKey === agent.agentKey)) {
+      if (
+        !candidates.some((candidate) => candidate.agentKey === agent.agentKey)
+      ) {
         candidates.push(agent);
         byTarget.set(key, candidates);
       }
     };
     for (const agent of agents) {
       registerTarget(agent.agentKey, agent);
-      if (agent.definitionSlug) registerTarget(agent.definitionSlug, agent);
+      for (const alias of agent.resolutionAliases) {
+        registerTarget(alias, agent);
+      }
     }
 
     const edges: SystemGraphEdge[] = [];
-    const warnings: GraphWarning[] = [];
+    const warnings: GraphWarning[] = [...inventory.warnings];
     const seenEdges = new Set<string>();
 
     // Source walks are independent. Run them together so first-open latency is
@@ -257,13 +154,18 @@ export class StaticSystemGraphBuilder implements SystemGraphBuilder {
       for (const launch of launches) {
         const candidates = byTarget.get(launch.slug) ?? [];
         if (candidates.length !== 1) {
+          const target = /^[A-Za-z0-9@_.:-]+$/.test(launch.slug)
+            ? launch.slug
+            : null;
           warnings.push({
             code: "unresolved-target",
             agentKey: caller.agentKey,
             message:
               candidates.length === 0
-                ? `${caller.label} invokes unknown agent ${launch.slug}.`
-                : `${caller.label} invokes ambiguous agent ${launch.slug}.`,
+                ? target
+                  ? `${caller.label} invokes unknown agent ${target}.`
+                  : `${caller.label} invokes an invalid agent target.`
+                : `${caller.label} invokes ambiguous agent ${target ?? "target"}.`,
           });
           continue;
         }

@@ -4,10 +4,10 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { WorkflowInfo } from "../shared/types.js";
 import {
+  HarnessRegistryInventoryProvider,
   LocalWorkspaceScopeCatalog,
   StaticSystemGraphBuilder,
-  WorkflowRegistryInventoryReader,
-  type LocalAgentInventoryReader,
+  type AgentInventoryProvider,
   type WorkspaceScope,
 } from "./system-graph.js";
 
@@ -70,37 +70,6 @@ describe("LocalWorkspaceScopeCatalog", () => {
   });
 });
 
-describe("WorkflowRegistryInventoryReader", () => {
-  it("filters to the workspace boundary and uses a package-relative fallback key", async () => {
-    const workflows = [
-      workflow("Research", "research", "research"),
-      workflow("Growth local", "growth", null),
-      {
-        ...workflow("Outside", "outside", "outside"),
-        path: `${FIXTURE}-elsewhere/outside`,
-      },
-    ];
-    const reader = new WorkflowRegistryInventoryReader(() => workflows);
-
-    await expect(
-      reader.list({ workspaceKey: "workspace-test", root: FIXTURE }),
-    ).resolves.toEqual([
-      {
-        agentKey: "local:growth",
-        definitionSlug: null,
-        label: "Growth local",
-        sourceRoot: path.join(FIXTURE, "growth"),
-      },
-      {
-        agentKey: "research",
-        definitionSlug: "research",
-        label: "Research",
-        sourceRoot: path.join(FIXTURE, "research"),
-      },
-    ]);
-  });
-});
-
 describe("StaticSystemGraphBuilder", () => {
   const scope: WorkspaceScope = {
     workspaceKey: "workspace-fixture",
@@ -108,12 +77,17 @@ describe("StaticSystemGraphBuilder", () => {
   };
 
   it("projects the literal Research -> Growth launch into the public contract", async () => {
-    const reader = new WorkflowRegistryInventoryReader(() => [
-      workflow("Research", "research", "research"),
-      workflow("Growth", "growth", "growth"),
-    ]);
+    const inventory = new HarnessRegistryInventoryProvider({
+      listWorkflows: () => [
+        workflow("Research", "research", "research"),
+        workflow("Growth", "growth", "growth"),
+      ],
+      listWorkspaceScopes: () => [
+        { workspaceKey: scope.workspaceKey, cwd: scope.root },
+      ],
+    });
 
-    const graph = await new StaticSystemGraphBuilder(reader).build(scope);
+    const graph = await new StaticSystemGraphBuilder(inventory).build(scope);
 
     expect(graph).toEqual({
       kind: "system",
@@ -137,21 +111,28 @@ describe("StaticSystemGraphBuilder", () => {
   });
 
   it("deduplicates edges, skips self-links, and reports unresolved targets deterministically", async () => {
-    const inventory: LocalAgentInventoryReader = {
-      list: vi.fn(async () => [
-        {
-          agentKey: "research",
-          definitionSlug: "research",
-          label: "Research",
-          sourceRoot: "/private/research",
-        },
-        {
-          agentKey: "growth",
-          definitionSlug: "growth",
-          label: "Growth",
-          sourceRoot: "/private/growth",
-        },
-      ]),
+    const inventory: AgentInventoryProvider = {
+      listAgents: vi.fn(async () => ({
+        agents: [
+          {
+            agentKey: "research",
+            definitionId: 1,
+            definitionSlug: "research",
+            label: "Research",
+            resolutionAliases: ["research"],
+            sourceRoot: "/private/research",
+          },
+          {
+            agentKey: "growth",
+            definitionId: 2,
+            definitionSlug: "growth",
+            label: "Growth",
+            resolutionAliases: ["growth"],
+            sourceRoot: "/private/growth",
+          },
+        ],
+        warnings: [],
+      })),
     };
     const detect = vi.fn(async (root: string) =>
       root.endsWith("research")
@@ -176,32 +157,18 @@ describe("StaticSystemGraphBuilder", () => {
   });
 
   it("keeps duplicate definition slugs as unique nodes and reports ambiguous launches", async () => {
-    const inventory: LocalAgentInventoryReader = {
-      list: vi.fn(async () => [
-        {
-          agentKey: "caller",
-          definitionSlug: "caller",
-          label: "Caller",
-          sourceRoot: path.join(FIXTURE, "caller"),
-        },
-        {
-          agentKey: "shared",
-          definitionSlug: "shared",
-          label: "First copy",
-          sourceRoot: path.join(FIXTURE, "growth"),
-        },
-        {
-          agentKey: "shared",
-          definitionSlug: "shared",
-          label: "Second copy",
-          sourceRoot: path.join(FIXTURE, "research"),
-        },
-      ]),
-    };
+    const inventory = new HarnessRegistryInventoryProvider({
+      listWorkflows: () => [
+        workflow("Caller", "caller", "caller"),
+        workflow("First copy", "growth", "shared"),
+        workflow("Second copy", "research", "shared"),
+      ],
+      listWorkspaceScopes: () => [
+        { workspaceKey: scope.workspaceKey, cwd: scope.root },
+      ],
+    });
     const detect = vi.fn(async (root: string) =>
-      root.endsWith("caller")
-        ? [{ slug: "shared", fromStepId: null }]
-        : [],
+      root.endsWith("caller") ? [{ slug: "shared", fromStepId: null }] : [],
     );
 
     const graph = await new StaticSystemGraphBuilder(inventory, detect).build(
@@ -217,6 +184,11 @@ describe("StaticSystemGraphBuilder", () => {
     expect(graph.edges).toEqual([]);
     expect(graph.warnings).toEqual([
       {
+        code: "duplicate-agent-key",
+        agentKey: "shared",
+        message: "Multiple agents use shared; kept each with a local identity.",
+      },
+      {
         code: "unresolved-target",
         agentKey: "caller",
         message: "Caller invokes ambiguous agent shared.",
@@ -226,15 +198,20 @@ describe("StaticSystemGraphBuilder", () => {
   });
 
   it("degrades a scanner failure into a path-free warning", async () => {
-    const inventory: LocalAgentInventoryReader = {
-      list: vi.fn(async () => [
-        {
-          agentKey: "research",
-          definitionSlug: "research",
-          label: "Research",
-          sourceRoot: "/private/research",
-        },
-      ]),
+    const inventory: AgentInventoryProvider = {
+      listAgents: vi.fn(async () => ({
+        agents: [
+          {
+            agentKey: "research",
+            definitionId: 1,
+            definitionSlug: "research",
+            label: "Research",
+            resolutionAliases: ["research"],
+            sourceRoot: "/private/research",
+          },
+        ],
+        warnings: [],
+      })),
     };
     const graph = await new StaticSystemGraphBuilder(
       inventory,
@@ -248,6 +225,93 @@ describe("StaticSystemGraphBuilder", () => {
         code: "projection-failed",
         agentKey: "research",
         message: "Could not inspect Research.",
+      },
+    ]);
+    expect(JSON.stringify(graph)).not.toContain("/private/");
+  });
+
+  it("keeps path-shaped registry and extraction values out of the public graph", async () => {
+    const inventory = new HarnessRegistryInventoryProvider({
+      listWorkflows: () => [
+        {
+          ...workflow(FIXTURE, "reporting", FIXTURE),
+          definitionId: null,
+        },
+      ],
+      listWorkspaceScopes: () => [
+        { workspaceKey: scope.workspaceKey, cwd: scope.root },
+      ],
+      resolveManifestName: vi.fn(async () => FIXTURE),
+    });
+
+    const graph = await new StaticSystemGraphBuilder(
+      inventory,
+      vi.fn(async () => []),
+    ).build(scope);
+
+    expect(graph.nodes).toEqual([
+      {
+        id: "agent:local:reporting",
+        agentKey: "local:reporting",
+        label: "Local agent",
+      },
+    ]);
+    expect(graph.warnings).toEqual([
+      {
+        code: "inventory-extraction-failed",
+        agentKey: "local:reporting",
+        message: "Could not inspect Local agent; using its local identity.",
+      },
+    ]);
+    expect(JSON.stringify(graph)).not.toContain(FIXTURE);
+  });
+
+  it("projects disconnected inventory nodes and merges inventory warnings", async () => {
+    const inventory: AgentInventoryProvider = {
+      listAgents: vi.fn(async () => ({
+        agents: [
+          {
+            agentKey: "research",
+            definitionId: 1,
+            definitionSlug: "research",
+            label: "Research",
+            resolutionAliases: ["research"],
+            sourceRoot: "/private/research",
+          },
+          {
+            agentKey: "local:reporting",
+            definitionId: null,
+            definitionSlug: null,
+            label: "Reporting",
+            resolutionAliases: [],
+            sourceRoot: "/private/reporting",
+          },
+        ],
+        warnings: [
+          {
+            code: "inventory-extraction-failed" as const,
+            agentKey: "local:reporting",
+            message: "Could not inspect Reporting; using its local identity.",
+          },
+        ],
+      })),
+    };
+
+    const graph = await new StaticSystemGraphBuilder(
+      inventory,
+      vi.fn(async () => []),
+    ).build(scope);
+
+    expect(graph.nodes.map((node) => node.agentKey)).toEqual([
+      "local:reporting",
+      "research",
+    ]);
+    expect(graph.edges).toEqual([]);
+    expect(graph.warnings).toEqual([
+      {
+        code: "inventory-extraction-failed",
+        agentKey: "local:reporting",
+        message: "Could not inspect Reporting; using its local identity.",
       },
     ]);
     expect(JSON.stringify(graph)).not.toContain("/private/");
