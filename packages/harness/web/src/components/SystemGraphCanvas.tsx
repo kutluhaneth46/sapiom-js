@@ -89,7 +89,7 @@ export function SystemGraphCanvas({
       <EmptyState
         className="canvas-empty system-graph-state"
         testId="system-graph-empty"
-        icon="Workflow"
+        icon="Frame"
         title="No agents in this workspace"
         body="Agent projects discovered inside this folder will appear here."
       />
