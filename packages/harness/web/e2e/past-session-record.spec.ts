@@ -35,6 +35,10 @@ test.beforeEach(async ({ page }) => {
 async function openHistoryRow(page: Page, testid: string): Promise<void> {
   await page.getByTestId("history-trigger").click();
   await expect(page.getByTestId("history-menu")).toBeVisible();
+  // Past-session rows moved into a flyout sub-card opened from this row.
+  // Hover to open it — a click would toggle it (mouse-enter already opened it).
+  await page.getByTestId("past-sessions-trigger").hover();
+  await expect(page.getByTestId("past-sessions-card")).toBeVisible();
   await page.getByTestId(testid).click();
 }
 
@@ -59,6 +63,8 @@ test("a claude-code history row renders its session turn by turn", async ({ page
 
 test("a CODEX session renders the same way — this reads our events, not a vendor transcript", async ({ page }) => {
   await page.getByTestId("history-trigger").click();
+  await page.getByTestId("past-sessions-trigger").hover();
+  await expect(page.getByTestId("past-sessions-card")).toBeVisible();
   await page.getByTestId(CODEX_EXITED_ROW).click();
 
   // Exited registry session: the metadata card stays, and the transcript is
@@ -69,7 +75,7 @@ test("a CODEX session renders the same way — this reads our events, not a vend
   const transcript = page.getByTestId("session-transcript");
   await expect(transcript).toBeVisible();
   await expect(page.getByTestId("transcript-turn")).toHaveCount(1);
-  await expect(page.getByTestId("transcript-prompt")).toContainText("Summarize what the rfq workflow does");
+  await expect(page.getByTestId("transcript-prompt")).toContainText("Summarize what the rfq agent does");
   await expect(page.getByTestId("transcript-tool-call")).toHaveCount(1);
 
   // Codex reports no assistant text to the harness. The view says that
@@ -95,6 +101,8 @@ test("truncation and an unfinished turn are stated, not smoothed over", async ({
   // The leasing record carries both: a truncated Edit result and a trailing
   // turn that never completed.
   await page.getByTestId("history-trigger").click();
+  await page.getByTestId("past-sessions-trigger").hover();
+  await expect(page.getByTestId("past-sessions-card")).toBeVisible();
   await page.getByTestId(CLAUDE_EXITED_ROW).click();
   await expect(page.getByTestId("session-transcript")).toBeVisible();
 
@@ -112,6 +120,9 @@ test("a session whose events are gone still renders — from its archived copy, 
   // This is the SAP-2060 case in the UI: events.ndjson swept this session out
   // weeks ago, and the record still opens.
   await expect(page.getByTestId("session-transcript")).toBeVisible();
+  const reason = page.getByTestId("past-session-reason");
+  await expect(reason).toContainText("the coding agent's history");
+  await expect(reason).toContainText("The new coding agent gets a briefing");
   const turns = page.getByTestId("transcript-turn");
   await expect(turns).toHaveCount(2);
   await expect(turns.nth(1).getByTestId("transcript-prompt")).toContainText("Ship the migration");

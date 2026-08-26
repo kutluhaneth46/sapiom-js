@@ -8,11 +8,21 @@ import { loadUiPrefs, saveUiPrefs } from "../lib/ui-prefs";
 import { CanvasStepInspector } from "./CanvasStepDetail";
 import { Icon } from "./Icon";
 
-/** What a rendered document posts as its overview chrome (or the mock copy). */
+/** One node-kind key row, posted by the document alongside the overview. */
+export interface CanvasLegendItem {
+  kind: string;
+  label: string;
+}
+
+/** What a rendered document posts as its overview chrome (or the mock copy).
+ *  `stats`, `badges` and `legend` used to be drawn on the board itself; they
+ *  live here now so the graph pane stays the graph. */
 export interface CanvasOverviewContent {
   description: string;
   stats: string;
   notes: string[];
+  badges?: string[];
+  legend?: CanvasLegendItem[];
 }
 
 /** Arrow keys move the handle by this many px (the drag's keyboard fallback). */
@@ -35,6 +45,13 @@ interface CanvasOverviewPanelProps {
   onDeselect: () => void;
   /** Collapses the overview to its ⓘ reopen affordance (overview mode only). */
   onCollapse: () => void;
+  /** "Describe with AI": runs a hidden background agent that authors the
+   *  `description` fields in the workflow source (the canvas re-renders from
+   *  them on save). Undefined when no session can take it — button hidden. */
+  onDescribeWithAI?: () => void;
+  /** True while a describe background run is in flight — drives the button's
+   *  loading state. */
+  describing?: boolean;
 }
 
 /**
@@ -58,6 +75,8 @@ export function CanvasOverviewPanel({
   onOpenSteps,
   onDeselect,
   onCollapse,
+  onDescribeWithAI,
+  describing = false,
 }: CanvasOverviewPanelProps): JSX.Element {
   const panelRef = useRef<HTMLDivElement>(null);
   const headRef = useRef<HTMLDivElement>(null);
@@ -68,6 +87,22 @@ export function CanvasOverviewPanel({
   const manualRef = useRef<number | null>(loadUiPrefs().canvasInspectorHeight ?? null);
   const [height, setHeight] = useState<number | null>(null);
   const [resizing, setResizing] = useState(false);
+
+  // "Describe with AI" loading. Optimistic on click so the user waits on
+  // nothing, then handed off to the real background run: `describing` is the
+  // live task state (from CanvasPane), `pending` covers the gap before the task
+  // appears (and is all mock mode has). A safety timeout drops an optimistic
+  // click that never became a task, so the button can't spin forever.
+  const [pending, setPending] = useState(false);
+  const describeLoading = pending || describing;
+  useEffect(() => {
+    if (describing) setPending(false);
+  }, [describing]);
+  useEffect(() => {
+    if (!pending) return;
+    const timer = window.setTimeout(() => setPending(false), 8000);
+    return () => window.clearTimeout(timer);
+  }, [pending]);
 
   /** Half the canvas pane — the hard cap for hug and drag alike. */
   const capHeight = (): number => {
@@ -213,8 +248,8 @@ export function CanvasOverviewPanel({
             <button
               className="theme-toggle canvas-overview-close"
               data-testid="canvas-inspector-close"
-              aria-label="Back to the workflow overview"
-              data-tooltip="Back to the workflow overview (Esc)"
+              aria-label="Back to the agent overview"
+              data-tooltip="Back to the agent overview (Esc)"
               onClick={onDeselect}
             >
               <Icon name="X" size={13} />
@@ -224,25 +259,11 @@ export function CanvasOverviewPanel({
           <>
             <Icon name="Radio" size={13} />
             Overview
-            <span className="canvas-overview-stats">
-              {(overview?.stats ?? "").split("·").map((pair) => {
-                const part = pair.trim();
-                if (!part) return null;
-                const gap = part.indexOf(" ");
-                const value = gap === -1 ? part : part.slice(0, gap);
-                const label = gap === -1 ? "" : part.slice(gap + 1);
-                return (
-                  <span key={part} className="canvas-overview-stat">
-                    <strong>{value}</strong> {label}
-                  </span>
-                );
-              })}
-            </span>
             <button
               className="theme-toggle canvas-overview-close"
               data-testid="canvas-overview-toggle"
-              aria-label="Collapse workflow overview"
-              data-tooltip="Collapse workflow overview"
+              aria-label="Collapse agent overview"
+              data-tooltip="Collapse agent overview"
               onClick={onCollapse}
             >
               <Icon name="X" size={13} />
@@ -263,8 +284,65 @@ export function CanvasOverviewPanel({
           ) : (
             overview && (
               <>
+                {/* The board's old floating chrome: what the agent is, in
+                    numbers, plus any state badge the render carried. */}
+                {(overview.stats || (overview.badges && overview.badges.length > 0)) && (
+                  <div className="canvas-overview-meta" data-testid="canvas-overview-meta">
+                    {overview.stats && (
+                      <span className="canvas-overview-stats">{overview.stats}</span>
+                    )}
+                    {overview.badges?.map((badge) => (
+                      <span key={badge} className="canvas-overview-badge">
+                        {badge}
+                      </span>
+                    ))}
+                  </div>
+                )}
                 {overview.description && (
                   <p className="canvas-overview-desc">{overview.description}</p>
+                )}
+                {/* AI authors the deterministic `description` fields in the
+                    source; the canvas re-renders from them on save. Hidden when
+                    no session can take the inject (onDescribeWithAI undefined). */}
+                {onDescribeWithAI && (
+                  <button
+                    type="button"
+                    className={"canvas-describe-ai" + (describeLoading ? " is-loading" : "")}
+                    data-testid="canvas-describe-ai"
+                    disabled={describeLoading}
+                    aria-busy={describeLoading}
+                    onClick={() => {
+                      // The Rewrite variant edits source that already has
+                      // hand-written descriptions — confirm before the agent can
+                      // replace them. The empty (Describe) variant has nothing to
+                      // destroy, so it fires straight away.
+                      if (
+                        overview.description &&
+                        !window.confirm(
+                          "Rewrite this agent's descriptions? The coding agent will edit the source and may replace text you wrote by hand.",
+                        )
+                      ) {
+                        return;
+                      }
+                      // Optimistic: the button shows loading the instant you
+                      // click, before the background run reports in.
+                      setPending(true);
+                      onDescribeWithAI();
+                    }}
+                    data-tooltip="Runs a hidden coding-agent session that writes descriptions into the agent source — the canvas updates when it saves"
+                  >
+                    {describeLoading ? (
+                      <>
+                        <span className="canvas-describe-spinner" aria-hidden="true" />
+                        Describing…
+                      </>
+                    ) : (
+                      <>
+                        <Icon name="Sparkles" size={13} />
+                        {overview.description ? "Rewrite descriptions with AI" : "Describe with AI"}
+                      </>
+                    )}
+                  </button>
                 )}
                 {overview.notes.length > 0 && (
                   <ul className="canvas-overview-notes">
@@ -273,20 +351,19 @@ export function CanvasOverviewPanel({
                     ))}
                   </ul>
                 )}
-                <div className="canvas-legend-row" aria-hidden="true">
-                  <span>
-                    <span className="dot dot--entry" />
-                    entry / active step
-                  </span>
-                  <span>
-                    <span className="dot dot--step" />
-                    step
-                  </span>
-                  <span>
-                    <span className="dot dot--terminal" />
-                    terminal
-                  </span>
-                </div>
+                {overview.legend && overview.legend.length > 0 && (
+                  <div className="canvas-overview-legend" data-testid="canvas-overview-legend">
+                    {overview.legend.map((item) => (
+                      <span key={item.kind} className="canvas-overview-legend-item">
+                        <span
+                          className={"canvas-step-dot dot--" + item.kind}
+                          aria-hidden="true"
+                        />
+                        {item.label}
+                      </span>
+                    ))}
+                  </div>
+                )}
               </>
             )
           )}

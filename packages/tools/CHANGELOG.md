@@ -1,5 +1,178 @@
 # @sapiom/tools
 
+## 0.32.0
+
+### Minor Changes
+
+- 065c9ca: `contentGeneration.images` / `contentGeneration.video`: `ImageCreateInput` and `VideoCreateInput` gain an optional `idempotencyKey` — a caller-supplied string forwarded verbatim as a top-level request field across the sync `create` and async `launch` paths. On platform deployments with content-generation idempotency support, keys are limited to 255 characters and repeated requests with the same per-tenant key return the existing generation. The SDK does not validate or deduplicate the key; deployments without platform support may ignore it.
+
+## 0.31.0
+
+### Minor Changes
+
+- d7d480a: `models.run`: `ModelRunOutcome` gains an optional `warnings` array surfacing routing/honesty warnings when the platform reports them on the run result — e.g. a supplied `model` value the platform didn't recognize, which (with the SAP-2765 platform-side change) routes via the platform default instead of being silently dropped. Treat absent as no warnings.
+
+## 0.30.0
+
+### Minor Changes
+
+- 5a8eeea: Execution results now expose the server's serving disclosure, in SKU vocabulary — plus structured-output and routing-label ergonomics for `llm.run`. Reissues #673 under the corrected disclosure contract (`servedClass`/`lane`, not the earlier draft's `servedModel`/provider `costUsd`).
+
+  - `models.run` (`ModelRunOutcome`) and `models.coding.run` (`CodingRunOutcome`): new optional `servedClass` + `lane` (wire `served_class`, `lane`) — the billing class (size) the run's label resolved to and the lane it executed in. Never a model or provider id. `undefined`/`null` on older servers or when coding cannot observe it — never fabricated.
+  - `llm.run` / `llm.redeem` / `llm.callSession`: new `LlmDisclosure` type describing the `served_class` / `lane` fields the server injects top-level into raw `/v2` non-streaming response bodies, plus a `readDisclosure()` helper returning the camel-cased `LlmDisclosureResult`. The response `model` field is unchanged and keeps echoing the requested label.
+  - `llm.run` gains an optional `output: { name, schema }` field — the blessed tool-calling pattern for structured output, automated: it appends a forced tool call to the request and forces `tool_choice` onto it. `run`'s return type is unchanged either way (still the verbatim response); read the parsed value with the new `structuredOf()` helper. A new `textOf()` helper reads the plain-text reply, correctly skipping a `thinking` block that may precede it.
+  - `model`/`label` fields across `llm.run`, `llm.submit`, `llm.createSession`, `models.run`, and `models.coding.run` are now typed as a soft union (`"smart" | (string & {})`, lint-safely spelled) for autocomplete, with JSDoc settled on "routing label" terminology: omit to let the platform choose, `"smart"` if you must pin, a raw provider model id is never honored.
+
+  All additions are optional: existing consumers compile and run unchanged. On results from older servers the mappers and `readDisclosure` return `servedClass`/`lane` as `null` (unknown).
+
+### Patch Changes
+
+- 5a8eeea: `sapiom-agent-authoring` skill: teaches the LLM call-surface rule from step
+  code (`llm.run` one-shot vs `models.run` platform-driven loop vs `agents.run`
+  deployed-agent dispatch, with a worked example against the "reply with only
+  JSON" + string-parsing mistake) and settles the platform's naming
+  conventions (the overloaded "agent"/"run"/"task"/"session"/"dispatch" terms,
+  and "label" as the author-facing term for a `model:` value). Synced across
+  the canonical source, both scaffold templates, and the Claude Code plugin
+  copy. `@sapiom/tools`: corrected stale `agent.run`/`agent.coding` naming in
+  `models/index.ts`'s doc comments — the actual exported namespace is
+  `models`.
+
+## 0.29.0
+
+### Minor Changes
+
+- 04b7df5: Expose structured `CodingRunHttpError` details for failed coding requests and clarify repository-handle usage.
+
+  Add guidance for handling deterministic coding-repository failures.
+
+## 0.28.1
+
+### Patch Changes
+
+- aa7874b: content-generation (stub): `images.launch` / `video.launch` now also honor the sync verb's override key (`contentGeneration.images.create` / `contentGeneration.video.create`), so a step that moves from `create()` to `launch()` — the documented fix for long-running fan-outs — keeps its stub instead of silently falling back to the built-in default. Precedence: `<ns>.launch` (the call you wrote) wins, then `<ns>.create`, then the legacy `<ns>.run` spelling, which stays honored for back-compat (contentGeneration has no `run` method, but the key resolved before this release). Internally the four inlined media stub payloads collapsed into shared `stubImageResult` / `stubVideoResult` factories, so the `create` and `launch` defaults can no longer drift apart.
+- 9544a0f: content-generation (stub): the `images.launch` / `video.launch` stubs no longer post-mutate `resolvedModel` onto the resolved result. Previously a frozen caller override under `contentGeneration.images.launch` / `contentGeneration.video.launch` threw a `TypeError`, and a non-frozen one had its `resolvedModel` silently clobbered by `input.model ?? "stub-model"` with the caller's object mutated in place. Now the fallback factory sets it, and the launch paths stamp it onto a **copy** of the resolved override — mirroring the routed client's `withDispatchCost` — so a caller-supplied override wins verbatim and is never touched, while `handle.resolvedModel`, `(await handle.wait()).resolvedModel`, and the durable resume payload always agree (when the override omits the field, all three fall back to `input.model ?? "stub-model"`, exactly like the routed path).
+
+  Also: `toImageResumePayload` / `toVideoResumePayload` now omit `resolvedModel` instead of emitting an own key with value `undefined` when the input lacks it (mirroring the adjacent `cost` guard and the real webhook resume shape), and `MediaCostEnvelope` / `MediaResumeFields` are now named type exports of the package root alongside `VideoResultPayload` / `ImageResultPayload`.
+
+  Docs: the content-generation README's storage example uses `count` (not the deprecated `numImages`), its `VideoResultPayload` block now shows the `resolvedModel` / `cost` resume metadata and `downloadUrlUnavailable`, and the cost-envelope section documents `cost.reference` and the out-of-band settled amount (`GET /v1/transactions/:id/costs`). The 0.27.0 changelog entry retroactively documents the `VIDEO_MODELS` deprecation that shipped with the video repoint.
+
+- f70909f: models (stub): `models.launch` now honors the documented override keys. It previously resolved only the stale `agent.launch` / `agent.run` spellings — stranded by the agent→models half of the #167 rename — so a `models.launch` or `models.run` override was silently ignored by `launch()` (only `run()` honored `models.run`) and the built-in default was returned instead. `launch()` now consults `models.launch` > `models.run` > legacy `agent.launch` > `agent.run`; the legacy spellings stay honored for back-compat but now add a warning to the `warnings` sink (they sit one character from the unrelated `agents.*` namespace).
+
+  The launch path also merges the override **over** the built-in defaults instead of using it verbatim: a partial stub (e.g. `{ "output": "..." }`, the documented minimal shape) keeps `status` / `error` / `result` filled so `handle.status()` works and the resume payload stays schema-valid; a function override returning a Promise is awaited; and an author-supplied `runId` is preserved across `wait()` and the resume correlation (in the real client `run()` _is_ `launch().wait()`, so both paths agree on the id). `models.run()` is unchanged (verbatim, as before).
+
+## 0.28.0
+
+### Minor Changes
+
+- b768b18: content-generation: surface the E4 neutral param vocabulary on the SDK (SAP-2579)
+
+  `contentGeneration.images.create` / `.launch` and `contentGeneration.video.create` / `.launch` now
+  accept the neutral params as first-class typed fields — images: `aspectRatio`, `count`, `seed`,
+  `negativePrompt`, `referenceImage`, `outputFormat`; video: `aspectRatio`, `resolution`, `duration`,
+  `audio`, `seed`, `negativePrompt`, `referenceImage` — plus a `passthrough` escape hatch. The router
+  validates each against the chosen model **before payment** and maps it to that model's provider
+  format, so a caller can write `video.create({ prompt, aspectRatio: "9:16", audio: true, duration: 10 })`
+  without any provider-specific param names. `numImages` and `params` keep working, now `@deprecated`
+  in favour of `count` and `passthrough` (not drop-in aliases — the merge order is `params` < neutral
+  fields < `passthrough`). New exported types: `AspectRatio`, `Resolution`, `OutputFormat`.
+
+### Patch Changes
+
+- beb0f6f: content-generation (stub): the offline `contentGeneration.images.create` and `video.create` stubs now
+  return `resolvedModel`, matching the required `ImageGenerationResult` / `VideoGenerationResult` type and
+  the real routed backend (which always echoes it). Previously the sync `create` stubs omitted the field
+  behind an `as …Result` cast, so code reading `result.resolvedModel` under the stub got `undefined` while
+  the type promised a `string`. The `launch` stubs already set it; this brings `create` in line
+  (`input.model ?? "stub-model"`).
+
+## 0.27.1
+
+### Patch Changes
+
+- 07a09c9: content-generation: `resolvedModel` is now optional on the durable workflow-resume payload — the backend omits it for uncataloged models (SAP-2650).
+
+  `MediaResumeFields.resolvedModel` (shared by `VideoResultPayload` / `ImageResultPayload`) is now `resolvedModel?: string`. A real webhook-driven resume can legitimately arrive without it: for a non-cataloged model the gateway deliberately refuses to thread caller-controlled free text through this field on the resume payload (a stray `\n` would crash `fetch`, and the field would be spoofable), so it omits it best-effort — see SAP-2650.
+
+  `resolvedModel` stays **required** everywhere the routed backend always echoes the alias (verbatim even for an uncataloged raw id): `VideoGenerationResult` / `ImageGenerationResult` and the sync / poll / launch handles are unchanged. Only the resume payload contract relaxes; `toVideoResumePayload` / `toImageResumePayload` keep emitting it from the (still-required) result field.
+
+## 0.27.0
+
+### Minor Changes
+
+- 2b133e2: content-generation: surface the SAP-2576 per-generation cost envelope + `resolvedModel` across every media-result path
+
+  Consumers (e.g. a platform re-billing generations to its own customers) can now price a generation without a second API call, consistently across synchronous image calls, polled results, launch handles, AND durable workflow resumes:
+
+  - New `MediaCostEnvelope` (`estimateUsd` inline + the settled charge out-of-band via `cost.reference`) and `resolvedModel` on `ImageGenerationResult` / `VideoGenerationResult` and the `images.launch` / `video.launch` handles.
+  - `resolvedModel` is **required** (the routed backend always echoes it — a cataloged raw id reverse-maps to its alias, an uncataloged one is echoed verbatim), matching the backend SAP-2576 contract. `cost` stays optional (quote/reference are best-effort).
+  - The durable resume payload (`VideoResultPayload` / `ImageResultPayload`, via `toVideoResumePayload` / `toImageResumePayload`) now carries `resolvedModel` + `cost` (new shared `MediaResumeFields`), so a workflow step that bills in the **resumed** step — after generation — can still read `cost.reference`.
+  - For video the envelope resolves at submit and is threaded from the dispatch handle onto the polled result (the gateway's queue passthrough carries neither).
+
+  > Companion (backend): the Fal workflow-resume producer must emit `resolvedModel` + `cost` in the resume payload JSON for real webhook-driven resumes to carry them; the SDK mapper covers local stubs/tests only.
+
+- beb3139: content-generation: route `video.create` / `video.launch` through the `/v1/capabilities/content.generation.video` router (SAP-2575)
+
+  Video verbs now submit through the shared capability router (like images), so the SDK no longer builds the gateway-direct `/run/<model>` URL: `model` is a request-body field the router's adapter resolves server-side (a semantic alias like `"veo3-fast"`, or a raw provider id, defaulted when omitted), and authentication rides the `/v1` guard's `x-api-key` header. The public `video.create` / `video.launch` surface and the submit-then-poll-to-completion behavior are unchanged.
+
+  With aliases resolving from the SDK, the `VIDEO_MODELS` raw-provider-id constants are now `@deprecated`: a pinned `VIDEO_MODELS.veo3Fast` keeps working (the adapter passes an already-resolved id straight through), but new code should pass the semantic alias (`"veo3-fast"`, `"kling-standard"`, …) directly to `model`.
+
+  **Breaking — video's base URL moves to Core.** Video now resolves its base URL from Core like every other routed capability (`resolveCoreBaseUrl()` → `SAPIOM_BASE_URL` ?? `SAPIOM_API_URL` ?? `https://api.sapiom.ai`):
+
+  - The content-generation-specific `SAPIOM_CONTENT_GENERATION_URL` override is **no longer read** for video — set **`SAPIOM_BASE_URL` / `SAPIOM_API_URL`** instead.
+  - Any explicit `baseUrl` passed to `video.create` / `video.launch` must now point to **Core** (e.g. `https://api.sapiom.ai`), **not the Fal gateway**. A Fal-gateway URL here will now hit the wrong host.
+
+## 0.26.2
+
+### Patch Changes
+
+- 9199d22: Align the `llm` capability's JSDoc label examples with the public Router
+  taxonomy (`smart`, `small`, `medium`, `large`).
+
+  The previous examples referenced model-name labels — `m2.7` (no longer a
+  routable `/v2` label; copying that example now yields a `400`), `minimax-m3`,
+  `sonnet`, `haiku`. The user-facing contract for the Router is the smart /
+  size-tier label set, so the docstrings and inline examples now show those.
+  No runtime behavior change: `model` / `label` remain free-form strings
+  validated by the gateway.
+
+## 0.26.1
+
+### Patch Changes
+
+- 1ac32ef: Keep public sandbox and routed-capability documentation provider-neutral while preserving required compatibility identifiers.
+
+## 0.26.0
+
+### Minor Changes
+
+- cc1ac0c: file-storage: add `fileStorage.getPublicUrl(fileId)` — a pure helper that builds the durable, unauthenticated `/public/:id` permalink (the gateway re-signs a fresh URL on each hit), so callers can email or embed a link for an external recipient instead of a ~15-min presigned URL.
+
+  content-generation: add `downloadUrlUnavailable?: boolean` to `ImageResultPayload` / `VideoResultPayload` outputs, so a resumed step can tell "URL omitted, re-fetch from fileId" from "no asset".
+
+  Both are additive; no breaking changes. (Releases the changes merged in #504.)
+
+## 0.25.0
+
+### Minor Changes
+
+- 27a1079: `contentGeneration.images.launch` — a dispatchable async surface for image generation, mirroring
+  `video.launch`.
+
+  The routed synchronous `images.create` holds its HTTP request open for the full generate+store,
+  which meets Core's 30s router cap: a concurrent fan-out (`Promise.all` over N rows) drove every
+  request in the batch past 30s, so the whole step 503'd on every retry. The backend already supported
+  async image dispatch (`dispatch: 'async'`, SAP-1802) over the same fal-queue → webhook → resume rail
+  as video, but the SDK never exposed it.
+
+  `images.launch` submits with `dispatch: 'async'`, forwards the workflow resume token, and returns an
+  `ImageLaunchHandle` (`requestId`, `dispatch`, and an inline `wait()`) — so the submit returns as soon
+  as the job is enqueued and the 30s wall no longer applies. Pass the handle to
+  `pauseUntilSignal(handle, { resumeStep })` to suspend a workflow step until the image is ready, or
+  `await handle.wait()` to poll inline. Also exported: `IMAGE_RESULT_SIGNAL`, the `ImageResultPayload`
+  shape a resumed step receives, and `toImageResumePayload`. `images.create` is unchanged. No backend
+  change is required — the async completion→resume path is media-agnostic.
+
 ## 0.24.0
 
 ### Minor Changes

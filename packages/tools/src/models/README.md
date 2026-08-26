@@ -17,7 +17,7 @@ if (run.result?.success) await repo.pushFromSandbox(run.sandbox, { message: "fea
 
 - **`run` blocks until the agent finishes; `launch` doesn't.** `run` polls to completion, which for a real task can take several minutes. Use `launch` when you'd rather kick off the run, do other work, and check on it yourself with `handle.status()` or `handle.wait()`.
 
-- **`gitRepository` sets up the checkout for you.** Passing a repository clones it into the sandbox at `/workspace/<slug>` with push access already configured — which is exactly what `repo.pushFromSandbox(run.sandbox)` needs afterward. Without it, the agent works in an empty sandbox and there's nothing to push.
+- **`gitRepository` sets up a managed checkout for you.** Pass a repository returned by `repositories.create()`, `repositories.get()`, or `repositories.list()`. `repositories.attach()` can rehydrate one of those handles but cannot import an external Git repository. Without `gitRepository`, the agent works in an empty sandbox and there's nothing to push.
 
 - **The sandbox stays alive after the run by default.** This lets a later step read files, run commands, or push from it. Pass `keepSandbox: false` to tear it down automatically when the run finishes (after which you can't push from it).
 
@@ -29,8 +29,10 @@ if (run.result?.success) await repo.pushFromSandbox(run.sandbox, { message: "fea
 
 - **Each run is billed.** Runs that fail or are aborted still cost. Check `run.result?.success` and `run.error` before relying on a run's output.
 
+- **Coding HTTP failures are structured.** `run`, `launch`, `handle.status()`, and `handle.wait()` throw `CodingRunHttpError`. Inspect `status`, `code`, `requestId`, and `body`; workflow steps can return `fail(error.message)` for `repository_not_found` and rethrow other errors.
+
 ## Reference
 
 `agent.coding.run(spec)` · `agent.coding.launch(spec)`
 
-See the exported types (`CodingRunSpec`, `CodingRunResult`, `RunHandle`) for full signatures.
+See the exported types (`CodingRunSpec`, `CodingRunResult`, `RunHandle`, `CodingRunHttpError`) for full signatures.

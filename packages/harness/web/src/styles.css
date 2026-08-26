@@ -1,16 +1,25 @@
 /* ==========================================================================
    Sapiom design-system consumption (the one rule: never redefine a token).
-   tokens.css is the single source of truth; agent-cloud.css layers the
-   shared product accent on top. This app carries exactly two sanctioned
-   deviations, each documented at its declaration: the brand accent (the
-   Sapiom mark green replaces the shared teal) and the micro type
-   floor (10px raised to 11px). Everything below the imports is a
-   COMPATIBILITY BRIDGE: the upstream engineering frontend names its
-   variables --bg-0..3/--text/--accent/…, so we map those names onto the
-   shared semantic tokens instead of carrying a second palette.
+   Import order is part of the contract: fonts register the Geist faces,
+   tokens.css is the single source of truth, and the named `studio.css` preset
+   layers the dense-IDE decisions on top (compact control/type density, the
+   scarce green brand, and NEUTRAL focus/selection chrome). `studio.css` itself
+   composes `agent-cloud.css`, so it is not imported separately — importing both
+   would create two places to reason about accent precedence.
+
+   The preset is scoped to `[data-product="sapiom-studio"]` (set on <html> in
+   index.html), so it owns the deliberate overrides of shared names such as
+   `--radius`, `--card-pad`, `--type-label`, `--type-meta`, `--control-h`, and
+   `--glyph-control`; this app must NOT restate them below.
+
+   Everything below the imports is a COMPATIBILITY BRIDGE: the upstream
+   engineering frontend names its variables --bg-0..3/--text/--accent/…, so we
+   map those names onto the shared semantic tokens instead of carrying a second
+   palette. It never redefines a token the preset owns.
    ========================================================================== */
+@import "@sapiom/design-system/fonts.css";
 @import "@sapiom/design-system/tokens.css";
-@import "@sapiom/design-system/themes/agent-cloud.css";
+@import "@sapiom/design-system/themes/studio.css";
 
 :root {
   /* Geometry + motion bridge (theme-independent). */
@@ -25,22 +34,19 @@
   --radius-full: 9999px;
   /* ONE horizontal inset for every header/subheader bar and panel well. */
   --pane-pad-x: var(--sp4);
+  /* How far a full-bleed row's own padding reaches inside its hover shape.
+     A row is inset by (--pane-pad-x - --row-bleed) and pads by --row-bleed, so
+     its glyphs land on the pane inset while the hover shape breathes around
+     them. Mirrors the studio rail reference. */
+  --row-bleed: var(--sp2);
   --font-sans: var(--font);
   --font-mono: var(--mono);
 
-  /* Legibility floor: the shared ramp's 10px micro step is below
-     comfortable reading size for this app's dense chrome (kbd hints, count
-     badges, section eyebrows), so the micro token is raised to 11px here.
-     Nothing in this app may render below 11px; 10px is reserved for
-     nothing. */
-  --type-micro: 11px;
-
-  /* Base UI font raised to 14px for comfortable reading; the rest of the
-     ramp steps down from it (14/13/12/11). Scoped override of the shared
-     type tokens for THIS app only — the design-system file is untouched. */
-  --type-ui: 14px;
-  --type-label: 13px;
-  --type-meta: 12px;
+  /* Type is owned by tokens.css + the Studio preset now, not restated here:
+     tokens.css already floors --type-micro at 11px and sets the 14px UI base,
+     and studio.css sets the dense ladder (--type-label 14px, --type-meta 12px,
+     --type-display 24px) under [data-product="sapiom-studio"]. Restating any of
+     them here would silently win the cascade over the preset. */
 
   /* Elevation — floating surfaces use the shared soft shadow; the small
      steps stay as subtle fixed alphas for popovers/menus. */
@@ -55,6 +61,16 @@
      Every CLICKABLE chip/pill (run picker, Preview, composer starter pills)
      floors at this so the hit target never collapses to text height. */
   --chip-h: 28px;
+
+  /* In-row icon-only controls (a row's hover action, a tab's ×): smaller than
+     the --control-h-xs chrome cluster, and the ONE size they all share so no
+     row invents its own square. */
+  --control-h-2xs: 22px;
+
+  /* Clearance for the frameless macOS traffic lights, the ONE number every
+     surface that can lead the window's top line uses. COUPLED to
+     harness-desktop main/windows.ts trafficLightPosition {x:19,y:21}. */
+  --mac-lights-inset: 78px;
 }
 
 /* --------------------------------------------------------------------------
@@ -265,10 +281,10 @@ input {
   color: var(--text-dim);
 }
 
-/* The auth state reads as "reconnect" (accent), the error state as a real
+/* The auth state reads as "reconnect" (neutral ink), the error state as a real
    fault (red); offline stays neutral — the copy carries the meaning. */
 .connectivity-screen[data-status="auth"] .connectivity-screen-icon {
-  color: var(--accent);
+  color: var(--ink-muted);
 }
 
 .connectivity-screen[data-status="error"] .connectivity-screen-icon {
@@ -370,51 +386,226 @@ input {
   flex-direction: column;
 }
 
+/* The rail's animating slot (desktop). Its inline width eases between the rail's
+   width and 0, and overflow:hidden clips the fixed-width rail inside it — so
+   collapse/expand slides like a drawer instead of the content squishing. A
+   resize-handle drag/reset (.is-resizing) drops the ease so the rail tracks the
+   cursor. The slot is a fixed column (no shrink); on windows narrower than the
+   rail + both panes' floor the shell scrolls rather than shrinking the rail.
+   On mobile the rail is a position:fixed drawer that escapes this wrapper. */
+.rail-slot {
+  /* A shrinkable flex container: the rail inside keeps its `flex: 0 1 auto`, so
+     it still reflows down to RAIL_MIN under space pressure (a narrow window)
+     rather than forcing horizontal scroll. The slot's inline width eases between
+     the rail's width and 0 on collapse, and overflow:hidden clips the last
+     stretch (below RAIL_MIN) like a drawer. */
+  display: flex;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  transition: width var(--base) var(--ease);
+}
+.rail-slot.is-resizing {
+  transition: none;
+}
+/* Once collapsed, take it out of AT + hit-testing (it is width 0 and inert
+   already). The 0s-delayed-by-var(--base) visibility change lets the width
+   finish easing before it goes hidden; on expand the base rule (no visibility
+   transition) flips it back instantly so the open ease is visible. */
+.rail-slot.is-collapsed {
+  visibility: hidden;
+  transition:
+    width var(--base) var(--ease),
+    visibility 0s var(--base);
+}
+@media (prefers-reduced-motion: reduce) {
+  .rail-slot {
+    transition: none;
+  }
+}
+
 /* Brand header row at the top of the rail — shares --pane-header-h with the
    session bar and right-pane tabs so the app's top edge is one 56px line. */
 .brand-header {
   flex: 0 0 auto;
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  gap: var(--sp2);
   height: var(--pane-header-h);
-  padding: 0 var(--pane-pad-x);
-  background: var(--surface-raised);
-  border-bottom: 1px solid var(--ui-line);
+  /* Window controls lead the line and back/forward closes it, both at --sp2 so
+     their icons line up with the Workspaces ⋯ and the tree's status icons
+     (which sit at the same --sp2 inset). */
+  padding: 0 var(--sp2);
+  /* Transparent — the rail block's surface shows through, so the wordmark row
+     is never a different colour from the rail beneath it. */
+  background: transparent;
 }
 
-.brand-lockup {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.brand-header-tools {
+/* The window group: the OS lights (frameless host) then the rail collapse. */
+.brand-header-window {
   display: flex;
   align-items: center;
   gap: var(--sp1);
 }
 
+/* Back/forward, the line's right anchor. */
+.session-nav {
+  display: flex;
+  align-items: center;
+  gap: var(--sp0);
+}
+
+.session-nav-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* ── Frameless macOS host ────────────────────────────────────────────────
+   The Electron window drops its native title bar and insets the OS traffic
+   lights into the rail's 56px top line (harness-desktop main/windows.ts), and
+   tells the SPA via ?frame=macos → data-window-frame on :root. NONE of this
+   applies in a browser (npx), which never sets the attribute: a header padded
+   for lights that are not there, or a drag region that cannot drag, would be
+   wrong anywhere but the frameless window. */
+/* Two-row rail header: only the window tools ride the traffic-light line; the
+   whole "sapiom agent.studio" lockup drops to the line below — into the space
+   under the lights, never pinned beside them. Only the rail's header grows; the
+   session bar and tabs stay one 56px line. */
+:root[data-window-frame="macos"] .brand-header {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  /* Row 1 is the traffic-light line, shortened from --header-h so the lockup
+     sits ONE --sp2 (the header's row-gap) below the window tools — matching the
+     agent.studio → Search gap instead of the old ~20px chasm under the lights.
+     The value keeps the tools' bottom exactly where a full --header-h row
+     centred them, so they stay aligned with the OS lights; the tools bottom-
+     align (below) to hold that line as the row shrinks. */
+  grid-template-rows: calc((var(--header-h) + var(--control-h-xs)) / 2) auto;
+  align-items: center;
+  height: auto;
+  /* No bottom padding: the --sp2 gap below agent.studio is owned by the nav's
+     padding-top, so agent.studio → Search matches every other top-stack gap.
+     Right inset is --sp2 so the tool cluster lines up with the ⋯ / status
+     icons below (see the browser-frame .brand-header note). */
+  padding: 0 var(--sp2) 0 var(--pane-pad-x);
+  column-gap: var(--sp2);
+}
+
+/* Collapse rides the traffic-light line, immediately to the RIGHT of the OS
+   lights, so the window controls read as one group; back/forward take the far
+   end of the same line. The left inset clears the lights themselves — the
+   header itself starts at --pane-pad-x, so the group only owes the remainder. */
+:root[data-window-frame="macos"] .brand-header .brand-header-window {
+  grid-column: 1;
+  grid-row: 1;
+  /* Bottom-align so the tools keep the lights' line as row 1 shrinks. */
+  align-self: end;
+  padding-left: calc(var(--mac-lights-inset) - var(--pane-pad-x));
+}
+
+:root[data-window-frame="macos"] .brand-header .session-nav {
+  grid-column: 3;
+  grid-row: 1;
+  align-self: end;
+}
+
+/* The lockup drops in full to the line below the lights, reading inline as
+   "sapiom agent.studio" (its default baseline-flex layout) at the rail's normal
+   left inset — no traffic-light clearance, because nothing shares this line. */
+:root[data-window-frame="macos"] .brand-header .brand-lockup {
+  grid-column: 1 / -1;
+  grid-row: 2;
+  padding-left: calc(var(--pane-pad-x) - var(--sp2));
+}
+
+/* The app's top line is the window's drag handle; every control on it opts back
+   out. Only these three chrome bars are draggable — never the panes below. */
+:root[data-window-frame="macos"] .brand-header,
+:root[data-window-frame="macos"] .session-bar,
+:root[data-window-frame="macos"] .right-pane-tabs {
+  -webkit-app-region: drag;
+}
+
+:root[data-window-frame="macos"] .brand-header :is(button, a, input, [role="tab"], [role="button"], [role="menuitem"]),
+:root[data-window-frame="macos"] .session-bar :is(button, a, input, [role="tab"], [role="button"], [role="menuitem"]),
+:root[data-window-frame="macos"] .right-pane-tabs :is(button, a, input, [role="tab"], [role="button"], [role="menuitem"]) {
+  -webkit-app-region: no-drag;
+}
+
+/* Collapsing the rail unmounts the brand header that clears the lights, so the
+   session bar becomes the top-left element — leading with its rail-expand
+   button, the affordance that brings the rail back. It takes over the
+   clearance so the lights never land on that button. */
+:root[data-window-frame="macos"] .app-shell[data-rail-collapsed] .session-bar,
+:root[data-window-frame="macos"] .app-shell[data-rail-collapsed] .templates-bar {
+  padding-left: var(--mac-lights-inset);
+}
+
+/* The rail toggle (collapse in the brand header, expand in the session bar)
+   leads the window's top line right after the OS lights. macOS hides those
+   lights whenever the window loses focus, emptying the clearance the toggle
+   sits after — a bare glyph then reads as a gap, not a control. Blurred, the
+   toggle carries its own resting surface so it still reads as the window tool
+   it is; focused, the lights are back and it returns to the ghost recipe. Only
+   the frameless host, because only there is the toggle a window control. */
+/* The ghost recipe transitions background+color only, and it is declared after
+   this block — carry the surface's other two properties at higher specificity
+   so the state fades in rather than snapping. */
+.theme-toggle.rail-toggle {
+  transition:
+    background-color var(--transition-fast),
+    border-color var(--transition-fast),
+    box-shadow var(--transition-fast),
+    color var(--transition-fast);
+}
+
+:root[data-window-frame="macos"][data-window-focused="false"] .rail-toggle {
+  background: var(--surface-raised);
+  border-color: var(--border);
+  box-shadow: var(--shadow-xs);
+}
+
+/* An inline confirm (EndSessionConfirm) renders its full-screen backdrop INSIDE
+   the draggable session bar. Without opting out, a backdrop click landing in
+   the top drag strip is eaten as a window-move instead of dismissing — so the
+   whole scrim opts out (harmless for the top-level modal backdrops). */
+:root[data-window-frame="macos"] .modal-backdrop {
+  -webkit-app-region: no-drag;
+}
+
+/* The lockup is an <h1>; strip the heading's default margin/size so it lays
+   out as a plain baseline row of wordmark + product name. */
+.brand-lockup {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp2);
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
+  font-size: var(--type-ui);
+}
+
+/* By default the mark wrapper dissolves — the logotype + hidden text sit
+   directly in the lockup's flex, so "sapiom agent.studio" reads inline. The
+   frameless-mac grid (below) re-materializes it to place it on its own row. */
 .brand-mark {
-  width: 18px;
-  height: 18px;
+  display: contents;
 }
 
-.brand-name {
-  font-size: var(--type-ui);
-  font-weight: 600;
+/* The Sapiom wordmark renders in currentColor. Keep it neutral ink — the
+   wordmark is the name, not a status, so it is not green. A replaced element
+   has no baseline of its own, so drop it onto the product name's text baseline
+   by the descender the asset publishes (set as an inline custom property). */
+.brand-logotype {
+  display: block;
   color: var(--text);
-  letter-spacing: -0.01em;
+  transform: translateY(var(--brand-logotype-descender, 0));
 }
 
-.brand-divider {
-  width: 1px;
-  height: 14px;
-  background: var(--border-strong);
-}
-
+/* Lowercase mono product name, matching the terminal masthead's voice. */
 .brand-product {
-  font-size: var(--type-ui);
+  font-family: var(--mono);
+  font-size: var(--type-meta);
   font-weight: 500;
   color: var(--text-dim);
 }
@@ -423,68 +614,28 @@ input {
    header — mirrors the design system's .sapiom-workspace-search anatomy
    (icon | text | kbd hint). The row itself is a standard header-height bar
    so the rail keeps the same 56px rhythm as every other bar. */
-.rail-search {
-  flex: 0 0 auto;
+/* Search + Templates: the persistent labelled destinations above the tree.
+   A quiet vertical stack of rows on the continuous rail surface — no boxed
+   field, no divider. */
+/* The top stack is a dense list, not a stack of cards: rows sit on the tree's
+   own --sp0 rhythm and take their height from --control-h, so Search →
+   Templates → Add existing agents read as one block. Only the Create new CTA
+   keeps a real gap below it, separating the action from the destinations. */
+.rail-nav {
   display: flex;
-  align-items: center;
-  gap: var(--sp2);
-  height: var(--pane-header-h);
-  padding: 0 var(--pane-pad-x);
-  border-bottom: 1px solid var(--ui-line);
+  flex-direction: column;
+  gap: var(--sp0);
+  padding: var(--sp2) 0 0;
 }
 
-/* When a search row carries a trailing action, the field itself must yield
-   width instead of the row growing. */
-.rail-search .palette-trigger {
-  flex: 1;
-  min-width: 0;
-  width: auto;
-}
-
-.palette-trigger {
-  display: grid;
-  grid-template-columns: 1rem minmax(0, 1fr) auto;
-  align-items: center;
-  gap: var(--sp2);
-  width: 100%;
-  height: var(--control-h-xs);
-  padding: 0 var(--sp2) 0 var(--sp3);
-  background: var(--surface-inset);
-  border: 1px solid var(--ui-line);
-  border-radius: var(--radius);
-  color: var(--text-dim);
-  font-size: var(--type-label);
-  text-align: left;
-  transition:
-    background-color var(--transition-fast),
-    border-color var(--transition-fast),
-    color var(--transition-fast);
-}
-
-.palette-trigger:hover {
-  border-color: var(--ui-line-strong);
-  color: var(--text);
-}
-
-.palette-trigger:focus-visible {
-  outline: 2px solid var(--focus);
-  outline-offset: 2px;
-}
-
-.palette-trigger-text {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.palette-trigger-hint {
+/* The unboxed shortcut hint on the Search row — right-aligned, quiet mono, no
+   key-cap box (the row itself is the affordance). */
+.rail-nav-kbd {
+  margin-left: auto;
   color: var(--text-faint);
   font-family: var(--font-mono);
-  font-size: var(--type-micro);
-  padding: 1px 5px;
-  border: 1px solid var(--ui-line);
-  border-radius: var(--radius);
-  background: var(--bg-0);
+  font-size: var(--type-meta);
+  letter-spacing: 0.02em;
 }
 
 /* Icon-only "ghost" button: no border at rest — matches the product's
@@ -514,6 +665,61 @@ input {
 .theme-toggle:focus-visible {
   outline: 2px solid var(--focus);
   outline-offset: 2px;
+}
+
+/* --------------------------------------------------------------------------
+   Icon-only controls are SQUARE, everywhere, always.
+   A button whose whole content is one glyph has no text to size it, so in a
+   flex row it inherits the row's stretch and the row's shrink and comes out
+   as a tall pill or a squashed sliver. Fixing width/height on each recipe was
+   not enough: flex-basis still let them give way. This one rule pins the
+   1:1 footprint (both axes, plus a min so shrink can't bite) and opts every
+   icon button out of stretching and shrinking. Recipes below may restyle a
+   control's surface; none of them may restate its size.
+   Labelled controls are deliberately absent — they size to their text.
+   -------------------------------------------------------------------------- */
+.theme-toggle,
+.macro-icon-btn,
+.dir-picker-up,
+.composer-attach,
+.composer-send {
+  box-sizing: border-box;
+  flex: 0 0 auto;
+  align-self: center;
+  width: var(--control-h-xs);
+  min-width: var(--control-h-xs);
+  height: var(--control-h-xs);
+  min-height: var(--control-h-xs);
+  padding: 0;
+  aspect-ratio: 1;
+}
+
+/* The zoom readout rides the .theme-toggle surface but is a LABEL ("100%"),
+   so it is the one member of the cluster that sizes to its text. */
+/* In-row icon-only controls: the same 1:1 contract at the smaller step. A
+   flex row must never stretch or squeeze a glyph button — it is a square or
+   it is nothing. */
+.workspace-row-action,
+.deploy-status-dismiss,
+.plan-card-menu-btn,
+.toast-dismiss {
+  box-sizing: border-box;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: var(--control-h-2xs);
+  min-width: var(--control-h-2xs);
+  height: var(--control-h-2xs);
+  min-height: var(--control-h-2xs);
+  padding: 0;
+  aspect-ratio: 1;
+}
+
+.canvas-zoom-reset {
+  width: auto;
+  aspect-ratio: auto;
+  padding: 0 var(--sp1);
 }
 
 .brand-identity {
@@ -562,7 +768,7 @@ input {
   background: none;
   border: none;
   padding: 0;
-  color: var(--accent);
+  color: var(--text-dim);
   font-size: inherit;
   cursor: pointer;
   text-decoration: underline;
@@ -570,7 +776,7 @@ input {
 }
 
 .telemetry-notice-settings-link:hover {
-  color: var(--accent-hover);
+  color: var(--text);
 }
 
 .telemetry-notice-dismiss {
@@ -641,9 +847,8 @@ input {
   flex-direction: column;
   min-width: 0;
   min-height: 0;
-  /* The rail's own border-right draws the left seam; only the canvas seam
-     belongs to this pane. */
-  border-right: 1px solid var(--border);
+  /* No shell divider: the panes read as one surface, told apart by their own
+     planes and the resize handle's hover affordance, not a permanent line. */
 }
 
 /* Rails ---------------------------------------------------------------- */
@@ -651,7 +856,9 @@ input {
 .rail {
   display: flex;
   flex-direction: column;
-  background: var(--bg-1);
+  /* Continuous base surface — the rail/main boundary is drawn by the resize
+     handle's border, not by a plane difference. */
+  background: var(--surface-base);
   min-width: 0;
   /* Upstream parity: without this the tree clips below the fold
      on first paint instead of scrolling. */
@@ -678,9 +885,10 @@ input {
   display: flex;
   align-items: center;
   gap: var(--sp2);
-  width: calc(100% - var(--sp3));
-  margin: 0 var(--sp2) var(--sp1);
-  padding: var(--sp2);
+  align-self: stretch;
+  height: var(--control-h);
+  margin: 0 calc(var(--pane-pad-x) - var(--row-bleed));
+  padding: 0 var(--row-bleed);
   border: none;
   border-radius: var(--radius-sm);
   background: transparent;
@@ -709,17 +917,97 @@ input {
   font-weight: 550;
 }
 
+/* "Create new": the primary affirmative action, promoted out of the header and
+   ABOVE Search. It's the app's primary CTA — a solid ink button (the same
+   --btn/--btn-ink treatment as Deploy / .btn-primary) — so it stays visually
+   distinct from the ghost Search/Templates rows while keeping their inset and
+   --sp2 rhythm. */
+.rail-nav-cta {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp2);
+  align-self: stretch;
+  margin: 0 calc(var(--pane-pad-x) - var(--row-bleed)) var(--sp2);
+  min-height: var(--control-h);
+  padding: 0 var(--row-bleed);
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: var(--btn);
+  box-shadow: var(--shadow-xs);
+  text-align: center;
+  font-size: var(--type-ui);
+  font-weight: 550;
+  color: var(--btn-ink);
+  cursor: pointer;
+  transition:
+    background-color var(--transition-fast),
+    box-shadow var(--transition-fast),
+    transform var(--transition-fast);
+}
+
+/* The plus is the create signal — the one reserved brand accent, riding the ink
+   button. Mixed toward the button's ink so the green stays legible whichever way
+   the ink button flips with the theme (dark-in-light, light-in-dark). */
+.rail-nav-cta svg {
+  color: color-mix(in srgb, var(--brand) 65%, var(--btn-ink));
+}
+
+.rail-nav-cta:hover {
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-soft);
+}
+
+.rail-nav-cta:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.rail-nav-cta:active {
+  transform: translateY(0);
+}
+
+/* Empty rail: keep the ink button but ring it in a soft brand halo, so the one
+   action a first-run user needs is the loudest thing on an otherwise empty rail
+   — without spending the reserved green as a full fill. */
+.rail-nav-cta.is-empty {
+  box-shadow:
+    0 0 0 4px color-mix(in srgb, var(--brand) 24%, transparent),
+    var(--shadow-xs);
+}
+
+.rail-nav-cta.is-empty:hover {
+  transform: translateY(-1px);
+  box-shadow:
+    0 0 0 4px color-mix(in srgb, var(--brand) 34%, transparent),
+    var(--shadow-soft);
+}
+
 .rail-header {
   position: relative;
   flex: 0 0 auto;
   display: flex;
   align-items: center;
   gap: var(--sp2);
-  height: var(--pane-header-h);
-  padding: 0 var(--sp2) 0 var(--pane-pad-x);
+  /* A compact section-label row (a peer of the Search/Templates nav rows and
+     the folder rows below), not a 56px band — it reads as the header of the
+     tree it sits above. Its gap from the nav group is the same --sp2 as every
+     other top-stack boundary, owned by the last nav row's bottom margin. */
+  min-height: var(--control-h);
+  margin-top: 0;
+  /* One deliberate divider under the Workspaces header, setting the explorer
+     tree off from the destinations above it (Search / Templates). It is the
+     rail's only rule — the main shell panes carry none. */
+  margin-bottom: var(--sp1);
+  padding: 0 var(--sp2) var(--sp2) var(--pane-pad-x);
+  border-bottom: 1px solid var(--ui-line);
   font-size: var(--type-label);
-  font-weight: 510;
-  color: var(--text-faint);
+  font-weight: 590;
+  color: var(--text-dim);
+}
+
+.rail-header-label {
+  min-width: 0;
 }
 
 .rail-header-actions {
@@ -762,8 +1050,13 @@ input {
    height/type token as the Workspace row it came from) + body. Portaled
    (AnchoredPopover) off the rail-header trigger, so no rail overflow or
    short viewport can crop its scroll body. */
+/* Opaque floating fill — NOT --surface-inset. This card is portaled to
+   document.body (AnchoredPopover), so it has no opaque parent to composite
+   over; the Studio preset remaps --surface-inset to a translucent wash
+   (--active-shade), which let the rail bleed through the whole card. --bg-2
+   (opaque --s2) is the same fill every sibling popover recipe already uses. */
 .connect-card {
-  background: var(--surface-inset);
+  background: var(--bg-2);
   border: 1px solid var(--ui-line-strong);
   border-radius: var(--radius);
   box-shadow: var(--shadow-md);
@@ -795,39 +1088,128 @@ input {
   padding: var(--sp3);
 }
 
-/* Sessions/history variant: the body is a scrollable menu list on the
-   tighter menu inset. Portaled, so the width is its own (it no longer
-   inherits the tree's), clamped for very narrow viewports. */
+/* Workspaces (⋯) variant: the OPTIONS card — four fixed choices plus the one
+   Past-sessions row. It does NOT scroll: the unbounded set moved to the
+   sub-card beside it (.past-sessions-list), so this card only ever holds what
+   fits. Portaled, so the width is its own, clamped for narrow viewports. */
 .history-card {
-  width: min(320px, calc(100vw - var(--sp4)));
+  width: min(300px, calc(100vw - var(--sp4)));
 }
 
 .history-card .connect-card-body {
   gap: var(--tree-row-gap);
   padding: 6px;
+}
+
+/* ── The ⋯ menu is a FLYER, not a card ────────────────────────────────────
+   A transparent shell hosting a flex track: the options card, a hit-testable
+   2px bridge, and the Past-sessions sub-card. The pair lifts ONCE (the shadow
+   is on the track, not each card) so the seam between two surfaces at the same
+   elevation never reads as a crop mark. It opens BESIDE the rail. */
+.menu-flyer {
+  padding: 0;
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+  animation: none;
+  /* The portal's positioned element IS the stacking context here (the cards
+     inside no longer set the layer), so the z-index lives on the shell — above
+     the pane resize splitters (z-index: 20), which otherwise paint over a menu
+     that overhangs a pane boundary. */
+  z-index: 40;
+}
+
+.menu-flyer-track {
+  display: flex;
+  align-items: flex-start;
+  gap: 0;
+  filter: drop-shadow(0 12px 28px rgba(0, 0, 0, 0.22));
+}
+
+.menu-flyer-track .connect-card {
+  box-shadow: none;
+}
+
+.menu-flyer-bridge {
+  align-self: stretch;
+  flex: 0 0 2px;
+  width: 2px;
+  pointer-events: auto;
+}
+
+/* The sub-card is .connect-card plus the two things that make it nested: it
+   aligns to the top of the track (the row that opened it) and slides in from
+   the left as it appears. */
+.menu-flyer-nested {
+  align-self: flex-start;
+  width: min(320px, calc(100vw - var(--sp4)));
+  animation: menu-nested-in 0.1s var(--ease) both;
+}
+
+@keyframes menu-nested-in {
+  from {
+    opacity: 0;
+    transform: translateX(-6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .menu-flyer-nested {
+    animation: none;
+  }
+}
+
+/* The scroller lives HERE, on the unbounded set — never on the options card. */
+.past-sessions-list {
   max-height: min(360px, 60vh);
   overflow-y: auto;
 }
 
-/* Add-menu variant: the same door rows the dialog shows, on the menu inset.
-   Matched to .history-card so the two popovers hanging off adjacent buttons
-   are visibly one control, not two designs. */
-.add-card {
-  width: min(320px, calc(100vw - var(--sp4)));
+/* The fixed-choices region (Group by + Sort). A hover target that closes the
+   Past-sessions flyout, so it must be a real box — but it re-states the body's
+   column + gap so wrapping the choices doesn't flatten their rhythm. */
+.menu-choice-group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--tree-row-gap);
 }
 
-.add-card .connect-card-body {
-  padding: 6px;
+/* A choice row (Group by / Sort): the shared menu-row anatomy plus a check in
+   the trailing gutter. `menuitemradio` carries the semantics; this only sizes
+   the mark slot so every row's copy column ends on the same edge, checked or
+   not. */
+.menu-choice-mark {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: var(--line-box, 20px);
+  color: var(--text);
 }
 
-/* In the modal a door is a full-bleed row on modal padding, separated from its
-   neighbours by a rule. In the menu it is an inset, rounded item like every
-   other popover row — and the rule above the first door would otherwise sit
-   directly under the header's own border, reading as a double line. */
-.add-card .aw-door {
-  padding: 6px 8px;
-  border-top: none;
-  border-radius: var(--radius-sm);
+/* The Past-sessions trigger: a normal menu row whose trailing chevron and
+   count sit at the far edge, marking it as a row that opens another surface. */
+.nested-trigger > .session-history-badge {
+  margin-left: auto;
+}
+
+.nested-trigger > svg:last-child {
+  flex: 0 0 auto;
+  color: var(--text-faint);
+}
+
+/* When a badge already pushed itself to the edge, the chevron follows it
+   rather than the copy column. */
+.nested-trigger > .session-history-badge + svg:last-child {
+  margin-left: var(--sp1);
+}
+
+.nested-trigger.is-open {
+  background: var(--active-shade);
 }
 
 .rail-list {
@@ -841,22 +1223,151 @@ input {
   padding: var(--sp3) var(--sp2);
 }
 
-/* Footer: stacked full-width rows, each on the shared bar height —
-   connect, then the analytics indicator, then the account entry. */
+/* Footer: a short stack — zero, one, or two CARDS (update, then plan), then
+   the flat account row — told apart by a gap on the shared rail inset. Still
+   no border-top and no inter-row rule: the rail stays a single surface, and
+   the cards sit ON it rather than banding it. */
 .rail-footer {
   flex: 0 0 auto;
-  border-top: 1px solid var(--ui-line);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp2);
+  /* Same horizontal inset as .rail-header / the tree — one vertical edge. */
+  padding: var(--sp2) var(--pane-pad-x) var(--sp3);
 }
 
 .rail-footer-row {
   display: flex;
   align-items: center;
-  height: var(--pane-header-h);
-  padding: 0 var(--pane-pad-x);
+  min-height: var(--pane-header-h);
+  /* The block's inset lives on .rail-footer now; rows are flush inside it. */
+  padding: 0;
 }
 
-.rail-footer-row + .rail-footer-row {
-  border-top: 1px solid var(--ui-line);
+/* The card rows size to their card, not to a full bar height. */
+.plan-row,
+.update-row {
+  min-height: 0;
+}
+
+/* The footer cards: the ONE deliberate exception to the flat-rail rule
+   (product mockup, 2026-08). Update card and plan card share this shaded
+   plane — an ink wash rather than a surface token, so it reads on the rail's
+   base in both themes without minting a new plane. Everything else in the
+   rail stays flat; don't grow this recipe more members without the same
+   deliberation that added these two. */
+.rail-footer-card {
+  display: flex;
+  align-items: center;
+  gap: var(--sp2);
+  width: 100%;
+  min-height: var(--row-h-xs);
+  padding: var(--sp2) var(--sp3);
+  background: var(--surface-inset);
+  border: 0;
+  border-radius: var(--radius);
+  color: var(--text-dim);
+  text-decoration: none;
+  text-align: left;
+}
+
+/* Plan name over the money line; the pair truncates before the CTA moves. */
+.plan-card-copy {
+  display: grid;
+  min-width: 0;
+  flex: 1;
+  gap: 1px;
+}
+
+.plan-card-name {
+  font-size: var(--type-label);
+  font-weight: 510;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Machine value: mono + tabular so "$12.40 / $50" doesn't wobble as it
+   refreshes. */
+.plan-card-readout {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--type-meta);
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+/* The Upgrade CTA rides the shared .pill surface but at a clickable height —
+   a tappable pill never collapses to text height (--chip-h floor). Neutral on
+   purpose: green is success/live, not a sales color. */
+.plan-card-upgrade {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  height: calc(var(--chip-h) - var(--sp1));
+  padding: 0 var(--sp3);
+}
+
+.plan-card-upgrade:hover {
+  color: var(--text);
+}
+
+.plan-card-upgrade:focus-visible,
+.plan-card-menu-btn:focus-visible,
+button.rail-footer-card:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.plan-card-menu-btn {
+  border: 0;
+  background: transparent;
+  border-radius: var(--radius);
+  color: var(--text-faint);
+}
+
+.plan-card-menu-btn:hover,
+.plan-card-menu-btn[aria-expanded="true"] {
+  color: var(--text);
+  background: var(--nested-shade);
+}
+
+/* The update card is one whole-card button: bold verb, mono target version,
+   trailing chevron. The click hands off to the desktop app's own update
+   window (there is no in-page apply, by design — see lib/desktop.ts). */
+button.rail-footer-card {
+  cursor: pointer;
+  transition: background-color var(--fast) var(--ease);
+}
+
+button.rail-footer-card:hover {
+  background: var(--nested-shade);
+}
+
+.update-card-label {
+  font-size: var(--type-label);
+  font-weight: 590;
+  color: var(--text);
+  white-space: nowrap;
+}
+
+.update-card-version {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--type-meta);
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.update-card > svg:last-child,
+.plan-card > svg:last-child {
+  flex: 0 0 auto;
+  color: var(--text-faint);
 }
 
 /* Profile row: avatar tile at the shared control size, identity copy,
@@ -920,10 +1431,14 @@ input {
 }
 
 .rail-profile-meta {
+  /* Inline-flex so the live-auth dot sits with the meta text (● no account
+     connected) rather than off at the row's far edge. */
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp1);
+  min-width: 0;
   color: var(--text-faint);
   font-size: var(--type-meta);
-  overflow: hidden;
-  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
@@ -935,9 +1450,11 @@ input {
 .canvas-detail-menu,
 .canvas-run-menu,
 .composer-library,
+.plan-menu,
 .profile-menu,
 .session-menu,
-.settings-popover {
+.settings-popover,
+.template-facts {
   display: flex;
   flex-direction: column;
   gap: var(--tree-row-gap);
@@ -950,14 +1467,21 @@ input {
   animation: pop-in var(--transition-fast) ease-out;
 }
 
+/* The plan card's overflow menu: menu-item rows need a real column to fill. */
+.plan-menu {
+  min-width: 12rem;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .canvas-detail-menu,
   .canvas-run-menu,
   .composer-library,
   .connect-card,
+  .plan-menu,
   .profile-menu,
   .session-menu,
-  .settings-popover {
+  .settings-popover,
+  .template-facts {
     animation: none;
   }
 }
@@ -992,6 +1516,16 @@ input {
 .profile-menu-item:disabled {
   opacity: 0.42;
   cursor: default;
+}
+
+/* The desktop app version trailing "Check for updates": quiet mono metadata,
+   right-aligned, so a user always sees which build they're on. */
+.profile-menu-version {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--type-meta);
+  color: var(--text-faint);
 }
 
 .profile-menu-item:focus-visible {
@@ -1114,14 +1648,95 @@ input {
   margin-left: auto;
 }
 
+.session-run-split {
+  display: inline-flex;
+  align-items: stretch;
+  border-radius: var(--radius);
+}
+
+.session-run-split > .session-step {
+  border-radius: 0;
+}
+
+.session-run-main {
+  border-radius: var(--radius) 0 0 var(--radius) !important;
+  border-right-width: 0;
+}
+
+.session-run-menu-trigger {
+  width: 26px;
+  min-width: 26px;
+  padding: 0;
+  justify-content: center;
+  border-radius: 0 var(--radius) var(--radius) 0 !important;
+}
+
+.session-run-menu-trigger.session-action-primary {
+  border-left-color: color-mix(in srgb, var(--btn-ink) 20%, transparent);
+}
+
+.session-run-split[data-running] {
+  outline: 1px dashed var(--accent-border);
+  outline-offset: 1px;
+}
+
+.session-run-menu {
+  width: min(300px, calc(100vw - 16px));
+}
+
+.run-target-option {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) 16px;
+  align-items: center;
+  gap: var(--sp2);
+  width: 100%;
+  min-height: 52px;
+  padding: var(--sp2) var(--sp3);
+  border: 0;
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--text-dim);
+  text-align: left;
+}
+
+.run-target-option:hover:not(:disabled),
+.run-target-option[data-selected] {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.run-target-option:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: -2px;
+}
+
+.run-target-option:disabled { opacity: 0.46; }
+.run-target-copy { display: grid; gap: 2px; min-width: 0; }
+.run-target-option strong {
+  color: var(--text);
+  font-size: var(--type-label);
+  font-weight: 550;
+}
+
+.run-target-option small {
+  color: var(--text-faint);
+  font-size: var(--type-meta);
+  line-height: 1.35;
+  white-space: normal;
+}
+
+.run-target-check { display: inline-flex; color: var(--brand); }
+
+/* Idle verbs are OUTLINED (a hairline box), so the filled CTA reads as the one
+   emphasized act. */
 .session-step {
   display: inline-flex;
   align-items: center;
-  gap: var(--sp2);
+  gap: var(--sp1);
   flex: 0 0 auto;
   height: var(--control-h-xs);
-  padding: 0 var(--sp2);
-  border: 0;
+  padding: 0 var(--sp3);
+  border: 1px solid var(--ui-line);
   background: transparent;
   border-radius: var(--radius);
   color: var(--text-dim);
@@ -1129,11 +1744,13 @@ input {
   font-weight: 510;
   transition:
     background-color var(--transition-fast),
+    border-color var(--transition-fast),
     color var(--transition-fast);
 }
 
 .session-step:hover:not(:disabled) {
   background: var(--surface-hover);
+  border-color: var(--ui-line-strong);
   color: var(--text);
 }
 
@@ -1147,16 +1764,30 @@ input {
   outline-offset: 2px;
 }
 
-/* Deploy is the row's primary: soft accent fill, same quiet scale. */
+/* The one filled CTA (Deploy for a Draft, Run for a Deployed agent): the ink
+   button, not the brand — green stays reserved for state. */
 .session-action-primary {
-  color: var(--brand);
-  background: var(--accent-dim);
-  box-shadow: inset 0 0 0 1px var(--accent-border);
+  color: var(--btn-ink);
+  background: var(--btn);
+  border-color: transparent;
+  box-shadow: var(--shadow-xs);
 }
 
 .session-action-primary:hover:not(:disabled) {
-  color: var(--brand);
-  background: var(--accent-dim);
+  color: var(--btn-ink);
+  background: var(--ink-muted);
+}
+
+/* Prod is a quiet icon-only shortcut, not one of the three verbs — no box. */
+.session-action-prod {
+  border-color: transparent;
+  padding: 0 var(--sp1);
+  color: var(--text-dim);
+}
+.session-action-prod:hover {
+  border-color: transparent;
+  background: var(--surface-hover);
+  color: var(--text);
 }
 
 /* In flight: this action was handed to the agent but no durable signal has
@@ -1368,6 +1999,28 @@ input {
   color: var(--text);
 }
 
+/* Optimistic "creating agent" folder: a spinning ring in the trailing action
+   slot marks the row as busy while the agent's session/definition is still on
+   its way. Reuses the canvas run spinner's keyframe. */
+.workspace-row-spinner {
+  flex: none;
+  width: 11px;
+  height: 11px;
+  margin-right: var(--tree-pad-x);
+  border: 1.5px solid var(--brand);
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: canvas-run-spin 0.9s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .workspace-row-spinner {
+    animation: none;
+    border-right-color: var(--brand);
+    opacity: 0.5;
+  }
+}
+
 /* The merged row's trailing state dot: always visible, centered on the same
    14px trailing axis as the child rows' dots (16px slot + row pad). */
 .workspace-row-trail {
@@ -1426,12 +2079,6 @@ input {
    caret. Direct clicks, no nested menu; the rightmost icon center sits on
    the same 14px trailing axis as the child rows' status icons. */
 .workspace-row-action {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  flex: 0 0 auto;
-  width: 22px;
-  height: 22px;
   border: none;
   background: transparent;
   border-radius: var(--radius);
@@ -1850,19 +2497,101 @@ input {
   height: var(--pane-header-h);
   flex: 0 0 auto;
   padding: 0 var(--pane-pad-x);
-  border-bottom: 1px solid var(--border);
-  background: var(--bg-1);
+  /* Surface (transparent — the bar IS the shell block) is owned by refine.css's
+     three-block model and declared there ONLY, so import order can't flip it. */
   position: relative;
+  /* The bar measures its own width so the verbs can compact before the session
+     queue starts clipping. */
+  container-type: inline-size;
 }
 
-/* Compact context strip — like Claude Code's own header: harness, status,
-   title, cwd, tags. Purely informative except the end-session ✕. */
-.session-context {
+/* Tight bar (e.g. the 3-pane split): the secondary verbs drop their labels to
+   icons, handing the freed width to the session queue so every session stays
+   reachable. The filled CTA (Run/Deploy) keeps its word; accessible names stay
+   on every button. */
+@container (max-width: 580px) {
+  .session-bar .session-step:not(.session-action-primary) .session-step-label {
+    display: none;
+  }
+  /* Icon-only now: square the box (width = its --control-h-xs height) and drop
+     the horizontal padding, so a bordered control reads as a square icon button
+     rather than a wide rectangle. */
+  .session-bar .session-step:not(.session-action-primary) {
+    width: var(--control-h-xs);
+    padding: 0;
+    justify-content: center;
+  }
+}
+
+/* The session queue owns the header's flexible left side. Live-session
+   overflow is handled inside .session-tabs-list, keeping the trailing + fixed
+   and the action cluster reachable without a second header row. */
+.session-queue {
   display: flex;
   align-items: center;
-  gap: var(--sp2);
+  gap: var(--sp1);
   flex: 1;
   min-width: 0;
+  overflow: hidden;
+}
+
+.session-current-wrap {
+  position: relative;
+  flex: 0 0 auto;
+}
+
+/* Static/ended session identity when a live tab strip does not apply. */
+.session-current {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp2);
+  flex: 0 0 auto;
+  height: var(--control-h-xs);
+  padding: 0 var(--sp2);
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  background: transparent;
+  font-size: var(--type-label);
+  font-weight: 510;
+  white-space: nowrap;
+  transition:
+    background-color var(--transition-fast),
+    color var(--transition-fast);
+}
+
+.session-current {
+  color: var(--text);
+  background: var(--active-shade);
+}
+.session-title-trigger {
+  cursor: pointer;
+}
+.session-title-trigger:hover {
+  background: var(--nested-shade);
+}
+
+/* Composing: the queue slot carries Back to the session behind the composer
+   instead of naming one, so it reads as an action rather than a session chip. */
+.session-back {
+  color: var(--text-dim);
+  background: transparent;
+  cursor: pointer;
+}
+.session-back:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+.session-back:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+.session-current-static {
+  cursor: default;
+}
+
+.session-title-trigger:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
 }
 
 /* The title is the primary claim: it never shrinks below its content until
@@ -1903,12 +2632,25 @@ input {
 }
 
 .session-menu {
-  min-width: 180px;
+  min-width: 220px;
 }
 
 .session-menu-danger:hover:not(:disabled) {
   color: var(--red-text);
   background: color-mix(in srgb, var(--red) 12%, transparent);
+}
+
+/* Bound-agent line: which agent's Canvas this session drives. Quiet metadata,
+   not a boxed chip — it never reads as another session (the old bar chip did). */
+.session-menu-bound {
+  padding: var(--sp1) var(--sp2) var(--sp2);
+  font-size: var(--type-meta);
+  line-height: 1.4;
+  color: var(--text-faint);
+}
+.session-menu-bound strong {
+  color: var(--text-dim);
+  font-weight: 600;
 }
 
 
@@ -1947,30 +2689,12 @@ input {
   height: 14px;
   padding: 0 3px;
   border-radius: var(--radius-full);
-  background: var(--accent);
-  color: var(--accent-foreground);
+  background: var(--surface-inset);
+  color: var(--text-dim);
   font-size: var(--type-micro);
   font-weight: 700;
   line-height: 14px;
   text-align: center;
-}
-
-/* Badge recipe (variant="active"): tinted fill + matching border + accent
-   text, rounded-md rather than a pill — the product's status chips are
-   small rounded rectangles, not fully-rounded tags. */
-.session-workflow-chip {
-  flex: 0 1 auto;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  padding: 2px 8px;
-  border-radius: var(--radius-md);
-  background: var(--accent-dim);
-  border: 1px solid var(--accent-border);
-  color: var(--accent);
-  font-size: var(--type-meta);
-  font-weight: 500;
 }
 
 /* Right-anchored status slot, pushed past the flexible title/cwd/chip run —
@@ -2002,68 +2726,70 @@ input {
 
 /* Session tab strip -------------------------------------------------------
 
-   One tab per live session belonging to the FOCUSED agent. Sits
-   directly under the session bar; session switching lives here. The strip
-   scrolls horizontally under pressure so the panes never widen past their
-   grid track. */
+   Browser-style tabs live INSIDE .session-bar. Only the list scrolls; the +
+   stays pinned beside it and the action cluster remains outside this flex
+   item. Ending a session stays in the active tab's options menu. */
 .session-tabs {
   display: flex;
   align-items: center;
   gap: var(--sp1);
-  flex: 0 0 auto;
+  flex: 1;
   min-width: 0;
-  padding: var(--sp1) var(--pane-pad-x);
-  border-bottom: 1px solid var(--border);
-  background: var(--bg-1);
+}
+
+.session-tabs-list {
+  display: flex;
+  align-items: center;
+  gap: var(--sp1);
+  flex: 1;
+  min-width: 0;
   overflow-x: auto;
   scrollbar-width: none;
 }
 
-.session-tabs::-webkit-scrollbar {
+.session-tabs-list::-webkit-scrollbar {
   display: none;
 }
 
-/* One tab: a main select button + a trailing × close. The tab reads selected
-   with a filled surface and a hairline; the resting tab is quiet. */
+/* One tab: a main select button plus the active tab's options caret. */
 .session-tab {
   display: inline-flex;
   align-items: center;
   flex: 0 0 auto;
-  max-width: 220px;
-  height: 28px;
-  border-radius: var(--radius-md);
-  border: 1px solid transparent;
-  color: var(--text-dim);
+  max-width: 24ch;
+  height: var(--control-h-xs);
+  border-radius: var(--radius);
+  color: var(--text-faint);
   transition:
     background-color var(--transition-fast),
-    border-color var(--transition-fast),
     color var(--transition-fast);
 }
 
 .session-tab:hover {
-  background: var(--bg-hover);
-  color: var(--text);
+  background: var(--surface-hover);
+  color: var(--text-dim);
 }
 
 .session-tab.is-active {
   background: var(--active-shade);
-  border-color: var(--ui-line);
   color: var(--text);
 }
 
 .session-tab-main {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--sp2);
+  flex: 1 1 auto;
   min-width: 0;
   height: 100%;
   padding: 0 var(--sp1) 0 var(--sp2);
-  border: none;
+  border: 0;
   background: transparent;
-  border-radius: var(--radius-md) 0 0 var(--radius-md);
+  border-radius: var(--radius) 0 0 var(--radius);
   color: inherit;
   font-size: var(--type-label);
   text-align: left;
+  cursor: pointer;
 }
 
 .session-tab-main:focus-visible {
@@ -2071,13 +2797,8 @@ input {
   outline-offset: -2px;
 }
 
-.session-tab-main > svg {
-  flex: 0 0 auto;
-  color: var(--text-faint);
-}
-
-.session-tab.is-active .session-tab-main > svg {
-  color: var(--brand);
+.session-tab.is-active .session-tab-main {
+  padding-right: 0;
 }
 
 .session-tab-label {
@@ -2087,113 +2808,38 @@ input {
   white-space: nowrap;
 }
 
-/* Live/starting/exited dot — same 7px trailing mark the session bar uses. */
-.session-tab-dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
+/* The caret belongs to the selected tab, and rotates while its menu is open. */
+.session-tab-menu {
   flex: 0 0 auto;
-  background: var(--text-faint);
+  color: inherit;
 }
 
-.session-tab-dot[data-status="running"] {
-  background: var(--green);
+.session-tab-menu[aria-expanded="true"] svg {
+  transform: rotate(180deg);
 }
 
-.session-tab-dot[data-status="starting"] {
-  background: var(--amber);
+.session-tab-rename {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  margin: 0 var(--sp1);
+  padding: 0 var(--sp1);
 }
 
-/* Busy pulse (output in the last ~3s) — replaces the dot on a background tab
-   so activity you are not looking at still reads. */
-.session-tab-busy {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  flex: 0 0 auto;
-  background: var(--accent);
-  animation: session-tab-busy-pulse 1.2s ease-in-out infinite;
-}
-
-.session-tab-close {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  flex: 0 0 auto;
-  width: 20px;
-  height: 20px;
-  margin-right: 4px;
-  border: none;
-  background: transparent;
-  border-radius: var(--radius-sm);
+.session-tab-new:disabled {
   color: var(--text-faint);
-  opacity: 0;
-  transition:
-    opacity var(--transition-fast),
-    background-color var(--transition-fast),
-    color var(--transition-fast);
+  cursor: wait;
 }
 
-/* The × reveals on tab hover/focus and stays visible on the active tab so the
-   current session is always closable without a hunt. */
-.session-tab:hover .session-tab-close,
-.session-tab.is-active .session-tab-close,
-.session-tab-close:focus-visible {
-  opacity: 1;
-}
-
-.session-tab-close:hover {
-  background: color-mix(in srgb, var(--red) 14%, transparent);
-  color: var(--red-text);
-}
-
-.session-tab-close:active {
-  background: color-mix(in srgb, var(--red) 22%, transparent);
-}
-
-.session-tab-close:focus-visible {
-  outline: 2px solid var(--focus);
-  outline-offset: -2px;
-}
-
-/* Trailing + : open another session on the focused agent. */
-.session-tab-new {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  flex: 0 0 auto;
-  width: 26px;
-  height: 26px;
-  border: none;
+.session-tab-new:disabled:hover {
   background: transparent;
-  border-radius: var(--radius-md);
-  color: var(--text-faint);
-  transition:
-    background-color var(--transition-fast),
-    color var(--transition-fast);
-}
-
-.session-tab-new:hover {
-  background: var(--bg-hover);
-  color: var(--text);
-}
-
-.session-tab-new:active {
-  background: var(--surface-inset);
-}
-
-.session-tab-new:focus-visible {
-  outline: 2px solid var(--focus);
-  outline-offset: -2px;
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .session-tab,
-  .session-tab-close,
-  .session-tab-new {
+  .session-tab {
     transition: none;
   }
-  .session-tab-busy {
+  .session-busy {
     animation: none;
   }
 }
@@ -2287,34 +2933,6 @@ input {
    subtle shadow, and — in light mode — a solid accent fill on hover (the
    product's `hover:bg-accent`); dark mode keeps the more restrained neutral
    hover the outline variant uses there. */
-.gear-btn {
-  width: var(--control-h-xs);
-  height: var(--control-h-xs);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  border: 1px solid var(--border-strong);
-  background: var(--bg-2);
-  border-radius: var(--radius-md);
-  box-shadow: var(--shadow-xs);
-  color: var(--text-dim);
-  transition:
-    background-color var(--transition-fast),
-    border-color var(--transition-fast),
-    color var(--transition-fast);
-}
-
-.gear-btn:hover {
-  background: var(--surface-hover);
-  border-color: var(--ui-line-strong);
-  color: var(--text);
-}
-
-.gear-btn:focus-visible {
-  outline: 2px solid var(--focus);
-  outline-offset: 2px;
-}
-
 /* Portaled off the rail's profile row (AnchoredPopover, matchWidth): the
    surface comes from the ONE popover recipe; only the roomier content
    padding is its own. */
@@ -2331,6 +2949,50 @@ input {
   border-bottom: 1px solid var(--border);
 }
 
+/* Sign-out row. Disconnect is the quiet OUTLINE counterpart to the ink
+   "Connect account" — a bordered ghost at rest, leaning on the readable danger
+   hue only on hover to say it signs you out. (Was unstyled, so it fell back to
+   the browser's default grey button.) */
+.settings-auth-row {
+  margin-bottom: 14px;
+}
+
+.settings-disconnect-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp1);
+  height: var(--control-h-xs);
+  padding: 0 var(--sp3);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--text-dim);
+  font: inherit;
+  font-size: var(--type-label);
+  font-weight: 510;
+  cursor: pointer;
+  transition:
+    background-color var(--transition-fast),
+    border-color var(--transition-fast),
+    color var(--transition-fast);
+}
+
+.settings-disconnect-btn:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--red-text) 50%, var(--border-strong));
+  background: color-mix(in srgb, var(--red-text) 9%, transparent);
+  color: var(--red-text);
+}
+
+.settings-disconnect-btn:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.settings-disconnect-btn:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
 .settings-toggle-row {
   display: flex;
   align-items: center;
@@ -2338,6 +3000,63 @@ input {
   gap: 12px;
   font-size: var(--type-label);
   color: var(--text-dim);
+}
+
+/* The one non-boolean preference in the settings card: sits in the same row
+   recipe as the toggles, so it lines up with them rather than reading as a
+   different kind of control. Native <select> on purpose — the OS menu is the
+   accessible, keyboard-complete one, and this popover is already anchored. */
+/* The editor picker wraps its native <select> so we can drop the OS chrome
+   (appearance:none) and lay our own ChevronDown caret over it — the same
+   disclosure the harness picker and menus use — instead of the platform arrow,
+   so the control reads as part of the theme rather than a system widget. */
+.settings-select-wrap {
+  position: relative;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+}
+
+.settings-select {
+  appearance: none;
+  -webkit-appearance: none;
+  height: var(--control-h-xs);
+  /* room for the caret on the right */
+  padding: 0 calc(var(--sp2) + 18px) 0 var(--sp2);
+  background: var(--surface-inset);
+  border: 1px solid var(--ui-line);
+  border-radius: var(--radius);
+  color: var(--text);
+  font: inherit;
+  font-size: var(--type-label);
+  cursor: pointer;
+  transition:
+    background-color var(--transition-fast),
+    border-color var(--transition-fast);
+}
+
+.settings-select:hover:not(:disabled) {
+  background: var(--surface-raised);
+  border-color: var(--border);
+}
+
+.settings-select:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.settings-select-caret {
+  position: absolute;
+  right: var(--sp2);
+  display: flex;
+  align-items: center;
+  color: var(--text-dim);
+  pointer-events: none;
+}
+
+.settings-select:disabled {
+  opacity: 0.55;
+  cursor: default;
 }
 
 .toggle-switch {
@@ -2412,7 +3131,8 @@ input {
   min-height: 0;
   display: flex;
   flex-direction: column;
-  background: var(--bg-0);
+  /* Transparent — the shell block's surface (center-pane) shows through. */
+  background: transparent;
 }
 
 /* The xterm.js container (.harness-terminal) is the flex-growing child.
@@ -2422,135 +3142,6 @@ input {
 .terminal-slot > .harness-terminal {
   flex: 1;
   min-height: 0;
-}
-
-/* Image composer ------------------------------------------------------
-   Wraps the session pane: the composer is the flex-growing child of
-   .terminal-slot, and .agent-view grows inside it. */
-.terminal-slot > .image-composer {
-  flex: 1;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-  position: relative;
-}
-
-.image-composer-pane {
-  flex: 1;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-}
-
-/* Drag overlay — covers the session pane while a file is dragged over it. */
-.image-composer-dropzone {
-  position: absolute;
-  inset: 0;
-  z-index: 5;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: var(--sp2);
-  border: 2px dashed var(--accent-border);
-  border-radius: var(--radius-lg);
-  background: var(--accent-dim);
-  color: var(--accent);
-  font-size: var(--type-ui);
-  font-weight: 500;
-  pointer-events: none;
-}
-
-.image-composer-bar {
-  flex-shrink: 0;
-  display: flex;
-  align-items: center;
-  gap: var(--sp2);
-  padding: var(--sp2) var(--pane-pad-x);
-  border-top: 1px solid var(--border);
-  background: var(--bg-1);
-}
-
-.image-composer-thumbs {
-  display: flex;
-  align-items: center;
-  gap: var(--sp2);
-  margin: 0;
-  padding: 0;
-  list-style: none;
-  overflow-x: auto;
-  flex: 1;
-  min-width: 0;
-}
-
-.image-composer-thumb {
-  position: relative;
-  flex-shrink: 0;
-  width: 40px;
-  height: 40px;
-  border-radius: var(--radius-md);
-  border: 1px solid var(--border-strong);
-  overflow: hidden;
-}
-
-.image-composer-thumb img {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  display: block;
-}
-
-/* Inside the thumb's corner (upstream floats it outside at -6px): the thumbs
-   list is an overflow-x scroller, which also clips vertically — an outset
-   nub would lose its top half to that clip. */
-.image-composer-thumb-remove {
-  position: absolute;
-  top: 2px;
-  right: 2px;
-  width: 16px;
-  height: 16px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 0;
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-full);
-  background: var(--bg-0);
-  color: var(--text-dim);
-  cursor: pointer;
-  transition:
-    color var(--transition-fast),
-    background-color var(--transition-fast);
-}
-
-.image-composer-thumb-remove:hover:not(:disabled) {
-  color: var(--text);
-  background: var(--bg-2);
-}
-
-.image-composer-thumb-remove:active:not(:disabled) {
-  background: var(--bg-3);
-}
-
-.image-composer-thumb-remove:focus-visible {
-  outline: 2px solid var(--focus);
-  outline-offset: 1px;
-}
-
-.image-composer-thumb-remove:disabled {
-  opacity: 0.42;
-  cursor: default;
-}
-
-.image-composer-send {
-  flex-shrink: 0;
-  font-size: var(--type-label);
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .image-composer-thumb-remove {
-    transition: none;
-  }
 }
 
 /* Terminal panel ------------------------------------------------------- */
@@ -2564,7 +3155,7 @@ input {
   height: 100%;
   width: 100%;
   min-height: 0;
-  background: var(--bg-0);
+  background: transparent;
   overflow: hidden;
 }
 
@@ -2575,11 +3166,110 @@ input {
   flex-shrink: 0;
   height: var(--pane-header-h);
   padding: 0 var(--pane-pad-x);
-  border-bottom: 1px solid var(--ui-line);
-  font-family: var(--font-mono);
+  /* No divider under the top elements: the session bar, this status line, and
+     the terminal read as one continuous shell block. */
+  font-family: var(--mono);
   font-size: var(--type-meta);
   font-variant-numeric: tabular-nums;
   color: var(--text-dim);
+}
+
+/* Terminal masthead — the Sapiom boot banner (see TerminalBrand). One ruled
+   box, titled on its top edge, with the brand (pixel mark + wordmark, in ink)
+   on the left and a facts table on the right. It replaces the agent CLI's own
+   welcome box so the shell names itself here. */
+.terminal-masthead {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: var(--sp5);
+  margin: var(--sp4) var(--pane-pad-x) var(--sp2);
+  padding: var(--sp4);
+  border: 1px solid var(--ui-line);
+  border-radius: var(--radius);
+  color: var(--ink);
+}
+.terminal-masthead-legend {
+  position: absolute;
+  top: 0;
+  left: var(--sp3);
+  transform: translateY(-50%);
+  margin: 0;
+  padding: 0 var(--sp1);
+  background: var(--surface-base);
+  font-family: var(--mono);
+  font-size: var(--type-meta);
+  font-weight: 500;
+  color: var(--ink-faint);
+}
+.terminal-masthead-brand {
+  display: flex;
+  align-items: center;
+  gap: var(--sp4);
+  flex-shrink: 0;
+  align-self: stretch;
+  padding-right: var(--sp4);
+  border-right: 1px solid var(--ui-line);
+  color: var(--ink);
+}
+.terminal-masthead-mark,
+.terminal-masthead-logotype {
+  display: block;
+  flex-shrink: 0;
+}
+.terminal-masthead-name {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--sp0);
+  min-width: 0;
+  line-height: var(--lh-tight);
+}
+.terminal-masthead-product {
+  font-family: var(--mono);
+  font-size: var(--type-meta);
+  font-weight: 500;
+  letter-spacing: 0.16em;
+  color: var(--ink-muted);
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.terminal-masthead-facts {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: var(--sp1) var(--sp3);
+  margin: 0;
+  min-width: 0;
+  flex: 1;
+  font-family: var(--mono);
+  font-size: var(--type-meta);
+  line-height: 1.5;
+}
+.terminal-masthead-fact {
+  display: contents;
+}
+.terminal-masthead-facts dt {
+  color: var(--ink-faint);
+}
+.terminal-masthead-facts dd {
+  margin: 0;
+  min-width: 0;
+  color: var(--ink-muted);
+}
+.terminal-masthead-facts code {
+  font-family: inherit;
+  color: var(--ink);
+}
+.terminal-masthead-path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.terminal-masthead-status {
+  color: var(--amber-text);
 }
 
 .terminal-status-dot {
@@ -3035,6 +3725,41 @@ input {
   margin-top: 4px;
 }
 
+/* Last-output tail from a session that exited abnormally — the coding agent's
+   own error line (e.g. "unknown option --plugin-dir"), preserved at exit. Left-
+   aligned monospace block, not part of the centred metadata card: it is raw
+   output, so it reads like a terminal and scrolls on its own rather than
+   forcing the pane wide. */
+.dead-session-exit-tail {
+  align-self: stretch;
+  max-width: 640px;
+  width: 100%;
+  margin: var(--sp3) auto 0;
+  text-align: left;
+}
+
+.dead-session-exit-tail-label {
+  color: var(--text-faint);
+  font-size: var(--type-label);
+  margin-bottom: var(--sp1);
+}
+
+.dead-session-exit-tail-body {
+  margin: 0;
+  max-height: 180px;
+  overflow: auto;
+  padding: var(--sp2);
+  border: 1px solid var(--ui-line);
+  border-radius: var(--radius-sm, 6px);
+  background: var(--surface-raised);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--type-meta);
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 /* Past session: the reconstructed transcript ---------------------------
    Unlike .dead-session-pane (a centred metadata card), this one is a
    document: a fixed header with the actions, and a scrolling body. The
@@ -3482,13 +4207,10 @@ input {
   flex: 1;
   display: flex;
   min-height: 0;
-  /* Reserve a strip at the bottom for the floating zoom/fit controls so they
-     sit BELOW the canvas iframe instead of on top of the diagram card
-     ("l'un sur l'autre"). The iframe (flex child) stretches to the content box
-     — i.e. shrinks by this much — and the absolute .canvas-view-controls
-     (bottom-anchored) land in the reserved strip. Keep in sync with
-     .canvas-pan-layer's bottom inset below. */
-  padding-bottom: 56px;
+  /* The iframe (dotted board) fills the whole visual, so the dot grid runs to
+     the bottom edge and the floating zoom/fit controls sit OVER it — the board
+     document already reserves a node-free bottom strip (its own padding) so the
+     controls never land on a diagram node. */
 }
 
 /* Overview / step inspector: a full-bleed bottom split block in the pane
@@ -3599,31 +4321,21 @@ input {
   color: var(--text-faint);
 }
 
+/* The step detail now opens inline in its list row, so there is no board↔detail
+   slide — the track holds a single, full-width pane (the active surface). */
 .canvas-slide-track {
   display: flex;
-  width: 200%;
+  width: 100%;
   flex: 1;
   min-height: 0;
-  transform: translateX(0);
-  transition: transform 260ms var(--ease);
-}
-
-.canvas-frame-wrap[data-view="detail"] .canvas-slide-track {
-  transform: translateX(-50%);
 }
 
 .canvas-slide-pane {
-  width: 50%;
-  flex: 0 0 50%;
+  width: 100%;
+  flex: 1;
   min-height: 0;
   display: flex;
   flex-direction: column;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .canvas-slide-track {
-    transition: none;
-  }
 }
 
 /* Detail subheader chrome: the main action sits right-anchored before the
@@ -3674,6 +4386,30 @@ input {
   flex-direction: column;
   gap: var(--sp2);
   padding: var(--sp1) var(--sp2) var(--sp3) calc(var(--sp2) + 7px + var(--sp2));
+}
+
+/* The step detail rendered INLINE inside a row's dropdown drops its full-pane
+   chrome: no independent scroll and no pane padding (the row already pads), and
+   it sizes to its content instead of filling a pane. */
+.canvas-step-expand .canvas-detail {
+  flex: initial;
+}
+.canvas-step-expand .canvas-detail-body {
+  overflow-y: visible;
+  padding: 0;
+  gap: var(--sp2);
+}
+
+/* Per-step coding-agent actions, a compact ghost-button row in the inline
+   detail (ported from the retired detail-pane header). */
+.canvas-detail-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp1);
+}
+.canvas-detail-actions .btn-ghost {
+  gap: 4px;
+  font-size: var(--type-meta);
 }
 
 .canvas-step-desc {
@@ -4044,6 +4780,151 @@ input {
   word-break: break-word;
 }
 
+/* --------------------------------------------------------------------------
+   Run observability: the payload copy affordance, the run-summary card, and
+   the deploy banner. Motion-light and reduced-motion-aware; CTAs stay within
+   the flat .status-tag idiom (the cards are the only bordered chrome).
+   -------------------------------------------------------------------------- */
+
+/* PayloadBlock: label on the left, Copy on the right. The disclosure marker is
+   dropped in favour of the whole row being the toggle (scoped to .payload-block
+   so the capability-call disclosures keep their default triangle). */
+.payload-block > summary {
+  display: flex;
+  align-items: center;
+  gap: var(--sp1);
+  list-style: none;
+  padding: 4px 6px;
+  border-radius: var(--radius-sm);
+  color: var(--text-dim);
+  transition: background-color var(--transition-fast);
+}
+.payload-block > summary::-webkit-details-marker {
+  display: none;
+}
+.payload-block > summary:hover {
+  background: var(--surface-hover, var(--bg-hover));
+}
+.payload-block-caret {
+  display: inline-flex;
+  color: var(--text-faint);
+  transition: transform var(--transition-fast);
+}
+.payload-block[open] > summary .payload-block-caret {
+  transform: rotate(90deg);
+}
+.payload-block .payload-block-label {
+  margin-right: auto;
+  color: var(--text-dim);
+  font-weight: 560;
+}
+@media (prefers-reduced-motion: reduce) {
+  .payload-block-caret,
+  .payload-block > summary {
+    transition: none;
+  }
+}
+.payload-copy {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 1px 6px;
+  border: 1px solid var(--ui-line);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-faint);
+  font-size: var(--type-micro);
+  font-weight: 510;
+  cursor: pointer;
+  transition:
+    color var(--transition-fast),
+    border-color var(--transition-fast);
+}
+.payload-copy:hover {
+  color: var(--text-dim);
+  border-color: var(--border-strong, var(--ui-line));
+}
+.payload-copy.is-copied {
+  color: var(--green-text, var(--green));
+  border-color: color-mix(in srgb, var(--green) 40%, var(--ui-line));
+}
+.payload-copy:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+
+/* Deploy banner: a deploy landing in the Steps surface — phase, then on ready
+   the dashboard + code CTAs. Reuses the .canvas-task-spinner while in flight. */
+.deploy-status-banner {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp2);
+  padding: var(--sp3);
+  margin-bottom: var(--sp3);
+  border: 1px solid var(--ui-line);
+  border-radius: var(--radius);
+  background: var(--surface-inset);
+}
+.deploy-status-banner.is-ready {
+  border-color: color-mix(in srgb, var(--green) 35%, var(--ui-line));
+  background: color-mix(in srgb, var(--green) 6%, transparent);
+}
+.deploy-status-banner.is-error {
+  border-color: color-mix(in srgb, var(--red, #e05a57) 35%, var(--ui-line));
+  background: color-mix(in srgb, var(--red, #e05a57) 6%, transparent);
+}
+.deploy-status-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp2);
+}
+.deploy-status-label {
+  font-size: var(--type-meta);
+  font-weight: 590;
+  color: var(--text);
+}
+.deploy-status-dismiss {
+  margin-left: auto;
+  border: 0;
+  background: transparent;
+  color: var(--text-faint);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.deploy-status-dismiss:hover {
+  color: var(--text-dim);
+}
+.deploy-status-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp3);
+}
+.deploy-status-actions .status-tag-action {
+  color: var(--brand);
+  font-weight: 560;
+}
+
+/* Action button, RUN in progress: a brand pulse tied to the real run status,
+   distinct from the dashed [data-pending] hand-off ring. */
+.session-step[data-running] {
+  animation: session-step-running 1.4s ease-in-out infinite;
+}
+@keyframes session-step-running {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--brand) 42%, transparent);
+  }
+  50% {
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--brand) 22%, transparent);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .session-step[data-running] {
+    animation: none;
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--brand) 30%, transparent);
+  }
+}
+
 /* Steps subheader run chip: the flat .status-tag recipe — run truth is a
    labeled fact ("prod run completed"), mono because it is data. */
 .canvas-run-chip {
@@ -4253,12 +5134,6 @@ input {
   flex-wrap: wrap;
 }
 
-/* The per-call result disclosure inherits .canvas-run-logs summary/pre rules
-   and only overrides the top-margin spacing within a call card. */
-.canvas-capability-call-result {
-  margin-top: var(--sp1);
-}
-
 .canvas-detail-kind {
   flex: 0 0 auto;
   padding: 2px 8px;
@@ -4417,32 +5292,6 @@ input {
   margin-left: var(--sp1);
 }
 
-/* The step count and entry point are the header's meta, not a body line. */
-/* Stat pairs on the head's right edge: the COUNT is the signal (ink,
-   tabular), the unit stays quiet — "5 steps · intake entry" reads as data,
-   not prose. */
-.canvas-overview-stats {
-  margin-left: auto;
-  display: flex;
-  align-items: baseline;
-  gap: var(--sp2);
-  font-size: var(--type-meta);
-  font-weight: 400;
-  color: var(--text-faint);
-}
-
-.canvas-overview-stat strong {
-  color: var(--text);
-  font-weight: 600;
-  font-variant-numeric: tabular-nums;
-}
-
-.canvas-overview-stat + .canvas-overview-stat::before {
-  content: "·";
-  margin-right: var(--sp2);
-  color: var(--text-faint);
-}
-
 .canvas-overview-body {
   flex: 1;
   min-height: 0;
@@ -4509,19 +5358,15 @@ input {
   font-variant-numeric: tabular-nums;
 }
 
-/* Debug macros: an actions band under the run facts, set off by a hairline.
-   The macro buttons stack full-width (they inherit .btn-ghost / .btn-primary);
-   the free-form ask spans the full width below. These rules own only the band
-   layout and the textarea — all on shared inspector tokens, so the section
-   reads as native to the panel above it. */
+/* The chat body: an actions band inside the chat panel. When a step is selected
+   it holds the macro pills (they inherit .btn-ghost / .btn-primary); the
+   free-form ask always spans the full width below. No hairline — the chat head
+   already sets this off from the panel above. */
 .canvas-inspector-macros {
   display: flex;
   flex-direction: row;
   flex-wrap: wrap;
-  gap: var(--sp1);
-  margin-top: var(--sp1);
-  padding-top: var(--sp2);
-  border-top: 1px solid var(--ui-line);
+  gap: var(--sp2);
 }
 
 /* The three macros ride as a single wrapping row of pills (they inherit
@@ -4532,30 +5377,42 @@ input {
   text-align: center;
 }
 
-/* The free-form ask always drops to its own full-width row below the pills. */
+/* The free-form ask spans a full-width row below the pills: a single clean
+   line with the Ask button bottom-anchored, so it holds the baseline as the
+   textarea grows upward. */
 .canvas-inspector-freeform {
   flex: 1 0 100%;
   display: flex;
-  flex-direction: column;
-  gap: var(--sp1);
+  flex-direction: row;
+  align-items: flex-end;
+  gap: var(--sp2);
 }
 
+/* Borderless, boxless input — a bare text row (mirrors .composer-input). It
+   auto-grows with its content up to five lines, then scrolls. */
 .canvas-inspector-freeform-input {
-  width: 100%;
-  resize: vertical;
-  padding: var(--sp1) var(--sp2);
+  flex: 1;
+  min-width: 0;
+  resize: none;
+  padding: 0;
+  border: 0;
+  background: transparent;
   font: inherit;
   font-size: var(--type-label);
+  line-height: 1.5;
   color: var(--text);
-  background: var(--surface-raised);
-  border: 1px solid var(--ui-line);
-  border-radius: var(--radius-md);
+  field-sizing: content;
+  min-height: 1.5em;
+  max-height: calc(1.5em * 5);
+  overflow-y: auto;
+}
+
+.canvas-inspector-freeform-input::placeholder {
+  color: var(--text-faint);
 }
 
 .canvas-inspector-freeform-input:focus-visible {
-  outline: 2px solid var(--focus);
-  outline-offset: 1px;
-  border-color: var(--ui-line-strong);
+  outline: none;
 }
 
 .canvas-inspector-freeform-ask {
@@ -4567,28 +5424,112 @@ input {
   color: var(--text);
 }
 
+/* The chrome the board used to float over the graph: the shape line and any
+   render badge, on one quiet row above the description. */
+.canvas-overview-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp2);
+  font-size: var(--type-meta);
+  color: var(--text-dim);
+}
+
+.canvas-overview-badge {
+  padding: 1px var(--sp2);
+  border: 1px solid var(--ui-line);
+  border-radius: 999px;
+  font-size: var(--type-micro);
+  color: var(--text-dim);
+}
+
+/* The node-kind key, read at the foot of the overview instead of on the
+   board. Only the kinds the graph actually uses are posted. */
+.canvas-overview-legend {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp1) var(--sp3);
+  font-size: var(--type-micro);
+  color: var(--text-faint);
+}
+
+.canvas-overview-legend-item {
+  display: flex;
+  align-items: center;
+  gap: var(--sp1);
+}
+
+/* The key mirrors the board, where entry carries no accent. */
+.canvas-overview-legend .dot--entry {
+  background: transparent;
+  border: 1px solid var(--text-faint);
+}
+
+.canvas-overview-legend-item .dot--cross {
+  width: 7px;
+  height: 7px;
+  border: 1px dashed var(--text-faint);
+  border-radius: 2px;
+}
+
+/* "Describe with AI": authors the deterministic `description` fields via the
+   bound agent. Accent-tinted, self-sized — sits in the overview content flow. */
+.canvas-describe-ai {
+  align-self: center;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--accent-border);
+  background: var(--accent-dim);
+  color: var(--text);
+  font: inherit;
+  font-size: var(--type-meta);
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+.canvas-describe-ai svg {
+  color: var(--ink-muted);
+}
+.canvas-describe-ai:hover {
+  background: var(--surface-hover);
+  border-color: var(--ui-line-strong);
+  color: var(--text);
+}
+.canvas-describe-ai:hover svg {
+  color: var(--text);
+}
+.canvas-describe-ai:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+/* Loading: hold the resting accent wash (no hover fill) while the hidden agent
+   runs — the spinner + "Describing…" carry the state. */
+.canvas-describe-ai.is-loading,
+.canvas-describe-ai:disabled {
+  cursor: default;
+  background: var(--accent-dim);
+  border-color: var(--accent-border);
+  color: var(--text);
+}
+.canvas-describe-spinner {
+  flex: 0 0 auto;
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--accent-border);
+  border-top-color: var(--ink-muted);
+  border-radius: 50%;
+  animation: canvas-run-spin 0.9s linear infinite;
+}
+
 .canvas-overview-notes {
   margin: 0;
   padding-left: var(--sp4);
   display: flex;
   flex-direction: column;
   gap: var(--sp1);
-}
-
-.canvas-legend-row {
-  display: flex;
-  align-items: center;
-  gap: var(--sp3);
-  color: var(--text-faint);
-  font-size: var(--type-meta);
-}
-
-.canvas-legend-row .dot {
-  display: inline-block;
-  width: 7px;
-  height: 7px;
-  border-radius: 999px;
-  margin-right: 5px;
 }
 
 .dot--entry { background: var(--brand); }
@@ -5390,11 +6331,14 @@ input {
   outline-offset: 2px;
 }
 
-/* Matches Button variant="default": solid accent fill, no border. */
+/* The affirmative CTA is the theme's own ink ("Vercel black button"), NOT the
+   brand: green is reserved for state (live / success / on / deployed). Ink
+   inverts by construction — dark text on a light chip in dark mode, the
+   reverse in light — so it stays the highest-contrast object on any surface. */
 .btn-primary {
-  background: var(--accent);
+  background: var(--btn);
   border: 1px solid transparent;
-  color: var(--accent-foreground);
+  color: var(--btn-ink);
   font-weight: 500;
   border-radius: var(--radius-md);
   box-shadow: var(--shadow-xs);
@@ -5404,7 +6348,7 @@ input {
 }
 
 .btn-primary:hover:not(:disabled) {
-  background: var(--accent-hover);
+  background: var(--ink-muted);
 }
 
 .btn-primary:focus-visible {
@@ -5451,27 +6395,954 @@ input {
   animation: pop-in var(--transition-fast) ease-out;
 }
 
+/* Unified execution sheet: compact enough for the Studio shell, with the
+   editor taking the available height rather than forcing a page scroll. */
+.run-sheet-backdrop {
+  justify-content: flex-end;
+}
+
+.run-sheet {
+  width: min(520px, calc(100vw - 24px));
+  max-width: 100vw;
+  height: calc(100dvh - 24px);
+  margin: 12px;
+  padding: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  overflow: hidden;
+}
+
+.run-sheet-header {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--sp4);
+  padding: var(--sp5);
+  border-bottom: 1px solid var(--border);
+}
+
+.run-sheet-header h2 {
+  margin: 3px 0 5px;
+  color: var(--text);
+  font-size: var(--type-title);
+  line-height: 1.2;
+}
+
+.run-sheet-header p,
+.run-sheet-notice {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: var(--type-label);
+  line-height: 1.5;
+}
+
+.run-sheet-kicker,
+.run-sheet-field-head span,
+.run-sheet-shortcut {
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: var(--type-meta);
+}
+
+.run-sheet-kicker {
+  color: var(--brand);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.run-sheet-body {
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--sp5);
+}
+
+.run-sheet-field-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: var(--sp2);
+  color: var(--text);
+  font-size: var(--type-label);
+  font-weight: 550;
+}
+
+.run-sheet-field-head h3 {
+  margin: 0;
+  font: inherit;
+}
+
+.run-input-mode {
+  display: inline-flex;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-inset);
+}
+
+.run-input-mode button {
+  min-height: 24px;
+  padding: 0 var(--sp2);
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-faint);
+  font-size: var(--type-meta);
+}
+
+.run-input-mode button[aria-selected="true"] {
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-xs);
+  color: var(--text);
+}
+
+.run-sheet-notice {
+  margin-bottom: var(--sp3);
+  padding: var(--sp3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-inset);
+}
+
+.run-sheet-notice[data-tone="warning"] {
+  color: var(--text-warning);
+  border-color: color-mix(in srgb, var(--text-warning) 30%, var(--border));
+}
+
+.run-sheet-editor {
+  display: block;
+  width: 100%;
+  min-height: 280px;
+  resize: vertical;
+  padding: var(--sp3);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--surface-inset);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--type-label);
+  line-height: 1.55;
+  tab-size: 2;
+}
+
+.run-sheet-editor:focus {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.run-sheet-editor[aria-invalid="true"] {
+  border-color: var(--red-text);
+}
+
+.run-sheet-loading {
+  padding: var(--sp5) 0;
+  color: var(--text-faint);
+  font-size: var(--type-label);
+}
+
+.run-sheet-stale {
+  display: flex;
+  align-items: center;
+  gap: var(--sp3);
+  margin-bottom: var(--sp4);
+  padding: var(--sp3);
+  border: 1px solid color-mix(in srgb, var(--text-warning) 35%, var(--border));
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--text-warning) 7%, transparent);
+  color: var(--text-warning);
+  font-size: var(--type-label);
+  line-height: 1.45;
+}
+
+.run-sheet-stale span {
+  flex: 1;
+}
+
+.run-sheet-validation-list {
+  margin: var(--sp2) 0 0;
+  padding-left: var(--sp5);
+  color: var(--red-text);
+  font-size: var(--type-label);
+  line-height: 1.5;
+}
+
+.run-schema-form {
+  display: grid;
+  gap: var(--sp4);
+}
+
+.schema-object-fields,
+.schema-property {
+  display: grid;
+  gap: var(--sp3);
+}
+
+.schema-property + .schema-property {
+  padding-top: var(--sp3);
+  border-top: 1px solid var(--border);
+}
+
+.schema-field,
+.schema-json-field {
+  display: grid;
+  gap: var(--sp1);
+}
+
+.schema-field > label,
+.schema-json-field > label,
+.schema-object > legend,
+.schema-array-field > legend {
+  color: var(--text);
+  font-size: var(--type-label);
+  font-weight: 550;
+}
+
+.schema-field > p,
+.schema-json-field > p,
+.schema-object > p,
+.schema-array-field > p {
+  margin: 0 0 var(--sp1);
+  color: var(--text-faint);
+  font-size: var(--type-meta);
+  line-height: 1.4;
+}
+
+.schema-field > :is(input, select),
+.schema-array-row > :is(input, select),
+.schema-json-field textarea {
+  width: 100%;
+  min-height: var(--control-h);
+  padding: 0 var(--sp2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--surface-inset);
+  color: var(--text);
+  font-size: var(--type-ui);
+}
+
+.schema-json-field textarea {
+  min-height: 110px;
+  padding: var(--sp2);
+  resize: vertical;
+  font-family: var(--font-mono);
+  font-size: var(--type-label);
+  line-height: 1.5;
+}
+
+.schema-field > :is(input, select):focus,
+.schema-array-row > :is(input, select):focus,
+.schema-json-field textarea:focus {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.schema-object {
+  min-width: 0;
+  margin: 0;
+  padding: var(--sp3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.schema-object > legend {
+  padding: 0 var(--sp1);
+}
+
+.schema-array-field {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.schema-array-field > legend {
+  padding: 0;
+}
+
+.schema-optional-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp2);
+  color: var(--text-dim);
+  font-size: var(--type-label);
+}
+
+.schema-array {
+  display: grid;
+  gap: var(--sp2);
+}
+
+.schema-array-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--sp1);
+}
+
+.schema-array-row .schema-field-errors {
+  grid-column: 1 / -1;
+}
+
+.schema-array-add,
+.run-sheet-reset {
+  justify-self: start;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp1);
+}
+
+.schema-field-error {
+  display: block;
+  color: var(--red-text);
+  font-size: var(--type-meta);
+  line-height: 1.4;
+}
+
+.schema-field-errors {
+  display: grid;
+  gap: 2px;
+}
+
+.run-sheet-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--sp2);
+  padding: var(--sp4) var(--sp5);
+  border-top: 1px solid var(--border);
+}
+
+.run-sheet-actions .btn-primary {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp1);
+}
+
+/* Run workspace --------------------------------------------------------- */
+.run-workspace {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  color: var(--text);
+}
+
+.run-workspace-header {
+  display: flex;
+  align-items: center;
+  gap: var(--sp2);
+  min-height: 38px;
+  padding: 0 var(--sp3);
+  border-bottom: 1px solid var(--border);
+  color: var(--text-faint);
+  font-size: var(--type-meta);
+}
+
+.run-workspace-header > span:not(.run-workspace-spacer) + span:not(.run-workspace-spacer)::before {
+  content: "·";
+  margin-right: var(--sp2);
+  color: var(--border-strong);
+}
+
+.run-workspace-status {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp1);
+  color: var(--text-dim);
+  font-weight: 550;
+}
+
+.run-workspace-status[data-status="completed"] { color: var(--brand); }
+.run-workspace-status[data-status="failed"],
+.run-workspace-status[data-status="cancelled"] { color: var(--red-text); }
+
+.run-workspace-spacer { flex: 1; }
+
+.run-workspace-header a {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp1);
+  color: var(--text-faint);
+  text-decoration: none;
+}
+
+.run-workspace-header a:hover { color: var(--text); }
+
+.run-workspace-pulse,
+.run-workspace-pending {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--brand);
+}
+
+.run-workspace-pulse { animation: run-workspace-pulse 1.4s ease-in-out infinite; }
+.run-workspace-pending { background: transparent; border: 1px solid var(--text-faint); }
+
+@keyframes run-workspace-pulse {
+  50% { opacity: 0.35; transform: scale(0.75); }
+}
+
+.run-overview,
+.run-attempt-inspector {
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--sp3);
+}
+
+.run-overview {
+  display: grid;
+  gap: var(--sp4);
+}
+
+.run-result-pending,
+.run-result-error {
+  display: flex;
+  align-items: center;
+  gap: var(--sp2);
+  min-height: 72px;
+  padding: var(--sp4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-inset);
+  color: var(--text-faint);
+  font-size: var(--type-label);
+}
+
+.run-result-error { align-items: flex-start; color: var(--red-text); }
+.run-result-error pre { margin: 0; white-space: pre-wrap; font: inherit; }
+
+.run-stub-notices {
+  border: 1px solid color-mix(in srgb, var(--text-warning) 28%, var(--border));
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--text-warning) 5%, transparent);
+  color: var(--text-dim);
+  font-size: var(--type-label);
+}
+
+.run-stub-notices > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 34px;
+  padding: 0 var(--sp3);
+  color: var(--text-warning);
+  cursor: pointer;
+}
+
+.run-stub-notices > summary span {
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: var(--type-meta);
+}
+
+.run-stub-notices section {
+  padding: 0 var(--sp3) var(--sp3);
+}
+
+.run-stub-notices h4 {
+  margin: var(--sp2) 0 var(--sp1);
+  color: var(--text-dim);
+  font-size: var(--type-meta);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.run-stub-notices ul {
+  margin: 0;
+  padding-left: var(--sp4);
+  line-height: 1.55;
+}
+
+.run-timeline {
+  display: grid;
+  align-content: start;
+  min-height: 0;
+}
+
+.run-timeline-title {
+  display: flex;
+  justify-content: space-between;
+  padding: var(--sp2) 0;
+  color: var(--text-faint);
+  font-size: var(--type-meta);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.run-timeline-row {
+  display: grid;
+  grid-template-columns: 25px 18px minmax(0, 1fr) auto;
+  gap: 0 var(--sp1);
+  align-items: center;
+  width: 100%;
+  min-height: 54px;
+  padding: var(--sp2);
+  border: 0;
+  border-top: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-dim);
+  text-align: left;
+}
+
+.run-timeline-row:hover,
+.run-timeline-row[aria-selected="true"] {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.run-timeline-row:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: -2px;
+}
+
+.run-timeline-index,
+.run-timeline-duration {
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: var(--type-meta);
+}
+
+.run-timeline-status {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  color: var(--brand);
+}
+
+.run-timeline-row[data-status="failed"] .run-timeline-status { color: var(--red-text); }
+
+.run-timeline-copy {
+  display: grid;
+  min-width: 0;
+}
+
+.run-timeline-copy strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: inherit;
+  font-size: var(--type-label);
+  font-weight: 550;
+}
+
+.run-timeline-copy small {
+  color: var(--text-faint);
+  font-size: var(--type-meta);
+}
+
+.run-timeline-track {
+  position: relative;
+  grid-column: 3 / 5;
+  height: 3px;
+  margin-top: var(--sp2);
+  overflow: hidden;
+  border-radius: var(--radius-full);
+  background: var(--border);
+}
+
+.run-timeline-track > span {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  border-radius: inherit;
+  background: var(--text-dim);
+}
+
+.run-timeline-row[data-status="failed"] .run-timeline-track > span { background: var(--red-text); }
+.run-timeline-row[data-status="running"] .run-timeline-track > span { background: var(--brand); }
+
+.run-workspace.is-focus {
+  height: 100%;
+}
+
+.run-focus-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 140;
+  isolation: isolate;
+  overflow: hidden;
+  background: var(--bg-0);
+}
+
+.run-focus-layer > .run-workspace {
+  width: 100%;
+  height: 100%;
+  background: var(--bg-0);
+}
+
+.run-focus-layer .run-workspace-header {
+  min-height: var(--pane-header-h);
+  background: var(--bg-0);
+}
+
+:root[data-window-frame="macos"] .run-focus-layer .run-workspace-header {
+  padding-left: var(--mac-lights-inset);
+  -webkit-app-region: drag;
+}
+
+:root[data-window-frame="macos"] .run-focus-layer .run-workspace-header :is(button, a) {
+  -webkit-app-region: no-drag;
+}
+
+.run-workspace-focus-grid {
+  display: grid;
+  grid-template-columns: minmax(260px, 34%) minmax(0, 1fr);
+  min-height: 0;
+  flex: 1;
+}
+
+.run-workspace-focus-grid > .run-timeline {
+  overflow-y: auto;
+  padding: var(--sp3);
+  border-right: 1px solid var(--border);
+}
+
+.run-workspace-inspector {
+  min-width: 0;
+  min-height: 0;
+}
+
+.run-workspace-inspector > :is(.run-overview, .run-attempt-inspector) { height: 100%; }
+
+.run-attempt-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp3);
+  margin-bottom: var(--sp3);
+}
+
+.run-attempt-head > div { min-width: 0; flex: 1; }
+.run-attempt-head h3 { margin: 0; font-size: var(--type-title); }
+.run-attempt-head p { margin: 3px 0 0; color: var(--text-faint); font-size: var(--type-meta); }
+.run-attempt-head p span[data-status="failed"] { color: var(--red-text); }
+.run-attempt-back,
+.run-attempt-debug { display: inline-flex; align-items: center; gap: var(--sp1); }
+
+.run-attempt-error {
+  display: flex;
+  gap: var(--sp2);
+  margin-bottom: var(--sp3);
+  padding: var(--sp3);
+  border: 1px solid color-mix(in srgb, var(--red-text) 35%, var(--border));
+  border-radius: var(--radius);
+  color: var(--red-text);
+  font-size: var(--type-label);
+}
+
+.run-evidence-tabs {
+  display: flex;
+  gap: var(--sp0);
+  overflow-x: auto;
+  border-bottom: 1px solid var(--border);
+}
+
+.run-evidence-tabs button {
+  min-height: 34px;
+  padding: 0 var(--sp2);
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  color: var(--text-faint);
+  font-size: var(--type-meta);
+}
+
+.run-evidence-tabs button[aria-selected="true"] {
+  border-bottom-color: var(--text);
+  color: var(--text);
+}
+
+.run-evidence-panel { padding-top: var(--sp3); }
+
+.run-evidence-empty {
+  display: flex;
+  align-items: center;
+  gap: var(--sp2);
+  padding: var(--sp4);
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius);
+  color: var(--text-faint);
+  font-size: var(--type-label);
+}
+
+.run-call-list { display: grid; gap: var(--sp3); }
+.run-call { border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+.run-call > header { display: flex; justify-content: space-between; padding: var(--sp2) var(--sp3); background: var(--surface-inset); }
+.run-call > header span { color: var(--brand); font-size: var(--type-meta); }
+.run-call-pair { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.run-call-pair section { min-width: 0; padding: var(--sp3); }
+.run-call-pair section + section { border-left: 1px solid var(--border); }
+.run-call p { color: var(--text-faint); font-size: var(--type-meta); }
+
+/* Artifact renderer ----------------------------------------------------- */
+.artifact-renderer {
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-2);
+}
+
+.artifact-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp3);
+  min-height: 42px;
+  padding: var(--sp2) var(--sp3);
+  border-bottom: 1px solid var(--border);
+}
+
+.artifact-disclosure {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp1);
+  min-width: 0;
+  padding: var(--sp1);
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text);
+}
+.artifact-disclosure:hover { background: var(--surface-hover); }
+.artifact-disclosure:focus-visible { outline: 2px solid var(--focus); }
+.artifact-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--type-label); font-weight: 600; }
+.artifact-actions { display: flex; align-items: center; gap: var(--sp2); }
+.artifact-mode { display: inline-flex; padding: 2px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-inset); }
+.artifact-mode button { min-height: 24px; padding: 0 var(--sp2); border: 0; border-radius: var(--radius-sm); background: transparent; color: var(--text-faint); font-size: var(--type-meta); }
+.artifact-mode button[aria-selected="true"] { background: var(--surface-raised); color: var(--text); box-shadow: var(--shadow-xs); }
+.artifact-copy { display: inline-flex; align-items: center; gap: var(--sp1); }
+
+.artifact-object,
+.artifact-list { display: grid; }
+
+.artifact-field,
+.artifact-list-item {
+  display: grid;
+  grid-template-columns: minmax(92px, 28%) minmax(0, 1fr);
+  gap: var(--sp3);
+  padding: var(--sp3);
+  border-top: 1px solid var(--border);
+}
+
+/* Nested structures must not recursively spend width on label columns. A
+   composite field becomes a full-width group; its scalar children can then
+   use the normal two-column row without progressively squeezing values. */
+.artifact-field[data-composite],
+.artifact-list-item[data-composite] {
+  grid-template-columns: 1fr;
+  gap: var(--sp2);
+}
+
+.artifact-object > .artifact-field:first-child,
+.artifact-list > .artifact-list-item:first-child { border-top: 0; }
+.artifact-field-label { color: var(--text-faint); font-size: var(--type-meta); text-transform: capitalize; }
+.artifact-field-value { min-width: 0; }
+.artifact-list-index { color: var(--text-faint); font-family: var(--font-mono); font-size: var(--type-meta); }
+.artifact-markdown { color: var(--text); font-size: var(--type-body); line-height: 1.58; }
+.artifact-markdown > :first-child { margin-top: 0; }
+.artifact-markdown > :last-child { margin-bottom: 0; }
+.artifact-markdown p { white-space: pre-wrap; }
+.artifact-markdown a,
+.artifact-link,
+.artifact-media a { color: var(--link, var(--brand)); }
+.artifact-link { display: inline-flex; align-items: center; gap: var(--sp1); overflow-wrap: anywhere; }
+.artifact-scalar { color: var(--text-dim); font-family: var(--font-mono); font-size: var(--type-label); }
+.artifact-media { margin: 0; display: grid; gap: var(--sp2); }
+.artifact-media img,
+.artifact-media video { display: block; width: min(100%, 720px); max-height: 420px; object-fit: contain; border-radius: var(--radius); background: var(--surface-inset); }
+.artifact-media audio { width: min(100%, 520px); }
+.artifact-media figcaption { font-size: var(--type-meta); overflow-wrap: anywhere; }
+.artifact-collection-more { border-top: 1px solid var(--border); }
+.artifact-collection-more > summary { padding: var(--sp3); color: var(--text-faint); font-size: var(--type-meta); cursor: pointer; }
+.artifact-source { margin: 0; padding: var(--sp3); overflow: auto; color: var(--text-dim); font-family: var(--font-mono); font-size: var(--type-meta); line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
+.artifact-text-more { display: inline-flex; align-items: center; gap: var(--sp1); margin: 0 var(--sp3) var(--sp3); }
+.artifact-text[data-kind="source"] { background: var(--surface-inset); }
+.artifact-renderer[data-collapsed] .artifact-header { border-bottom: 0; }
+
+@media (max-width: 720px) {
+  .run-attempt-head { align-items: flex-start; flex-wrap: wrap; }
+  .run-attempt-debug { width: 100%; justify-content: center; }
+  .run-call-pair { grid-template-columns: 1fr; }
+  .run-call-pair section + section { border-left: 0; border-top: 1px solid var(--border); }
+  .artifact-field { grid-template-columns: 1fr; gap: var(--sp1); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .run-workspace-pulse { animation: none; }
+}
+
+.run-sheet-shortcut {
+  margin-right: auto;
+}
+
+@media (max-width: 640px) {
+  .run-sheet-backdrop {
+    align-items: flex-end;
+  }
+
+  .run-sheet {
+    width: 100vw;
+    height: min(86dvh, 760px);
+    margin: 0;
+    border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+  }
+
+  .run-sheet-shortcut {
+    display: none;
+  }
+}
+
 .command-palette {
-  width: 480px;
+  width: min(640px, calc(100vw - 32px));
   padding: 0;
   overflow: hidden;
 }
 
-.command-palette-input {
-  width: 100%;
+/* THREE BARS: a search bar on top, a tab row under it, a shortcut bar at the
+   bottom — the result list scrolls between them. */
+.command-palette-search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   height: var(--pane-header-h);
   padding: 0 var(--pane-pad-x);
-  border: none;
   border-bottom: 1px solid var(--border);
+  color: var(--text-faint);
+}
+
+.command-palette-input {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  padding: 0;
+  border: none;
   background: transparent;
   color: var(--text);
   font-size: var(--type-body);
-  transition: border-color var(--transition-fast);
 }
 
 .command-palette-input:focus {
   outline: none;
-  border-bottom-color: var(--accent);
+}
+
+.command-palette-clear {
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: var(--radius-full);
+  background: var(--surface-hover);
+  color: var(--text-dim);
+  flex-shrink: 0;
+}
+
+.command-palette-clear:hover {
+  color: var(--text);
+  background: var(--active-shade);
+}
+
+/* The filter tabs, with one pill that TRAVELS behind the active tab instead
+   of two backgrounds blinking on and off. */
+.tab-track {
+  position: relative;
+}
+
+.tab-indicator {
+  position: absolute;
+  z-index: 0;
+  top: 50%;
+  left: 0;
+  height: var(--control-h);
+  margin-top: calc(var(--control-h) / -2);
+  border-radius: var(--radius);
+  background: var(--active-shade);
+  pointer-events: none;
+  transition:
+    transform 0.18s ease,
+    width 0.18s ease,
+    opacity var(--transition-fast);
+}
+
+.tab-track > [role="tab"] {
+  position: relative;
+  z-index: 1;
+  border-radius: var(--radius);
+}
+
+.command-palette-filters {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 40px;
+  flex: 0 0 auto;
+  padding: 0 var(--sp2);
+  border-bottom: 1px solid var(--border);
+}
+
+.command-palette-filter {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: var(--control-h);
+  padding: 0 10px;
+  border: none;
+  background: transparent;
+  color: var(--text-faint);
+  font-size: var(--type-label);
+}
+
+.command-palette-filter:hover {
+  color: var(--text-dim);
+  background: var(--surface-hover);
+}
+
+.command-palette-filter.is-active {
+  background: transparent;
+  color: var(--text);
+}
+
+.command-palette-footer {
+  display: flex;
+  align-items: center;
+  gap: var(--sp3);
+  height: 40px;
+  flex: 0 0 auto;
+  padding: 0 var(--sp2) 0 var(--sp3);
+  overflow: hidden;
+  border-top: 1px solid var(--border);
+  color: var(--text-faint);
+  font-size: var(--type-meta);
+}
+
+.command-palette-footer kbd {
+  margin-right: 2px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 4px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-inset);
+  font-family: var(--font-mono);
+  font-size: var(--type-meta);
+  line-height: 1;
+  color: var(--text-dim);
+}
+
+.command-palette-footer-mod {
+  margin-left: auto;
+}
+
+/* The tab's destination, anchored to the bar's right edge and sized to sit
+   INSIDE the 40px bar rather than growing it. */
+.command-palette-footer-cta {
+  margin-left: auto;
+  height: var(--control-h);
+  font-size: var(--type-meta);
 }
 
 .command-palette-list {
@@ -5503,9 +7374,10 @@ input {
 }
 
 .command-palette-item.is-selected {
-  background: var(--accent);
-  /* The icon has no color of its own — it inherits this via currentColor. */
-  color: var(--accent-foreground);
+  /* Neutral keyboard/hover selection — a wash, not the brand. Stronger step
+     (nested-shade) so it reads clearly on the raised palette surface. */
+  background: var(--nested-shade);
+  color: var(--text);
 }
 
 .command-palette-item-label {
@@ -5521,16 +7393,40 @@ input {
 .command-palette-item-meta {
   font-size: var(--type-meta);
   color: var(--text-faint);
-  font-family: var(--font-mono);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   flex: 1;
 }
 
-.command-palette-item.is-selected .command-palette-item-label,
+/* Paths read as code; action and doc one-liners read as prose. */
+.command-palette-item-meta[data-code] {
+  font-family: var(--font-mono);
+}
+
+/* Selection is the row WASH alone — the text keeps its reading colors, so
+   the match highlight (an accent-tinted cap behind the hit characters) stays
+   the one colored signal on any row. Accent-colored text on the selected row
+   fought that cap and read as murk in dark mode. */
+.command-palette-item.is-selected .command-palette-item-label {
+  color: var(--text);
+}
+
 .command-palette-item.is-selected .command-palette-item-meta {
-  color: var(--accent-foreground);
+  color: var(--text-dim);
+}
+
+/* The active session's row: identifiable at a glance, but NEVER the same
+   affordance as keyboard selection — a quiet accent pill after the name. */
+.command-palette-current {
+  flex-shrink: 0;
+  padding: 1px 7px;
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  color: var(--accent);
+  font-size: var(--type-micro);
+  font-weight: 600;
+  letter-spacing: 0.02em;
 }
 
 /* DialogHeader recipe: a hairline separator under the title. */
@@ -5617,7 +7513,7 @@ input {
 
 .recent-dir-chip:hover {
   color: var(--text);
-  border-color: var(--accent);
+  border-color: var(--ui-line-strong);
 }
 
 .recent-dir-chip:focus-visible {
@@ -5628,8 +7524,7 @@ input {
 /* Full-bleed dialog anatomy: the dialog owns no padding; header / body /
    footer blocks own theirs and are separated by hairlines — mirrors the
    design system's .sapiom-dialog. */
-.modal-new-session,
-.modal-add-workspace,
+.modal-start,
 .modal-confirm {
   /* Every block (header, body, full-bleed rows, actions) shares the app's
      standard pane inset, so dialog content aligns with panel content. */
@@ -5706,8 +7601,7 @@ input {
   outline-offset: 2px;
 }
 
-.modal-new-session .modal-header,
-.modal-add-workspace .modal-header {
+.modal-start .modal-header {
   display: flex;
   align-items: center;
   min-height: var(--pane-header-h);
@@ -5750,11 +7644,54 @@ input {
   min-width: 0;
 }
 
-.modal-new-session .modal-actions,
-.modal-add-workspace .modal-actions {
+.modal-start .modal-actions {
   margin-top: 0;
   padding: var(--sp3) var(--modal-pad-x);
 }
+
+/* Keep each action button's label on one line and let the row wrap to stack
+   whole buttons when the dialog is narrow — otherwise flexbox shrinks them
+   below their content width and labels like "Start bare session" and
+   "Scaffold here" break mid-word (the plain/new states carry several actions). */
+.modal-start .modal-actions {
+  flex-wrap: wrap;
+}
+
+.modal-start .modal-actions > button {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+/* --- StartDialog: the unified, detection-driven Add dialog --------------- */
+
+/* A flex column so the BODY scrolls (picker listing + detection status + the
+   "Start from" tray can be tall) while the header and the morphing footer stay
+   put — the primary action never scrolls out of reach. */
+.modal-start {
+  display: flex;
+  flex-direction: column;
+  max-height: min(88vh, 760px);
+}
+
+.modal-start .modal-header,
+.modal-start .modal-actions {
+  flex: none;
+}
+
+.modal-start .modal-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  /* The first body row is prose (the subtitle), not the full-bleed picker, so
+     restore the top inset the picker variant deliberately drops. */
+  padding-top: var(--sp3);
+}
+
+.modal-start-title {
+  font-weight: var(--fw-strong, 600);
+  font-size: var(--type-h2, 1rem);
+}
+
 
 /* Harness dropdown: compact trigger in the footer — [brand icon][label]
    [caret], same anatomy as the composer's provider control. The menu itself
@@ -5831,7 +7768,7 @@ input {
   border-bottom: 1px solid var(--ui-line);
 }
 
-/* Matches Button variant="outline" size="icon" — see .gear-btn. */
+/* Matches Button variant="outline" size="icon": a 32px square icon button. */
 .dir-picker-up {
   flex: 0 0 auto;
   width: var(--control-h-xs);
@@ -5953,6 +7890,13 @@ input {
   font-size: var(--type-micro);
 }
 
+/* The ordinary floating card (design-eng widget spec): the same surface,
+   hairline, radius and shadow every popover here uses. The tone lives in the
+   LEADING ICON, never in a coloured bar or wash on the frame — a bar paints
+   meaning onto the container instead of into the content, and every toast
+   used to get the red one, so a finished scan read as a failure. Enters on
+   the shared spring ease from below; `.is-leaving` plays the exit before
+   Toast.tsx unmounts on animationend. */
 .toast {
   position: fixed;
   left: 50%;
@@ -5960,43 +7904,95 @@ input {
   transform: translateX(-50%);
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: var(--sp2);
   max-width: 480px;
-  padding: 10px 14px;
-  background: var(--bg-2);
-  border: 1px solid var(--border-strong);
-  border-left: 3px solid var(--red);
-  border-radius: var(--radius-md);
+  padding: var(--sp2) var(--sp2) var(--sp2) var(--sp3);
+  background: var(--surface-floating);
+  border: 1px solid var(--ui-line-strong);
+  border-radius: var(--radius);
   box-shadow: var(--shadow-md);
   z-index: 100;
-  animation: pop-in var(--transition-fast) ease-out;
+  animation: toast-in 0.34s var(--ease) both;
+}
+
+/* The whole tone signal — sized and aligned like a row's leading glyph, so a
+   toast reads as one more row of this app rather than as a banner. */
+.toast-icon {
+  display: flex;
+  flex-shrink: 0;
+  color: var(--ink-faint);
+}
+
+.toast[data-tone="success"] .toast-icon {
+  color: var(--green-text, var(--green));
+}
+
+.toast[data-tone="error"] .toast-icon {
+  color: var(--red-text, var(--red));
+}
+
+.toast.is-leaving {
+  animation: toast-out 0.18s ease-in both;
+  pointer-events: none;
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, 10px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0) scale(1);
+  }
+}
+
+@keyframes toast-out {
+  from {
+    opacity: 1;
+    transform: translate(-50%, 0) scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: translate(-50%, 8px) scale(0.98);
+  }
+}
+
+/* Near-zero duration instead of `none` so animationend still fires and the
+   leaving state resolves to the unmount. */
+@media (prefers-reduced-motion: reduce) {
+  .toast,
+  .toast.is-leaving {
+    animation-duration: 0.01s;
+  }
 }
 
 .toast-message {
   color: var(--text);
-  font-size: var(--type-ui);
+  font-size: var(--type-label);
   line-height: 1.4;
 }
 
 .toast-dismiss {
+  margin-left: auto;
   border: none;
   background: transparent;
   color: var(--text-faint);
-  font-size: var(--type-h2);
-  line-height: 1;
   cursor: pointer;
-  padding: 0 2px;
   border-radius: var(--radius-sm);
-  transition: color var(--transition-fast);
+  transition:
+    color var(--transition-fast),
+    background var(--transition-fast);
 }
 
 .toast-dismiss:hover {
   color: var(--text);
+  background: var(--bg-hover);
 }
 
 .toast-dismiss:focus-visible {
   outline: 2px solid var(--focus);
-  outline-offset: 2px;
+  outline-offset: 1px;
 }
 
 /* Prompt bar ------------------------------------------------------------ */
@@ -6010,7 +8006,9 @@ input {
 .right-pane {
   display: flex;
   flex-direction: column;
-  background: var(--bg-1);
+  /* Block surface (the raised white graph pane) is owned by refine.css's
+     three-block model and declared there ONLY — so import order can't silently
+     flip the pane back to grey. Do not re-add a background here. */
   min-width: 0;
   min-height: 0;
   overflow: hidden;
@@ -6041,8 +8039,8 @@ input {
   flex-shrink: 0;
   height: var(--pane-header-h);
   padding: 0 var(--pane-pad-x);
-  border-bottom: 1px solid var(--border);
-  background: var(--surface-raised);
+  /* Surface (transparent — it shows the graph block) is owned by refine.css's
+     three-block model and declared there ONLY, so import order can't flip it. */
 }
 
 /* Individual segment buttons — small, rounded pills (fill bg-1 / subtle
@@ -6285,18 +8283,19 @@ input {
   margin-top: 0;
 }
 
-/* The fuzzy-matched characters, bolded in place. */
+/* The fuzzy-matched characters: a soft accent-tinted cap behind the hit, the
+   way an editor marks find results — legible on the plain row AND on the
+   selected wash in both themes, where color-only bolding disappeared. */
 .palette-match {
   font-weight: 700;
   color: var(--text);
+  background: color-mix(in srgb, var(--accent) 26%, transparent);
+  border-radius: 3px;
 }
 
 .command-palette-item-meta .palette-match {
   color: var(--text-dim);
-}
-
-.command-palette-item.is-selected .palette-match {
-  color: var(--accent-foreground);
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
 }
 
 .command-palette-error {
@@ -6322,79 +8321,6 @@ input {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.aw-back {
-  margin-right: var(--sp2);
-  flex: 0 0 auto;
-}
-
-/* Doors are full-bleed rows: the GROUP owns its separators, so no row draws a
-   perimeter line and the dividers reach the dialog edge. */
-.aw-doors {
-  display: flex;
-  flex-direction: column;
-}
-
-.aw-door {
-  display: flex;
-  align-items: center;
-  gap: var(--sp3);
-  width: 100%;
-  padding: var(--sp3) var(--modal-pad-x);
-  border: none;
-  border-top: 1px solid var(--border);
-  background: transparent;
-  border-radius: 0;
-  text-align: left;
-  color: var(--text);
-  transition: background-color var(--transition-fast);
-}
-
-.aw-door:hover,
-.aw-door:focus-visible {
-  background: var(--surface-hover);
-}
-
-.aw-door-icon {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  flex: 0 0 auto;
-  width: 28px;
-  height: 28px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--bg-2);
-  color: var(--text-dim);
-}
-
-.aw-door-text {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  flex: 1 1 auto;
-  min-width: 0;
-}
-
-.aw-door-title {
-  font-size: var(--type-ui);
-  font-weight: 500;
-}
-
-.aw-door-sub {
-  font-size: var(--type-meta);
-  color: var(--text-faint);
-}
-
-.aw-door-arrow {
-  flex: 0 0 auto;
-  color: var(--text-faint);
-  transition: transform var(--transition-fast);
-}
-
-.aw-door:hover .aw-door-arrow {
-  transform: translateX(2px);
 }
 
 /* Detection outcome. Scaffold / template / bulk-scan / MCP-setup all live
@@ -6489,6 +8415,16 @@ input {
   font-size: var(--type-meta);
   color: var(--text-dim);
   line-height: 1.5;
+}
+
+/* The copy/setup-prompt buttons hold their size and keep their label on one
+   line; the descriptive text (flex 1, min-width 0) absorbs the row and wraps
+   instead, so "Copy setup prompt" never breaks onto three lines in the narrow
+   "no agent project" modal. Applies to the expandable per-agent list rows too. */
+.aw-mcp-row > .btn-ghost,
+.aw-mcp-list-row > .btn-ghost {
+  flex-shrink: 0;
+  white-space: nowrap;
 }
 
 .aw-mcp-dim {
@@ -7389,5 +9325,632 @@ input {
 @media (prefers-reduced-motion: reduce) {
   .template-example-summary {
     transition: none;
+  }
+}
+
+/* ── New-session composer (the "add new" home) ────────────────────────────
+   The centre-pane screen shown when there is no active session (first run, or
+   the user asks for a new one): a greeting, the "what should your agent do?"
+   composer, and a starter template row. No terminal, no canvas yet — the grid
+   is single-column while it's up (App's gridTemplateColumns). */
+.composer-home {
+  position: relative;
+  height: 100%;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp6);
+  padding: var(--sp7) var(--sp5) var(--sp6);
+  animation: refine-content-in var(--base, 0.22s) var(--ease) both;
+}
+
+.composer-hero {
+  width: 100%;
+  max-width: 640px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+}
+
+.composer-greeting {
+  margin: 0 0 var(--sp2);
+  font-size: var(--type-ui);
+  color: var(--text-dim);
+}
+
+.composer-heading {
+  margin: 0 0 var(--sp4);
+  font-size: 1.6rem;
+  font-weight: 640;
+  letter-spacing: -0.02em;
+  color: var(--text);
+}
+
+/* Quick-start chips PREFILL the box, so they read as suggestions, not actions. */
+.composer-chips {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: var(--sp2);
+  margin-bottom: var(--sp4);
+}
+.composer-chip {
+  height: var(--control-h-xs);
+  padding: 0 var(--sp3);
+  border: 1px solid var(--ui-line-strong);
+  border-radius: var(--radius);
+  background: var(--surface-raised);
+  color: var(--text-dim);
+  font-size: var(--type-label);
+  cursor: pointer;
+  transition:
+    background-color var(--transition-fast),
+    color var(--transition-fast),
+    border-color var(--transition-fast),
+    transform var(--transition-fast);
+}
+.composer-chip:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+  transform: translateY(-1px);
+}
+
+/* The composer box: a raised, rounded field with a two-part action row. */
+.composer-box {
+  position: relative;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  padding: var(--sp3);
+  border: 1px solid var(--ui-line-strong);
+  border-radius: var(--r-lg, 14px);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-soft);
+  text-align: left;
+  transition:
+    border-color var(--transition-fast),
+    box-shadow var(--transition-fast);
+}
+.composer-box:focus-within {
+  border-color: color-mix(in srgb, var(--brand) 55%, var(--ui-line-strong));
+  box-shadow: var(--shadow);
+}
+.composer-box.is-dragging-files {
+  border-color: var(--brand);
+  background: color-mix(in srgb, var(--brand) 7%, var(--surface-raised));
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--brand) 18%, transparent);
+}
+.composer-box.is-busy {
+  border-color: color-mix(in srgb, var(--brand) 38%, var(--ui-line-strong));
+  cursor: progress;
+}
+.composer-drop-hint {
+  position: absolute;
+  inset: var(--sp1);
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp2);
+  border-radius: calc(var(--r-lg) - var(--sp1));
+  background: color-mix(in srgb, var(--brand) 10%, var(--surface-raised));
+  color: var(--text);
+  font-size: var(--type-ui);
+  font-weight: 590;
+  pointer-events: none;
+}
+.composer-input {
+  width: 100%;
+  border: 0;
+  background: transparent;
+  resize: none;
+  color: var(--text);
+  font: inherit;
+  font-size: var(--type-ui);
+  line-height: 1.5;
+  min-height: calc(1.5em * 2);
+}
+.composer-input::placeholder {
+  color: var(--text-faint);
+}
+.composer-input:focus-visible {
+  outline: none;
+}
+.composer-files {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp2);
+  margin: var(--sp2) 0 0;
+  padding: 0;
+  list-style: none;
+}
+.composer-file {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp2);
+  min-width: 0;
+  max-width: 260px;
+  height: var(--control-h-xs);
+  padding: 0 var(--sp1) 0 var(--sp2);
+  border: 1px solid var(--ui-line-strong);
+  border-radius: var(--radius);
+  background: var(--surface-hover);
+  color: var(--text-dim);
+}
+.composer-file-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--type-label);
+}
+.composer-file-remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--control-h-2xs);
+  height: var(--control-h-2xs);
+  padding: 0;
+  border: 0;
+  border-radius: var(--r-sm, 5px);
+  background: transparent;
+  color: var(--text-faint);
+  cursor: pointer;
+}
+.composer-file-remove:hover {
+  background: var(--surface-raised);
+  color: var(--text);
+}
+.composer-box-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--sp2);
+  margin-top: var(--sp2);
+}
+.composer-attach {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--control-h-xs);
+  height: var(--control-h-xs);
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  transition:
+    background-color var(--transition-fast),
+    color var(--transition-fast);
+}
+.composer-attach:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+.composer-box-right {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: var(--sp2);
+}
+/* The provider selector reuses .harness-select; only its resting fill differs
+   so it doesn't fight the box it sits inside. */
+.composer-harness {
+  background: transparent;
+}
+.composer-send {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--control-h-xs);
+  height: var(--control-h-xs);
+  border: 0;
+  border-radius: var(--radius);
+  background: var(--btn);
+  color: var(--btn-ink);
+  cursor: pointer;
+  transition:
+    transform var(--transition-fast),
+    box-shadow var(--transition-fast);
+}
+.composer-send:hover {
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-soft);
+}
+.composer-send:disabled,
+.composer-attach:disabled,
+.composer-file-remove:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+.composer-send:disabled:hover {
+  transform: none;
+  box-shadow: none;
+}
+.composer-send:active {
+  transform: translateY(0);
+}
+.composer-chip:focus-visible,
+.composer-attach:focus-visible,
+.composer-file-remove:focus-visible,
+.composer-send:focus-visible,
+.composer-templates-all:focus-visible,
+.composer-template-card:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+@media (max-width: 640px) {
+  .composer-home {
+    justify-content: flex-start;
+    padding: var(--sp5) var(--sp3);
+  }
+  .composer-files {
+    width: 100%;
+    flex-direction: column;
+  }
+  .composer-file {
+    width: 100%;
+    max-width: 100%;
+    min-height: var(--icon-lg);
+    height: auto;
+  }
+  .composer-file-remove {
+    width: var(--icon-lg);
+    min-width: var(--icon-lg);
+    height: var(--icon-lg);
+    margin-left: auto;
+  }
+  .composer-box-actions {
+    flex-wrap: wrap;
+  }
+  .composer-box-right {
+    width: 100%;
+    margin-left: 0;
+  }
+  .composer-harness {
+    flex: 1;
+    justify-content: flex-start;
+  }
+  .composer-attach,
+  .composer-send {
+    width: var(--icon-lg);
+    height: var(--icon-lg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .composer-home {
+    animation: none;
+  }
+  .composer-box,
+  .composer-chip,
+  .composer-attach,
+  .composer-send {
+    transition: none;
+  }
+}
+
+/* Starter template row. */
+.composer-templates {
+  width: 100%;
+  max-width: 880px;
+}
+.composer-templates-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: var(--sp3);
+}
+.composer-templates-title {
+  font-size: var(--type-label);
+  font-weight: 590;
+  color: var(--text-dim);
+}
+.composer-templates-all {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp1);
+  border: 0;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: var(--type-label);
+  cursor: pointer;
+  transition: color var(--transition-fast);
+}
+.composer-templates-all:hover {
+  color: var(--text);
+}
+.composer-template-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--sp3);
+}
+@media (max-width: 900px) {
+  .composer-template-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+/* Under ~640px two cards leave each one ~230px, where the name ellipsis eats
+   the words that tell templates apart. One column instead. */
+@media (max-width: 640px) {
+  .composer-template-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+.composer-template-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp2);
+  padding: var(--sp3);
+  border: 1px solid var(--ui-line);
+  border-radius: var(--radius-md);
+  background: var(--surface-raised);
+  text-align: left;
+  cursor: pointer;
+  transition:
+    border-color var(--transition-fast),
+    box-shadow var(--transition-fast),
+    transform var(--transition-fast);
+}
+.composer-template-card:hover {
+  border-color: var(--ui-line-strong);
+  box-shadow: var(--shadow-soft);
+  transform: translateY(-1px);
+}
+.composer-template-cardhead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp2);
+}
+.composer-template-name {
+  font-size: var(--type-ui);
+  font-weight: 590;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.composer-template-suggested {
+  flex: 0 0 auto;
+  padding: 1px var(--sp2);
+  border-radius: var(--radius-full, 999px);
+  background: var(--brand-wash, var(--accent-dim));
+  color: var(--green-text, var(--brand));
+  font-size: var(--type-micro);
+  font-weight: 600;
+}
+.composer-template-desc {
+  color: var(--text-dim);
+  font-size: var(--type-label);
+  line-height: 1.45;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.composer-template-meta {
+  font-family: var(--font-mono);
+  font-size: var(--type-meta);
+  color: var(--text-faint);
+}
+
+/* First-run footer: the one-time telemetry opt-in + docs link. */
+.composer-footer {
+  width: 100%;
+  max-width: 640px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--sp3);
+  text-align: center;
+}
+.composer-consent {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp2);
+  max-width: 520px;
+  text-align: left;
+}
+.composer-consent-copy {
+  font-size: var(--type-meta);
+  color: var(--text-faint);
+  line-height: 1.5;
+}
+.composer-docs {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp1);
+  color: var(--text-dim);
+  font-size: var(--type-label);
+  text-decoration: none;
+}
+.composer-docs:hover {
+  color: var(--text);
+}
+/* ── Overview: a CARD ON TOP that introduces the app ──────────────────────
+   Summoned from the account menu. An app-level overlay fixed over the WHOLE
+   shell (rail, terminal, canvas), centred on a scrim, so re-reading what
+   Studio is never costs you the place you were in. It sits below the modal
+   layer (100) so its own nested picker stacks above it, and below tooltips
+   (200). Neutral throughout: --brand is not spent on an introduction. */
+.overview-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--sp5) var(--sp4);
+  overflow: hidden;
+  background: var(--scrim-bg);
+  animation: fade-in var(--transition-fast) ease-out;
+}
+
+.overview-modal-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  width: min(600px, 100%);
+  max-height: 100%;
+  overflow: hidden;
+  background: var(--surface-raised);
+  border: 1px solid var(--ui-line-strong);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-lg);
+  animation: overview-modal-rise var(--slow) var(--ease) both;
+}
+
+@keyframes overview-modal-rise {
+  from {
+    opacity: 0;
+    transform: translateY(10px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.overview-modal-close {
+  position: absolute;
+  top: var(--sp3);
+  right: var(--sp3);
+  z-index: 2;
+}
+
+/* The card is copy plus two actions, so its padding carries the composition. */
+.overview-modal-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp3);
+  min-height: 0;
+  padding: var(--sp6) var(--sp6) var(--sp5);
+  overflow-y: auto;
+}
+
+.overview-modal-title {
+  margin: 0;
+  font-size: var(--type-display);
+  font-weight: var(--fw-strong, 600);
+  letter-spacing: -0.02em;
+  line-height: 1.2;
+  color: var(--text);
+}
+
+/* The running build, right under the name — the one place a user checks
+   which version they are on before reporting anything about it. */
+.overview-modal-version {
+  margin: calc(var(--sp3) * -1) 0 0;
+  font-family: var(--font-mono);
+  font-size: var(--type-micro);
+  color: var(--text-faint);
+}
+
+.overview-modal-intro {
+  margin: 0 0 var(--sp1);
+  font-size: var(--type-label);
+  line-height: 1.55;
+  color: var(--text-dim);
+}
+
+/* The two paths share one anatomy: glyph, copy, action right. */
+.overview-modal-path {
+  display: flex;
+  align-items: center;
+  gap: var(--sp3);
+  padding: var(--sp4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-xs);
+}
+
+.overview-modal-path-icon {
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: 2.5rem;
+  height: 2.5rem;
+  border-radius: var(--radius);
+  background: var(--surface-inset);
+  color: var(--text-dim);
+}
+
+.overview-modal-path-copy {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+}
+
+.overview-modal-path-title {
+  font-size: var(--type-label);
+  font-weight: var(--fw-strong, 600);
+  color: var(--text);
+}
+
+.overview-modal-path-desc {
+  font-size: var(--type-meta);
+  line-height: 1.4;
+  color: var(--text-faint);
+}
+
+/* Padding stays the button variant's own: this CTA is worn by .btn-primary
+   and .btn-line, which pad differently on purpose. */
+.overview-modal-cta {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.overview-modal-docs {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp1);
+  height: var(--control-h);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-dim);
+  font-size: var(--type-label);
+  font-weight: 510;
+  text-decoration: none;
+  transition:
+    color var(--transition-fast),
+    border-color var(--transition-fast),
+    background-color var(--transition-fast);
+}
+
+.overview-modal-docs:hover {
+  color: var(--text);
+  border-color: var(--ui-line-strong);
+  background: var(--surface-hover);
+}
+
+.overview-modal-docs:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+
+@media (max-width: 640px) {
+  .overview-modal-body {
+    padding: var(--sp5) var(--sp4);
+  }
+
+  .overview-modal-path {
+    flex-wrap: wrap;
+  }
+
+  .overview-modal-cta {
+    width: 100%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .overview-modal-card {
+    animation: none;
   }
 }

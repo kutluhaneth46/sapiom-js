@@ -37,6 +37,7 @@ export type {
 // Validate / build a `CodingResultPayload`, and the env `type` whose `id` is a
 // sandbox name for `sandboxes.attach(id)`.
 export {
+  CodingRunHttpError,
   codingResultSchema,
   CodingResultSchemaError,
   toResumePayload,
@@ -79,7 +80,10 @@ export { agentResultSchema, AgentResultSchemaError } from "./agents/index.js";
 // `releaseSession` — deferred capacity, repeatable calls).
 export * as llm from "./llm/index.js";
 // Surfaced top-level for the static `pause: { signal }` decl on an llm step.
-export { LLM_ROUTE_RESULT_SIGNAL, LLM_SESSION_READY_SIGNAL } from "./llm/index.js";
+export {
+  LLM_ROUTE_RESULT_SIGNAL,
+  LLM_SESSION_READY_SIGNAL,
+} from "./llm/index.js";
 // The shape a step resumed from `pauseUntilSignal(llmHandle, …)` receives as
 // input — annotate the resumed step with it instead of hand-rolling the shape.
 export type { LlmRouteResultPayload } from "./llm/index.js";
@@ -94,13 +98,30 @@ export { FileStorageHttpError } from "./file-storage/index.js";
 
 export * as contentGeneration from "./content-generation/index.js";
 export { ContentGenerationHttpError } from "./content-generation/index.js";
+// Concrete video model ids the gateway serves, for callers that want to pin one. Prefer a semantic
+// alias (e.g. "veo3-fast") — the routed video capability resolves it server-side (SAP-2575).
+export { VIDEO_MODELS } from "./content-generation/index.js";
+export type { KnownVideoModel } from "./content-generation/index.js";
+// Neutral param vocabulary (E4/SAP-2579) — name these when building typed media inputs.
+export type {
+  AspectRatio,
+  Resolution,
+  OutputFormat,
+} from "./content-generation/index.js";
 // Surfaced top-level for the static `pause: { signal }` decl on a workflow step.
 export { VIDEO_RESULT_SIGNAL } from "./content-generation/index.js";
-// The shape a step resumed from `pauseUntilSignal(videoLaunchHandle, …)` receives
-// as input — annotate the resumed step with it instead of hand-rolling the shape.
+export { IMAGE_RESULT_SIGNAL } from "./content-generation/index.js";
+// The shape a step resumed from `pauseUntilSignal(launchHandle, …)` receives as input
+// — annotate the resumed step with it instead of hand-rolling the shape.
 export type { VideoResultPayload } from "./content-generation/index.js";
-// Map a live VideoGenerationResult to the wire shape the resumed step receives.
+export type { ImageResultPayload } from "./content-generation/index.js";
+// The per-generation cost envelope (SAP-2576) + the resume-metadata half both payloads share —
+// name these when typing a re-billing step that persists `cost.reference`.
+export type { MediaCostEnvelope } from "./content-generation/index.js";
+export type { MediaResumeFields } from "./content-generation/index.js";
+// Map a live generation result to the wire shape the resumed step receives.
 export { toVideoResumePayload } from "./content-generation/index.js";
+export { toImageResumePayload } from "./content-generation/index.js";
 
 export * as search from "./search/index.js";
 export { SearchHttpError } from "./search/index.js";
@@ -125,3 +146,7 @@ export { BrowserAutomationHttpError } from "./browser-automation/index.js";
 
 export * as vault from "./vault/index.js";
 export { VaultHttpError } from "./vault/index.js";
+
+export * as keys from "./keys/index.js";
+export { KeysHttpError } from "./keys/index.js";
+export type { MintScopedInput, ScopedKey } from "./keys/index.js";

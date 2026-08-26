@@ -10,11 +10,10 @@ import { SPAWNABLE_HARNESS_KINDS } from "@shared/types";
 /** Fallback shown until (or in case) the registry fetch resolves — the two
  *  embedded adapters every install ships, assumed selectable so demo mode
  *  and older servers behave exactly as before. Labels mirror the upstream
- *  adapter descriptors. `imageInput: false` is the honest pre-fetch default
- *  (no image affordance until the real registry confirms support). */
+ *  adapter descriptors. */
 export const FALLBACK_HARNESSES: HarnessEntry[] = [
-  { id: "claude-code", label: "Claude Code", mode: "embedded", experimental: false, installed: true, installMcpPrompt: "", imageInput: false },
-  { id: "codex", label: "Codex CLI", mode: "embedded", experimental: false, installed: true, installMcpPrompt: "", imageInput: false },
+  { id: "claude-code", label: "Claude Code", mode: "embedded", experimental: false, installed: true, installMcpPrompt: "" },
+  { id: "codex", label: "Codex CLI", mode: "embedded", experimental: false, installed: true, installMcpPrompt: "" },
 ];
 
 /**
@@ -50,14 +49,14 @@ export function isHarnessSelectable(entry: HarnessEntry): boolean {
  *  the absence when it doesn't. */
 export function harnessUnavailableReason(entry: HarnessEntry): string | null {
   if (isHarnessSelectable(entry)) return null;
-  if (entry.mode === "external") return `${entry.label} runs in its own app. Studio can't launch it yet.`;
+  if (entry.mode === "external") return `${entry.label} runs in its own app. Agent Studio can't launch it yet.`;
   if (!entry.installed) {
     const prompt = entry.installMcpPrompt.trim();
     return prompt.length > 0
       ? prompt
-      : `${entry.label} isn't on this machine's PATH. Install its CLI, then restart the Studio server.`;
+      : `${entry.label} isn't on this machine's PATH. Install its CLI, then restart the Agent Studio server.`;
   }
-  return `This Studio build can't launch ${entry.label} yet.`;
+  return `This Agent Studio build can't launch ${entry.label} yet.`;
 }
 
 /** The label the registry ships for an id, falling back to the id itself. */

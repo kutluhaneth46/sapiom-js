@@ -79,6 +79,29 @@ describe("renderCanvasForSession", () => {
     expect(graph.edges.length).toBeGreaterThan(0);
   });
 
+  it("labels a definition link separately from a ready deployment", async () => {
+    const linkedCwd = await tmpCwd();
+    await renderCanvasForSession(
+      { cwd: linkedCwd, boundWorkflowPath: ORDER_TRIAGE },
+      [{ path: ORDER_TRIAGE, name: "order-triage", definitionId: 42 }],
+    );
+    expect(await readRender(linkedCwd, ORDER_TRIAGE)).toContain(">linked<");
+
+    const readyCwd = await tmpCwd();
+    await renderCanvasForSession(
+      { cwd: readyCwd, boundWorkflowPath: ORDER_TRIAGE },
+      [
+        {
+          path: ORDER_TRIAGE,
+          name: "order-triage",
+          definitionId: 42,
+          activeBuildRunStatus: "ready",
+        },
+      ],
+    );
+    expect(await readRender(readyCwd, ORDER_TRIAGE)).toContain(">deployed<");
+  });
+
   it("serves the second render of an unchanged workflow from the extraction cache", async () => {
     const cwd = await tmpCwd();
     const workflows: RenderableWorkflow[] = [{ path: ORDER_TRIAGE, name: "order-triage", definitionId: null }];
@@ -106,6 +129,7 @@ describe("renderCanvasForSession", () => {
     const html = await readRender(cwd, HUB);
     expect(html).toContain("node--launched-workflow");
     expect(html).toContain(">spoke-workflow<");
+    expect(html).toContain("launches another agent");
     expect(html).toContain("canvas-edge--launch");
     expect(html).toContain(">launch()<");
   });
@@ -120,7 +144,10 @@ describe("renderCanvasForSession", () => {
     const html = await readRender(cwd, NO_DEFINITION);
     expect(html).toContain("broken-flow");
     expect(html).toContain("render failed");
-    expect(html).toContain("Could not extract this workflow's step graph");
+    expect(html).toContain("Could not extract this agent's step graph");
+    expect(html).toContain('id="sapiom-render-error"');
+    expect(html).toContain('"title":"broken-flow"');
+    expect(html).toContain("sapiom-canvas:error");
     expect(html).not.toContain('class="canvas-node '); // no diagram — just the note
   });
 
@@ -198,6 +225,74 @@ describe("renderCanvasForSession", () => {
   });
 });
 
+describe("dependencies not installed yet (fresh scaffold, pre-`npm install`)", () => {
+  // A temp dir under os.tmpdir() is OUTSIDE the repo, so no ancestor
+  // node_modules resolves @sapiom/agent — exactly a freshly scaffolded,
+  // not-yet-installed project. (The repo's own __fixtures__ resolve the SDK via
+  // the monorepo's node_modules, so they are NOT deps-missing.)
+  async function depsMissingProject(): Promise<string> {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "canvas-render-noinstall-"));
+    tmpDirs.push(dir);
+    await fs.writeFile(
+      path.join(dir, "index.ts"),
+      `import { defineAgent } from "@sapiom/agent";\nexport default defineAgent({ name: "x", entry: "s", steps: {} });\n`,
+      "utf8",
+    );
+    return dir;
+  }
+
+  it("shows the calm 'preparing' placeholder — not the esbuild error — and flags depsMissing", async () => {
+    const cwd = await tmpCwd();
+    const project = await depsMissingProject();
+    const workflows: RenderableWorkflow[] = [{ path: project, name: "enrich-list-leads", definitionId: null }];
+
+    const outcome = await renderCanvasForSession({ cwd, boundWorkflowPath: project }, workflows);
+
+    expect(outcome.depsMissing).toBe(true);
+    expect(outcome.extractionFailed).toEqual([]);
+    const html = await readRender(cwd, project);
+    expect(html).toContain("Preparing your agent");
+    // Crucially NOT the honest-error panel: no "render failed" badge, and no
+    // #sapiom-render-error script (which the SPA turns into the Retry card).
+    expect(html).not.toContain("render failed");
+    expect(html).not.toContain("Could not resolve");
+    expect(html).not.toContain('id="sapiom-render-error"');
+  });
+
+  it("preserves an existing good render on an unprompted deps-missing pass", async () => {
+    const cwd = await tmpCwd();
+    const project = await depsMissingProject();
+    const renderPath = renderFileFor(cwd, project);
+    await fs.mkdir(path.dirname(renderPath), { recursive: true });
+    await fs.writeFile(renderPath, "<!doctype html><!-- good -->", "utf8");
+    const workflows: RenderableWorkflow[] = [{ path: project, name: "enrich-list-leads", definitionId: null }];
+
+    const outcome = await renderCanvasForSession({ cwd, boundWorkflowPath: project }, workflows, {
+      preserveExistingOnFailure: true,
+    });
+
+    expect(outcome.depsMissing).toBe(true);
+    expect(outcome.preservedExisting).toBe(true);
+    expect(await readRender(cwd, project)).toBe("<!doctype html><!-- good -->");
+  });
+
+  it("surfaceErrorOnMissingDeps forces the honest error (the install-timeout safety valve)", async () => {
+    const cwd = await tmpCwd();
+    const project = await depsMissingProject();
+    const workflows: RenderableWorkflow[] = [{ path: project, name: "enrich-list-leads", definitionId: null }];
+
+    const outcome = await renderCanvasForSession({ cwd, boundWorkflowPath: project }, workflows, {
+      surfaceErrorOnMissingDeps: true,
+    });
+
+    // Extraction runs and genuinely fails to resolve the SDK — the error panel
+    // (and its Retry/Ask actions) is restored, and depsMissing is NOT set.
+    expect(outcome.depsMissing).toBeUndefined();
+    expect(outcome.extractionFailed).toEqual(["enrich-list-leads"]);
+    expect(await readRender(cwd, project)).toContain("render failed");
+  });
+});
+
 describe("deterministic enrichment merged into renders", () => {
   const workflows: RenderableWorkflow[] = [{ path: ORDER_TRIAGE, name: "order-triage", definitionId: null }];
 
@@ -207,8 +302,8 @@ describe("deterministic enrichment merged into renders", () => {
     expect(outcome.enrichmentApplied).toBe(true);
 
     const html = await readRender(cwd, ORDER_TRIAGE);
-    // order-triage: 5 steps, one branch point (route), two success terminals.
-    expect(html).toContain("5 steps · 1 branch point · 2 success outcomes");
+    // order-triage: 3 pipeline steps, one branch point, two success terminals.
+    expect(html).toContain("3 steps · 1 branch point · 2 success outcomes");
     expect(html).not.toContain("stale — Refresh");
     // Never writes an enrichment cache dir — the annotation is recomputed each render.
     await expect(fs.access(path.join(cwd, CANVAS_DIR, "cache"))).rejects.toThrow();

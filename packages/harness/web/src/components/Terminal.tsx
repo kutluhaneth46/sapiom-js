@@ -24,15 +24,20 @@ import { Terminal as XTerm, type ITheme } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import "@xterm/xterm/css/xterm.css";
+import { getDesktopBridge } from "../lib/desktop.js";
+import { dropPayload } from "../lib/terminal-drop.js";
 import { buildTerminalWsUrl } from "../lib/terminal-ws.js";
 import { getTheme, subscribeTheme, type Theme } from "../lib/theme.js";
 import { isMockMode } from "../lib/api.js";
 import { attachMockTerminal, type MockTerminalHandle } from "../lib/mock-terminal.js";
+import { trackingAttrs } from "../lib/analytics/tracking-attrs";
 
 export interface TerminalProps {
   sessionId: string;
   /** Per-boot token baked into the SPA; required on the WS upgrade. */
   token: string;
+  /** The session's working directory, shown in the masthead's dir fact. */
+  cwd?: string | null;
 }
 
 type ConnectionStatus = "connecting" | "connected" | "error";
@@ -53,42 +58,50 @@ function readToken(name: string, fallback: string): string {
 }
 
 // ANSI 16-color ramps: terminal DATA colors (what CLIs paint with), not app
-// chrome — kept as constants per theme, same as a data-viz scale.
+// chrome — kept as constants per theme, same as a data-viz scale. Brand-coherent
+// and authoritative over Claude Code's colors: the harness pins Claude to its
+// `dark-ansi`/`light-ansi` theme (see core/inject/claude-settings.ts), so what
+// Claude calls "blue"/"green"/etc. is literally whatever these slots hold. Green
+// is the Studio brand green; blue is a calmer, less-saturated tone; the rest are
+// harmonized to read cleanly on --bg without any one hue shouting.
 const DARK_ANSI: Partial<ITheme> = {
   black: "#1a1a1e",
-  red: "#f87171",
-  green: "#4ade80",
-  yellow: "#f59e0b",
-  blue: "#3b82f6",
-  magenta: "#9b8fc4",
-  cyan: "#22d3ee",
-  white: "#f3f3f5",
-  brightBlack: "#404046",
-  brightRed: "#ff9b96",
-  brightGreen: "#86efac",
-  brightYellow: "#ffd966",
-  brightBlue: "#60a5fa",
-  brightMagenta: "#c4b5fd",
-  brightCyan: "#67e8f9",
+  red: "#e88a84",
+  green: "#6be195", // Studio brand green (dark)
+  yellow: "#e6b96f",
+  blue: "#6f9ae0", // calmer blue
+  magenta: "#b7a6dd",
+  cyan: "#74c8d4",
+  white: "#e8e8ec",
+  brightBlack: "#565661", // dim text — bumped from #404046 for legibility
+  brightRed: "#f4a7a1",
+  brightGreen: "#8ceab0", // brand green hover (dark)
+  brightYellow: "#f2cf93",
+  brightBlue: "#8fb5ea",
+  brightMagenta: "#ccbdf0",
+  brightCyan: "#97dce7",
   brightWhite: "#ffffff",
 };
 
 const LIGHT_ANSI: Partial<ITheme> = {
   black: "#3a3a3e",
-  red: "#dc2626",
-  green: "#16a34a",
-  yellow: "#b45309",
-  blue: "#2563eb",
-  magenta: "#7c3aed",
-  cyan: "#0891b2",
-  white: "#d4d4d8",
-  brightBlack: "#6b6b75",
-  brightRed: "#ef4444",
-  brightGreen: "#22c55e",
-  brightYellow: "#f59e0b",
-  brightBlue: "#3b82f6",
-  brightMagenta: "#9b8fc4",
-  brightCyan: "#22d3ee",
+  red: "#c0392b",
+  green: "#167e3a", // Studio brand green (light)
+  yellow: "#a86414",
+  blue: "#4f7cc4", // calmer blue
+  magenta: "#7a4fb0",
+  cyan: "#0e7d94",
+  // Mid grey, not near-white: near-white foreground is invisible on the light
+  // --bg anyway, and this keeps dim text legible if a dark-base session's
+  // `white` slot ends up mapped here after a mid-session theme toggle.
+  white: "#a6a6ae",
+  brightBlack: "#6b6b75", // dim text
+  brightRed: "#d64a3d",
+  brightGreen: "#1f9a4a", // brand green (brighter, light)
+  brightYellow: "#c67d1a",
+  brightBlue: "#6f9ae0",
+  brightMagenta: "#9268c4",
+  brightCyan: "#1596ad",
   brightWhite: "#ffffff",
 };
 
@@ -98,7 +111,9 @@ const LIGHT_ANSI: Partial<ITheme> = {
  * time so it always reflects the current [data-theme].
  */
 function xtermThemeFor(theme: Theme): ITheme {
-  const background = readToken("--bg", theme === "dark" ? "#0c0c0e" : "#fbfbfc");
+  // The shell block is the recessed surface (same as the rail), so the xterm
+  // canvas paints --bg to match the session bar + masthead around it.
+  const background = readToken("--bg", theme === "dark" ? "#0b0e13" : "#f8f9fa");
   const foreground = readToken("--ink", theme === "dark" ? "#f3f3f5" : "#16161a");
   // Fallbacks mirror the per-theme --brand values in styles.css.
   const brand = readToken("--brand", theme === "dark" ? "#6be195" : "#167e3a");
@@ -149,7 +164,17 @@ export const Terminal = ({ sessionId, token }: TerminalProps): JSX.Element => {
     termRef.current = term;
     const fitAddon = new FitAddon();
     term.loadAddon(fitAddon);
-    term.loadAddon(new WebLinksAddon());
+    // Explicit activation handler: the addon's default calls `window.open()`
+    // with NO url (about:blank) and assigns `location.href` afterwards. Inside
+    // the desktop app the window-open handler intercepts that first call, sees
+    // only "about:blank", and hands it to the OS — macOS answers with a "no
+    // application set to open the URL about:blank" dialog and the real link
+    // never opens. Passing the uri directly gives every host the actual link.
+    term.loadAddon(
+      new WebLinksAddon((_event, uri) => {
+        window.open(uri, "_blank", "noopener,noreferrer");
+      }),
+    );
 
     // XDA reply: some CLIs query "CSI > q" to identify the terminal before
     // enabling terminal-dependent features. xterm.js doesn't answer by
@@ -203,6 +228,33 @@ export const Terminal = ({ sessionId, token }: TerminalProps): JSX.Element => {
     });
     resizeObserver.observe(container);
 
+    // Drop-to-path, like a native emulator: a file dropped on the terminal
+    // types its quoted path at the cursor (Claude/Codex then handle it — an
+    // image path pastes as `[Image #1]`). Only the desktop bridge can resolve
+    // a File to a real path; in a plain browser the drop resolves to nothing,
+    // but default is still prevented — the browser's default for a file drop
+    // is to navigate the whole SPA away to the file.
+    const onDragOver = (event: DragEvent): void => {
+      if (!event.dataTransfer?.types.includes("Files")) return;
+      event.preventDefault();
+      event.dataTransfer.dropEffect = "copy";
+    };
+    const onDrop = (event: DragEvent): void => {
+      const files = event.dataTransfer?.files;
+      if (!files || files.length === 0) return;
+      event.preventDefault();
+      const pathForFile = getDesktopBridge()?.pathForFile;
+      if (!pathForFile) return;
+      const payload = dropPayload(Array.from(files, (file) => pathForFile(file)));
+      if (payload === null) return;
+      // paste() honors bracketed-paste mode, so the CLI sees one paste event
+      // (the same reason injected prompts are bracketed — see core/bracketed-paste).
+      term.paste(payload);
+      term.focus();
+    };
+    container.addEventListener("dragover", onDragOver);
+    container.addEventListener("drop", onDrop);
+
     function connect(): void {
       if (disposed) return;
       const socket = new WebSocket(buildTerminalWsUrl(sessionId, token));
@@ -249,6 +301,8 @@ export const Terminal = ({ sessionId, token }: TerminalProps): JSX.Element => {
     return () => {
       disposed = true;
       if (reconnectTimer) clearTimeout(reconnectTimer);
+      container.removeEventListener("dragover", onDragOver);
+      container.removeEventListener("drop", onDrop);
       resizeObserver.disconnect();
       inputDisposable.dispose();
       mock?.dispose();
@@ -258,23 +312,10 @@ export const Terminal = ({ sessionId, token }: TerminalProps): JSX.Element => {
     };
   }, [sessionId, token]);
 
-  const statusLabel =
-    status === "connected"
-      ? isMockMode()
-        ? "Demo session, scripted. No live agent."
-        : "Connected"
-      : status === "error"
-        ? (errorMessage ?? "Error")
-        : "Connecting…";
-
   return (
-    // Full-bleed terminal block: a status subheader over the raw PTY screen.
+    // Full-bleed terminal block: the raw PTY screen, full-bleed.
     // All chrome styling is class + token based — see styles.css.
-    <div className="harness-terminal">
-      <div className="terminal-statusbar" data-status={status}>
-        <span className="terminal-status-dot" aria-hidden="true" />
-        <span className="terminal-status-label">{statusLabel}</span>
-      </div>
+    <div className="harness-terminal" {...trackingAttrs({ surface: "terminal" })}>
       <div ref={containerRef} className="terminal-screen" />
     </div>
   );

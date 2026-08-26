@@ -53,4 +53,56 @@ describe("server instructions", () => {
       "entry step's `inputSchema` is the agent's public API",
     );
   });
+
+  it("teaches the LLM call-surface rule (SAP-2775) — kept byte-identical to the backend copy", () => {
+    expect(AUTHORING_INSTRUCTIONS).toContain("ctx.sapiom.llm.run");
+    expect(AUTHORING_INSTRUCTIONS).toContain("ctx.sapiom.models.run");
+    expect(AUTHORING_INSTRUCTIONS).toContain("models.coding.run");
+    expect(AUTHORING_INSTRUCTIONS).toContain("ctx.sapiom.agents.run");
+    expect(AUTHORING_INSTRUCTIONS).toContain("You never pick a model");
+    // The internal `workflows`-service naming must never reach this customer-facing
+    // primer — the per-step debugging endpoint lives in the docs guide, not spelled
+    // out here verbatim (matches this package's own scaffold terminology guard).
+    expect(AUTHORING_INSTRUCTIONS).toContain("Run Inspector");
+    expect(AUTHORING_INSTRUCTIONS).not.toContain("/v1/workflows/");
+    // Structured/forced-tool output has no `text` block — the reply lives in the
+    // `tool_use` block's `input`. Reading only `type === 'text'` there returns
+    // `undefined` and invites exactly the string-parsing fallback this rule bans.
+    expect(AUTHORING_INSTRUCTIONS).toContain("tool_use");
+    // `output` is sugar for a forced tool call — one mechanism, one payload location.
+    expect(AUTHORING_INSTRUCTIONS).toContain("it forces a tool");
+    // The disclosure claim stays scoped: coding runs report honest nulls, and older
+    // servers omit the fields entirely — never a flat "always on the result" promise.
+    expect(AUTHORING_INSTRUCTIONS).toContain("treat missing as unknown");
+    expect(AUTHORING_INSTRUCTIONS).toContain("reports both as `null` today");
+    // "Pin the `smart` label" was a no-op (smart IS the default) and wrong-field on
+    // the sessions surface — it must not come back.
+    expect(AUTHORING_INSTRUCTIONS).not.toContain("If you must pin");
+  });
+
+  it("documents the complete ctx.shared quota contract", () => {
+    expect(AUTHORING_INSTRUCTIONS).toContain(
+      "inclusive 256 KiB (262,144-byte) quota",
+    );
+    expect(AUTHORING_INSTRUCTIONS).toContain("measured as compact");
+    expect(AUTHORING_INSTRUCTIONS).toContain("`JSON.stringify` UTF-8 bytes");
+    expect(AUTHORING_INSTRUCTIONS).toContain(
+      "IDs/references here instead of bulk state",
+    );
+    expect(AUTHORING_INSTRUCTIONS).toContain(
+      "`ctx.shared.set()` validates the complete candidate synchronously",
+    );
+    expect(AUTHORING_INSTRUCTIONS).toContain(
+      "construct this SDK version's `InMemoryContextStore`",
+    );
+    expect(AUTHORING_INSTRUCTIONS).toContain(
+      "snapshot unchanged after an oversized or unserializable write",
+    );
+    expect(AUTHORING_INSTRUCTIONS).toContain("structural payload guards");
+    expect(AUTHORING_INSTRUCTIONS).toContain("than `instanceof`");
+    expect(AUTHORING_INSTRUCTIONS).toContain("Hosts that have not adopted");
+    expect(AUTHORING_INSTRUCTIONS).toContain(
+      "There is no `delete()` operation",
+    );
+  });
 });

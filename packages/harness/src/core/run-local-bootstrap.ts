@@ -6,8 +6,10 @@
  * (`runLocalFromDir` from @sapiom/agent-core) and writes the result as an
  * NDJSON stream to stdout: one line per {@link LocalStepTrace}, then a single
  * terminal summary line `{ outcome, output, error, unusedStubs, stubWarnings }`.
- * Fully offline and zero-cost — run-local resolves every `ctx.sapiom.*` call
- * from stubs and never touches the network.
+ * It needs no Sapiom account and resolves every `ctx.sapiom.*` call from stubs,
+ * so it creates no Sapiom capability request or capability spend. The imported
+ * definition and author step code are ordinary local code and may still perform
+ * their own filesystem, process, environment, or network effects.
  *
  * Why a separate child process (not an in-process import):
  *  1. `runLocalFromDir` esbuild-bundles and dynamically `import()`s a workflow
@@ -68,6 +70,14 @@ export interface RunLocalSummaryLine {
   stubWarnings: string[];
 }
 
+/** Live attempt event. `started` and `settled` share one stable trace key
+ * (`step + attempt`) so clients upsert rather than duplicate a row. */
+export interface RunLocalStepLine {
+  kind: "step";
+  phase: "started" | "settled";
+  trace: LocalStepTrace;
+}
+
 /**
  * The terminal line written when the run could not be *invoked* at all — a
  * malformed request, an unreadable stub file, a project that fails to load.
@@ -122,8 +132,8 @@ export function parseRunLocalRequest(raw: string): RunLocalRequest {
 }
 
 /** Serialize one step trace as a single NDJSON line (newline-terminated). */
-function traceLine(step: LocalStepTrace): string {
-  return JSON.stringify(step) + "\n";
+function traceLine(line: RunLocalStepLine): string {
+  return JSON.stringify(line) + "\n";
 }
 
 /** Serialize the terminal summary as a single NDJSON line. */
@@ -149,13 +159,10 @@ export async function runBootstrap(
       input: request.input,
       stubs: request.stubs,
       maxAttemptsPerStep: request.maxAttemptsPerStep,
+      onStepTrace(phase, trace) {
+        out.write(traceLine({ kind: "step", phase, trace }));
+      },
     });
-
-    // One line per step-attempt, in execution order — the consumer parses them
-    // incrementally rather than buffering the whole trace as a single blob.
-    for (const step of result.steps) {
-      out.write(traceLine(step));
-    }
 
     const summary: RunLocalSummaryLine = {
       kind: "summary",

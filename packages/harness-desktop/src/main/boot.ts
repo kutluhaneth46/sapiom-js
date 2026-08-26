@@ -6,11 +6,13 @@
  * surface added in `@sapiom/harness` — the npx CLI stays the untouched backup.
  */
 import { app, BrowserWindow, ipcMain } from "electron";
+import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
+import { promisify } from "node:util";
 import {
   runDoctor,
   pickDefaultHarness,
@@ -23,19 +25,32 @@ import {
   hasStoredSettings,
   startServer,
   createClaudeCodeAdapter,
+  resolveSpawnTarget,
   CLAUDE_INSTALL_COMMAND,
   CODEX_INSTALL_COMMAND,
   type HarnessServer,
   type HarnessIdentity,
   type DoctorReport,
 } from "@sapiom/harness";
+import { resolveLaunchDir } from "./launch-dir.js";
 import { augmentProcessPath } from "./env.js";
 import { esbuildBinaryPath } from "./esbuild-binary.js";
 import { resolveWebDir } from "./paths.js";
 import { createMainWindow } from "./windows.js";
-import { ensureSapiomCli, installClaudeCode } from "./agent-install.js";
+import { agentPrefixDir, ensureSapiomCli, installClaudeCode, installSapiomMcp } from "./agent-install.js";
+import { agentRepairDecision } from "./agent-repair.js";
+import { ensureMinGit } from "./git-provision.js";
+import { ensureSapiomMcp } from "./mcp-install.js";
 import { installRuntimeShims } from "./runtime-shims.js";
-import { BOOT_PROGRESS, BOOT_ERROR, CONSENT_SUBMIT, RETRY, type BootProgress, type BootErrorPayload } from "./ipc.js";
+import {
+  BOOT_PROGRESS,
+  BOOT_ERROR,
+  CONSENT_SUBMIT,
+  RETRY,
+  type BootProgress,
+  type BootErrorPayload,
+  type DeepLinkTarget,
+} from "./ipc.js";
 
 export interface BootResult {
   server: HarnessServer;
@@ -48,6 +63,22 @@ export interface BootResult {
  *  stuck onboarding can be pinpointed without a visible setup window. */
 function debug(msg: string): void {
   if (process.env.SAPIOM_BOOT_DEBUG === "1") console.error(`[boot] ${msg}`);
+}
+
+/**
+ * Is a system git on PATH? Shells `where` — the same probe the doctor uses
+ * (`harness/src/cli/doctor.ts`) — rather than resolveSpawnTarget, which on
+ * non-Windows is a filesystem-blind passthrough. Windows-only caller today,
+ * but keep the POSIX arm so the helper stays honest if that changes.
+ */
+async function hasSystemGit(): Promise<boolean> {
+  const exec = promisify(execFile);
+  try {
+    await exec(process.platform === "win32" ? "where" : "which", ["git"], { windowsHide: true });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function progress(setupWin: BrowserWindow, p: BootProgress): void {
@@ -114,7 +145,10 @@ async function decideConsent(
   }
 
   // First run, interactive: ask in the setup window and wait for the answer.
-  progress(setupWin, { phase: "consent", message: "Share anonymous usage data?", status: "active" });
+  // No subtitle: the checkbox below IS the question, so a "Share anonymous usage
+  // data?" detail line just duplicates it. "One quick question…" + the checkbox
+  // is the whole ask.
+  progress(setupWin, { phase: "consent", message: "", status: "active" });
   const optIn = await new Promise<boolean>((resolve) => {
     ipcMain.handleOnce(CONSENT_SUBMIT, (_e, value: boolean) => {
       resolve(Boolean(value));
@@ -154,20 +188,20 @@ function defaultProjectRoot(): string {
 /**
  * The directory the coding agent opens in. NEVER the app's own cwd (that would
  * open the agent inside the install dir), and NEVER an OS folder picker — a
- * one-click user shouldn't have to choose a path. Precedence:
- *   1. SAPIOM_LAUNCH_DIR env (explicit dev/testing override)
- *   2. most recent *valid* project dir (returning users)
- *   3. the default project root under ~/.sapiom (first launch / new project)
+ * one-click user shouldn't have to choose a path.
+ *
+ * Always the harness home (unless `SAPIOM_LAUNCH_DIR` overrides it): the launch
+ * dir is the stable scan root that `projectRoot = <launchDir>/projects` is
+ * derived from, so it must not drift into a project subfolder. See
+ * `resolveLaunchDir` for why deriving it from `recentDirs` nested every new
+ * agent one level deeper.
  */
 async function chooseLaunchDir(): Promise<string> {
-  const override = process.env.SAPIOM_LAUNCH_DIR;
-  if (isDir(override)) return override;
-
-  const settings = await loadSettings();
-  const lastValid = settings.recentDirs?.find(isDir);
-  if (lastValid) return lastValid;
-
-  const dir = defaultProjectRoot();
+  const dir = resolveLaunchDir({
+    override: process.env.SAPIOM_LAUNCH_DIR,
+    harnessHome: defaultProjectRoot(),
+    isDir,
+  });
   await fs.promises.mkdir(dir, { recursive: true });
   return dir;
 }
@@ -241,11 +275,19 @@ export interface BootMode {
    * smoke pass still exercises PATH, asar paths, the server, and the windows.
    */
   smoke: boolean;
+  /**
+   * A `sapiom://` deep link present at COLD start (a macOS `open-url` that
+   * arrived before `whenReady`, or the URL in Windows/Linux argv). Its target is
+   * threaded onto the SPA load URL as `?agent=<id>` so the first render already
+   * has it — no IPC race. Links that arrive while the app is running are pushed
+   * over the DEEP_LINK_NAVIGATE channel instead (see index.ts).
+   */
+  deepLink?: DeepLinkTarget;
 }
 
 export async function boot(setupWin: BrowserWindow, mode: BootMode): Promise<BootResult> {
   const { devMode, smoke } = mode;
-  progress(setupWin, { phase: "starting", message: "Starting Sapiom…", status: "active" });
+  progress(setupWin, { phase: "starting", message: "Starting…", status: "active" });
 
   // 1. PATH — must precede doctor so `which claude` works in a GUI app. Also
   //    materialize node/npm shims (Electron-as-Node) and put them first, so the
@@ -259,6 +301,37 @@ export async function boot(setupWin: BrowserWindow, mode: BootMode): Promise<Boo
   //     earlier than here, because esbuild reads the setting when its module
   //     loads (esbuild-binary.ts). Only traced here, where the boot log is.
   debug(`esbuild binary: ${esbuildBinaryPath ?? "left to esbuild's own resolution"}`);
+
+  // 1c. Git, on Windows machines that have none. Template cloning and deploy
+  //     shell out to a real git (agent-core's cloneRepo/pushSynthesizedTree),
+  //     and Windows ships without one — the same reasoning as the node/npm
+  //     shims and the agent auto-install: the one-click user must not be sent
+  //     to git-scm.com. Downloads the checksum-pinned official MinGit into
+  //     userData on first boot (see git-provision.ts); non-fatal, and never in
+  //     smoke (no network in CI). A user-installed git always wins: this
+  //     branch is skipped whenever `where git` resolves, and the provisioned
+  //     dir is APPENDED to PATH. When the MinGit variant carries a bash.exe,
+  //     advertise it via CLAUDE_CODE_GIT_BASH_PATH — Claude Code prefers Git
+  //     Bash for its shell/hooks on Windows and falls back to PowerShell
+  //     without it.
+  if (!smoke && process.platform === "win32" && !(await hasSystemGit())) {
+    progress(setupWin, { phase: "starting", message: "Setting up Git…", status: "active" });
+    const provisioned = await ensureMinGit({
+      installRoot: path.join(app.getPath("userData"), "mingit"),
+      onLine: (line) => {
+        debug(`git provision: ${line}`);
+        progress(setupWin, { phase: "starting", message: line, status: "active" });
+      },
+    });
+    if (provisioned) {
+      process.env.PATH = `${process.env.PATH ?? ""};${provisioned.cmdDir}`;
+      if (provisioned.bashPath && !process.env.CLAUDE_CODE_GIT_BASH_PATH) {
+        process.env.CLAUDE_CODE_GIT_BASH_PATH = provisioned.bashPath;
+      }
+    }
+    // null → offline or blocked: boot proceeds; template/deploy flows surface
+    // the actionable GIT_NOT_INSTALLED remedy when actually used.
+  }
 
   // 2. Doctor.
   progress(setupWin, { phase: "doctor", message: "Checking your environment…", status: "active" });
@@ -275,6 +348,53 @@ export async function boot(setupWin: BrowserWindow, mode: BootMode): Promise<Boo
   if (!smoke && (forceNoAgent || report.availableHarnesses.length === 0)) {
     report = await ensureAgentAvailable(setupWin, report);
   }
+
+  // 3a. Windows: doctor's presence check (`where`) finds `claude.CMD` even when
+  //     the shim's target binary is gone — the state Claude Code's own native
+  //     auto-updater left one machine in (renamed claude.exe → .old.<ts>, never
+  //     wrote the replacement), after which EVERY session spawn failed while
+  //     doctor stayed green. resolveSpawnTarget is the real oracle; when it
+  //     refuses and the broken install is the app-managed one, re-run the
+  //     (idempotent) npm install to put a working binary back.
+  // BOTH global layouts: npm puts packages under `<prefix>/node_modules` on
+  // Windows and `<prefix>/lib/node_modules` on POSIX (agent-install.ts).
+  // Checking only the Windows shape meant the DISABLE_AUTOUPDATER opt-out
+  // below silently never applied on macOS/Linux — leaving the very
+  // self-updater that tears managed installs live on those platforms.
+  const managedClaudeInstalled = (): boolean =>
+    [
+      path.join(agentPrefixDir(), "node_modules", "@anthropic-ai", "claude-code"),
+      path.join(agentPrefixDir(), "lib", "node_modules", "@anthropic-ai", "claude-code"),
+    ].some((dir) => fs.existsSync(dir));
+  if (!smoke && report.availableHarnesses.includes("claude-code")) {
+    const decision = agentRepairDecision({
+      platform: process.platform,
+      managedInstallExists: managedClaudeInstalled(),
+      checkSpawn: () => void resolveSpawnTarget("claude", []),
+    });
+    if (decision.repair) {
+      debug(`agent repair: ${decision.reason ?? "spawn check failed"}`);
+      progress(setupWin, { phase: "installing-agent", message: "Repairing Claude Code…", status: "active" });
+      await installClaudeCode((line) => {
+        progress(setupWin, { phase: "installing-agent", message: line, status: "active" });
+      });
+      report = await runDoctor();
+    }
+  }
+
+  // 3b'. The agent's own self-updater must not mutate an install the app
+  //      manages: in-place update of a running exe is exactly what produced the
+  //      .old wreckage above, and the app repairs/refreshes the install itself
+  //      via npm. DISABLE_AUTOUPDATER is Claude Code's documented opt-out; it
+  //      rides process.env into every session the server spawns. Never set when
+  //      the user runs their own claude (their install, their update policy) —
+  //      the managed prefix is prepended to PATH, so when it exists it IS the
+  //      active claude.
+  if (managedClaudeInstalled()) {
+    process.env.DISABLE_AUTOUPDATER = "1";
+    debug("managed Claude Code install detected — agent self-updater disabled for sessions");
+  }
+
   progress(setupWin, { phase: "doctor", message: `Found: ${report.availableHarnesses.join(", ")}`, status: "done" });
 
   // 3b. The `sapiom` CLI. The agent is told to run `sapiom agents deploy` /
@@ -298,6 +418,35 @@ export async function boot(setupWin: BrowserWindow, mode: BootMode): Promise<Boo
     );
   } catch (err) {
     debug(`sapiom CLI install threw (ignored): ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  // 3c. The local sapiom-dev MCP server, installed into the same prefix so
+  //     sessions launch it as `<this app binary> <entry.js>` (Electron-as-Node)
+  //     instead of `npx @sapiom/mcp@latest`. On Windows the npx chain's cmd.exe
+  //     sat as a PERSISTENT blank console window (Claude Code spawns without
+  //     windowsHide); users closed it, killing the MCP server, after which
+  //     every sapiom-dev tool call hung. A GUI-subsystem launcher can never
+  //     have that window. Non-fatal: null falls back to the npx config —
+  //     exactly the previous behavior. See mcp-install.ts.
+  // console.log (not debug()): these land in main.log unconditionally — the
+  // one-line-per-boot breadcrumb that turns "sessions still use npx, why?"
+  // from a remote guessing game into a file read.
+  let sapiomDevMcpEntry: string | null = null;
+  try {
+    sapiomDevMcpEntry = await ensureSapiomMcp({
+      prefix: agentPrefixDir(),
+      smoke,
+      devMode,
+      install: installSapiomMcp,
+      onLine: (line) => console.log(`[boot] sapiom-mcp: ${line}`),
+    });
+    console.log(
+      sapiomDevMcpEntry
+        ? `[boot] sapiom-dev MCP: launching sessions via app binary + ${sapiomDevMcpEntry}`
+        : "[boot] sapiom-dev MCP: no local install — sessions use the npx launch",
+    );
+  } catch (err) {
+    console.log(`[boot] sapiom-mcp setup threw (ignored): ${err instanceof Error ? err.message : String(err)}`);
   }
 
   // 4. Machine id + first-run. "First run" means the user has never completed
@@ -382,6 +531,18 @@ export async function boot(setupWin: BrowserWindow, mode: BootMode): Promise<Boo
     // launchDir itself must stay put: it is the scan root, and moving it would
     // orphan the seeded sample from the rail.
     projectRoot: path.join(launchDir, "projects"),
+    // Console-free sapiom-dev MCP launch (see 3c above). ELECTRON_RUN_AS_NODE
+    // rides the MCP config's own env block, so it applies to exactly this
+    // child and never leaks into the session at large.
+    ...(sapiomDevMcpEntry
+      ? {
+          sapiomDevMcp: {
+            command: process.execPath,
+            args: [sapiomDevMcpEntry],
+            env: { ELECTRON_RUN_AS_NODE: "1" },
+          },
+        }
+      : {}),
     autoCreateSession: !firstRun,
     defaultHarnessKind: stubbedHarnesses ? "claude-code" : pickDefaultHarness(report),
     availableHarnesses: stubbedHarnesses ? [...stubbedHarnesses] : report.availableHarnesses,
@@ -390,7 +551,7 @@ export async function boot(setupWin: BrowserWindow, mode: BootMode): Promise<Boo
   });
 
   // 9. Load the SPA in the main window; close setup once it renders.
-  const url = `http://127.0.0.1:${server.port}/?token=${bootToken}`;
+  const url = withDeepLinkParams(`http://127.0.0.1:${server.port}/?token=${bootToken}`, mode.deepLink);
   const mainWindow = createMainWindow(url);
   mainWindow.webContents.once("did-finish-load", () => {
     if (!setupWin.isDestroyed()) setupWin.close();
@@ -398,4 +559,28 @@ export async function boot(setupWin: BrowserWindow, mode: BootMode): Promise<Boo
   progress(setupWin, { phase: "ready", message: "Ready.", status: "done" });
 
   return { server, mainWindow, url };
+}
+
+/**
+ * Thread a cold-start deep link's target onto the SPA load URL as query params.
+ * Query only — never a path segment: `isTrustedSender` (trusted-sender.ts) fails
+ * closed unless the top frame's pathname is exactly "/", so a path-based route
+ * here would break the update + folder-picker IPC. The SPA reads these back in
+ * `web/src/lib/deep-link.ts`.
+ */
+function withDeepLinkParams(loadUrl: string, target: DeepLinkTarget | undefined): string {
+  if (!target) return loadUrl;
+  try {
+    const u = new URL(loadUrl);
+    if (target.kind === "agent") {
+      u.searchParams.set("agent", target.definitionId);
+      if (target.slug) u.searchParams.set("agentSlug", target.slug);
+    } else {
+      u.searchParams.set("template", target.templateId);
+      if (target.slug) u.searchParams.set("templateSlug", target.slug);
+    }
+    return u.toString();
+  } catch {
+    return loadUrl;
+  }
 }

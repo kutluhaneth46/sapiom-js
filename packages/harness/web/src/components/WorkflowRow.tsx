@@ -2,6 +2,9 @@ import type { JSX } from "react";
 import type { WorkflowInfo } from "@shared/types";
 
 import { Icon } from "./Icon";
+import { displayAgentName } from "../lib/agent-name";
+import { workflowDeploymentState } from "../lib/workflow-deployment";
+import { trackingAttrs } from "../lib/analytics/tracking-attrs";
 
 /**
  * One agent (workflow) row — the hero of the rail, LEVEL 2 under a workspace
@@ -10,8 +13,9 @@ import { Icon } from "./Icon";
  * strip to that agent's sessions. Sessions are not a rail concern, so this row
  * carries no session dot, no expander, and no session sub-rows.
  *
- * Row anatomy: [zap glyph][agent name][deployed/draft cloud glyph]. The
- * focused agent is the single filled selection (is-focused).
+ * Row anatomy: [agent name][deployed/draft cloud glyph] — no leading glyph
+ * (indent alone carries the nesting under the workspace folder). The focused
+ * agent is the single filled selection (is-focused).
  */
 export function WorkflowRow({
   workflow,
@@ -23,11 +27,26 @@ export function WorkflowRow({
   isFocused: boolean;
   onFocus: (path: string) => void;
 }): JSX.Element {
-  const deployed = workflow.definitionId != null;
+  const deploymentState = workflowDeploymentState(workflow);
+  const deployed = deploymentState === "ready";
+  const statusTitle =
+    deploymentState === "ready"
+      ? "Deployed to Sapiom with a ready build."
+      : deploymentState === "building"
+        ? "Cloud build in progress."
+        : deploymentState === "failed"
+          ? "Cloud build failed."
+          : deploymentState === "linked"
+            ? "Linked to Sapiom; no ready build confirmed."
+            : "Draft. Not deployed to Sapiom yet.";
   return (
     <div
       className={"workflow-item" + (isFocused ? " is-focused" : "")}
       data-testid={`workflow-${workflow.name}`}
+      // `object: "agent"` is load-bearing for privacy, not just for breakdowns:
+      // before-send reads it to drop $el_text on this subtree, because an
+      // agent's label is a name its owner wrote. See USER_NAMED_OBJECTS.
+      {...trackingAttrs({ object: "agent" })}
     >
       <button
         className="tree-row workflow-item-trigger"
@@ -35,13 +54,15 @@ export function WorkflowRow({
         aria-pressed={isFocused}
         data-tooltip={isFocused ? "Focused agent" : "Focus this agent"}
       >
-        <Icon name="Zap" size={13} />
-        <span className="tree-row-label">{workflow.name}</span>
+        <span className="tree-row-label" title={workflow.name}>
+          {displayAgentName(workflow.name)}
+        </span>
         <span
           className="workflow-status"
           data-deployed={deployed}
+          data-deployment-state={deploymentState}
           data-testid={`workflow-status-${workflow.name}`}
-          title={deployed ? "Deployed to Sapiom" : "Draft. Not deployed to Sapiom yet."}
+          title={statusTitle}
         >
           <Icon name={deployed ? "Cloud" : "CloudOff"} size={13} />
         </span>

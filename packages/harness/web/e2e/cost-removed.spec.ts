@@ -38,6 +38,16 @@
  *
  * Runs against `vite dev` with VITE_MOCK=1 (playwright.config.ts) — no
  * harness server required.
+ *
+ * DELIBERATE EXEMPTION (2026-08): the rail FOOTER's plan card renders an
+ * account-level readout ("$12.40 / $50" — spend vs the org's spend-limit
+ * rule, served by GET /api/account/plan, the dashboard's own pair). That is
+ * an account-billing surface, not the per-run/per-step cost UI this suite
+ * guards against reintroducing. The scoped "$" walks above intentionally do
+ * not cover `.rail-footer`; the DOM-wide class/testid bans and the
+ * /spend|/transactions network sentinel still apply to it (the card uses
+ * `plan-*` names and its data rides /api/account/plan). See
+ * e2e/rail-footer-cards.spec.ts for that card's own coverage.
  */
 import { expect, test, type Page } from "@playwright/test";
 
@@ -209,17 +219,24 @@ test.describe("cost-removed guard", () => {
   });
 
   test("workflow macro strip has no cost affordances", async ({ page }) => {
-    const stepsBar = page.locator(".session-steps");
+    // The agent action cluster kept its testid ("session-steps") but its CSS
+    // class is now ".session-actions", so address it by testid.
+    const stepsBar = page.getByTestId("session-steps");
     await expect(stepsBar).toBeVisible();
     await assertNoDollarInChrome(stepsBar, "macro strip");
     await assertNoCostAffordance(stepsBar, "macro strip");
 
-    // The lifecycle chip label is "Deployed" or "Draft" — not a cost term
-    const chip = page.getByTestId("session-lifecycle-chip");
-    await expect(chip).toBeVisible();
-    await expect(chip).not.toContainText("wallet");
-    await expect(chip).not.toContainText("spend");
-    await expect(chip).not.toContainText("price");
+    // The lifecycle pill left the macro strip: a deployed agent's pill now lives
+    // once in the right-pane header as "workflow-dashboard-link", rendered on the
+    // Canvas tab. It reads lowercase "deployed" — a lifecycle word, never a cost
+    // term (and the focused agent, leasing, is deployed).
+    await page.getByTestId("right-tab-canvas").click();
+    const deployedPill = page.getByTestId("workflow-dashboard-link");
+    await expect(deployedPill).toBeVisible();
+    await expect(deployedPill).toContainText("deployed");
+    await expect(deployedPill).not.toContainText("wallet");
+    await expect(deployedPill).not.toContainText("spend");
+    await expect(deployedPill).not.toContainText("price");
   });
 
   // -------------------------------------------------------------------------
@@ -284,6 +301,8 @@ test.describe("cost-removed guard", () => {
   test("steps tab has no cost affordances (empty state)", async ({ page }) => {
     // Scratch session has no board — clean empty state on the Steps tab
     await page.getByTestId("workspace-focus-scratch").click();
+    // Focusing scratch (no canvas board) auto-collapses the right pane — reopen it first.
+    await page.getByTestId("right-expand").click();
     await page.getByTestId("right-tab-steps").click();
 
     const stepsEmpty = page.locator(".canvas-empty");
@@ -305,12 +324,13 @@ test.describe("cost-removed guard", () => {
     await assertNoDollarInChrome(stepsPanel, "steps tab with run");
     await assertNoCostAffordance(stepsPanel, "steps tab with run");
 
-    // Explicit: the step-run-note shows "prod run" (not a cost label)
-    const runNote = page.getByTestId("canvas-steps-run-note");
-    await expect(runNote).toContainText("run");
-    await expect(runNote).not.toContainText("$");
-    await expect(runNote).not.toContainText("wallet");
-    await expect(runNote).not.toContainText("spend");
+    // Explicit: the compact run header shows status + target, never cost.
+    const runHeader = page.locator(".run-workspace-header");
+    await expect(runHeader).toContainText("Completed");
+    await expect(runHeader).toContainText("Cloud");
+    await expect(runHeader).not.toContainText("$");
+    await expect(runHeader).not.toContainText("wallet");
+    await expect(runHeader).not.toContainText("spend");
   });
 
   // -------------------------------------------------------------------------
@@ -370,7 +390,16 @@ test.describe("cost-removed guard", () => {
     await assertNoDollarInChrome(historyMenu, "history menu");
     await assertNoCostAffordance(historyMenu, "history menu");
 
-    // Open a dead-session pane
+    // Past sessions moved into a flyout sub-card: it opens on hover (a click
+    // would hover-open then toggle it shut in the same gesture). Assert its
+    // chrome — the rows a dead session is reached through — carries no cost terms.
+    await page.getByTestId("past-sessions-trigger").hover();
+    const pastCard = page.getByTestId("past-sessions-card");
+    await expect(pastCard).toBeVisible();
+    await assertNoDollarInChrome(pastCard, "past sessions card");
+    await assertNoCostAffordance(pastCard, "past sessions card");
+
+    // Open a dead-session pane from the flyout
     await page.getByTestId("exited-session-sess-leasing").click();
     const deadPane = page.getByTestId("dead-session-pane");
     await expect(deadPane).toBeVisible();

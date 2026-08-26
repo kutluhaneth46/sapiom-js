@@ -4,10 +4,19 @@
  * Tokens come from the design system, resolved through the SAME seam the SPA
  * uses: `scripts/copy-renderer.mjs` probes for the private
  * `@sapiom/design-system` package and falls back to the harness's committed
- * `web/src/styles/ds-neutral` token set, then copies the resolved files in as
- * `ds-tokens.css` + `ds-agent-cloud.css`. So this window and the SPA read the
- * same token VALUES from the same source, and a public clone still renders
- * legibly. See `packages/harness/web/vite.config.ts` for the seam's rationale.
+ * `web/src/styles/ds-neutral` token set, then copies the resolved layer in as
+ * `ds-fonts.css` + `ds-tokens.css` + `themes/` (a directory) + `assets/fonts/`.
+ * `setup.html` links fonts → tokens → `themes/studio.css` → this file: the same
+ * three design-system files, in the same order, as the SPA's `styles.css`
+ * imports. So this window and the SPA read the same token VALUES from the same
+ * source, in the same brand, and a public clone still renders legibly. See
+ * `packages/harness/web/vite.config.ts` for the seam's rationale and
+ * `setup.html` for why agent-cloud.css is never linked separately.
+ *
+ * The Studio preset is scoped to `[data-product="sapiom-studio"]`, set on <html>
+ * in `setup.html`. It owns the deliberate overrides of shared names — `--radius`,
+ * `--type-label`, `--type-meta`, `--focus-ring`, `--brand*` — so this file must
+ * NOT restate them.
  *
  * The one rule this file inherits: **never redefine a design-system token.**
  * Everything below reads tokens via `var()` and declares no `--custom-property`
@@ -15,18 +24,21 @@
  * 2000-line app stylesheet, and it carries the app's own bridge from the
  * upstream `--bg-0/--text/--accent` var names onto these tokens), so it
  * addresses the system tokens directly: --bg/--s1/--ink/--ink-muted/--line for
- * surfaces and ink, --brand/--brand-hover/--brand-ink for the accent, --red for
- * the error state.
+ * surfaces and ink, --btn/--btn-ink for the primary button, --red for the error
+ * state.
  *
- * NOTE on `--brand` vs `--accent`: the design system's shadcn alias block
- * defines `--accent` as a hover WASH, not the product accent — the SPA remaps it
- * in its bridge. A window without that bridge must say `--brand` for the accent
- * or the wordmark renders as a near-invisible translucent fill.
+ * This window spends NO green. Studio chrome is neutral: the wordmark is the
+ * brand name in ink (--ink), the affirmative CTA is the design system's ink
+ * button (--btn/--btn-ink), and the consent checkbox is ink too. Green (--brand)
+ * is a semantic STATE — live/success/on — and this window has no such state, so
+ * it is not used here. (Do NOT reach for --accent as a stand-in: the shadcn alias
+ * block defines it as a hover WASH, not a product accent, so it renders as a
+ * near-invisible translucent fill without the SPA's bridge.)
  *
  * The button lives here rather than in a shared primitives layer: it is the only
  * control in the only window this package renders, so a shared file would be one
- * consumer wide. It mirrors the SPA's `.btn-primary` (solid accent fill, no
- * border, 3px focus ring).
+ * consumer wide. It mirrors the SPA's `.btn-primary` (solid ink fill --btn,
+ * hover to --ink-muted, neutral focus ring).
  */
 
 * {
@@ -40,37 +52,89 @@ body {
 body {
   font: var(--type-ui) / 1.45 var(--font);
   -webkit-font-smoothing: antialiased;
-  background: var(--bg);
+  /* The window itself is the card: paint the raised surface (--s1) edge to edge.
+     A frameless macOS window is rounded + shadowed by the OS, so this reads as a
+     single floating card; framed platforms get an --s1-filled window. */
+  background: var(--s1);
   color: var(--ink);
   display: grid;
   place-items: center;
   padding: var(--sp5);
+  /* Frameless window has no title bar to drag by, so the body is the drag
+     handle; interactive/selectable bits opt out below. */
+  -webkit-app-region: drag;
+}
+
+/* Form controls do NOT inherit the document font — Chromium's UA sheet pins them
+   to Arial 13.333px, so without this the CTA and the checkbox render in Arial
+   while the card around them is Geist. The SPA resets this globally
+   (styles.css's `button`/`input` rules); this window needs the same reset or
+   loading the faces above buys nothing for the one control it has. `inherit`
+   redefines no token — it reads whatever `body` resolved. */
+button,
+input {
+  font: inherit;
+  color: inherit;
+}
+
+/* Frameless window: the body is the drag handle, so opt interactive and
+   selectable elements back out or they can't be clicked / their text copied. */
+.btn-primary,
+.consent-row,
+input,
+.error-message {
+  -webkit-app-region: no-drag;
 }
 
 .card {
+  /* Just the centered content column now — the window itself is the card surface
+     (see body), so this carries no background/border/shadow of its own. */
   width: 100%;
   max-width: 420px;
-  padding: 36px var(--sp6);
+  padding: 40px var(--sp6);
   text-align: center;
-  background: var(--s1);
-  border: 1px solid var(--line);
-  /* Literal, not a token override: the app pins ONE 0.5rem radius for every
-     surface (its documented deviation from the system's r-sm/r/r-lg/r-xl
-     scale — see styles.css). Matching that literally keeps the first screen a
-     user sees consistent with the app, without redeclaring `--radius` here. */
-  border-radius: 0.5rem;
-  box-shadow: var(--shadow);
 }
 
-.brand {
-  font-weight: 600;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  color: var(--brand);
+/* The brand lockup — the Sapiom wordmark + the product name "agent.studio",
+   mirroring the SPA's .brand-header so the app names itself the same way in the
+   onboarding window it does in the shell it launches into. Addresses the system
+   tokens directly (--ink/--ink-muted/--mono/--type-meta) since this window can't
+   load the SPA's bridge. */
+.brand-lockup {
+  display: flex;
+  align-items: baseline;
+  justify-content: center;
+  gap: var(--sp2);
+  margin: 0 0 12px;
+}
+
+/* The wordmark IS the name, so it is neutral ink, never green (green is scarce —
+   state/live/entry only). A replaced element has no baseline of its own, so drop
+   it onto the product name's text baseline by the descender the asset publishes
+   (the inline --brand-logotype-descender on the element). Width follows the
+   89×24 aspect from the viewBox. */
+.brand-logotype {
+  display: block;
+  height: 22px;
+  width: auto;
+  color: var(--ink);
+  transform: translateY(var(--brand-logotype-descender, 0));
+}
+
+/* Lowercase mono product name, matching the SPA's brand header and the terminal
+   masthead voice. */
+.brand-product {
+  font-family: var(--mono);
   font-size: var(--type-meta);
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  color: var(--ink-muted);
 }
 
 h1 {
+  /* Off-ladder on purpose: Studio steps 16px (--type-h2) → 22px (--type-title),
+     and this is the hero line of a 420px card, not an app pane. Either token is a
+     visible re-scale of the most prominent element in the window. */
   font-size: 19px;
   font-weight: 600;
   letter-spacing: -0.01em;
@@ -80,6 +144,11 @@ h1 {
 h1[data-status="error"] {
   color: var(--red);
 }
+/* Some phases carry no heading (consent — the checkbox IS the question), so the
+   status line is empty; collapse it rather than leave a gap. */
+h1:empty {
+  display: none;
+}
 
 .detail {
   color: var(--ink-muted);
@@ -87,6 +156,11 @@ h1[data-status="error"] {
   margin: 0;
   white-space: pre-wrap;
   font-size: var(--type-ui);
+}
+/* When a phase has no extra detail, don't reserve a blank line — collapse it so
+   the status sits directly above the consent/error content. */
+.detail:empty {
+  min-height: 0;
 }
 
 .consent {
@@ -102,7 +176,9 @@ h1[data-status="error"] {
 }
 .consent-row input[type="checkbox"] {
   margin-top: 1px;
-  accent-color: var(--brand);
+  /* Neutral ink, not green: Studio chrome is neutral, and green is reserved for
+     semantic state. Matches the ink CTA above. */
+  accent-color: var(--ink);
   width: 15px;
   height: 15px;
   flex-shrink: 0;
@@ -110,7 +186,10 @@ h1[data-status="error"] {
 
 .error {
   margin-top: 22px;
-  text-align: left;
+  /* Centered to sit under the centered status/wordmark; text-align inherits into
+     the <pre> message and centers its (short, wrapped) lines, and the Retry
+     button already centers via margin auto. */
+  text-align: center;
 }
 .error-message {
   color: var(--red);
@@ -121,33 +200,92 @@ h1[data-status="error"] {
   margin: 0;
 }
 
-/* Mirrors the SPA's .btn-primary: solid accent fill, no visible border. */
+/* The affirmative CTA — the design system's neutral INK button (--btn/--btn-ink),
+   never green (green is a semantic STATE, not the primary action). Given the
+   modern "physical key" treatment the rest of the product uses: a crisp Geist
+   label, a fine top inset highlight and a soft layered shadow that lifts on
+   hover, presses on click.
+   COLLISION-PROOF LABEL: the fill and text fall back to --ink / --s1 — the two
+   tokens the card already proves resolve (it paints with them) — so if a token
+   layer ever ships --btn without --btn-ink, the label degrades to --s1 on --ink
+   (a real contrast pair) instead of inheriting --ink onto an --ink fill and
+   vanishing, which is the bug this replaces. */
 .btn-primary {
-  background: var(--brand);
-  border: 1px solid transparent;
-  color: var(--brand-ink);
-  font-weight: 500;
-  border-radius: 0.5rem;
-  transition: background-color var(--fast) var(--ease);
+  appearance: none;
+  -webkit-appearance: none;
+  background: var(--btn, var(--ink));
+  color: var(--btn-ink, var(--s1));
+  border: none;
+  border-radius: 10px;
+  font-family: var(--font);
+  font-weight: 550;
+  font-size: 13.5px;
+  letter-spacing: -0.006em;
+  cursor: pointer;
+  /* Drop shadows stay BLACK on both themes — an --ink-tinted shadow turns into a
+     white glow in dark mode. On dark the white fill carries the elevation; the
+     shadow only grounds it. */
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, #fff 20%, transparent),
+    0 1px 2px rgba(0, 0, 0, 0.22),
+    0 4px 12px -3px rgba(0, 0, 0, 0.3);
+  transition:
+    transform var(--fast) var(--ease),
+    box-shadow var(--fast) var(--ease);
 }
 .btn-primary:hover:not(:disabled) {
-  background: var(--brand-hover);
+  transform: translateY(-1px);
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, #fff 24%, transparent),
+    0 2px 4px rgba(0, 0, 0, 0.24),
+    0 10px 22px -6px rgba(0, 0, 0, 0.36);
+}
+.btn-primary:active:not(:disabled) {
+  transform: translateY(0);
+  box-shadow:
+    inset 0 1px 2px rgba(0, 0, 0, 0.16),
+    0 1px 2px rgba(0, 0, 0, 0.18);
 }
 .btn-primary:focus-visible {
   outline: none;
-  box-shadow: 0 0 0 3px var(--focus-ring);
+  box-shadow:
+    0 0 0 3px var(--focus-ring),
+    0 4px 12px -3px rgba(0, 0, 0, 0.3);
 }
 .btn-primary:disabled {
   opacity: 0.5;
   cursor: not-allowed;
 }
 
-/* Centers the CTA and matches the SPA welcome panel's CTA sizing. */
+/* The lift is the only motion; honor a reduced-motion preference. */
+@media (prefers-reduced-motion: reduce) {
+  .btn-primary {
+    transition: none;
+  }
+  .btn-primary:hover:not(:disabled),
+  .btn-primary:active:not(:disabled) {
+    transform: none;
+  }
+}
+
+/* Forced-colors / high-contrast (and some force-dark modes): hand the button to
+   the system palette so the label can never collide with the fill and vanish. */
+@media (forced-colors: active) {
+  .btn-primary {
+    background: ButtonFace;
+    color: ButtonText;
+    border: 1px solid ButtonText;
+    box-shadow: none;
+  }
+}
+
+/* Centered under the content, with real presence (min-width + generous padding)
+   instead of the old off-ladder pill. */
 .consent .btn-primary,
 .error .btn-primary {
   display: block;
   width: fit-content;
-  margin: 18px auto 0;
-  padding: var(--sp2) 14px;
-  font-size: 12.5px;
+  min-width: 132px;
+  margin: 22px auto 0;
+  padding: 11px 24px;
 }

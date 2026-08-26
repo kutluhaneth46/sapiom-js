@@ -7,7 +7,15 @@ import {
   terminate,
   type AgentExecutionContext,
 } from "@sapiom/agent";
-import { VIDEO_RESULT_SIGNAL, type VideoResultPayload } from "@sapiom/tools";
+import {
+  EmailHttpError,
+  VIDEO_RESULT_SIGNAL,
+  IMAGE_RESULT_SIGNAL,
+  fileStorage,
+  type AspectRatio,
+  type VideoResultPayload,
+  type ImageResultPayload,
+} from "@sapiom/tools";
 import postgres from "postgres";
 import { z } from "zod/v4";
 
@@ -20,31 +28,33 @@ import { z } from "zod/v4";
  * asset — an image (`contentGeneration.images`) or a short clip
  * (`contentGeneration.video`) — persists it, and emails the recipient a link.
  *
- * The graph forks on the chosen medium:
+ * The graph forks on the chosen medium — both are async launch/collect loops:
  *
- *   fetch ─▶ renderImages ─────────────────▶ deliver
- *   (db)  └▶ renderClip ⇄ collectClip ──────▶ deliver
- *            (video.launch)   (drain)          (email)
+ *   fetch ─▶ renderImage ⇄ collectImage ────▶ deliver
+ *   (db)  └▶ renderClip  ⇄ collectClip  ────▶ deliver
+ *            (images/video.launch) (drain)     (email)
  *
  *   1. fetch — read up to `limit` recipient rows from a Postgres table
  *      (`ctx.sapiom.database`), creating and seeding it on first run so the
  *      template works out of the box. `dryRun` stops here and returns the rows
  *      plus the prompt each would get, with nothing generated or sent.
- *   2a. renderImages (image medium) — fan out one personalized image per row,
- *       all at once (sync), each persisted for a durable `fileId`.
- *   2b. renderClip ⇄ collectClip (video medium) — one row at a time, launch an
- *       async text-to-video job and `pauseUntilSignal` on it; the FAL webhook
- *       resumes `collectClip`, which records the clip and loops back for the
- *       next row or advances once every row is done.
+ *   2a. renderImage ⇄ collectImage (image medium) — one row at a time, launch an
+ *       async image job and `pauseUntilSignal` on it; the completion webhook
+ *       resumes `collectImage`, which records the image and loops back for the next row
+ *       or advances once every row is done.
+ *   2b. renderClip ⇄ collectClip (video medium) — same shape with `video.launch`.
  *   3. deliver — email each recipient a link to their own asset.
  *
- * Why sequential clips rather than launching every video at once: a paused step
- * waits on a single `(signal, correlationId)` pair, so launching shot i only
- * after shot i-1 has resumed keeps a paused step always waiting before its job
- * can complete (the `scene-to-video` lesson).
+ * Why sequential rather than launching every job at once: a paused step waits on a
+ * single `(signal, correlationId)` pair, so launching row i only after row i-1 has
+ * resumed keeps a paused step always waiting before its job can complete (the
+ * `scene-to-video` lesson). This is also why images moved OFF the old sync
+ * `Promise.all` fan-out: the routed sync `images.create` holds the request open for
+ * the full generate+store, and a concurrent fan-out drove every request past Core's
+ * 30s router cap → 503s. `images.launch` enqueues and returns immediately, so the
+ * 30s wall no longer applies.
  *
- * Images are the cheaper default. Video is async and pricier — keep `limit`
- * small while you try it.
+ * Images are the cheaper default. Video is pricier — keep `limit` small while you try it.
  */
 
 // ─────────────────────────────────────────────────────────────── config ──
@@ -60,8 +70,6 @@ const MAX_LIMIT = 25;
 const DEFAULT_SCHEDULE = "0 9 * * *";
 /** Default async text-to-video model alias (resolved server-side). */
 const DEFAULT_VIDEO_MODEL = "veo3-fast";
-/** Username for the inbox we send from (created once, then reused). */
-const SENDER_USERNAME = "personalized-media";
 
 // ─────────────────────────────────────────────────────────────── shapes ──
 type Medium = "image" | "video";
@@ -70,7 +78,7 @@ type Medium = "image" | "video";
 interface EntryInput {
   /** Database handle holding the recipient table. */
   dbHandle?: string;
-  /** "image" (default, sync, cheaper) or "video" (async, pricier). */
+  /** "image" (default, cheaper) or "video" (pricier). Both render async per row. */
   medium?: Medium;
   /** Cron cadence this batch is meant to run on (e.g. "0 9 * * *"). */
   schedule?: string;
@@ -79,8 +87,8 @@ interface EntryInput {
   /** A creative direction folded into every prompt (e.g. "warm, editorial"). */
   style?: string;
   /** Aspect ratio for generated video (default "16:9"); images use the model default. */
-  aspectRatio?: string;
-  /** Video model alias or raw id, passed through to `video.launch`. */
+  aspectRatio?: AspectRatio;
+  /** Video model — a Sapiom semantic alias (e.g. "veo3-fast"); neutral params like `aspectRatio` require a cataloged model. */
   videoModel?: string;
   /** Plan only — read the rows and prompts, generate and send nothing. */
   dryRun?: boolean;
@@ -110,12 +118,12 @@ interface Shared extends Record<string, unknown> {
   medium: Medium;
   schedule: string;
   style: string;
-  aspectRatio: string;
+  aspectRatio: AspectRatio;
   videoModel: string;
   rows: Recipient[];
   assets: Asset[];
-  /** Index of the next row to animate; advanced by `collectClip`. */
-  clipIndex: number;
+  /** Index of the next row to render; advanced by `collectImage` / `collectClip`. */
+  mediaIndex: number;
   /** One plain sentence about whose rows these are and whether we provisioned them. */
   note?: string;
 }
@@ -133,10 +141,41 @@ function must<T>(v: T | undefined, name: string): T {
   return v;
 }
 
+/** Escape the small set of characters that would break out of HTML text. */
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+/**
+ * Minimal HTML email body so the personalized asset actually shows in the inbox
+ * (the SAP-2781 lesson: a bare URL in a plain-text body renders as a link at
+ * best). An image embeds inline; a clip stays a link — inline `<video>` is
+ * stripped by most mail clients. The plain-text body remains as the fallback.
+ */
+function renderAssetHtml(asset: Asset): string {
+  const media = !asset.downloadUrl
+    ? `<em>(asset link unavailable)</em>`
+    : asset.medium === "image"
+      ? `<img src="${escapeHtml(asset.downloadUrl)}" alt="A personalized image for ${escapeHtml(asset.name)}" style="max-width:100%;border-radius:8px;" />`
+      : `<a href="${escapeHtml(asset.downloadUrl)}">Watch your personalized clip</a>`;
+  return (
+    `<div style="font-family:system-ui,sans-serif;max-width:640px;margin:0 auto;">` +
+    `<p>Hi ${escapeHtml(asset.name)},</p>` +
+    `<p>We put together a personalized ${escapeHtml(asset.medium)} just for you:</p>` +
+    media +
+    `<p>— The team</p>` +
+    `</div>`
+  );
+}
+
 /**
  * Build the personalized generation prompt for a row. Deterministic on purpose —
  * this template generates media, not copy, so no LLM is in the loop. Swap in
- * `ctx.sapiom.models.run` here if you want the prompt itself written per row.
+ * `ctx.sapiom.llm.run` here if you want the prompt itself written per row.
  */
 function buildPrompt(row: Recipient, medium: Medium, style: string): string {
   const look = style.trim() || "clean, modern, brand-friendly";
@@ -250,15 +289,32 @@ function isReservedAddress(email: string): boolean {
   );
 }
 
-/** Reuse an existing inbox to send from, else provision one. */
+/**
+ * Reuse an existing inbox to send from, else provision one.
+ *
+ * We deliberately omit `username`. AgentMail addresses are globally unique, so a
+ * fixed local part can only ever be owned by ONE account across the whole
+ * platform — every other tenant's `create` 409s with "Email address is already
+ * taken", which fails the step. Omitting it lets AgentMail auto-generate a
+ * globally-unique address, so a fresh tenant's first run succeeds and two
+ * tenants never collide. `create` still isn't atomic against the `list`, so a
+ * 409 is treated as "someone already provisioned one" — re-list and reuse.
+ */
 async function resolveSenderInbox(ctx: Ctx): Promise<string> {
   const existing = await ctx.sapiom.email.inboxes.list({ limit: 1 });
   if (existing.inboxes.length > 0) return existing.inboxes[0].inboxId;
-  const inbox = await ctx.sapiom.email.inboxes.create({
-    username: SENDER_USERNAME,
-    displayName: "Personalized Media",
-  });
-  return inbox.inboxId;
+  try {
+    const inbox = await ctx.sapiom.email.inboxes.create({
+      displayName: "Personalized Media",
+    });
+    return inbox.inboxId;
+  } catch (err) {
+    if (err instanceof EmailHttpError && err.status === 409) {
+      const retry = await ctx.sapiom.email.inboxes.list({ limit: 1 });
+      if (retry.inboxes.length > 0) return retry.inboxes[0].inboxId;
+    }
+    throw err;
+  }
 }
 
 // ─────────────────────────────────────────────────────────────── steps ──
@@ -292,15 +348,17 @@ const entryInput = z.object({
       'A creative direction folded into every prompt (e.g. "warm, editorial").',
     ),
   aspectRatio: z
-    .string()
+    .enum(["1:1", "16:9", "9:16", "4:3", "3:4"])
     .default("16:9")
     .describe(
-      "Aspect ratio for generated video; images use the model default.",
+      "Neutral aspect ratio for generated video; images use the model default.",
     ),
   videoModel: z
     .string()
     .optional()
-    .describe("Video model alias or raw id, passed through to video.launch."),
+    .describe(
+      'Video model — a semantic alias (e.g. "veo3-fast"). Neutral params like aspectRatio are validated against the resolved model, so a cataloged alias is required.',
+    ),
   dryRun: z
     .boolean()
     .optional()
@@ -312,7 +370,7 @@ const entryInput = z.object({
 const fetch = defineStep({
   name: "fetch",
   inputSchema: entryInput,
-  next: ["renderImages", "renderClip"],
+  next: ["renderImage", "renderClip"],
   terminal: true,
   async run(input: EntryInput, ctx: Ctx) {
     const dbHandle = resolveResourceHandle(input, {
@@ -321,7 +379,7 @@ const fetch = defineStep({
     const medium: Medium = input.medium === "video" ? "video" : "image";
     const dryRun = input.dryRun === true;
     const style = input.style?.trim() ?? "";
-    const aspectRatio = input.aspectRatio?.trim() || "16:9";
+    const aspectRatio: AspectRatio = input.aspectRatio ?? "16:9";
     const videoModel = input.videoModel?.trim() || DEFAULT_VIDEO_MODEL;
     const limit = clampLimit(input.limit);
 
@@ -332,7 +390,7 @@ const fetch = defineStep({
     ctx.shared.set("aspectRatio", aspectRatio);
     ctx.shared.set("videoModel", videoModel);
     ctx.shared.set("assets", []);
-    ctx.shared.set("clipIndex", 0);
+    ctx.shared.set("mediaIndex", 0);
 
     // Read the recipient rows (free — runs on a dry run too). Under stubbed
     // capabilities in run_local there's no connection string, so `rows` stays
@@ -408,44 +466,69 @@ const fetch = defineStep({
           .join(" "),
       });
     }
-    return goto(medium === "video" ? "renderClip" : "renderImages", {});
+    return goto(medium === "video" ? "renderClip" : "renderImage", {});
   },
 });
 
-const renderImages = defineStep({
-  name: "renderImages",
-  next: ["deliver"],
+const renderImage = defineStep({
+  name: "renderImage",
+  next: [],
+  // Async pause/resume, same as the video path: `images.launch` submits and returns a
+  // handle immediately (the submit is a quick enqueue, so it never meets Core's 30s
+  // router cap — the 503 the old sync `Promise.all` fan-out hit). The completion
+  // webhook fires IMAGE_RESULT_SIGNAL, resuming `collectImage` with the image's result.
+  pause: { signal: IMAGE_RESULT_SIGNAL, resumeStep: "collectImage" },
   async run(_input: unknown, ctx: Ctx) {
     const rows = must(ctx.shared.get("rows"), "rows");
     const style = ctx.shared.get("style") ?? "";
-    ctx.logger.info("generating images", { rows: rows.length });
+    const index = must(ctx.shared.get("mediaIndex"), "mediaIndex");
+    const row = rows[index];
 
-    // Fan-out: one personalized image per row, generated concurrently. `storage`
-    // persists each output so we get a durable `fileId` + a ready-to-use link.
-    const generated = await Promise.all(
-      rows.map((row) =>
-        ctx.sapiom.contentGeneration.images.create({
-          prompt: buildPrompt(row, "image", style),
-          numImages: 1,
-          storage: { visibility: "private" },
-        }),
-      ),
-    );
-    const assets: Asset[] = generated.map((result, i) => {
-      const row = rows[i];
-      const img = result.images?.[0];
-      return {
-        recipientId: row.id,
-        name: row.name,
-        email: row.email,
-        medium: "image",
-        fileId: img?.fileId ?? null,
-        downloadUrl: img?.downloadUrl ?? img?.url ?? null,
-      };
+    ctx.logger.info("rendering image", { index: index + 1, of: rows.length });
+    const handle = await ctx.sapiom.contentGeneration.images.launch({
+      prompt: buildPrompt(row, "image", style),
+      count: 1,
+      // Public: the render is emailed as a durable permalink below, not
+      // fetched in-process, so it needs to outlive a presigned URL's ~15min TTL.
+      storage: { visibility: "public" },
     });
-    ctx.shared.set("assets", assets);
-    ctx.logger.info("images ready", { count: assets.length });
-    return goto("deliver", { assets });
+    return await pauseUntilSignal(handle, { resumeStep: "collectImage" });
+  },
+});
+
+const collectImage = defineStep({
+  name: "collectImage",
+  next: ["renderImage", "deliver"],
+  async run(result: ImageResultPayload, ctx: Ctx) {
+    const rows = must(ctx.shared.get("rows"), "rows");
+    const assets = must(ctx.shared.get("assets"), "assets");
+    const index = must(ctx.shared.get("mediaIndex"), "mediaIndex");
+    const row = rows[index];
+
+    const out = result.outputs?.[0];
+    const asset: Asset = {
+      recipientId: row.id,
+      name: row.name,
+      email: row.email,
+      medium: "image",
+      fileId: out?.fileId ?? null,
+      downloadUrl: out?.fileId
+        ? fileStorage.getPublicUrl(out.fileId)
+        : (out?.downloadUrl ?? null),
+    };
+    const nextAssets = [...assets, asset];
+    const nextIndex = index + 1;
+    ctx.shared.set("assets", nextAssets);
+    ctx.shared.set("mediaIndex", nextIndex);
+    ctx.logger.info("collected image", {
+      collected: nextAssets.length,
+      of: rows.length,
+    });
+
+    // More rows to render? Loop back. Otherwise every image is in — deliver them.
+    return nextIndex < rows.length
+      ? goto("renderImage", {})
+      : goto("deliver", { assets: nextAssets });
   },
 });
 
@@ -453,22 +536,24 @@ const renderClip = defineStep({
   name: "renderClip",
   next: [],
   // Async pause/resume: the launched video job fires VIDEO_RESULT_SIGNAL on
-  // completion (the FAL webhook), resuming `collectClip` with the clip's result.
+  // completion (the routed webhook), resuming `collectClip` with the clip's result.
   pause: { signal: VIDEO_RESULT_SIGNAL, resumeStep: "collectClip" },
   async run(_input: unknown, ctx: Ctx) {
     const rows = must(ctx.shared.get("rows"), "rows");
     const style = ctx.shared.get("style") ?? "";
-    const index = must(ctx.shared.get("clipIndex"), "clipIndex");
+    const index = must(ctx.shared.get("mediaIndex"), "mediaIndex");
     const row = rows[index];
 
     ctx.logger.info("rendering clip", { index: index + 1, of: rows.length });
     const handle = await ctx.sapiom.contentGeneration.video.launch({
       model: must(ctx.shared.get("videoModel"), "videoModel"),
       prompt: buildPrompt(row, "video", style),
-      params: {
-        aspect_ratio: must(ctx.shared.get("aspectRatio"), "aspectRatio"),
-      },
-      storage: { visibility: "private" },
+      // Neutral param (E4): the router validates it against the resolved model and maps it to
+      // the provider's aspect-ratio key — no per-model param name in caller code.
+      aspectRatio: must(ctx.shared.get("aspectRatio"), "aspectRatio"),
+      // Public: the clip is emailed as a durable permalink below, not
+      // fetched in-process, so it needs to outlive a presigned URL's ~15min TTL.
+      storage: { visibility: "public" },
     });
     return await pauseUntilSignal(handle, { resumeStep: "collectClip" });
   },
@@ -480,7 +565,7 @@ const collectClip = defineStep({
   async run(result: VideoResultPayload, ctx: Ctx) {
     const rows = must(ctx.shared.get("rows"), "rows");
     const assets = must(ctx.shared.get("assets"), "assets");
-    const index = must(ctx.shared.get("clipIndex"), "clipIndex");
+    const index = must(ctx.shared.get("mediaIndex"), "mediaIndex");
     const row = rows[index];
 
     const out = result.outputs?.[0];
@@ -490,12 +575,14 @@ const collectClip = defineStep({
       email: row.email,
       medium: "video",
       fileId: out?.fileId ?? null,
-      downloadUrl: out?.downloadUrl ?? null,
+      downloadUrl: out?.fileId
+        ? fileStorage.getPublicUrl(out.fileId)
+        : (out?.downloadUrl ?? null),
     };
     const nextAssets = [...assets, asset];
     const nextIndex = index + 1;
     ctx.shared.set("assets", nextAssets);
-    ctx.shared.set("clipIndex", nextIndex);
+    ctx.shared.set("mediaIndex", nextIndex);
     ctx.logger.info("collected clip", {
       collected: nextAssets.length,
       of: rows.length,
@@ -573,6 +660,9 @@ const deliver = defineStep({
           to: asset.email,
           subject,
           text,
+          // HTML body so an image renders inline in the inbox; `text` stays as
+          // the plain-text fallback.
+          html: renderAssetHtml(asset),
         });
         results.push({
           recipientId: asset.recipientId,
@@ -616,5 +706,5 @@ const deliver = defineStep({
 export const agent = defineAgent<EntryInput, Shared>({
   name: "personalized-media-at-scale",
   entry: "fetch",
-  steps: { fetch, renderImages, renderClip, collectClip, deliver },
+  steps: { fetch, renderImage, collectImage, renderClip, collectClip, deliver },
 });

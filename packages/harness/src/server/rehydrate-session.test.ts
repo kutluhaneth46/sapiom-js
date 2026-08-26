@@ -85,6 +85,11 @@ describe("portable continue — rehydrating a fresh session", () => {
   /** Seed events.ndjson with a prior session the harness recorded itself —
    *  the whole point being that no vendor transcript exists for it. */
   async function seedPriorSession(harness: HarnessKind): Promise<void> {
+    // Keep the fixture safely inside the 30-day events.ndjson retention
+    // window. A fixed timestamp eventually makes the boot-time sweep race
+    // rehydration: direct manager calls can read the event first while the
+    // HTTP request reaches the server after the sweep has removed it.
+    const startedAt = Date.now() - 10 * 60_000;
     const base = {
       seq: 1,
       userId: null,
@@ -95,7 +100,7 @@ describe("portable continue — rehydrating a fresh session", () => {
       harness,
     };
     const at = (minutes: number): string =>
-      `2026-07-27T10:${String(minutes).padStart(2, "0")}:00.000Z`;
+      new Date(startedAt + minutes * 60_000).toISOString();
     const event = (
       n: number,
       type: AnalyticsEventType,
@@ -164,6 +169,10 @@ describe("portable continue — rehydrating a fresh session", () => {
         // The harness's own profile is still there — the brief is appended to
         // it, never a replacement for it.
         expect(prompt).toContain(DEFAULT_SYSTEM_PROMPT.slice(0, 60));
+        expect(prompt).toContain('"boundAgent"');
+        expect(prompt).toContain('"agents"');
+        expect(prompt).not.toContain('"boundWorkflow"');
+        expect(prompt).not.toContain('"workflows"');
         // …and it is labelled as a reconstruction before anything else.
         expect(prompt).toContain("reconstruction, not restored context");
         // What the session was doing.

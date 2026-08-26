@@ -56,6 +56,12 @@ touching this package, and how to tell whether a change actually works on the OS
 - **Paths contain spaces** (`C:\Program Files`, `/Users/x/My Drive`): prefer argv arrays over shell
   strings, and don't hand-quote.
 - Use `os.homedir()` / `app.getPath("userData")`, never a literal `~` or `%USERPROFILE%`.
+- **Every `child_process` call needs `windowsHide: true`.** The app is a GUI-subsystem process with
+  no console, so any console-subsystem child (`git`, `where`, npm, a `.cmd` chain) otherwise
+  ALLOCATES A VISIBLE CONSOLE WINDOW on the user's screen — and closing that window kills the
+  child's whole tree (this killed live MCP servers mid-session). Node's default is `false`; the
+  flag is a no-op on POSIX. Applies equally to `@sapiom/harness`, `@sapiom/agent-core` and
+  `@sapiom/mcp` code, all of which run inside this console-less process or its children.
 - **A test harness is part of the system under test.** `smoke.sh` exported `HOME`/`USERPROFILE`/
   `APPDATA` from `mktemp -d`, which under git-bash is a POSIX path (`/tmp/…`) with no drive letter.
   Electron uses `APPDATA` to compute `userData`, so it died creating those directories *before logging
@@ -225,9 +231,11 @@ the network.
 
 There are two ways an update reaches the user, and they are not interchangeable:
 
-- **Scheduled** (30 s after boot, then every 4 h) → silent, and only ever surfaces the native
-  "restart to install" dialog. That dialog stays native because it fires whenever a background
-  download finishes and must work regardless of what the window is showing.
+- **Scheduled** (30 s after boot, then every 4 h) → silent, and only ever surfaces the
+  main-process-owned update window (`update-window.ts`, our bundled `update.html` — never remote or
+  agent content). It stays main-process-owned because it fires whenever a background download
+  finishes and must work regardless of what the main window is showing; its "Restart / Later / Skip
+  this version" answers ride two IPC channels sender-gated to that exact window.
 - **On demand** → the profile menu's "Check for updates" item, via
   `window.sapiomDesktop.checkForUpdates()`. Note WHICH menu: the rail's profile drawer has a
   Disconnect button and so does the Settings popover one level deeper — the item belongs in the
@@ -235,6 +243,15 @@ There are two ways an update reaches the user, and they are not interchangeable:
   differs in three ways that each matter: it *reports* an outcome (a button that appears to do
   nothing is broken), it clears the per-run "Later" set (asking is undeclining), and it answers
   `downloaded` for an update already on disk instead of the true-but-useless "up to date".
+
+A third surface rides the second: the rail's **"Update now" card** (`UpdateCard` in the SPA).
+`updater.ts` pushes `UPDATE_STATE` (receive-only, `onUpdateState` on the bridge) when a download
+finishes, when a failed apply clears `pending`, and on every `did-finish-load` — the card mirrors
+`pending` and survives a page reload because of that re-send. Its click is just
+`checkForUpdates()`: the pending branch re-raises the update window, so the card adds **no**
+install channel and the no-apply-channel rule below is untouched. A version the user chose "Skip
+this version" for never raises the card (and clears a staged auto-install), and choosing skip
+retracts an already-shown card — the card mirrors `pending`, and skip empties it.
 
 The main window carries a preload (`src/preload/desktop.mts`) — it did not before. Watch out for:
 
@@ -250,16 +267,22 @@ The main window carries a preload (`src/preload/desktop.mts`) — it did not bef
   agent prints. That made an agent-printed URL one click from a window holding `restartToUpdate()`,
   i.e. an agent could kill every live session. Local pop-outs go through `createPreviewWindow`
   (no preload, `sandbox: true`), which is explicit rather than dependent on override-merge semantics.
-- **There is no "apply the update" channel, and there must not be.** A restart ends every running
-  agent session, and page code shares an origin with agent-authored files. The confirmation is a
-  native dialog only; an on-demand check with something already downloaded re-raises it. The
-  `desktop-bridge` smoke check asserts the bridge exposes NOTHING beyond `appVersion` and
-  `checkForUpdates`, so a future addition has to be deliberate.
-- **Validate the IPC sender.** `isTrustedSender` requires the main window's `webContents` *and* a top
-  frame at `/`, because the main window could itself navigate to agent content on the same origin. It
-  reads the window from `host` (set every launch) and not from `active` (set only when updates are
-  on) — deriving it from `active` made a disabled build reject every sender and report
-  "not available here" instead of the real reason.
+- **There is no "apply the update" channel reachable from the main window, and there must not
+  be.** A restart ends every running agent session, and page code shares an origin with
+  agent-authored files. The confirmation lives in the separate update window (whose own two
+  channels are gated on the sender being exactly that window's `webContents`); an on-demand check
+  with something already downloaded re-raises it. The
+  `desktop-bridge` smoke check asserts the bridge exposes NOTHING beyond `appVersion`,
+  `checkForUpdates`, `chooseDirectory` (the read-only native folder picker behind the SPA's
+  Browse button — it returns only a path and opens no file), and the two receive-only
+  subscriptions `onDeepLink` / `onUpdateState` (main → renderer pushes; nothing to invoke), so a
+  future addition has to be deliberate.
+- **Validate the IPC sender.** `isTrustedSender` (`trusted-sender.ts`, shared by the updater and the
+  folder-picker channels) requires the main window's `webContents` *and* a top frame at `/`, because
+  the main window could itself navigate to agent content on the same origin. It reads the window set
+  once at boot by `index.ts` via `setTrustedWindow`, so it works even in a build with updates disabled
+  — deriving it from the updater's `active` state once made a disabled build reject every sender and
+  report "not available here" instead of the real reason.
 - **The app version reaches the preload via `webPreferences.additionalArguments`**, not `process.env`.
   Setting env in main and reading it in a renderer depends on inheriting a variable mutated after
   startup. The `desktop-bridge` smoke check fails on an empty `appVersion` precisely so this stays
@@ -276,7 +299,7 @@ The main window carries a preload (`src/preload/desktop.mts`) — it did not bef
 
 ## What the app installs for the user
 
-Three shims (`runtime-shims.ts`, PATH-prepended) plus two npm installs into
+Three shims (`runtime-shims.ts`, PATH-prepended) plus three npm installs into
 `userData/npm-global` (`agent-install.ts`, on PATH via `agentBinDir()`):
 
 | Provided | Why |
@@ -284,6 +307,8 @@ Three shims (`runtime-shims.ts`, PATH-prepended) plus two npm installs into
 | `node`, `npm`, **`npx`** shims | Electron bundles Node but not npm, and the machine may have neither |
 | Claude Code (if no agent on PATH) | the app is useless without an agent |
 | `@sapiom/cli` (if `sapiom` not on PATH) | macros and templates hand the agent `sapiom agents …` |
+| `@sapiom/mcp` (the sapiom-dev server) | so sessions launch it as `<app binary> <entry.js>` (Electron-as-Node) instead of `npx`. A GUI-subsystem launcher can allocate no console — the npx chain's `cmd.exe` sat on Windows users' screens as a persistent blank window, and closing it killed the MCP server mid-session. Also removes an npm round-trip per session. Refreshed at boot only when the install is older than `REFRESH_AFTER_MS`, and **awaited** — a background refresh would rewrite the tree the running sessions were spawned from (`mcp-install.ts`) |
+| **MinGit** (Windows, if no `git` on PATH) | template cloning and deploy shell out to a real `git`, and Windows ships none; downloaded checksum-pinned from git-for-windows' official releases into `userData/mingit` at first boot (`git-provision.ts`) — never bundled, so no installer bloat and no GPL redistribution. Its `bash.exe` (when the variant has one) is advertised via `CLAUDE_CODE_GIT_BASH_PATH`, which upgrades Claude Code's Windows shell from the PowerShell fallback to Git Bash. A user-installed git always wins (`where git` short-circuits; the provisioned dir is PATH-appended) |
 
 `npx` and the CLI were both missing until they were added together, and both failed
 **silently**: the per-session MCP config launches the sapiom-dev server with
@@ -315,7 +340,9 @@ HOME=$(mktemp -d) SAPIOM_TELEMETRY_DISABLED=1 \
 
 `--smoke` (`src/main/smoke.ts`) boots the app and asserts the SPA is served from inside the asar, the
 REST surface answers and rejects an untokened request, a real session spawns, the setup window's
-preload bridge loaded, node-pty loads under Electron's ABI and can spawn, the plain-Node subprocess's
+preload bridge loaded and that window resolved its design-system layer in the Studio brand (tokens, the
+`themes/studio.css` preset and its nested agent-cloud import), node-pty loads under Electron's ABI and
+can spawn, the plain-Node subprocess's
 imports exist on disk, a deploy can bundle and a local run's child really starts (both spawn-from-asar
 bugs — see below), the agent inherits a clean environment, and the auto-update config is baked in. Exit
 code is the signal; CI runs it per OS after packaging.

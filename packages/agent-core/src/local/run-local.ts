@@ -1,8 +1,10 @@
 /**
  * runLocal — execute an agent entirely in-process, resolving every
  * `ctx.sapiom.*` capability call from a stub file. Runs the author's actual
- * step bodies on the `@sapiom/agent-runtime` walker, so a local pass is
- * real evidence, offline and at zero cost.
+ * step bodies on the `@sapiom/agent-runtime` walker, so a local pass is real
+ * evidence without a Sapiom account, capability request, or capability spend.
+ * Author code remains ordinary local code and can still read files, inspect
+ * environment variables, start processes, or make its own network requests.
  *
  * Returns a structured per-step trace plus `unusedStubs` (supplied keys that
  * matched no call) and `stubWarnings` (keys that matched but carried the wrong
@@ -11,10 +13,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 
-import type {
-  AgentDefinition,
-  AgentManifest,
-} from "@sapiom/agent";
+import type { AgentDefinition, AgentManifest } from "@sapiom/agent";
 import {
   DEFAULT_MAX_ATTEMPTS_PER_STEP,
   InMemoryExecutionStore,
@@ -24,7 +23,11 @@ import {
 
 import { getOrchestrationAnalytics } from "../analytics.js";
 import { AgentOperationError } from "../errors.js";
-import { LocalStubDispatcher, type LocalStepTrace } from "./dispatcher.js";
+import {
+  LocalStubDispatcher,
+  type LocalStepTrace,
+  type LocalStepTraceSink,
+} from "./dispatcher.js";
 import { loadDefinition } from "./load.js";
 import { parseStubFile, type StubFile } from "./stubs.js";
 
@@ -56,13 +59,16 @@ export interface RunLocalOptions {
   /** Stub overrides (already parsed). Unmatched calls use built-in defaults. */
   stubs?: StubFile;
   maxAttemptsPerStep?: number;
+  /** Called synchronously at attempt start and settlement for live Studio
+   * observability. Exceptions are isolated by the dispatcher. */
+  onStepTrace?: LocalStepTraceSink;
 }
 
 export type LocalRunOutcome = "completed" | "failed" | "paused" | "running";
 
 /** A supplied stub key that no capability call in its step ever matched — almost
- *  always a typo or the wrong path form (e.g. `models.coding.launch` instead of
- *  `models.coding.run`, or the plural `repositories.pushFromSandbox` instead of
+ *  always a typo or the wrong path form (e.g. `agent.coding.launch` instead of
+ *  `models.coding.launch`, or the plural `repositories.pushFromSandbox` instead of
  *  the handle-method `repository.pushFromSandbox`). */
 export interface UnusedStub {
   step: string;
@@ -92,7 +98,11 @@ export async function runLocal(opts: RunLocalOptions): Promise<LocalRunResult> {
   const max = opts.maxAttemptsPerStep ?? DEFAULT_MAX_ATTEMPTS_PER_STEP;
 
   const store = new InMemoryExecutionStore();
-  const dispatcher = new LocalStubDispatcher(opts.definition, stubs);
+  const dispatcher = new LocalStubDispatcher(
+    opts.definition,
+    stubs,
+    opts.onStepTrace,
+  );
   // Shared registry: a launched capability (e.g. models.coding.launch) records the
   // result that should resume a pause on its signal.
   const signals = new Map<string, unknown>();
@@ -182,6 +192,7 @@ export async function runLocalFromDir(opts: {
   input?: unknown;
   stubs?: StubFile;
   maxAttemptsPerStep?: number;
+  onStepTrace?: LocalStepTraceSink;
 }): Promise<LocalRunResult> {
   const { definition, manifest } = await loadDefinition(opts.sourceDir);
   const stubs = opts.stubs ?? loadStubsFile(opts.sourceDir);
@@ -191,5 +202,6 @@ export async function runLocalFromDir(opts: {
     input: opts.input,
     stubs,
     maxAttemptsPerStep: opts.maxAttemptsPerStep,
+    onStepTrace: opts.onStepTrace,
   });
 }

@@ -1,5 +1,194 @@
 # @sapiom/cli
 
+## 7.0.4
+
+### Patch Changes
+
+- 52efab3: `sapiom-agent-authoring` skill + scaffold `AGENTS.md`: system-design teaching for multi-stage builds. New "Composing Deployed Agents" section — one agent per PROJECT; a multi-stage system is several small projects composed via `ctx.sapiom.agents.run`, with a worked coordinator example — and the scaffold's "keep exactly one `defineAgent` export" rule now says so inline, so it reads as a per-project rule rather than a design instruction to inline every stage. Also drops the "pass `smart` if you must pin" no-op from the label rule (omitting `model` is the recommendation; `smart` already is the default).
+- Updated dependencies [555475d]
+- Updated dependencies [52efab3]
+  - @sapiom/agent@0.12.0
+  - @sapiom/agent-core@0.13.0
+  - @sapiom/harness@0.8.5
+
+## 7.0.3
+
+### Patch Changes
+
+- Updated dependencies [9afeda9]
+  - @sapiom/agent@0.11.0
+  - @sapiom/agent-core@0.12.2
+  - @sapiom/harness@0.8.4
+
+## 7.0.2
+
+### Patch Changes
+
+- Updated dependencies [5a8eeea]
+- Updated dependencies [00b8814]
+- Updated dependencies [5a8eeea]
+  - @sapiom/harness@0.8.3
+  - @sapiom/agent-core@0.12.0
+  - @sapiom/agent@0.10.1
+  - @sapiom/sandbox-preview@0.1.16
+
+## 7.0.1
+
+### Patch Changes
+
+- Updated dependencies [af764cd]
+  - @sapiom/agent@0.10.0
+  - @sapiom/agent-core@0.11.4
+  - @sapiom/harness@0.8.2
+
+## 7.0.0
+
+### Patch Changes
+
+- Updated dependencies [bb0df7d]
+- Updated dependencies [b1d791b]
+- Updated dependencies [8ef5374]
+- Updated dependencies [f5a67c2]
+  - @sapiom/harness@0.8.0
+  - @sapiom/agent-core@0.11.0
+
+## 6.0.0
+
+### Patch Changes
+
+- f21f6a6: Windows: sessions create and deliver their prompt, the canvas refreshes, and nothing pops a console window
+
+  The desktop app was unusable on Windows — every `POST /api/sessions` answered
+  `500 {"error":"internal error"}`, and when a session did start, its first
+  prompt never reached the agent. Root-caused on a real machine and fixed
+  end to end.
+
+  - **Sessions.** Claude Code's own native auto-updater had renamed the running
+    `claude.exe` to `claude.exe.old.<ts>` inside the app-managed npm prefix and
+    never written the replacement, so every spawn failed while `doctor` (which
+    shells `where`) still reported the agent present. Boot now verifies the
+    agent actually spawns, repairs the managed install when it doesn't, and sets
+    `DISABLE_AUTOUPDATER` for installs the app owns. The refusal itself names
+    the situation instead of "target could not be determined".
+  - **The first prompt.** It is held until the session reports ready, which only
+    happens when the generated `SessionStart` hook POSTs back — and Claude Code
+    runs hooks through Git Bash on Windows, which cannot resolve a `.cmd`, so
+    the desktop's `node.cmd`-only shims meant the hook never ran. The host now
+    ships npm's extensionless sh shim too, a 20s hook-timeout fallback rescues a
+    session whose hook chain is broken (gated on Claude's blocking-prompt
+    screens so it can never answer a trust dialog), `emit.cjs` gets budgets a
+    cold loopback survives (SessionStart only — the other hooks block the
+    agent), and multi-line prompts are paste-wrapped under ConPTY, which hides
+    the bracketed-paste announcement.
+  - **Console windows.** The `sapiom-dev` MCP server was launched via `npx`,
+    whose `cmd.exe` sat on screen as a persistent blank window; closing it
+    killed the server and every later tool call hung. The app now installs
+    `@sapiom/mcp` into its own prefix and launches it through the app binary
+    (GUI subsystem — no console can exist), and every `child_process` call
+    across the harness, agent-core, the MCP and the desktop passes
+    `windowsHide`.
+  - **Canvas.** `fs.watch` reports native separators, so the watcher's
+    POSIX-literal comparison never matched on Windows and `canvas.reload` was
+    never published — every canvas hot-reload was silently dead there (the
+    "Preparing your agent" placeholder outliving a finished install was the
+    visible symptom).
+  - **Diagnosis.** 500s now carry the real message (and errno) instead of
+    "internal error", the desktop tees its main-process log to
+    `<userData>/logs/main.log`, and spawn failures map to actionable 4xx.
+  - **Also:** Git is provisioned from git-for-windows' checksum-pinned MinGit
+    when a Windows machine has none (template clone and deploy shell out to a
+    real `git`); client-supplied `cwd` is normalized server-side and the SPA's
+    path helpers understand both separators; gateway requests time out instead
+    of hanging an MCP tool call for minutes; and the updater falls back to
+    HTTP/1.1, names a GitHub 429 for what it is, and bounds every path that can
+    reach GitHub.
+
+- Updated dependencies [3cbe957]
+- Updated dependencies [4edcbf5]
+- Updated dependencies [f21f6a6]
+  - @sapiom/harness@0.7.0
+  - @sapiom/agent-core@0.10.7
+
+## 5.0.0
+
+### Patch Changes
+
+- Updated dependencies [651c407]
+- Updated dependencies [7bef8b2]
+- Updated dependencies [651c407]
+- Updated dependencies [95241fb]
+- Updated dependencies [928a639]
+- Updated dependencies [5c0c646]
+- Updated dependencies [21bb3f0]
+  - @sapiom/harness@0.6.0
+  - @sapiom/agent-core@0.10.6
+
+## 4.0.0
+
+### Patch Changes
+
+- Updated dependencies [19b8bbb]
+- Updated dependencies [03d23c8]
+- Updated dependencies [5aa3e01]
+  - @sapiom/agent-core@0.10.5
+  - @sapiom/harness@0.5.0
+
+## 3.0.0
+
+### Patch Changes
+
+- Updated dependencies [38a7327]
+- Updated dependencies [0b0784c]
+- Updated dependencies [0b0784c]
+- Updated dependencies [feaaeaa]
+- Updated dependencies [2c4e8d9]
+- Updated dependencies [58f8008]
+- Updated dependencies [1b3c103]
+  - @sapiom/harness@0.4.0
+
+## 2.0.0
+
+### Patch Changes
+
+- 1000510: Describe deploy as a synthesized bundle of current local source, distinguish
+  account-free local validation from metered cloud builds and production runs,
+  and make execution inspection's cost-agnostic evidence boundary explicit.
+- Updated dependencies [3ef1454]
+- Updated dependencies [1000510]
+- Updated dependencies [2485561]
+- Updated dependencies [25fc26f]
+- Updated dependencies [9addb66]
+- Updated dependencies [533cc88]
+- Updated dependencies [7ae67f6]
+- Updated dependencies [cc2e4aa]
+- Updated dependencies [baa6102]
+  - @sapiom/harness@0.3.0
+  - @sapiom/agent-core@0.10.3
+
+## 1.0.3
+
+### Patch Changes
+
+- 40d1c64: Use Agent and Agent run terminology in scaffolded and published authoring assets.
+- Updated dependencies [824eb1e]
+- Updated dependencies [368125b]
+- Updated dependencies [addb63c]
+- Updated dependencies [40d1c64]
+- Updated dependencies [9199e10]
+- Updated dependencies [be2b81b]
+- Updated dependencies [94584a2]
+  - @sapiom/harness@0.2.6
+  - @sapiom/agent-core@0.10.0
+
+## 1.0.2
+
+### Patch Changes
+
+- Updated dependencies [c8072cd]
+  - @sapiom/agent@0.9.0
+  - @sapiom/agent-core@0.9.13
+  - @sapiom/harness@0.2.5
+
 ## 1.0.1
 
 ### Patch Changes

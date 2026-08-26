@@ -39,7 +39,7 @@ export {
 } from "./config.js";
 export type { SapiomConfig, LinkedSapiomConfig } from "./config.js";
 
-// scaffold (local, no network)
+// scaffold (local filesystem; version resolution may query npm)
 export {
   scaffold,
   resolveVersions,
@@ -53,7 +53,12 @@ export type {
   ResolvedVersions,
 } from "./scaffold.js";
 
-// check (local, no network)
+// Best-effort dependency install + bundle-failure hinting — shared by scaffold,
+// the example seed, and the Canvas/check/run-local bundle paths.
+export { installProjectDependencies } from "./install-deps.js";
+export { describeBundleFailure } from "./bundle-error.js";
+
+// check (no Sapiom service call; imports author code while deriving the manifest)
 export { check } from "./check.js";
 export type { CheckOptions, CheckResult } from "./check.js";
 
@@ -81,6 +86,7 @@ export type { RunOptions, RunResult } from "./run.js";
 export type {
   ExecutionProjection,
   StepProjection,
+  StepIoDetail,
   CostNode,
   SettleState,
   ExecutionRef,
@@ -97,11 +103,12 @@ export { SSE_EVENT_TYPES } from "./types.js";
 // projection decode (tolerant normalization of the REST body) — the reusable
 // entry point consumers use to re-decode a body after an SSE refetch. The
 // finer-grained helpers stay module-internal to keep the published surface small.
-export { decodeExecutionProjection } from "./decode.js";
+export { decodeExecutionProjection, decodeStepIoDetail } from "./decode.js";
 
 // inspect / logs (networked)
 export {
   inspect,
+  inspectStep,
   listExecutions,
   inspectBuild,
   waitForExecution,
@@ -109,6 +116,7 @@ export {
 } from "./inspect.js";
 export type {
   InspectOptions,
+  InspectStepOptions,
   InspectBuildOptions,
   InspectBuildResult,
   BuildDetail,
@@ -125,8 +133,18 @@ export type { WatchExecutionOptions } from "./watch.js";
 export { signal, parseSignalPayload } from "./signal.js";
 export type { SignalOptions, SignalResult } from "./signal.js";
 
+// feedback (networked) — relay a user's product feedback to the Sapiom team
+export { sendFeedback } from "./feedback.js";
+export type { SendFeedbackOptions, SendFeedbackResult } from "./feedback.js";
+
 // schedules / triggers (networked)
-export { createSchedule, listSchedules, getSchedule, cancelSchedule, previewCron } from "./schedule.js";
+export {
+  createSchedule,
+  listSchedules,
+  getSchedule,
+  cancelSchedule,
+  previewCron,
+} from "./schedule.js";
 export type {
   ScheduleKind,
   ScheduleStatus,
@@ -141,7 +159,12 @@ export type {
 } from "./schedule.js";
 
 // git helpers (used by deploy/clone; exported for consumers that need them directly)
-export { assertDeployable, pushHead, cloneRepo, redactCredentials } from "./git.js";
+export {
+  assertDeployable,
+  pushHead,
+  cloneRepo,
+  redactCredentials,
+} from "./git.js";
 export type { CloneRepoOptions } from "./git.js";
 
 // local stub file model (per-step capability overrides for run_local)
@@ -158,4 +181,9 @@ export type {
 export { loadDefinition } from "./local/load.js";
 export type { LoadedDefinition } from "./local/load.js";
 export { LocalStubDispatcher } from "./local/dispatcher.js";
-export type { LocalStepTrace, LogEntry } from "./local/dispatcher.js";
+export type {
+  LocalStepTrace,
+  LocalStepTracePhase,
+  LocalStepTraceSink,
+  LogEntry,
+} from "./local/dispatcher.js";

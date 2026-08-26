@@ -34,6 +34,9 @@ import { AGENTS_RESULT_SIGNAL } from "../agents/index.js";
 import {
   LLM_ROUTE_RESULT_SIGNAL,
   LLM_SESSION_READY_SIGNAL,
+  readDisclosure as llmReadDisclosure,
+  textOf as llmTextOf,
+  structuredOf as llmStructuredOf,
 } from "../llm/index.js";
 import type {
   AgentRunResult,
@@ -58,10 +61,15 @@ import type {
 } from "../file-storage/index.js";
 import {
   VIDEO_RESULT_SIGNAL,
+  IMAGE_RESULT_SIGNAL,
   toVideoResumePayload,
+  toImageResumePayload,
 } from "../content-generation/index.js";
 import type {
+  ImageCreateInput,
   ImageGenerationResult,
+  ImageLaunchHandle,
+  VideoCreateInput,
   VideoGenerationResult,
   VideoLaunchHandle,
 } from "../content-generation/index.js";
@@ -109,6 +117,7 @@ import type {
   Identity,
   ActiveSession,
 } from "../browser-automation/index.js";
+import type { ScopedKey } from "../keys/index.js";
 
 /** Per-capability overrides, keyed by capability path (see module docs). */
 export type StubOverrides = Record<
@@ -274,6 +283,18 @@ function resolve(
  */
 function dispatchedKeys(namespace: string): string[] {
   return [`${namespace}.launch`, `${namespace}.run`];
+}
+
+/**
+ * The override keys a contentGeneration `launch` accepts, in precedence order: the method
+ * actually called (`<ns>.launch`), then the real blocking sibling (`<ns>.create` — the key
+ * authors already write for the sync verb, so a step that moves from `create()` to `launch()`
+ * keeps its stub), then the legacy `<ns>.run` spelling {@link dispatchedKeys} consulted here
+ * before 0.28.1 — contentGeneration has no `run` method, but the key resolved, so it stays
+ * honored for back-compat.
+ */
+function mediaDispatchedKeys(namespace: string): string[] {
+  return [`${namespace}.launch`, `${namespace}.create`, `${namespace}.run`];
 }
 
 /**
@@ -536,6 +557,52 @@ function stubRunHandle(
   ) as RunHandle;
 }
 
+// Default media results for the contentGeneration stub — ONE factory per media type, shared by
+// `create` and `launch` so the two verbs can never drift (the create/launch resolvedModel drift
+// fixed in #664 came from inlined twin literals). SAP-2576: the routed backend always echoes a
+// resolvedModel (a required field), so the factory does too — set here, inside the fallback,
+// never post-mutated onto a resolved override.
+function stubImageResult(input: ImageCreateInput): ImageGenerationResult {
+  return {
+    images: [
+      {
+        url: "https://content.local/stub-image.png",
+        contentType: "image/png",
+        width: 512,
+        height: 512,
+        // mirror the real behavior: a fileId only when storage was requested.
+        ...(input.storage
+          ? {
+              fileId: "stub-file",
+              downloadUrl: "https://content.local/stub-download",
+              downloadUrlExpiresAt: "2026-01-01T00:00:00Z",
+            }
+          : {}),
+      },
+    ],
+    resolvedModel: input.model ?? "stub-model",
+  };
+}
+
+/** As {@link stubImageResult}, for video. */
+function stubVideoResult(input: VideoCreateInput): VideoGenerationResult {
+  return {
+    video: {
+      url: "https://content.local/stub-video.mp4",
+      contentType: "video/mp4",
+      // mirror the real behavior: a fileId only when storage was requested.
+      ...(input.storage
+        ? {
+            fileId: "stub-file",
+            downloadUrl: "https://content.local/stub-download",
+            downloadUrlExpiresAt: "2026-01-01T00:00:00Z",
+          }
+        : {}),
+    },
+    resolvedModel: input.model ?? "stub-model",
+  };
+}
+
 function stubAgentResult(): ModelRunResult {
   return {
     runId: "stub-run",
@@ -679,7 +746,8 @@ export function createStubClient(opts: StubClientOptions = {}): Sapiom {
     args: unknown[],
     fallback: () => unknown,
     capabilityOverride?: string,
-  ) => resolve(overrides, paths, args, fallback, opts.calls, capabilityOverride);
+  ) =>
+    resolve(overrides, paths, args, fallback, opts.calls, capabilityOverride);
 
   // Per-client memory state: namespace → (id → record). See the `memory`
   // capability below for what is and isn't simulated.
@@ -700,8 +768,9 @@ export function createStubClient(opts: StubClientOptions = {}): Sapiom {
     return { ...res, sandbox: asSandbox(res.sandbox, overrides, opts.calls) };
   };
 
-  // Default (instant) agent result — no sandbox to re-wrap, so it's the resolved
-  // value as-is. `keys` lets `launch()` accept `models.launch` and `models.run`.
+  // Default (instant) agent result for the blocking `run()` — no sandbox to re-wrap, so it's
+  // the resolved value as-is, verbatim (launch() resolves its own key list and merges over the
+  // defaults instead: its handle and resume payload need the full ModelRunResult shape).
   const resolveModelResult = (
     spec: unknown,
     keys: string | string[],
@@ -781,16 +850,51 @@ export function createStubClient(opts: StubClientOptions = {}): Sapiom {
     },
     models: {
       run: (spec) => Promise.resolve(resolveModelResult(spec, "models.run")),
-      launch: (spec) => {
+      launch: async (spec) => {
         const correlationId = `stub-run-${++launchSeq}`;
-        // `launch()` honors `models.launch` first, then the shared `models.run`.
-        const result = {
-          ...resolveModelResult(spec, dispatchedKeys("agent")),
-          runId: correlationId,
+        // `launch()` honors `models.launch` first, then the shared `models.run` — the keys the
+        // module docs promise and the ones `run()` above resolves. The `agent.*` spellings were
+        // stranded by the agent→models half of the #167 rename and were the only keys this
+        // path actually consulted until now, so they stay honored last for back-compat — with
+        // a warning, because they sit one character away from the unrelated `agents.*`
+        // namespace and would otherwise defeat the usedKeys typo detector.
+        const keys = [...dispatchedKeys("models"), ...dispatchedKeys("agent")];
+        const matched = keys.find((k) =>
+          Object.prototype.hasOwnProperty.call(overrides, k),
+        );
+        if (matched?.startsWith("agent.")) {
+          opts.warnings?.add(
+            `'${matched}' is a legacy spelling for models.launch overrides — rename it to 'models.run' ` +
+              `(or 'models.launch'). It is one character away from the 'agents.*' namespace, which it does NOT stub.`,
+          );
+        }
+        // Unlike `run()` (verbatim, longstanding), launch() must produce a full ModelRunResult:
+        // the handle reads `result.status` and the resume payload is schema-validated by the
+        // local runner. Merge the override OVER the defaults — the override wins field by
+        // field, missing required fields are filled, nothing is mutated. The await unwraps a
+        // function override that returned a Promise (run()'s Promise.resolve does the same).
+        const resolved = await Promise.resolve(
+          r(keys, [spec], () => stubAgentResult()),
+        );
+        if (resolved === null || typeof resolved !== "object") {
+          opts.warnings?.add(
+            `'${matched}' stub must be a ModelRunResult-shaped object; got ${describeShape(resolved)}. ` +
+              `Using the built-in default.`,
+          );
+        }
+        const base = (
+          resolved !== null && typeof resolved === "object" ? resolved : {}
+        ) as Partial<ModelRunResult>;
+        const result: ModelRunResult = {
+          ...stubAgentResult(),
+          ...base,
+          // Preserve an author-supplied runId (run() would return it verbatim, and in the real
+          // client run() IS launch().wait(), so the two paths must agree on the id).
+          runId: base.runId ?? correlationId,
         };
         // The resume payload IS the result (no live handles to strip).
         return dispatchable(
-          stubModelRunHandle(overrides, correlationId, result, opts.calls),
+          stubModelRunHandle(overrides, result.runId, result, opts.calls),
           opts.signals,
           () => result,
         );
@@ -978,10 +1082,16 @@ export function createStubClient(opts: StubClientOptions = {}): Sapiom {
       releaseSession: (session) =>
         Promise.resolve(
           r("llm.releaseSession", [session], () => ({
-            sessionId: typeof session === "string" ? session : session.sessionId,
+            sessionId:
+              typeof session === "string" ? session : session.sessionId,
             state: "expired" as const,
           })) as LlmSession,
         ),
+      // Pure functions over a result value, not network calls — no stub
+      // recording needed; delegate straight to the real implementation.
+      readDisclosure: (result) => llmReadDisclosure(result),
+      textOf: (response) => llmTextOf(response),
+      structuredOf: (response, name) => llmStructuredOf(response, name),
     },
     fileStorage: {
       upload: (input) =>
@@ -1000,6 +1110,13 @@ export function createStubClient(opts: StubClientOptions = {}): Sapiom {
             expiresAt: "2099-01-01T00:00:00Z",
           })) as DownloadUrlResponse,
         ),
+      // Pure/synchronous in the real client — mirror that here (no Promise wrap).
+      getPublicUrl: (fileId) =>
+        r(
+          "fileStorage.getPublicUrl",
+          [fileId],
+          () => `https://storage.local/public/${fileId}`,
+        ) as string,
       list: (listOpts) =>
         Promise.resolve(
           r("fileStorage.list", [listOpts], () => ({
@@ -1029,66 +1146,73 @@ export function createStubClient(opts: StubClientOptions = {}): Sapiom {
       images: {
         create: (input) =>
           Promise.resolve(
-            r("contentGeneration.images.create", [input], () => ({
-              images: [
-                {
-                  url: "https://content.local/stub-image.png",
-                  contentType: "image/png",
-                  width: 512,
-                  height: 512,
-                  // mirror the real behavior: a fileId only when storage was requested.
-                  ...(input.storage
-                    ? {
-                        fileId: "stub-file",
-                        downloadUrl: "https://content.local/stub-download",
-                        downloadUrlExpiresAt: "2026-01-01T00:00:00Z",
-                      }
-                    : {}),
-                },
-              ],
-            })) as ImageGenerationResult,
+            // Fallback shared with `launch` via stubImageResult (a caller-supplied override
+            // wins verbatim; a frozen override is never mutated).
+            r("contentGeneration.images.create", [input], () =>
+              stubImageResult(input),
+            ) as ImageGenerationResult,
           ),
+        launch: (input) => {
+          const requestId = `stub-image-${++launchSeq}`;
+          const resolved = r(
+            mediaDispatchedKeys("contentGeneration.images"),
+            [input],
+            () => stubImageResult(input),
+          ) as ImageGenerationResult;
+          // Mirror the real client's `withDispatchCost`: stamp the resolvedModel onto a COPY, so
+          // the handle, `wait()`, and the resume payload all carry the same value — an invariant
+          // the routed path guarantees — while the caller's override object is never touched and
+          // its own resolvedModel wins when present.
+          const result: ImageGenerationResult = {
+            ...resolved,
+            resolvedModel: resolved.resolvedModel ?? input.model ?? "stub-model",
+          };
+
+          const handle: ImageLaunchHandle = {
+            requestId,
+            resolvedModel: result.resolvedModel,
+            dispatch: {
+              correlationId: requestId,
+              resultSignal: IMAGE_RESULT_SIGNAL,
+            },
+            wait: () => Promise.resolve(result),
+          };
+
+          // Register the resume payload so a local `pauseUntilSignal` on this handle
+          // resolves with an ImageResultPayload.
+          return dispatchable(handle, opts.signals, () =>
+            toImageResumePayload(result),
+          );
+        },
       },
       video: {
         create: (input) =>
           Promise.resolve(
-            r("contentGeneration.video.create", [input], () => ({
-              video: {
-                url: "https://content.local/stub-video.mp4",
-                contentType: "video/mp4",
-                // mirror the real behavior: a fileId only when storage was requested.
-                ...(input.storage
-                  ? {
-                      fileId: "stub-file",
-                      downloadUrl: "https://content.local/stub-download",
-                      downloadUrlExpiresAt: "2026-01-01T00:00:00Z",
-                    }
-                  : {}),
-              },
-            })) as VideoGenerationResult,
+            // Fallback shared with `launch` via stubVideoResult (a caller-supplied override
+            // wins verbatim; a frozen override is never mutated).
+            r("contentGeneration.video.create", [input], () =>
+              stubVideoResult(input),
+            ) as VideoGenerationResult,
           ),
         launch: (input) => {
           const requestId = `stub-video-${++launchSeq}`;
-          const result = r(
-            dispatchedKeys("contentGeneration.video"),
+          const resolved = r(
+            mediaDispatchedKeys("contentGeneration.video"),
             [input],
-            () => ({
-              video: {
-                url: "https://content.local/stub-video.mp4",
-                contentType: "video/mp4",
-                ...(input.storage
-                  ? {
-                      fileId: "stub-file",
-                      downloadUrl: "https://content.local/stub-download",
-                      downloadUrlExpiresAt: "2026-01-01T00:00:00Z",
-                    }
-                  : {}),
-              },
-            }),
+            () => stubVideoResult(input),
           ) as VideoGenerationResult;
+          // Mirror the real client's `withDispatchCost`: stamp the resolvedModel onto a COPY, so
+          // the handle, `wait()`, and the resume payload all carry the same value — an invariant
+          // the routed path guarantees — while the caller's override object is never touched and
+          // its own resolvedModel wins when present.
+          const result: VideoGenerationResult = {
+            ...resolved,
+            resolvedModel: resolved.resolvedModel ?? input.model ?? "stub-model",
+          };
 
           const handle: VideoLaunchHandle = {
             requestId,
+            resolvedModel: result.resolvedModel,
             dispatch: {
               correlationId: requestId,
               resultSignal: VIDEO_RESULT_SIGNAL,
@@ -1633,7 +1757,9 @@ export function createStubClient(opts: StubClientOptions = {}): Sapiom {
       list: (ref: string) =>
         Promise.resolve(r("vault.list", [ref], () => []) as string[]),
       get: (ref: string, key: string) =>
-        Promise.resolve(r("vault.get", [ref, key], () => null) as string | null),
+        Promise.resolve(
+          r("vault.get", [ref, key], () => null) as string | null,
+        ),
       getMany: (ref: string, keys: string[]) =>
         Promise.resolve(
           r("vault.getMany", [ref, keys], () => ({})) as Record<string, string>,
@@ -1641,6 +1767,24 @@ export function createStubClient(opts: StubClientOptions = {}): Sapiom {
       getAll: (ref: string) =>
         Promise.resolve(
           r("vault.getAll", [ref], () => ({})) as Record<string, string>,
+        ),
+    },
+    // Scoped-key mint (SAP-2300). A local run mints no real credential — it returns a
+    // clearly-fake, shape-faithful key so a deploy step can trace the full graph
+    // offline. The `key` is an obvious placeholder, never a usable secret.
+    keys: {
+      mintScoped: (input) =>
+        Promise.resolve(
+          r("keys.mintScoped", [input], () => ({
+            key: "sk_live_stub-scoped-key",
+            id: "stub-scoped-key",
+            expiresAt: null,
+            permissions: Array.isArray(input.scope)
+              ? input.scope
+              : input.scope
+                ? [input.scope]
+                : ["org.transactions.write"],
+          })) as ScopedKey,
         ),
     },
     speech: {

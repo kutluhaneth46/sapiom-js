@@ -6,13 +6,13 @@
     "url": "https://sapiom.ai/"
   },
   "whatItDoes": "Post a message to Slack using your own bot token. The starter for calling any outside service with your own credential — fork it, repoint the endpoint and the credential, and it notifies Discord, PagerDuty, or your own webhook instead.",
-  "longDescription": "Post a message to Slack using your own bot token, which Sapiom collects when you use this template and hands to the run as an environment variable. Slack is the hook, but the real lesson is transferable: store a secret, read it at runtime, call an API. Swap Slack for anything else by changing the `fetch` URL and the credential key.\n\nIt runs two steps. `validate` checks the message and settles the config — which credential to use and, for bot mode, which channel. `post` reads the token from the environment Sapiom injected it into and calls Slack directly: either `chat.postMessage` with a bot token, which returns the channel and message timestamp, or an incoming-webhook URL, where the channel is fixed by the URL. The token is never written into the code.\n\nYou can trace the whole thing before you have a token. `run_local` runs in dryRun mode, and a missing credential behaves the same way — the graph runs validate → post end to end and returns `posted: false` with `skipped` telling you why, without touching the network.\n\nNothing here calls a paid model. It calls no metered capability at all: the Slack request goes out on your own token, so a run costs you nothing on Sapiom.",
+  "longDescription": "Post a message to Slack using your own bot token, which Sapiom hands to the run as an environment variable. Slack is the hook, but the lesson is transferable: store a secret, read it at runtime, call an API, and swap Slack for anything by changing the `fetch` URL and credential key. `validate` settles the config; `post` reads the token and calls Slack directly, never writing it into code. `run_local` runs in dryRun mode, as does a missing credential, returning `posted: false` with `skipped`.",
   "useCases": [
     "Slack message from a run",
     "Bring-your-own credential",
     "Repoint to any webhook"
   ],
-  "notes": "Click **Use this template** — Sapiom builds and deploys it for you, then run it from the workflow page. Your $5 signup credit covers first runs.\n\nThis one needs a secret before it can post for real. It runs with no setup: with no credential set it composes the message, reports `posted: false, skipped: \"no-credential\"`, and says what it would have sent. To post for real, supply `SLACK_BOT_TOKEN` (a bot token with `chat:write`) and a `channel`, or `SLACK_WEBHOOK_URL` for webhook mode — Sapiom asks for these when you use the template. Until you set it, runs trace the full graph and return `posted: false, skipped: \"no-credential\"` instead of failing. For bot mode, also pass a `channel` (like `#general`); webhook mode carries the channel in the URL. To point this at another service, change the `fetch` URL and the credential key in `index.ts` and store that API's key under the matching ref.\n\nPrefer to work from the code? Run it locally with `run_local` to trace the whole flow for free (it skips the network), or edit and deploy it with the Sapiom MCP.",
+  "notes": "Click **Use this template** — Sapiom builds and deploys it for you; open it on the **Agents** page and run it. Your $5 signup credit covers first runs.\n\nThis one needs a secret before it can post for real. It runs with no setup: with no credential set it composes the message, reports `posted: false, skipped: \"no-credential\"`, and says what it would have sent. To post for real, supply `SLACK_BOT_TOKEN` (a bot token with `chat:write`) and a `channel`, or `SLACK_WEBHOOK_URL` for webhook mode — Sapiom asks for these when you use the template. Until you set it, runs trace the full graph and return `posted: false, skipped: \"no-credential\"` instead of failing. For bot mode, also pass a `channel` (like `#general`); webhook mode carries the channel in the URL. To point this at another service, change the `fetch` URL and the credential key in `index.ts` and store that API's key under the matching ref.\n\nPrefer to work from the code? Run it locally with `run_local` to trace the whole flow for free (it skips the network), or edit and deploy it with the Sapiom MCP.",
   "requiredSecrets": [
     {
       "key": "SLACK_BOT_TOKEN",
@@ -74,5 +74,14 @@
         "ts": "1717171717.000100"
       }
     }
-  ]
+  ],
+  "zeroSetup": {
+    "terminalState": "completed_partial",
+    "expect": [
+      { "path": "posted", "assert": "equals", "value": false },
+      { "path": "skipped", "assert": "equals", "value": "no-credential" },
+      { "path": "unmet", "assert": "nonEmptyArray" }
+    ],
+    "narrative": "Composes the message and prints it; posts nothing to Slack (no bot token)."
+  }
 }

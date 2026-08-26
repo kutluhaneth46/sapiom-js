@@ -1,4 +1,4 @@
-import { BrowserWindow, app, shell } from "electron";
+import { BrowserWindow, app, nativeTheme, shell } from "electron";
 import { APP_VERSION_ARG } from "./ipc.js";
 import { desktopPreloadPath, setupHtmlPath, setupPreloadPath } from "./paths.js";
 
@@ -8,12 +8,27 @@ import { desktopPreloadPath, setupHtmlPath, setupPreloadPath } from "./paths.js"
  * contextIsolation; no direct Node in the renderer.
  */
 export function createSetupWindow(): BrowserWindow {
+  const isMac = process.platform === "darwin";
   const win = new BrowserWindow({
     width: 560,
     height: 460,
     resizable: false,
     show: true,
     title: "Sapiom",
+    // macOS: drop the grey title bar but KEEP the traffic lights (hiddenInset),
+    // inset into the card's top-left — no title-bar chrome, still closable and
+    // movable. The window itself IS the card (the renderer paints --s1 edge to
+    // edge) and keeps its standard rounded corners + drop shadow. Windows/Linux
+    // keep their native frame.
+    ...(isMac ? { titleBarStyle: "hiddenInset" as const, trafficLightPosition: { x: 16, y: 16 } } : {}),
+    // Pre-paint in the card surface (--s1) so there's no flash before the
+    // stylesheet loads. The renderer resolves the theme from stored-pref ??
+    // system before first paint; the main process can't read that storage, so it
+    // approximates with the system theme (nativeTheme) — exact on a first run and
+    // a single pre-paint frame at worst if a user stored the non-system theme.
+    // The hexes are ds-neutral --s1 (dark #12161d, light #ffffff);
+    // window-background.test.ts pins them to that token so this can't drift.
+    backgroundColor: nativeTheme.shouldUseDarkColors ? "#12161d" : "#ffffff",
     webPreferences: {
       preload: setupPreloadPath(),
       contextIsolation: true,
@@ -48,11 +63,30 @@ export function createSetupWindow(): BrowserWindow {
  * omits those affordances in a browser — see `harness/web/src/lib/desktop.ts`.
  */
 export function createMainWindow(loadUrl: string): BrowserWindow {
+  // macOS only: drop the native title bar and inset the traffic lights so they
+  // sit in the rail's 56px top line, which the SPA then treats as a drag region.
+  // trafficLightPosition centres the ~14px light group vertically in that line;
+  // the SPA is told it is this frame via ?frame=macos (below) and pads its brand
+  // header to clear the lights. Windows/Linux keep their native frame for now.
+  //
+  // COUPLING: {x:19,y:21} and the SPA's `padding-left:78px`
+  // (:root[data-window-frame="macos"] .brand-header) are both sized to the
+  // 56px header line (--header-h in the design-system tokens). The main process
+  // can't read CSS, so if --header-h ever changes, re-center y and re-check the
+  // x/padding clearance here and in styles.css together.
+  const isMac = process.platform === "darwin";
   const win = new BrowserWindow({
     width: 1280,
     height: 860,
+    // 35rem is the narrowest frame the SPA is composed for: it folds to the
+    // one-column shell at 768px (styles.css "Mobile shell") and that column
+    // still reads at 560. Below it the window was a strip of overlapping
+    // labels, so the frame refuses to go there rather than the layout coping.
+    minWidth: 560,
+    minHeight: 480,
     show: false, // show on ready-to-show to avoid a white flash
     title: "Sapiom",
+    ...(isMac ? { titleBarStyle: "hiddenInset" as const, trafficLightPosition: { x: 19, y: 21 } } : {}),
     webPreferences: {
       preload: desktopPreloadPath(),
       contextIsolation: true,
@@ -94,18 +128,32 @@ export function createMainWindow(loadUrl: string): BrowserWindow {
       createPreviewWindow(url);
       return { action: "deny" };
     }
-    void shell.openExternal(url);
+    openInSystemBrowser(url);
     return { action: "deny" };
   });
   win.webContents.on("will-navigate", (event, url) => {
     if (!isLocalUrl(url)) {
       event.preventDefault();
-      void shell.openExternal(url);
+      openInSystemBrowser(url);
     }
   });
 
-  void win.loadURL(loadUrl);
+  // Hand the SPA its frame so it clears the traffic lights and drags by its top
+  // line — only on the frameless-mac window; a browser (npx) never carries it.
+  const framedUrl = isMac ? withFrameParam(loadUrl, "macos") : loadUrl;
+  void win.loadURL(framedUrl);
   return win;
+}
+
+/** Append ?frame=<value> without disturbing the existing boot-token query. */
+function withFrameParam(loadUrl: string, frame: string): string {
+  try {
+    const u = new URL(loadUrl);
+    u.searchParams.set("frame", frame);
+    return u.toString();
+  } catch {
+    return loadUrl;
+  }
 }
 
 /**
@@ -131,11 +179,30 @@ export function createPreviewWindow(url: string): BrowserWindow {
   // A preview window is a leaf: it gets no bridge, and it cannot spawn further
   // windows that might. Off-origin links still go to the real browser.
   win.webContents.setWindowOpenHandler(({ url: next }) => {
-    if (!isLocalUrl(next)) void shell.openExternal(next);
+    if (!isLocalUrl(next)) openInSystemBrowser(next);
     return { action: "deny" };
   });
   void win.loadURL(url);
   return win;
+}
+
+/**
+ * Hand a URL to the OS default handler — but only a web URL. `window.open()`
+ * with no argument reaches the window-open handlers as "about:blank", and
+ * `shell.openExternal("about:blank")` makes macOS show a "there is no
+ * application set to open the URL" picker (no app registers that scheme).
+ * Anything that isn't http(s)/mailto is dropped rather than handed over —
+ * arbitrary schemes from page content shouldn't launch arbitrary apps anyway.
+ */
+function openInSystemBrowser(url: string): void {
+  try {
+    const protocol = new URL(url).protocol;
+    if (protocol === "http:" || protocol === "https:" || protocol === "mailto:") {
+      void shell.openExternal(url);
+    }
+  } catch {
+    // Not a parseable URL — nothing the OS could open.
+  }
 }
 
 function isLocalUrl(url: string): boolean {

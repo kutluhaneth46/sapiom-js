@@ -12,7 +12,7 @@
  *
  *   const reply = await ctx.sapiom.llm.run({
  *     request: { messages: [{ role: "user", content: "…" }], max_tokens: 512 },
- *     model: "m2.7", // a label (m2.7 | minimax-m3 | sonnet | …); omit → default label
+ *     model: "large", // a label (smart | small | medium | large); omit → default label
  *   });
  *
  * `submit` — DEFERRED (`POST /v2/route/async`): unlike `agents.run` (a full
@@ -26,7 +26,7 @@
  *
  *   const handle = await ctx.sapiom.llm.submit({
  *     request: { messages: [{ role: "user", content: "…" }], max_tokens: 512 },
- *     model: "m2.7", // a label; omit → default label
+ *     model: "large", // a label; omit → default label
  *     deadlineMinutes: 30,
  *   });
  *   return pauseUntilSignal(handle, { resumeStep: "use-answer" });
@@ -34,7 +34,7 @@
  *   // …and in the resumed step (input: LlmRouteResultPayload):
  *   const reply = await ctx.sapiom.llm.redeem(input.link!, savedRequestBody);
  *
- * Inside a workflow the engine's resume token (ambient on the transport) rides the
+ * Inside an agent run the engine's resume token (ambient on the transport) rides the
  * `x-sapiom-workflow-token` header; the gateway echoes it in its webhook so the
  * engine's forwarder can resume the paused step. Standalone callers can instead
  * poll `handle.wait()` — same admission, no pause.
@@ -47,7 +47,7 @@
  * keep working until the migration completes.
  *
  *   const s = await ctx.sapiom.llm.createSession({
- *     label: "sonnet", deadlineMinutes: 60,
+ *     label: "large", deadlineMinutes: 60,
  *     budget: { maxTokens: 2_000_000, ttlMinutes: 120 },
  *   });
  *   const ready = await s.wait();                       // or pauseUntilSignal(s, …)
@@ -61,9 +61,19 @@ import type { DispatchHandle } from "../dispatch.js";
 const DEFAULT_BASE_URL = resolveServiceUrl("llm", process.env.SAPIOM_LLM_URL);
 
 /**
+ * A routing label — the vocabulary the gateway resolves against its
+ * configured label set (never a raw provider model id). `"smart"` is
+ * suggested for autocomplete; any other string is still accepted, since the
+ * full label set is configured server-side. `Record<never, never>` is the
+ * lint-safe spelling of the `string & {}` idiom (see
+ * `content-generation/index.ts`'s `LiteralUnion`).
+ */
+export type RoutingLabel = "smart" | (string & Record<never, never>);
+
+/**
  * Capability-stable signal a routed job fires when it reaches a terminal state
  * (granted OR failed — it carries the result either way, the resumed step
- * branches). A workflow step paused on a submit handle resumes on this; it is the
+ * branches). An agent step paused on a submit handle resumes on this; it is the
  * value carried in the handle's `dispatch.resultSignal`.
  */
 export const LLM_ROUTE_RESULT_SIGNAL = "llm.route.result";
@@ -92,19 +102,42 @@ export interface LlmRunSpec {
    * is superseded by the routing decision (set the route label via `model` below).
    */
   request: Record<string, unknown>;
-  /** Route label (e.g. `"m2.7"`, `"minimax-m3"`, `"sonnet"`). Omit → the gateway's default label. */
-  model?: string;
+  /**
+   * Routing label (e.g. `"smart"`, `"small"`, `"medium"`, `"large"`). The
+   * gateway resolves it against its configured label set — a raw provider
+   * model id is never honored. Omit to let the gateway choose (the
+   * recommended default); pass `"smart"` if you need to pin explicitly.
+   */
+  model?: RoutingLabel;
   /**
    * Guarantee an answer by spilling to the label's declared fallback when the
    * preferred capacity is saturated (never-429). DEFAULTS TO TRUE here: the
    * gateway's own direct default is OFF (drop-in callers get plain 429 +
-   * backoff), but a workflow step usually can't retry-with-backoff cheaply, so
-   * the SDK opts workflows in. Set `false` to take 429s and handle them.
-   * Note: spilling can serve a costlier deployment (usually Anthropic).
+   * backoff), but an agent step usually can't retry-with-backoff cheaply, so
+   * the SDK opts agent runs in. Set `false` to take 429s and handle them.
+   * Note: spilling can serve a costlier deployment.
    */
   neverFail?: boolean;
   /** Explicit complexity/capacity weight override (gateway clamps to its bounds). */
   complexity?: number;
+  /**
+   * Structured-output convenience — the blessed pattern (a forced tool call),
+   * automated: setting this appends a tool named `name` (schema `schema`) to
+   * `request.tools` and forces `tool_choice` onto it. {@link run}'s return
+   * type is unchanged either way (still the verbatim response); read the
+   * parsed value with {@link structuredOf}. Omit and build `request.tools` /
+   * `tool_choice` yourself for anything this convenience doesn't cover (e.g.
+   * more than one candidate tool).
+   */
+  output?: LlmStructuredOutputSpec;
+}
+
+/** {@link LlmRunSpec.output} — see there for what setting it does. */
+export interface LlmStructuredOutputSpec {
+  /** Tool name the model is forced to call; read back with {@link structuredOf}'s `name`. */
+  name: string;
+  /** JSON Schema (the Anthropic Messages `input_schema` shape) the model's tool call must satisfy. */
+  schema: Record<string, unknown>;
 }
 
 export interface LlmSubmitSpec {
@@ -114,8 +147,13 @@ export interface LlmSubmitSpec {
    * `ctx.shared`) and re-send it to `redeem` when the grant arrives.
    */
   request: Record<string, unknown>;
-  /** Route label (e.g. `"m2.7"`, `"minimax-m3"`, `"sonnet"`). Omit → the gateway's default label. */
-  model?: string;
+  /**
+   * Routing label (e.g. `"smart"`, `"small"`, `"medium"`, `"large"`). The
+   * gateway resolves it against its configured label set — a raw provider
+   * model id is never honored. Omit to let the gateway choose (the
+   * recommended default); pass `"smart"` if you need to pin explicitly.
+   */
+  model?: RoutingLabel;
   /**
    * How long the caller will wait, in minutes. Omitted or <= 0 → run-now (top
    * priority, immediate escalation). The gateway orders jobs earliest-deadline-
@@ -131,7 +169,7 @@ export interface LlmSubmitSpec {
   /** Explicit complexity/capacity weight override (gateway clamps to its bounds). */
   complexity?: number;
   /**
-   * Where the gateway reports the grant (or failure). Inside a workflow leave it
+   * Where the gateway reports the grant (or failure). Inside an agent run leave it
    * unset — the engine injects `SAPIOM_LLM_WEBHOOK_URL` (its resume forwarder).
    * Standalone callers must pass one, or rely purely on `handle.wait()` polling
    * via a URL of their own.
@@ -149,7 +187,7 @@ export interface LlmSubmitSpec {
 export interface LlmGrantLink {
   anthropicBaseUrl: string;
   apiKey: string;
-  /** USER-FACING model label (e.g. `"m2.7"`, `"minimax-m3"`) — the provider is never disclosed. */
+  /** USER-FACING model label (e.g. `"smart"`, `"large"`) — the provider is never disclosed. */
   model: string;
   expiresAtMs: number;
   usage: string;
@@ -205,7 +243,7 @@ export const llmRouteResultSchema = {
 /**
  * A submitted-but-not-awaited routed job. Satisfies {@link DispatchHandle}, so it
  * can be handed straight to `pauseUntilSignal(handle, { resumeStep })` to suspend
- * a workflow step until the gateway grants (or fails) it — or `wait()`-ed inline
+ * an agent step until the gateway grants (or fails) it — or `wait()`-ed inline
  * for standalone use (polls the gateway's status endpoint).
  */
 export interface LlmRouteHandle extends DispatchHandle {
@@ -284,7 +322,7 @@ function submitHeaders(spec: LlmSubmitSpec, resumeToken: string | undefined) {
   const webhookUrl = spec.webhookUrl ?? process.env.SAPIOM_LLM_WEBHOOK_URL;
   if (!webhookUrl) {
     throw new Error(
-      "llm.submit: no webhook URL. Inside a workflow the engine injects " +
+      "llm.submit: no webhook URL. Inside an agent run the engine injects " +
         "SAPIOM_LLM_WEBHOOK_URL; standalone callers must pass { webhookUrl }.",
     );
   }
@@ -304,6 +342,109 @@ function submitHeaders(spec: LlmSubmitSpec, resumeToken: string | undefined) {
 }
 
 /**
+ * Serving-disclosure fields as they appear on raw `/v2` non-streaming response
+ * bodies — snake_case, injected top-level by the server next to `model`, in
+ * the same casing as the rest of the raw body {@link run} returns. The
+ * response `model` field keeps echoing the requested label; these dedicated
+ * fields report what the request resolved to, in the SKU vocabulary the
+ * platform bills in (billing class/size × lane) — never a model or provider
+ * id, and never a provider price. Absent = the server did not disclose
+ * (older server, resolution failure) — treat as unknown, never assume a
+ * value. (Streaming responses carry the same data as the
+ * `x-sapiom-served-class` / `x-sapiom-lane` response headers instead, which
+ * this module does not read.)
+ */
+export interface LlmDisclosure {
+  /** The billing class (size) the request's label resolved to. */
+  served_class?: string;
+  /** The billing lane the call executed in (e.g. `"run_now"`). */
+  lane?: string;
+}
+
+/** Camel-cased view of {@link LlmDisclosure}; `null` = the server did not disclose. */
+export interface LlmDisclosureResult {
+  servedClass: string | null;
+  lane: string | null;
+}
+
+/**
+ * Read the serving disclosure off a raw `/v2` response body ({@link run} /
+ * {@link redeem} / {@link callSession} results), camelCased. Missing or
+ * malformed fields come back `null` (unknown) — safe on responses from older
+ * servers, which never had this shape.
+ */
+export function readDisclosure(result: unknown): LlmDisclosureResult {
+  const body = (result ?? {}) as LlmDisclosure;
+  return {
+    servedClass: typeof body.served_class === "string" && body.served_class ? body.served_class : null,
+    lane: typeof body.lane === "string" && body.lane ? body.lane : null,
+  };
+}
+
+/**
+ * A single Anthropic Messages content block, narrowed to the fields
+ * {@link textOf} and {@link structuredOf} read. The real union has more
+ * variants (e.g. `thinking`, `redacted_thinking`, `tool_result`); this module
+ * only ever reads `type`, and — depending on that — `text` or `input`/`name`.
+ */
+interface AnthropicContentBlock {
+  type: string;
+  text?: string;
+  name?: string;
+  input?: unknown;
+}
+
+function isContentBlock(value: unknown): value is AnthropicContentBlock {
+  return typeof value === "object" && value !== null && typeof (value as { type?: unknown }).type === "string";
+}
+
+function contentBlocksOf(response: unknown): AnthropicContentBlock[] {
+  const content = (response as { content?: unknown } | null | undefined)?.content;
+  return Array.isArray(content) ? content.filter(isContentBlock) : [];
+}
+
+/**
+ * Extract the response's text block, from a raw {@link run} / {@link redeem} /
+ * {@link callSession} result. Some labels return a `thinking` block ahead of
+ * the text — this skips it (and any other non-`text` block) rather than
+ * assuming the first content entry is the answer. Returns `undefined` when
+ * the response has no text block (e.g. a pure tool-use turn) — never guesses.
+ */
+export function textOf(response: unknown): string | undefined {
+  return contentBlocksOf(response).find((block) => block.type === "text")?.text;
+}
+
+/**
+ * Structured-output convenience for {@link LlmRunSpec.output}: extracts the
+ * matching `tool_use` block's `input`, typed as `TSchema`. Pass `name` to
+ * disambiguate when the request declared more than one tool (e.g. more than
+ * one `output`-shaped call in the same conversation); omitted, the first
+ * `tool_use` block wins. Returns `undefined` when no matching block is
+ * present — never guesses at a shape the response didn't actually return.
+ */
+export function structuredOf<TSchema = unknown>(response: unknown, name?: string): TSchema | undefined {
+  const block = contentBlocksOf(response).find(
+    (b) => b.type === "tool_use" && (name === undefined || b.name === name),
+  );
+  return block?.input as TSchema | undefined;
+}
+
+/**
+ * Build the wire request `run` sends when {@link LlmRunSpec.output} is set:
+ * appends a tool named `output.name` (schema `output.schema`) to any
+ * caller-declared tools, and forces `tool_choice` onto it — the blessed
+ * tool-calling pattern for structured output, automated.
+ */
+function withStructuredOutput(request: Record<string, unknown>, output: LlmStructuredOutputSpec): Record<string, unknown> {
+  const existingTools = Array.isArray(request.tools) ? request.tools : [];
+  return {
+    ...request,
+    tools: [...existingTools, { name: output.name, input_schema: output.schema }],
+    tool_choice: { type: "tool", name: output.name },
+  };
+}
+
+/**
  * Synchronous routed call: `POST /v2/anthropic/v1/messages` on the x402 edge (Surface A —
  * the PATH is the wire shape; this client speaks Anthropic Messages). The gateway
  * selects the deployment (the label via `spec.model`, else the default label), admits it
@@ -311,6 +452,13 @@ function submitHeaders(spec: LlmSubmitSpec, resumeToken: string | undefined) {
  * and returns the completion inline. Billing settles against the caller's
  * Sapiom API key at the edge (identity mode; the default `x-sapiom-api-key`
  * header is exactly what the edge's identity guard reads).
+ *
+ * The response `model` echoes the requested label; the body additionally
+ * carries the serving disclosure ({@link LlmDisclosure}: `served_class` +
+ * `lane`) — read it with {@link readDisclosure}. For a plain text reply, read
+ * it with {@link textOf} rather than indexing `content[0]` (a `thinking`
+ * block can precede the text). For structured output, set `spec.output`
+ * (forces a tool call) and read the result with {@link structuredOf}.
  */
 export async function run<T = Record<string, unknown>>(
   spec: LlmRunSpec,
@@ -319,14 +467,15 @@ export async function run<T = Record<string, unknown>>(
 ): Promise<T> {
   const headers: Record<string, string> = {};
   if (spec.model) headers["x-sapiom-model"] = spec.model;
-  // Workflow surface defaults to never-fail ON (see LlmRunSpec.neverFail) —
+  // Agent surface defaults to never-fail ON (see LlmRunSpec.neverFail) —
   // sent explicitly either way so the behavior never rides a gateway default.
   headers["x-sapiom-never-fail"] = String(spec.neverFail ?? true);
   if (spec.complexity !== undefined)
     headers["x-sapiom-complexity"] = String(spec.complexity);
+  const request = spec.output ? withStructuredOutput(spec.request, spec.output) : spec.request;
   return transport.request<T>(`${baseUrl}/v2/anthropic/v1/messages`, {
     method: "POST",
-    body: JSON.stringify(spec.request),
+    body: JSON.stringify(request),
     headers,
   });
 }
@@ -386,8 +535,10 @@ export async function submit(
  * edge settles it against the caller's account ("payment at redemption",
  * SAP-1496), and the gateway routes it to the exact deployment the grant
  * reserved (single-use, consumed atomically; the response `model` carries the
- * user-facing label). `request.model` may be anything — the reserved deployment
- * wins. Returns the parsed LLM response.
+ * user-facing label, and the body carries the serving disclosure —
+ * {@link LlmDisclosure}, read with {@link readDisclosure}). `request.model`
+ * may be anything — the reserved deployment wins. Returns the parsed LLM
+ * response.
  */
 export async function redeem<T = Record<string, unknown>>(
   link: LlmGrantLink,
@@ -436,9 +587,17 @@ const SESSION_SETTLED = new Set<LlmSessionState>([
 ]);
 
 export interface LlmSessionCreateSpec {
-  /** Route label (e.g. `"sonnet"`, `"haiku"`). Mutually exclusive with `model`; omit both → the gateway's default label. */
-  label?: string;
-  /** Pin an exact Sapiom-supported alias. Mutually exclusive with `label`. */
+  /**
+   * Routing label (e.g. `"smart"`, `"large"`) — resolved against the
+   * gateway's configured label set; a raw provider model id is never
+   * honored. Mutually exclusive with `model`; omit both to let the gateway
+   * choose (the recommended default).
+   */
+  label?: RoutingLabel;
+  /**
+   * Pin an exact Sapiom-supported alias rather than a resolved label.
+   * Mutually exclusive with `label`.
+   */
   model?: string;
   /** How long you'll wait for capacity, in minutes. Omitted or <= 0 → run-now. */
   deadlineMinutes?: number;
@@ -455,7 +614,7 @@ export interface LlmSessionCreateSpec {
    */
   neverFail?: boolean;
   /**
-   * Where the gateway reports readiness. Inside a workflow leave it unset —
+   * Where the gateway reports readiness. Inside an agent run leave it unset —
    * the engine's `SAPIOM_LLM_WEBHOOK_URL` (resume forwarder) is used when
    * present. Unlike `submit`, a webhook is OPTIONAL: standalone callers may
    * rely purely on `handle.wait()` polling.
@@ -469,7 +628,7 @@ export interface LlmSessionCreateSpec {
 export interface LlmSession {
   sessionId: string;
   state: LlmSessionState;
-  /** USER-FACING label (e.g. `"sonnet"`) — the serving provider is never disclosed. */
+  /** USER-FACING label (e.g. `"smart"`) — the serving provider is never disclosed. */
   model?: string;
   /** Present from READY on: the drop-in base URLs scoped under the session. */
   baseUrls?: { anthropic: string; openai: string };
@@ -548,7 +707,7 @@ export async function createSession(
     body.budget = budget;
   }
   if (spec.neverFail !== undefined) body.never_fail = spec.neverFail;
-  // Webhook is optional (poll-only is a legitimate mode). Inside a workflow the
+  // Webhook is optional (poll-only is a legitimate mode). Inside an agent run the
   // engine's forwarder URL + the ambient resume token wire up pause/resume.
   const webhookUrl = spec.webhookUrl ?? process.env.SAPIOM_LLM_WEBHOOK_URL;
   if (webhookUrl) {
@@ -615,7 +774,9 @@ export async function getSession(
  * terminals return 410 (`session_expired` / `session_exhausted`); each call is
  * billed individually against the caller's Sapiom key, exactly like `run`.
  * `request.model` may be anything — the session's reserved deployment wins,
- * and the response `model` carries the user-facing label.
+ * and the response `model` carries the user-facing label (the body also
+ * carries the serving disclosure — {@link LlmDisclosure}, read with
+ * {@link readDisclosure}).
  */
 export async function callSession<T = Record<string, unknown>>(
   session: LlmSessionHandle | LlmSession | string,

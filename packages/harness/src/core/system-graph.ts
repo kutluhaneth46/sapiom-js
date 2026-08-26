@@ -26,11 +26,11 @@ export interface LocalAgentInventoryItem {
 }
 
 export interface WorkspaceScopeResolver {
-  resolve(workspaceKey: WorkspaceKey): WorkspaceScope | null;
+  resolve(workspaceKey: WorkspaceKey): Promise<WorkspaceScope | null>;
 }
 
 export interface WorkspaceScopeCatalog extends WorkspaceScopeResolver {
-  list(): WorkspaceScopeSummary[];
+  list(): Promise<WorkspaceScopeSummary[]>;
 }
 
 export interface LocalAgentInventoryReader {
@@ -69,11 +69,15 @@ function isWithin(root: string, candidate: string): boolean {
  * manufacture a key and turn the graph endpoint into an arbitrary path scan.
  */
 export class LocalWorkspaceScopeCatalog implements WorkspaceScopeCatalog {
-  constructor(private readonly listRoots: () => readonly string[]) {}
+  constructor(
+    private readonly listRoots: () =>
+      | readonly string[]
+      | Promise<readonly string[]>,
+  ) {}
 
-  list(): WorkspaceScopeSummary[] {
+  async list(): Promise<WorkspaceScopeSummary[]> {
     const byRoot = new Map<string, WorkspaceScopeSummary>();
-    for (const root of this.listRoots()) {
+    for (const root of await this.listRoots()) {
       const canonical = canonicalRoot(root);
       byRoot.set(canonical, {
         workspaceKey: workspaceKeyForRoot(canonical),
@@ -85,8 +89,8 @@ export class LocalWorkspaceScopeCatalog implements WorkspaceScopeCatalog {
       .map(([, summary]) => summary);
   }
 
-  resolve(workspaceKey: WorkspaceKey): WorkspaceScope | null {
-    for (const root of this.listRoots()) {
+  async resolve(workspaceKey: WorkspaceKey): Promise<WorkspaceScope | null> {
+    for (const root of await this.listRoots()) {
       const canonical = canonicalRoot(root);
       if (workspaceKeyForRoot(canonical) === workspaceKey) {
         return { workspaceKey, root: canonical };

@@ -1,5 +1,100 @@
 # @sapiom/orchestration-runtime
 
+## 0.7.0
+
+### Minor Changes
+
+- 555475d: Make `ctx.shared.set()` on the SDK's `InMemoryContextStore` an atomic
+  whole-snapshot quota gate. `runLocal` now constructs this store with step
+  context; hosts that have not adopted this store version may enforce the contract
+  only at execution boundaries during rollout. The store measures the complete
+  candidate as compact JSON UTF-8 before committing it, so oversized writes throw
+  `CTX_SHARED_SIZE_LIMIT_EXCEEDED` and retain the previous state.
+
+  Publish the bounded `CTX_SHARED_SERIALIZATION_FAILED` terminal error contract
+  for circular references, BigInt values, throwing `toJSON` methods, and other
+  `JSON.stringify` failures. Completion serializers and runners recognize the
+  new code through the closed platform-error registry and fail the step on its
+  current attempt without retrying. Ordinary JSON omission and coercion semantics
+  remain unchanged.
+
+  **Breaking:** `InMemoryContextStore.set()` can now throw synchronously for an
+  oversized or unserializable candidate. Existing local agents that wrote such
+  state now fail non-retryably on attempt 0. Migrate bulk state to durable storage
+  and keep only compact, JSON-compatible values or references in `ctx.shared`. If
+  a store is seeded with legacy invalid state, replace an offending key with a
+  value small enough to bring the complete candidate within the quota;
+  `TypedContextStore` has no `delete()` operation.
+
+### Patch Changes
+
+- Updated dependencies [555475d]
+  - @sapiom/agent@0.12.0
+
+## 0.6.0
+
+### Minor Changes
+
+- 9afeda9: Add a closed, versioned retry-classification contract for platform-owned step
+  errors. `CTX_SHARED_SIZE_LIMIT_EXCEEDED` and
+  `STEP_INPUT_VALIDATION_FAILED` now settle executions terminally without
+  consuming workflow retries; unknown, author, and capability errors keep the
+  legacy retry behavior.
+
+  `StepInputValidationError` now exposes a dedicated bounded wire payload with
+  stable `code`, `version`, `stepName`, and `retryable: false` fields while its
+  ordinary JSON representation continues carrying raw Zod issues for in-process
+  callers. Hosts receive a normalizing `parseNonRetryableStepErrorPayload`
+  registry plus `serializeStepCompletionError()` for completion reporters, and
+  may implement the additive atomic active-dispatch failure capability required
+  for terminal settlement. Older stores omit that capability and retain the
+  legacy retry path.
+
+### Patch Changes
+
+- Updated dependencies [9afeda9]
+  - @sapiom/agent@0.11.0
+
+## 0.5.0
+
+### Minor Changes
+
+- af764cd: Publish the authoritative 256 KiB `ctx.shared` whole-snapshot contract from
+  `@sapiom/agent`: `CTX_SHARED_QUOTA_CONTRACT`,
+  `MAX_SHARED_SNAPSHOT_BYTES`, `measureCtxSharedSnapshotBytes`,
+  `findCtxSharedSizeViolation`, `CtxSharedSizeLimitExceededError`,
+  `ctxSharedSizeLimitExceededPayloadSchema`, and
+  `isCtxSharedSizeLimitExceededPayload`, plus the
+  `CtxSharedSizeLimitPhase`, `CtxSharedSizeViolation`,
+  `CtxSharedSizeLimitExceededPayload`, and
+  `CtxSharedSizeLimitExceededErrorOptions` types.
+
+  `@sapiom/agent-runtime` now publicly exports `stepCompletionErrorSchema`,
+  preserves compatible structured quota payloads through protocol-1 parsing, and
+  re-exports the canonical compatibility limit.
+
+  Structured quota payloads include the reporting contract `version` and retain
+  unknown non-empty future phases during mixed-version rollouts; current error
+  construction remains limited to the three published enforcement phases.
+
+  This release defines measurement and error contracts; it does not make
+  `ctx.shared.set()` an atomic size gate or add local/final host-boundary
+  enforcement by itself. Host versions must adopt the contract. Authoring skills,
+  scaffolds, and MCP guidance now document compact ID/reference usage and that
+  enforcement can vary during rollout.
+
+### Patch Changes
+
+- Updated dependencies [af764cd]
+  - @sapiom/agent@0.10.0
+
+## 0.4.3
+
+### Patch Changes
+
+- Updated dependencies [c8072cd]
+  - @sapiom/agent@0.9.0
+
 ## 0.4.2
 
 ### Patch Changes

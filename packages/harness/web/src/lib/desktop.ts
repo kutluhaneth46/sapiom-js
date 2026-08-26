@@ -17,6 +17,33 @@
  * "no bridge".
  */
 
+/**
+ * A `sapiom://` deep-link target. Mirrors the desktop app's `DeepLinkTarget`
+ * (harness-desktop `ipc.ts`) — a discriminated union of the two link kinds.
+ */
+export type DeepLinkTarget = DeepLinkAgentTarget | DeepLinkTemplateTarget;
+
+/** `sapiom://agent/<definitionId>` — focus or clone that agent locally. */
+export interface DeepLinkAgentTarget {
+  kind: "agent";
+  definitionId: string;
+  slug?: string;
+  org?: string;
+}
+
+/** `sapiom://templates/<id>` — open that template in the gallery. */
+export interface DeepLinkTemplateTarget {
+  kind: "template";
+  templateId: string;
+  slug?: string;
+}
+
+/** Downloaded-update state pushed by the desktop app (mirrors its
+ *  `UpdateStatePayload`). `none` retracts the rail's "Update now" card. */
+export type UpdateStatePayload =
+  | { kind: "none" }
+  | { kind: "downloaded"; version: string };
+
 /** Result of an on-demand update check. Mirrors the desktop app's `UpdateCheckOutcome`. */
 export type UpdateCheckOutcome =
   | { kind: "available"; version: string }
@@ -30,9 +57,44 @@ export interface DesktopBridge {
   /** The desktop app's own version (may be empty on older builds). */
   appVersion: string;
   checkForUpdates: () => Promise<UpdateCheckOutcome>;
-  // No restart method: applying an update is confirmed by a native dialog in the
-  // desktop app, so page code — which shares an origin with agent-authored files
-  // the harness serves — has no way to end a user's sessions.
+  /**
+   * Open the OS-native folder chooser, optionally starting at `defaultPath`.
+   * Resolves with the chosen absolute path, or null when cancelled.
+   *
+   * Optional on purpose: a desktop build older than this SPA won't expose it, and
+   * a plain browser has no bridge at all — callers must feature-detect it and fall
+   * back to the in-app directory listing, never assume it.
+   */
+  chooseDirectory?: (defaultPath?: string) => Promise<string | null>;
+  /**
+   * Subscribe to `sapiom://` deep links that arrive while the app is running
+   * (main → renderer push); returns an unsubscribe fn. Optional on purpose: a
+   * plain browser has no bridge, and a desktop build older than this SPA won't
+   * expose it — callers must feature-detect it. Cold-start links arrive via the
+   * `agent=` load-URL param (see `deep-link.ts`), not this channel.
+   */
+  onDeepLink?: (callback: (target: DeepLinkTarget) => void) => () => void;
+  /**
+   * Subscribe to downloaded-update state (main → renderer push); returns an
+   * unsubscribe fn. Drives the rail's "Update now" card: the desktop preload
+   * buffers the latest push and replays it on subscribe (the load-time re-push
+   * lands before mount effects run), so subscribing at mount is the whole
+   * protocol. Optional for the usual reason — older desktop builds don't
+   * expose it, and a browser has no bridge; the card then never renders.
+   */
+  onUpdateState?: (callback: (state: UpdateStatePayload) => void) => () => void;
+  /**
+   * The absolute filesystem path of a dropped/picked File, or "" when the
+   * desktop app can't resolve one. This is what lets a drop on the terminal
+   * behave like a native emulator (the file's path is typed into the pty): a
+   * plain browser's File object exposes no path at all. Optional for the usual
+   * reason — older desktop builds and browsers don't have it, and callers must
+   * degrade to doing nothing rather than assume it.
+   */
+  pathForFile?: (file: File) => string;
+  // No restart method: applying an update is confirmed in the desktop app's own
+  // main-process-owned update window, so page code — which shares an origin with
+  // agent-authored files the harness serves — has no way to end a user's sessions.
 }
 
 declare global {
@@ -68,6 +130,18 @@ export function getDesktopBridge(host: DesktopHost | undefined = defaultHost()):
   return {
     appVersion: typeof bridge.appVersion === "string" ? bridge.appVersion : "",
     checkForUpdates: bridge.checkForUpdates,
+    // Optional: only surfaced when the desktop build actually provides it, so an
+    // older app degrades to the in-app listing rather than a rejecting call.
+    chooseDirectory: typeof bridge.chooseDirectory === "function" ? bridge.chooseDirectory : undefined,
+    // Optional for the same reason: an older desktop build (or a browser) simply
+    // never delivers a warm deep link, and cold links still ride the load-URL param.
+    onDeepLink: typeof bridge.onDeepLink === "function" ? bridge.onDeepLink : undefined,
+    // Optional again: with no subscription there is no update state, so the
+    // "Update now" card simply never appears on an older desktop build.
+    onUpdateState: typeof bridge.onUpdateState === "function" ? bridge.onUpdateState : undefined,
+    // Optional: a browser (or older desktop build) can't resolve a File's path,
+    // so a drop on the terminal simply does nothing there.
+    pathForFile: typeof bridge.pathForFile === "function" ? bridge.pathForFile : undefined,
   };
 }
 

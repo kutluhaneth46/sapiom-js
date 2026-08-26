@@ -2,7 +2,8 @@
  * Fixture data for `VITE_MOCK=1` — lets the SPA render fully without a
  * running harness server (see MockApi in ./api).
  */
-import type { HarnessEntry, HarnessSession, HarnessSettings, MacroDef, SessionRecord, SessionSummary, TemplateDetailView, TemplateSummary, WorkflowInfo } from "@shared/types";
+import type { CanvasOverviewContent } from "../components/CanvasOverviewPanel";
+import type { AccountPlanView, HarnessEntry, HarnessSession, HarnessSettings, MacroDef, SessionRecord, SessionSummary, TemplateDetailView, TemplateSummary, WorkflowInfo } from "@shared/types";
 
 const now = Date.now();
 const minutesAgo = (n: number): string => new Date(now - n * 60_000).toISOString();
@@ -11,10 +12,7 @@ const daysAgo = (n: number): string => new Date(now - n * 24 * 60 * 60_000).toIS
 /** The directory the harness itself was launched from (`npx @sapiom/harness [dir]`). */
 /** Demo-only canvas overview content (the real renderer emits this inside
  * its own document; live mode therefore renders no app-side panel). */
-export const MOCK_CANVAS_OVERVIEWS: Record<
-  string,
-  { description: string; stats: string; notes: string[] }
-> = {
+export const MOCK_CANVAS_OVERVIEWS: Record<string, CanvasOverviewContent> = {
   "/Users/demo/acme-app/leasing": {
     description: "Handles lease applications end to end: screening, credit check, and approval routing.",
     // Counting rule shared with the Steps tab (canvas-graph's graphCounts):
@@ -25,10 +23,26 @@ export const MOCK_CANVAS_OVERVIEWS: Record<
       "Only scores of 620 and above auto-draft a lease; everything else escalates.",
       "Both terminal steps are marked terminal-success in the graph.",
     ],
+    // The chrome the board used to float over the graph.
+    badges: ["deployed agent"],
+    legend: [
+      { kind: "entry", label: "entry / active step" },
+      { kind: "step", label: "step" },
+      { kind: "terminal-success", label: "terminal · success" },
+    ],
   },
 };
 
 export const MOCK_LAUNCH_DIR = "/Users/demo/acme-app";
+
+/** The rail's plan card in demo mode: the limit readout ("$12.40 / $50"), the
+ *  same pair the dashboard's balance card renders, so the demo shows the
+ *  card's fullest honest state. */
+export const MOCK_ACCOUNT_PLAN: AccountPlanView = {
+  plan: { name: "Free plan", status: "active" },
+  readout: { kind: "limit", usedUsd: 12.4, limitUsd: 50 },
+  source: "live",
+};
 
 /** The ONLY mock sessions with a real bundled canvas document under
  *  public/canvas/<id>/. The canvas pane must never mount an iframe for any
@@ -340,8 +354,8 @@ export const MOCK_SESSIONS: HarnessSession[] = [
     agentSessionId: "9c1a2b3d-4e5f-4061-8a7b-6c5d4e3f2a10",
     boundWorkflowPath: null,
     harness: "codex",
-    cwd: "/Users/demo/rfq-workflows",
-    title: "rfq-workflows",
+    cwd: "/Users/demo/rfq-agent",
+    title: "rfq-agent",
     status: "exited",
     createdAt: daysAgo(2),
     lastActiveAt: daysAgo(1),
@@ -392,7 +406,9 @@ export const MOCK_SESSIONS: HarnessSession[] = [
     // its tab carries the busy pulse shortly after load — the pulse only means
     // anything on a tab you are not already looking at.
     boundWorkflowPath: "/Users/demo/acme-app/leasing",
-    harness: "claude-code",
+    // Mixed-provider siblings prove the tab + inherits the selected session's
+    // adapter rather than defaulting every new conversation to Claude Code.
+    harness: "codex",
     cwd: MOCK_LAUNCH_DIR,
     title: "acme-app",
     status: "running",
@@ -431,14 +447,21 @@ export const MOCK_ACTIVITY_SESSION_ID = "sess-leasing-2";
 export const MOCK_FS_TREE: Record<string, string[]> = {
   "/": ["Users"],
   "/Users": ["demo"],
-  "/Users/demo": ["acme-app", "rfq-workflows", "onboarding-flow", "scratch"],
-  "/Users/demo/acme-app": ["leasing", "src", "docs"],
+  "/Users/demo": ["acme-app", "rfq-agent", "onboarding-flow", "scratch"],
+  "/Users/demo/acme-app": ["projects", "leasing", "src", "docs"],
+  // The project root (`<launchDir>/projects`, mirroring the Electron host — see
+  // MockApi.state's defaultProjectRoot). Present so the "Add existing agents"
+  // picker, which now opens on the project root, lands on a real directory.
+  "/Users/demo/acme-app/projects": ["leasing", "src", "docs"],
+  "/Users/demo/acme-app/projects/leasing": [],
+  "/Users/demo/acme-app/projects/src": [],
+  "/Users/demo/acme-app/projects/docs": [],
   "/Users/demo/acme-app/leasing": [],
   "/Users/demo/acme-app/src": [],
   "/Users/demo/acme-app/docs": [],
-  "/Users/demo/rfq-workflows": ["src", "tests"],
-  "/Users/demo/rfq-workflows/src": [],
-  "/Users/demo/rfq-workflows/tests": [],
+  "/Users/demo/rfq-agent": ["src", "tests"],
+  "/Users/demo/rfq-agent/src": [],
+  "/Users/demo/rfq-agent/tests": [],
   "/Users/demo/onboarding-flow": [],
   "/Users/demo/scratch": [],
 };
@@ -544,13 +567,13 @@ export const MOCK_HISTORY: Record<string, SessionSummary[]> = {
       turnCount: 9,
     },
   ],
-  "/Users/demo/rfq-workflows": [
+  "/Users/demo/rfq-agent": [
     {
       harnessSessionId: "sess-rfq",
       agentSessionId: "9c1a2b3d-4e5f-4061-8a7b-6c5d4e3f2a10",
       harness: "codex",
-      cwd: "/Users/demo/rfq-workflows",
-      title: "rfq-workflows",
+      cwd: "/Users/demo/rfq-agent",
+      title: "rfq-agent",
       lastActiveAt: daysAgo(1),
       source: "registry",
       resumeMode: "agent-resume",
@@ -587,13 +610,13 @@ export const MOCK_SESSION_RECORDS: Record<string, SessionRecord> = {
     turns: [
       {
         index: 1,
-        prompt: "Add the screening step to the leasing workflow and wire it to the credit check.",
+        prompt: "Add the screening step to the leasing agent and wire it to the credit check.",
         promptAt: minutesAgo(48),
         toolCalls: [
           {
             name: "Read",
             input: '{"file_path":"/Users/demo/acme-app/leasing/index.ts"}',
-            responseSummary: "export const leasing = defineWorkflow({ … })",
+            responseSummary: "export const leasing = defineAgent({ … })",
             responseTruncated: false,
             at: minutesAgo(47),
           },
@@ -752,7 +775,7 @@ export const MOCK_SESSION_RECORDS: Record<string, SessionRecord> = {
     mergedSessionIds: ["sess-rfq"],
     agentSessionId: "9c1a2b3d-4e5f-4061-8a7b-6c5d4e3f2a10",
     harness: "codex",
-    cwd: "/Users/demo/rfq-workflows",
+    cwd: "/Users/demo/rfq-agent",
     startedAt: daysAgo(1),
     endedAt: null,
     turnCount: 1,
@@ -765,13 +788,13 @@ export const MOCK_SESSION_RECORDS: Record<string, SessionRecord> = {
     turns: [
       {
         index: 1,
-        prompt: "Summarize what the rfq workflow does.",
+        prompt: "Summarize what the rfq agent does.",
         promptAt: daysAgo(1),
         toolCalls: [
           {
             name: "shell",
             input: '{"command":["cat","README.md"]}',
-            responseSummary: "# rfq-workflows\nRequest-for-quote intake and routing.",
+            responseSummary: "# rfq-agent\nRequest-for-quote intake and routing.",
             responseTruncated: false,
             at: daysAgo(1),
           },
@@ -841,12 +864,125 @@ export const MOCK_SESSION_RECORDS: Record<string, SessionRecord> = {
 };
 
 export const MOCK_WORKFLOWS: WorkflowInfo[] = [
-  { name: "leasing", path: "/Users/demo/acme-app/leasing", definitionId: 4821, definitionSlug: "leasing", source: "scan" },
-  { name: "rfq", path: "/Users/demo/rfq-workflows", definitionId: null, definitionSlug: null, source: "scan" },
+  {
+    name: "leasing",
+    path: "/Users/demo/acme-app/leasing",
+    definitionId: 4821,
+    definitionSlug: "leasing",
+    activeBuildRunId: "build-leasing-ready",
+    activeBuildRunStatus: "ready",
+    // A gallery clone writes templateId AND forkId — the deploy e2e asserts
+    // this provenance resolves to source "template".
+    templateId: "leasing-copilot",
+    forkId: "fork-leasing-1",
+    source: "scan",
+  },
+  {
+    name: "rfq",
+    path: "/Users/demo/rfq-agent",
+    definitionId: null,
+    definitionSlug: null,
+    activeBuildRunId: null,
+    activeBuildRunStatus: null,
+    source: "scan",
+  },
   // Deployed like "leasing" but with a much longer name — exercises the
   // canvas header's deployed-dot staying pinned regardless of name length.
-  { name: "onboarding-flow", path: "/Users/demo/onboarding-flow", definitionId: 9001, definitionSlug: "onboarding-flow", source: "connect" },
+  {
+    name: "onboarding-flow",
+    path: "/Users/demo/onboarding-flow",
+    definitionId: 9001,
+    definitionSlug: "onboarding-flow",
+    activeBuildRunId: "build-onboarding-ready",
+    activeBuildRunStatus: "ready",
+    // Scaffolded from a bundled starter — keeps all three provenance buckets
+    // visible in mock mode (rfq stays bare = scratch).
+    starterId: "coding-pause",
+    source: "connect",
+  },
 ];
+
+/**
+ * `?mockFixtures=search` only — the shapes from the 2026-08-11 search bug
+ * report, kept out of the default fixtures so every fixture-count assertion
+ * elsewhere holds verbatim. Their paths deliberately stay out of
+ * MOCK_FS_TREE and MOCK_SETTINGS.recentDirs so directory-picker badges and
+ * bulk-scan counts never see them either.
+ */
+export const MOCK_SEARCH_WORKFLOWS: WorkflowInfo[] = [
+  // Raw scoped package name vs the rail's display name "slack-notifier" —
+  // the palette must search and show the short form.
+  {
+    name: "@sapiom/example-slack-notifier",
+    path: "/Users/demo/team-tools/slack-notifier",
+    definitionId: null,
+    definitionSlug: null,
+    source: "scan",
+  },
+  // Its PATH carries s…l…a…c…k scattered across segments ("social…stack"),
+  // which the old matcher accepted — a "slack" query must NOT surface it.
+  {
+    name: "daily-activity-analyst",
+    path: "/Users/demo/social-marketing/analytics-stack/daily-activity-analyst",
+    definitionId: null,
+    definitionSlug: null,
+    source: "scan",
+  },
+];
+
+export const MOCK_SEARCH_HISTORY: Record<string, SessionSummary[]> = {
+  // Under the boot session's cwd so the palette-open history fan-out already
+  // covers this directory — no recentDirs change needed.
+  "/Users/demo/acme-app": [
+    // Three transcript rows the user cannot tell apart (same title, same
+    // folder) — the palette collapses them to the newest.
+    ...[2, 4, 5].map((age, index) => ({
+      agentSessionId: `search-standup-${index + 1}`,
+      harness: "claude-code" as const,
+      cwd: "/Users/demo/acme-app",
+      title: "Standup summary for #eng",
+      lastActiveAt: daysAgo(age),
+      source: "transcript" as const,
+      resumeMode: "rehydrate" as const,
+      turnCount: 6 - index,
+    })),
+    // A raw first-prompt title — the old matcher let short queries land on
+    // characters scattered through strings like this.
+    {
+      agentSessionId: "search-annotate",
+      harness: "claude-code" as const,
+      cwd: "/Users/demo/acme-app",
+      title: "You are annotating an already-generated draft of the leasing docs",
+      lastActiveAt: daysAgo(3),
+      source: "transcript" as const,
+      resumeMode: "rehydrate" as const,
+      turnCount: 2,
+    },
+    // Noise rows for the "daily" query: titles that share letters with it
+    // (the old matcher scattered across them) but carry no boundary hit, so
+    // the agent must be the only match.
+    {
+      agentSessionId: "search-digest",
+      harness: "claude-code" as const,
+      cwd: "/Users/demo/acme-app",
+      title: "Digest and activity rollup",
+      lastActiveAt: daysAgo(1),
+      source: "transcript" as const,
+      resumeMode: "rehydrate" as const,
+      turnCount: 4,
+    },
+    {
+      agentSessionId: "search-activity-log",
+      harness: "claude-code" as const,
+      cwd: "/Users/demo/acme-app",
+      title: "Check the activity log",
+      lastActiveAt: daysAgo(6),
+      source: "transcript" as const,
+      resumeMode: "rehydrate" as const,
+      turnCount: 3,
+    },
+  ],
+};
 
 export const MOCK_MACROS: MacroDef[] = [
   {
@@ -871,14 +1007,25 @@ export const MOCK_MACROS: MacroDef[] = [
     requiresWorkflow: true,
   },
   {
-    // One-click force refresh: deterministic re-render + AI enrichment task
-    // re-spawn, all server-side — no LLM in the render itself, no pty
-    // involved. Matches the real DEFAULT_MACROS contract (src/core/macros.ts).
+    // One-click force refresh: deterministic extraction + derived annotations,
+    // all server-side — no LLM and no pty involved. Matches the real
+    // DEFAULT_MACROS contract (src/core/macros.ts).
     id: "visualize",
     label: "Visualize",
     icon: "Sparkles",
     action: { kind: "render-canvas" },
     requiresWorkflow: false,
+  },
+  {
+    // "Describe with AI" — headless background authoring pass. Mirrors the real
+    // DEFAULT_MACROS contract (src/core/macros.ts). Invoked programmatically by
+    // the canvas overview button, never rendered in the action rail.
+    id: "describe",
+    label: "Describe with AI",
+    icon: "Sparkles",
+    action: { kind: "inject", text: "{{subject}}", submit: true },
+    requiresWorkflow: true,
+    execution: "background",
   },
 ];
 
@@ -897,9 +1044,6 @@ export const MOCK_HARNESSES: HarnessEntry[] = [
     installed: true,
     installMcpPrompt:
       "Add the Sapiom MCP server to this project: run `claude mcp add sapiom --transport http https://api.sapiom.ai/v1/mcp`, restart the session, then run /mcp to confirm the sapiom tools are listed.",
-    // Mirrors the upstream adapter descriptors: claude-code and
-    // codex read images from a file path, so the composer offers attach.
-    imageInput: true,
   },
   {
     id: "codex",
@@ -909,7 +1053,6 @@ export const MOCK_HARNESSES: HarnessEntry[] = [
     installed: true,
     installMcpPrompt:
       'Add the Sapiom MCP server to Codex: in ~/.codex/config.toml add an [mcp_servers.sapiom] entry with url = "https://api.sapiom.ai/v1/mcp", then restart Codex and confirm the sapiom tools are listed.',
-    imageInput: true,
   },
   // The rest of the registry, honestly non-launchable: the pickers list them
   // disabled with the reason in a tooltip (no fabricated availability).
@@ -920,7 +1063,6 @@ export const MOCK_HARNESSES: HarnessEntry[] = [
     experimental: true,
     installed: false,
     installMcpPrompt: "",
-    imageInput: false,
   },
   {
     id: "opencode",
@@ -929,7 +1071,6 @@ export const MOCK_HARNESSES: HarnessEntry[] = [
     experimental: true,
     installed: false,
     installMcpPrompt: "",
-    imageInput: false,
   },
   {
     id: "conductor",
@@ -938,16 +1079,13 @@ export const MOCK_HARNESSES: HarnessEntry[] = [
     experimental: false,
     installed: false,
     installMcpPrompt: "",
-    imageInput: false,
   },
 ];
 
 export const MOCK_SETTINGS: HarnessSettings = {
   telemetryOptIn: false,
-  recentDirs: ["/Users/demo/acme-app", "/Users/demo/rfq-workflows", "/Users/demo/onboarding-flow"],
+  recentDirs: ["/Users/demo/acme-app", "/Users/demo/rfq-agent", "/Users/demo/onboarding-flow"],
   // Matches the real default: opt-in, because it spends tokens on a background
   // LLM call the user never asked for.
   rollingSummary: false,
 };
-
-

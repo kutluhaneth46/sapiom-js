@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
   AppState,
+  AttachFileRequest,
+  AttachFileResponse,
   BackgroundTask,
   BusMessage,
   RunView,
@@ -9,12 +11,18 @@ import type {
   HarnessSession,
   HarnessSettings,
   RunMacroRequest,
+  RunTarget,
   SessionRecord,
   SessionSummary,
   WorkflowInfo,
+  WorkflowInputContractResponse,
 } from "@shared/types";
 
-import type { HarnessEntry, TemplateDetailView, TemplateListResponse } from "@shared/types";
+import type {
+  HarnessEntry,
+  TemplateDetailView,
+  TemplateListResponse,
+} from "@shared/types";
 
 import {
   ApiError,
@@ -27,8 +35,21 @@ import {
   type RunLocalLine,
 } from "./api";
 import { type ConnectivityErrorInput } from "./connectivity";
+import { isWithinDir } from "./paths";
 import { mergeHistory } from "./history-meta";
+import { createToastMessage, type ToastMessage, type ToastTone } from "./toast";
 import { subscribeEvents } from "./events";
+import { track as trackProduct } from "./analytics/events";
+import {
+  agentProvenance,
+  deployErrorKind,
+  initialRunFunnelState,
+  localRunOutcomeKind,
+  newAgentPaths,
+  runFunnelStep,
+  slugFromPath,
+  type RunFunnelEvent,
+} from "./analytics/lifecycle";
 import { renderLocalRun } from "@shared/render-local-run";
 import type { LocalStepTrace, LocalRunOutcome } from "@sapiom/agent-core";
 
@@ -47,10 +68,17 @@ const BUSY_WINDOW_MS = 3_000;
  *  cli/settings.ts) and its response replaces this guess. */
 const RECENT_DIRS_UI_CAP = 8;
 
-/** Where a run executed — the server announces it on execution.started.
- *  "local" runs are stubbed (capabilities run against fixtures); "prod" runs
- *  are real cloud executions. */
-export type RunTarget = "prod" | "local";
+
+/** Upper bound on {@link announcedRuns}. A Studio left open for days can
+ *  accumulate executionIds without limit otherwise; the set only needs to
+ *  cover the redelivery window, not the whole session. */
+const ANNOUNCED_RUNS_CAP = 500;
+
+/** Re-exported from `@shared/types`, where it now lives so the analytics
+ *  registry can name it without importing this module (which imports the
+ *  registry). Existing `import { RunTarget } from "./use-harness-state"`
+ *  callers keep working. */
+export type { RunTarget };
 
 /** One observed run: the polled RunView plus the facts captured when its
  *  execution.started announcement arrived. */
@@ -65,6 +93,28 @@ export interface ObservedRun {
    *  RunView carries no server timestamps, so observation time is the only
    *  honest time the Studio can show for a run. */
   observedAt: number;
+}
+
+/** Live progress of a deploy, surfaced in the Steps pane. The wire stream has
+ *  a transient `warning` phase folded into `building` here — the banner only
+ *  needs "in flight" vs "landed" vs "failed". */
+export interface DeployProgress {
+  phase: "linking" | "building" | "ready" | "error";
+  /** A complete, user-facing sentence when the server supplied one (a warning
+   *  passthrough, or an error message); absent otherwise. */
+  message?: string;
+}
+
+/**
+ * An optimistic rail entry for a folder whose agent is still being created.
+ * `sessionSeen` records that a live session for this `cwd` has appeared at least
+ * once — the pruning logic uses it to tell "the create hasn't produced a session
+ * yet" (keep waiting) from "a session came and went without producing an agent"
+ * (abandoned — drop the ghost row).
+ */
+export interface PendingWorkspace {
+  cwd: string;
+  sessionSeen: boolean;
 }
 
 export interface HarnessStateHook {
@@ -93,11 +143,19 @@ export interface HarnessStateHook {
    *  resume view, not one directory at a time). */
   loadHistory: (cwds: string[]) => Promise<void>;
   createSession: (req: CreateSessionRequest) => Promise<HarnessSession>;
+  attachFile: (
+    sessionId: string,
+    request: AttachFileRequest,
+  ) => Promise<AttachFileResponse>;
   /** The live template gallery + one template's detail (server relays core;
    *  the API key never reaches the browser). Surfaced here so components stay
    *  prop-driven rather than reaching for a module-level api singleton. */
   listTemplates: () => Promise<TemplateListResponse>;
   getTemplate: (id: string) => Promise<TemplateDetailView>;
+  /** Loads the selected agent's entry JSON Schema for the run sheet. */
+  getWorkflowInputContract: (
+    workflowPath: string,
+  ) => Promise<WorkflowInputContractResponse>;
   /** A past session's reconstructed transcript (null when nothing was
    *  recorded for it). Stable identity — safe as an effect dependency. */
   sessionRecord: (id: string) => Promise<SessionRecord | null>;
@@ -124,7 +182,10 @@ export interface HarnessStateHook {
    *  (installed/experimental/external flags) and the MCP setup prompts. */
   listHarnesses: () => Promise<HarnessEntry[]>;
   /** Binds a workflow to a session ("what am I working on") — null unbinds. */
-  bindWorkflow: (sessionId: string, workflowPath: string | null) => Promise<void>;
+  bindWorkflow: (
+    sessionId: string,
+    workflowPath: string | null,
+  ) => Promise<void>;
   updateSettings: (patch: Partial<HarnessSettings>) => Promise<HarnessSettings>;
   runMacro: (id: string, req: RunMacroRequest) => Promise<void>;
   /**
@@ -144,6 +205,28 @@ export interface HarnessStateHook {
    */
   lastDeployErrorFor: (workflowPath: string) => string | null;
   /**
+   * Live deploy progress per workflow path (linking → building → ready/error),
+   * so the Steps surface can show a deploy landing. In-memory only. Absent = no
+   * deploy observed this session (or the completion banner was dismissed).
+   */
+  deployStateByPath: Map<string, DeployProgress>;
+  /** Dismiss a workflow's deploy banner (clears its `deployStateByPath` entry). */
+  dismissDeployState: (workflowPath: string) => void;
+  /**
+   * Folders whose agent is being created but whose session/agent has not yet
+   * landed in `state`. Presentational overlay only — never enters `sessions`/
+   * `workflows` — so the rail can show a "Creating agent…" row from the instant
+   * creation starts. Newest first. Pruned automatically once a real session or
+   * agent covers the `cwd` (or the create fails / is abandoned). */
+  pendingWorkspaces: PendingWorkspace[];
+  /** Optimistically mark `cwd` as a workspace being created (call synchronously
+   *  at the start of the create flow, before the network round-trip). No-op if
+   *  already pending. */
+  addPendingWorkspace: (cwd: string) => void;
+  /** Drop the optimistic entry for `cwd` — used when session creation fails so
+   *  no ghost row lingers. */
+  removePendingWorkspace: (cwd: string) => void;
+  /**
    * Monotonic counter bumped on every direct-action settle (deploy or run,
    * success or failure). SessionStepsBar adds this to its `useEffect` deps so
    * the pending ring clears on every settle — including re-deploys of an
@@ -157,25 +240,35 @@ export interface HarnessStateHook {
    * poller so the run shows up in the Steps tab exactly as a CLI-launched run
    * does. Errors go to the toast slot.
    */
-  startProdRun: (sessionId: string, definitionId: string, input?: unknown) => Promise<void>;
+  startProdRun: (
+    sessionId: string,
+    definitionId: string,
+    input?: unknown,
+  ) => Promise<void>;
   /**
-   * Runs the workflow at `sourceDir` OFFLINE against stub capabilities and
+   * Runs the workflow at `sourceDir` locally against stub capabilities and
    * streams the result into the SAME run store the prod poller feeds — so the
    * click-into-step inspector renders a local stub run exactly as it renders a
    * prod run (per-step logs + pass/fail + IO), just `target: "local"` (free,
    * untimed). Resolves when the stream ends; a failed *run* is a normal
-   * terminal state (surfaced in the run), not a rejection. Fully offline: no
-   * key, no cost, works signed-out.
+   * terminal state (surfaced in the run), not a rejection. It needs no Sapiom
+   * key, creates no Sapiom capability spend, and works signed-out; author
+   * code's own side effects remain real.
    */
-  runLocal: (sessionId: string, sourceDir: string, input?: unknown) => Promise<void>;
+  runLocal: (
+    sessionId: string,
+    sourceDir: string,
+    input?: unknown,
+  ) => Promise<void>;
   /**
    * Submits text to a session's pty via POST /api/sessions/:id/input.
    * Throws `ApiError` on HTTP errors — callers handle 409 (session not ready)
    * by showing the reason inline rather than as a toast.
    */
   injectInput: (sessionId: string, text: string) => Promise<void>;
-  /** Expose the toast setter so panels can push their own toasts. */
-  showToast: (message: string) => void;
+  /** Expose the toast setter so panels can push their own toasts. Defaults
+   *  to the "error" tone; callers announcing a result opt into "info". */
+  showToast: (message: string, tone?: ToastTone) => void;
   listDir: (path?: string) => Promise<FsListResponse>;
   lastMessage: BusMessage | null;
   /** The run each session's Steps tab is showing (the latest observed by
@@ -197,7 +290,7 @@ export interface HarnessStateHook {
    *  run against a not-yet-ready session) — null when there's nothing to
    *  show. `runMacro` never rejects on this kind of failure; it sets this
    *  instead, since its only caller today fires it without awaiting. */
-  toast: string | null;
+  toast: ToastMessage | null;
   dismissToast: () => void;
   /** Session ids with terminal output in roughly the last `BUSY_WINDOW_MS` —
    *  drives each session tab's busy pulse (see `session.activity` BusMessage). */
@@ -237,22 +330,37 @@ export function useHarnessState(): HarnessStateHook {
    */
   const settingsRef = useRef<HarnessSettings | null>(null);
   settingsRef.current = settings;
+  /**
+   * Mirror of `state.workflows` for deploy()'s provenance lookup. deploy is
+   * memoised WITHOUT state in its deps on purpose — inFlightDeploys dedupes
+   * double-clicks by handing back the same in-flight promise, which only works
+   * while the callback stays stable — so it reads the registry through this
+   * ref. Same render-phase mirror contract as settingsRef above.
+   */
+  const workflowsRef = useRef<WorkflowInfo[]>([]);
+  workflowsRef.current = state?.workflows ?? [];
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   // Boot-error facts (HTTP status / network-throw flag), shaped for the
   // connectivity classifier so the shell can pick a recoverable offline vs
   // auth vs generic state instead of a dead "Failed to load" screen.
-  const [errorKind, setErrorKind] = useState<ConnectivityErrorInput | null>(null);
+  const [errorKind, setErrorKind] = useState<ConnectivityErrorInput | null>(
+    null,
+  );
   // Bumped by reload() to re-run the one-shot boot fetch (the recovery path).
   const [reloadSeq, setReloadSeq] = useState(0);
-  const [selectedWorkflowPath, setSelectedWorkflowPath] = useState<string | null>(null);
+  const [selectedWorkflowPath, setSelectedWorkflowPath] = useState<
+    string | null
+  >(null);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [history, setHistory] = useState<SessionSummary[]>([]);
-  const [toast, setToast] = useState<string | null>(null);
+  const [toast, setToast] = useState<ToastMessage | null>(null);
   const [historyLoading, setHistoryLoading] = useState(false);
   // History fan-out bookkeeping — see loadHistory. Refs, not state: neither
   // affects the render, and both are read/written within a single call.
-  const inFlightHistory = useRef<Map<string, Promise<SessionSummary[]>>>(new Map());
+  const inFlightHistory = useRef<Map<string, Promise<SessionSummary[]>>>(
+    new Map(),
+  );
   const historyLoads = useRef(0);
   // Deploys in flight, keyed by workflow path. A second click while one is
   // running must not start another: for an UNLINKED project each deploy calls
@@ -263,26 +371,135 @@ export function useHarnessState(): HarnessStateHook {
   const [lastMessage, setLastMessage] = useState<BusMessage | null>(null);
   const [busySessionIds, setBusySessionIds] = useState<Set<string>>(new Set());
   const [tasks, setTasks] = useState<BackgroundTask[]>([]);
-  const busyTimers = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+  const busyTimers = useRef<Map<string, ReturnType<typeof setTimeout>>>(
+    new Map(),
+  );
   // Runs (upstream runtime-analytics contract): an execution.started bus
   // message starts polling /api/runs/:id/state until the run is terminal.
   // Snapshots accumulate per executionId — never replaced by a later run —
   // so a new execution can't erase the one you were reading (or its costs).
-  const [runsByExecution, setRunsByExecution] = useState<Map<string, ObservedRun>>(new Map());
+  const [runsByExecution, setRunsByExecution] = useState<
+    Map<string, ObservedRun>
+  >(new Map());
   // Ordered executionIds observed per session, oldest first.
-  const [runIdsBySession, setRunIdsBySession] = useState<Map<string, string[]>>(new Map());
+  const [runIdsBySession, setRunIdsBySession] = useState<Map<string, string[]>>(
+    new Map(),
+  );
   // Explicit run picks per session; absent = follow the latest run.
-  const [pickedRunBySession, setPickedRunBySession] = useState<Map<string, string>>(new Map());
-  const runPollers = useRef<Map<string, ReturnType<typeof setInterval>>>(new Map());
+  const [pickedRunBySession, setPickedRunBySession] = useState<
+    Map<string, string>
+  >(new Map());
+  const runPollers = useRef<Map<string, ReturnType<typeof setInterval>>>(
+    new Map(),
+  );
+  // executionIds already counted into the run funnel. `execution.started` is a
+  // bus message, and nothing upstream promises it arrives exactly once — a
+  // reconnect that replays it, or the ExecutionDetector matching the CLI's
+  // "Started execution" line twice, would otherwise book a second
+  // `agent.run_started` for one run and inflate the funnel. Restarting the
+  // poller on a repeat is harmless (the UI just re-reads the same run), so the
+  // guard covers only the analytics.
+  const announcedRuns = useRef<Set<string>>(new Set());
   // One-click preview loop: the server's PortDetector announces a
   // dev server the agent started; the session surfaces a Preview chip.
-  const [previewBySession, setPreviewBySession] = useState<Map<string, { port: number; url: string }>>(new Map());
+  const [previewBySession, setPreviewBySession] = useState<
+    Map<string, { port: number; url: string }>
+  >(new Map());
   // Per-workflow deploy error: set when a deploy stream ends with phase:"error",
   // cleared when a later deploy for that workflow succeeds. Keyed by workflow
   // path — survives toast dismissal so the disabled-reason in the action bar
   // stays accurate ("Last deploy failed — retry Deploy") instead of reverting
   // to "Not deployed yet" which would be misleading.
-  const [lastDeployErrorByPath, setLastDeployErrorByPath] = useState<Map<string, string>>(new Map());
+  const [lastDeployErrorByPath, setLastDeployErrorByPath] = useState<
+    Map<string, string>
+  >(new Map());
+  // Live deploy progress per workflow path, so the Steps surface can show a
+  // deploy landing the same way a run does: linking → building → ready (or
+  // error). In-memory only (clears on reload); the durable "is deployed" truth
+  // stays the workflow registry's definitionId + the dashboard pill. Cleared to
+  // null when the user dismisses the completion banner.
+  const [deployStateByPath, setDeployStateByPath] = useState<
+    Map<string, DeployProgress>
+  >(new Map());
+  const setDeployProgress = useCallback(
+    (workflowPath: string, next: DeployProgress | null): void => {
+      setDeployStateByPath((prev) => {
+        if (next === null) {
+          if (!prev.has(workflowPath)) return prev;
+          const map = new Map(prev);
+          map.delete(workflowPath);
+          return map;
+        }
+        return new Map(prev).set(workflowPath, next);
+      });
+    },
+    [],
+  );
+  // Optimistic rail rows for folders whose agent is being created. The `cwd` is
+  // known synchronously at the start of the create flow, long before the session
+  // POST resolves or the scaffolded `sapiom.json` is registered, so this bridges
+  // the whole window during which the rail would otherwise show nothing to
+  // return to. Presentational only — never enters `sessions`/`workflows`.
+  const [pendingWorkspaces, setPendingWorkspaces] = useState<PendingWorkspace[]>(
+    [],
+  );
+  const addPendingWorkspace = useCallback((cwd: string): void => {
+    setPendingWorkspaces((prev) =>
+      prev.some((p) => p.cwd === cwd)
+        ? prev
+        : [{ cwd, sessionSeen: false }, ...prev],
+    );
+  }, []);
+  const removePendingWorkspace = useCallback((cwd: string): void => {
+    setPendingWorkspaces((prev) =>
+      prev.some((p) => p.cwd === cwd)
+        ? prev.filter((p) => p.cwd !== cwd)
+        : prev,
+    );
+  }, []);
+  // Reconcile the optimistic entries against real state. One folder-owns-path
+  // rule (a path is under `cwd` if it equals it or sits below it):
+  //  - an agent (workflow) is now registered under the cwd → creation reached
+  //    its goal, drop the entry;
+  //  - a live session has appeared under the cwd → remember it (`sessionSeen`),
+  //    so we can later tell an abandoned create from one still in flight;
+  //  - a session was seen but none is live any more → the create produced no
+  //    agent (exited/abandoned), drop the entry so no ghost row lingers.
+  // The row itself stays visible across the bind→register flicker because in
+  // that window there is still a live (now bound) session under the cwd, so the
+  // entry is kept while the rail renders it as pending.
+  useEffect(() => {
+    if (pendingWorkspaces.length === 0) return;
+    const sessions = state?.sessions ?? [];
+    const workflows = state?.workflows ?? [];
+    const isUnder = (path: string, cwd: string): boolean => isWithinDir(cwd, path);
+    setPendingWorkspaces((prev) => {
+      let changed = false;
+      const next: PendingWorkspace[] = [];
+      for (const entry of prev) {
+        const hasAgent = workflows.some((w) => isUnder(w.path, entry.cwd));
+        if (hasAgent) {
+          changed = true;
+          continue;
+        }
+        const hasLiveSession = sessions.some(
+          (s) => s.status !== "exited" && isUnder(s.cwd, entry.cwd),
+        );
+        if (entry.sessionSeen && !hasLiveSession) {
+          changed = true;
+          continue;
+        }
+        if (hasLiveSession && !entry.sessionSeen) {
+          next.push({ ...entry, sessionSeen: true });
+          changed = true;
+          continue;
+        }
+        next.push(entry);
+      }
+      return changed ? next : prev;
+    });
+  }, [state?.sessions, state?.workflows, pendingWorkspaces]);
+
   // Monotonic settle counter for direct actions: bumped each time a deploy or
   // run (prod/local) reaches its terminal state — success OR failure. The
   // SessionStepsBar adds this to its useEffect deps so the pending ring clears
@@ -318,7 +535,9 @@ export function useHarnessState(): HarnessStateHook {
       .then((run) =>
         setRunsByExecution((prev) => {
           const stored = prev.get(executionId);
-          return stored ? new Map(prev).set(executionId, { ...stored, run }) : prev;
+          return stored
+            ? new Map(prev).set(executionId, { ...stored, run })
+            : prev;
         }),
       )
       .catch(() => {});
@@ -326,49 +545,116 @@ export function useHarnessState(): HarnessStateHook {
 
   // Poll one run until terminal. A new run for the same session replaces the
   // old POLLER only — the previous run's snapshot stays in runsByExecution.
-  const startRunPolling = useCallback((sessionId: string, executionId: string, target: RunTarget) => {
-    const existing = runPollers.current.get(sessionId);
-    if (existing) clearInterval(existing);
-    // Attribution facts are captured NOW, not at read time: the workflow the
-    // session is bound to when the run is announced owns the run's cost.
-    // Attributing later through the current binding would lie whenever a
-    // session re-binds mid-session.
-    const workflowPath = boundWorkflowPathOf(sessionsRef.current.find((s) => s.id === sessionId));
-    const observedAt = Date.now();
-    setRunIdsBySession((prev) => {
-      const ids = prev.get(sessionId) ?? [];
-      if (ids.includes(executionId)) return prev;
-      return new Map(prev).set(sessionId, [...ids, executionId]);
-    });
-    // A freshly started run takes the Steps tab over: drop any explicit pick
-    // so the session follows its latest run again (the picker gets back to
-    // any past run — nothing is lost, unlike the old overwrite model).
-    setPickedRunBySession((prev) => {
-      if (!prev.has(sessionId)) return prev;
-      const next = new Map(prev);
-      next.delete(sessionId);
-      return next;
-    });
-    const poll = async (): Promise<void> => {
-      try {
-        const run = await api.getRunState(executionId);
-        setRunsByExecution((prev) => new Map(prev).set(executionId, { run, target, workflowPath, observedAt }));
-        if (run.status !== "running") {
-          const timer = runPollers.current.get(sessionId);
-          if (timer) clearInterval(timer);
-          runPollers.current.delete(sessionId);
+  const startRunPolling = useCallback(
+    (sessionId: string, executionId: string, target: RunTarget) => {
+      const existing = runPollers.current.get(sessionId);
+      // Superseding a live poller abandons the run it was watching, and that
+      // run gets NO terminal analytics event — deliberately. It is still
+      // executing server-side; we simply stopped looking. Calling it failed
+      // would be a lie, and calling it succeeded worse. This is the one place
+      // `run_started` legitimately outnumbers its terminal events.
+      if (existing) clearInterval(existing);
+      // Attribution facts are captured NOW, not at read time: the workflow the
+      // session is bound to when the run is announced owns the run's cost.
+      // Attributing later through the current binding would lie whenever a
+      // session re-binds mid-session.
+      const workflowPath = boundWorkflowPathOf(
+        sessionsRef.current.find((s) => s.id === sessionId),
+      );
+      const observedAt = Date.now();
+      setRunIdsBySession((prev) => {
+        const ids = prev.get(sessionId) ?? [];
+        if (ids.includes(executionId)) return prev;
+        return new Map(prev).set(sessionId, [...ids, executionId]);
+      });
+      // A freshly started run takes the Steps tab over: drop any explicit pick
+      // so the session follows its latest run again (the picker gets back to
+      // any past run — nothing is lost, unlike the old overwrite model).
+      setPickedRunBySession((prev) => {
+        if (!prev.has(sessionId)) return prev;
+        const next = new Map(prev);
+        next.delete(sessionId);
+        return next;
+      });
+
+      // ---- run funnel -----------------------------------------------------
+      // This is the single door every prod run comes through — the Prod Run
+      // button AND a CLI-launched run the ExecutionDetector announced on the
+      // bus — so instrumenting here counts runs the user caused, not clicks.
+      // Every decision here — dedupe the start, emit at most one terminal,
+      // tolerate N failures, tell `exception` from `unobservable` — lives in
+      // the pure `runFunnelStep` reducer, unit-tested in lifecycle.test.ts.
+      // This block only drives it and sends what it returns; keeping the rules
+      // out of a closure over React refs and timers is what makes them testable
+      // at all (both bugs found in review round 1 were invisible to the suite).
+      const runSlug = workflowPath ? slugFromPath(workflowPath) : undefined;
+      const runBase = { workflow_slug: runSlug, session_id: sessionId, target };
+      let funnel = initialRunFunnelState();
+
+      const advanceFunnel = (event: RunFunnelEvent): void => {
+        const { state: next, emit } = runFunnelStep(funnel, event);
+        funnel = next;
+        if (emit.event === null) return;
+        if (emit.event === "agent.run_started") {
+          trackProduct("agent.run_started", runBase);
+          return;
         }
-      } catch {
-        // Endpoint absent (server predates runtime analytics) or transient
-        // failure: stop polling quietly - the UI simply shows no run state.
+        const duration_ms = Date.now() - observedAt;
+        if (emit.event === "agent.run_succeeded") {
+          trackProduct("agent.run_succeeded", { ...runBase, duration_ms });
+          return;
+        }
+        trackProduct("agent.run_failed", { ...runBase, duration_ms, error_kind: emit.error_kind });
+      };
+
+      const alreadyAnnounced = announcedRuns.current.has(executionId);
+      // Bounded: drop the oldest ids once past the cap. Insertion order is
+      // iteration order for a Set, so the first key is the oldest.
+      if (announcedRuns.current.size >= ANNOUNCED_RUNS_CAP) {
+        const oldest = announcedRuns.current.values().next().value;
+        if (oldest !== undefined) announcedRuns.current.delete(oldest);
+      }
+      announcedRuns.current.add(executionId);
+      // A redelivery re-polls (so the UI still tracks the run) but must not
+      // re-count the start. The terminal event is deliberately NOT suppressed.
+      advanceFunnel({ kind: "announced", duplicate: alreadyAnnounced });
+
+      const stopPolling = (): void => {
         const timer = runPollers.current.get(sessionId);
         if (timer) clearInterval(timer);
         runPollers.current.delete(sessionId);
-      }
-    };
-    void poll();
-    runPollers.current.set(sessionId, setInterval(() => void poll(), 2000));
-  }, []);
+      };
+
+      const poll = async (): Promise<void> => {
+        try {
+          const run = await api.getRunState(executionId);
+          setRunsByExecution((prev) =>
+            new Map(prev).set(executionId, {
+              run,
+              target,
+              workflowPath,
+              observedAt,
+            }),
+          );
+          advanceFunnel({ kind: "polled", status: run.status });
+          if (run.status !== "running") stopPolling();
+        } catch {
+          // Endpoint absent (server predates runtime analytics) or transient
+          // failure. The reducer decides when enough consecutive failures have
+          // accrued to call it; until then this keeps polling, because a single
+          // 2-second blip is not a failed run.
+          advanceFunnel({ kind: "poll_failed" });
+          if (funnel.settled) stopPolling();
+        }
+      };
+      void poll();
+      runPollers.current.set(
+        sessionId,
+        setInterval(() => void poll(), 2000),
+      );
+    },
+    [],
+  );
 
   // Monotonic counter for synthesizing local-run execution ids. A local run has
   // no server-issued id (it never touches the backend), so the store mints one;
@@ -377,7 +663,7 @@ export function useHarnessState(): HarnessStateHook {
   const localRunSeq = useRef(0);
 
   /**
-   * Run an offline stub run and stream it into the shared run store. The NDJSON
+   * Run locally with Sapiom capability calls stubbed and stream it into the shared run store. The NDJSON
    * arrives per-step: each {@link LocalStepTrace} line appends to a local buffer
    * that is re-mapped through `renderLocalRun` and written to `runsByExecution`,
    * so the inspector lights up step-by-step (same store, same shape, same
@@ -386,15 +672,25 @@ export function useHarnessState(): HarnessStateHook {
    * failed step so the failure is still visible rather than silent.
    */
   const runLocal = useCallback(
-    async (sessionId: string, sourceDir: string, input?: unknown): Promise<void> => {
+    async (
+      sessionId: string,
+      sourceDir: string,
+      input?: unknown,
+    ): Promise<void> => {
       localRunSeq.current += 1;
       const executionId = `local-${Date.now()}-${localRunSeq.current}`;
       // Attribution + observation facts captured now, exactly like a prod run
       // (see startRunPolling) — a later re-bind must not re-attribute this run.
-      const workflowPath = boundWorkflowPathOf(sessionsRef.current.find((s) => s.id === sessionId));
+      const workflowPath = boundWorkflowPathOf(
+        sessionsRef.current.find((s) => s.id === sessionId),
+      );
       const observedAt = Date.now();
+      const startedAt = new Date(observedAt).toISOString();
       const traces: LocalStepTrace[] = [];
       let outcome: LocalRunOutcome | undefined;
+      let output: unknown;
+      let runError: unknown;
+      let finishedAt: string | undefined;
       // Stub-hygiene signals from the terminal summary line (WB15-2). Held
       // alongside outcome so each re-map through renderLocalRun carries them;
       // absent until the summary lands, and renderLocalRun drops empties.
@@ -416,18 +712,47 @@ export function useHarnessState(): HarnessStateHook {
       });
 
       const publish = (): void => {
-        const run = renderLocalRun(traces, { executionId, outcome, unusedStubs, stubWarnings });
+        const run = renderLocalRun(traces, {
+          executionId,
+          outcome,
+          unusedStubs,
+          stubWarnings,
+          input,
+          output,
+          error: runError,
+          startedAt,
+          finishedAt,
+        });
         setRunsByExecution((prev) =>
-          new Map(prev).set(executionId, { run, target: "local", workflowPath, observedAt }),
+          new Map(prev).set(executionId, {
+            run,
+            target: "local",
+            workflowPath,
+            observedAt,
+          }),
         );
       };
       // Seed an empty running RunView up front so the Steps tab switches to this
       // run immediately, before the first trace line lands.
       publish();
 
+      // ---- run funnel (local half; the prod half is in startRunPolling) ----
+      const runBase = {
+        workflow_slug: workflowPath ? slugFromPath(workflowPath) : undefined,
+        session_id: sessionId,
+        target: "local" as const,
+      };
+      // True when the stream itself broke, as opposed to the run reporting a
+      // failure — the difference between `exception` and `failed`.
+      let transportBroke = false;
+      trackProduct("agent.run_started", runBase);
+
       const onLine = (line: RunLocalLine): void => {
         if (line.kind === "summary") {
           outcome = line.outcome;
+          output = line.output;
+          runError = line.error;
+          finishedAt = new Date().toISOString();
           // Carry the stub-hygiene signals so the inspector can surface a no-op
           // mock (unusedStubs) or a wrong-shape stub (stubWarnings). Passed
           // straight through; renderLocalRun applies the honest-absence rule.
@@ -438,17 +763,42 @@ export function useHarnessState(): HarnessStateHook {
           // as a failed run carrying one failed step so the inspector shows the
           // reason instead of an empty, silently-failed run.
           outcome = "failed";
-          traces.push({
+          runError = line.error;
+          finishedAt = new Date().toISOString();
+          const failedTrace: LocalStepTrace = {
             step: "run-local",
             attempt: 1,
             input,
             status: "threw",
+            startedAt,
+            finishedAt,
             error: { name: "RunLocalError", message: line.error },
             logs: [],
-          });
+          };
+          const index = traces.findIndex(
+            (trace) =>
+              trace.step === failedTrace.step &&
+              trace.attempt === failedTrace.attempt,
+          );
+          if (index >= 0) traces[index] = failedTrace;
+          else traces.push(failedTrace);
+        } else if (line.kind === "step") {
+          const next = line.trace;
+          const index = traces.findIndex(
+            (trace) =>
+              trace.step === next.step && trace.attempt === next.attempt,
+          );
+          if (index >= 0) traces[index] = next;
+          else traces.push(next);
         } else {
-          // A per-step trace line (no `kind`).
-          traces.push(line);
+          // Backward-compatible with older bootstraps that emitted settled
+          // traces without the discriminated step wrapper.
+          const index = traces.findIndex(
+            (trace) =>
+              trace.step === line.step && trace.attempt === line.attempt,
+          );
+          if (index >= 0) traces[index] = line;
+          else traces.push(line);
         }
         publish();
       };
@@ -457,11 +807,55 @@ export function useHarnessState(): HarnessStateHook {
         await api.runLocal({ sourceDir, input }, onLine);
       } catch (err) {
         // Transport failure (the stream itself broke) — mark the run failed so
-        // it doesn't spin as "running" forever, and toast the reason.
+        // it doesn't spin as "running" forever. Give the workspace a concrete
+        // failed attempt so its failure-first Logs rule still has evidence to
+        // select even though no runtime step line could arrive.
+        const message =
+          err instanceof ApiError && err.reason
+            ? err.reason
+            : err instanceof Error
+              ? err.message
+              : "Local execution failed.";
         outcome = "failed";
+        // The stream broke, as opposed to the run reporting a failure — that
+        // is the difference between `exception` and `failed` in the funnel.
+        transportBroke = true;
+        runError = message;
+        finishedAt = new Date().toISOString();
+        const failedTrace: LocalStepTrace = {
+          step: "run-local",
+          attempt: 1,
+          input,
+          status: "threw",
+          startedAt,
+          finishedAt,
+          error: { name: "RunLocalError", message },
+          logs: [{ level: "error", msg: message }],
+        };
+        const failedIndex = traces.findIndex(
+          (trace) =>
+            trace.step === failedTrace.step &&
+            trace.attempt === failedTrace.attempt,
+        );
+        if (failedIndex >= 0) traces[failedIndex] = failedTrace;
+        else traces.push(failedTrace);
         publish();
-        setToast(err instanceof ApiError && err.reason ? err.reason : (err as Error).message);
+        setToast(createToastMessage(message));
       } finally {
+        // Close the run funnel. `pending` means the stream ended without a
+        // terminal outcome — a `paused` run waiting on a signal is still alive,
+        // so it gets no terminal event rather than a fabricated one.
+        const kind = localRunOutcomeKind(outcome);
+        const duration_ms = Date.now() - observedAt;
+        if (kind === "succeeded") {
+          trackProduct("agent.run_succeeded", { ...runBase, duration_ms });
+        } else if (kind === "failed") {
+          trackProduct("agent.run_failed", {
+            ...runBase,
+            duration_ms,
+            error_kind: transportBroke ? "exception" : "failed",
+          });
+        }
         // Signal settle so the SessionStepsBar clears the Local Run button's
         // pending ring — the stream ended (success or failure), the button's
         // "in flight" state is over.
@@ -473,7 +867,9 @@ export function useHarnessState(): HarnessStateHook {
 
   const selectRun = useCallback(
     (sessionId: string, executionId: string) => {
-      setPickedRunBySession((prev) => new Map(prev).set(sessionId, executionId));
+      setPickedRunBySession((prev) =>
+        new Map(prev).set(sessionId, executionId),
+      );
       // Refetch so a past run shows current server truth, not a stale
       // mid-poll snapshot (refreshRun keeps the captured start facts).
       refreshRun(executionId);
@@ -520,6 +916,13 @@ export function useHarnessState(): HarnessStateHook {
     };
   }, []);
 
+  // "Agents built" product metric. The seen-set is the built baseline: paths
+  // present at load and paths brought in by explicit imports (scan / connect)
+  // are folded in WITHOUT emitting, so only an agent that materializes
+  // afterwards — a fresh sapiom.json the workspace watcher reports via the
+  // `workflows.changed` bus — counts as newly built. See analytics/lifecycle.ts.
+  const seenAgentPathsRef = useRef<Set<string> | null>(null);
+
   useEffect(() => {
     let cancelled = false;
     // A retry re-enters the loading state and clears the prior failure so the
@@ -533,12 +936,19 @@ export function useHarnessState(): HarnessStateHook {
       .then(([appState, harnessSettings]) => {
         if (cancelled) return;
         setState(appState);
+        // Baseline the built-agents metric: everything present at load already
+        // existed, so seed it into the seen-set and never count it as built.
+        const seenAtLoad = (seenAgentPathsRef.current ??= new Set<string>());
+        for (const workflow of appState.workflows) seenAtLoad.add(workflow.path);
         setSettings(harnessSettings);
         setErrorKind(null);
         if (appState.tasks) setTasks(appState.tasks);
-        const running = appState.sessions.find((session) => session.status !== "exited");
+        const running = appState.sessions.find(
+          (session) => session.status !== "exited",
+        );
         if (running) setActiveSessionId(running.id);
-        if (appState.workflows[0]) setSelectedWorkflowPath(appState.workflows[0].path);
+        if (appState.workflows[0])
+          setSelectedWorkflowPath(appState.workflows[0].path);
       })
       .catch((err: unknown) => {
         if (cancelled) return;
@@ -547,7 +957,11 @@ export function useHarnessState(): HarnessStateHook {
         // generic); anything else is a network-level throw the browser raises
         // when it never got a response (offline / unreachable) — recorded as
         // such so the classifier picks the offline state, not a dead end.
-        setErrorKind(err instanceof ApiError ? { status: err.status } : { networkError: true });
+        setErrorKind(
+          err instanceof ApiError
+            ? { status: err.status }
+            : { networkError: true },
+        );
       })
       .finally(() => !cancelled && setLoading(false));
     return () => {
@@ -572,6 +986,7 @@ export function useHarnessState(): HarnessStateHook {
   const refreshWorkflows = useCallback(async () => {
     const workflows = await api.listWorkflows();
     setState((prev) => (prev ? { ...prev, workflows } : prev));
+    return workflows;
   }, []);
 
   useEffect(() => {
@@ -580,9 +995,13 @@ export function useHarnessState(): HarnessStateHook {
       if (message.type === "session.status") {
         setState((prev) => {
           if (!prev) return prev;
-          const exists = prev.sessions.some((session) => session.id === message.session.id);
+          const exists = prev.sessions.some(
+            (session) => session.id === message.session.id,
+          );
           const sessions = exists
-            ? prev.sessions.map((session) => (session.id === message.session.id ? message.session : session))
+            ? prev.sessions.map((session) =>
+                session.id === message.session.id ? message.session : session,
+              )
             : [...prev.sessions, message.session];
           return { ...prev, sessions };
         });
@@ -604,24 +1023,52 @@ export function useHarnessState(): HarnessStateHook {
           });
         }
       } else if (message.type === "workflows.changed") {
-        void refreshWorkflows();
+        // The workspace watcher saw a sapiom.json appear/change — the one
+        // client signal for an agent built in-app. Emit agent.created for any
+        // path we haven't already baselined (load) or imported (scan/connect).
+        void refreshWorkflows().then((workflows) => {
+          const seen = seenAgentPathsRef.current;
+          if (seen === null) {
+            // Lost the race with the initial load — baseline, don't emit.
+            seenAgentPathsRef.current = new Set(workflows.map((w) => w.path));
+            return;
+          }
+          for (const path of newAgentPaths(seen, workflows)) {
+            seen.add(path);
+            trackProduct("agent.created", {
+              workflow_slug: slugFromPath(path),
+              ...agentProvenance(workflows.find((w) => w.path === path)),
+            });
+          }
+        });
       } else if (message.type === "execution.started") {
-        startRunPolling(message.harnessSessionId, message.executionId, message.target);
+        startRunPolling(
+          message.harnessSessionId,
+          message.executionId,
+          message.target,
+        );
       } else if (message.type === "port.detected") {
         setPreviewBySession((prev) =>
-          new Map(prev).set(message.harnessSessionId, { port: message.port, url: message.url }),
+          new Map(prev).set(message.harnessSessionId, {
+            port: message.port,
+            url: message.url,
+          }),
         );
       } else if (message.type === "task.status") {
         // Each frame is a full snapshot of one task — upsert by id.
         setTasks((prev) => {
           const exists = prev.some((task) => task.id === message.task.id);
           return exists
-            ? prev.map((task) => (task.id === message.task.id ? message.task : task))
+            ? prev.map((task) =>
+                task.id === message.task.id ? message.task : task,
+              )
             : [...prev, message.task];
         });
       } else if (message.type === "session.activity") {
         const id = message.harnessSessionId;
-        setBusySessionIds((prev) => (prev.has(id) ? prev : new Set(prev).add(id)));
+        setBusySessionIds((prev) =>
+          prev.has(id) ? prev : new Set(prev).add(id),
+        );
         const existingTimer = busyTimers.current.get(id);
         if (existingTimer) clearTimeout(existingTimer);
         busyTimers.current.set(
@@ -649,6 +1096,10 @@ export function useHarnessState(): HarnessStateHook {
               }
             : prev,
         );
+        // Definition build evidence is authenticated enrichment. Re-list on
+        // both sign-in and sign-out so a post-boot login can enable a ready
+        // agent and a logout cannot leave tenant metadata pinned in memory.
+        void refreshWorkflows();
       }
     });
   }, [refreshWorkflows, startRunPolling]);
@@ -706,57 +1157,85 @@ export function useHarnessState(): HarnessStateHook {
     }
   }, []);
 
-  const createSession = useCallback(async (req: CreateSessionRequest): Promise<HarnessSession> => {
-    const session = await api.createSession(req);
-    // The event bus can deliver this session's first `session.status` before
-    // the POST response resolves (the server broadcasts starting/running
-    // during create) — appending unconditionally then renders a duplicate
-    // tab. When it's already in the list, the bus copy is also the fresher
-    // one, so keep it rather than overwrite with this response's snapshot.
-    setState((prev) =>
-      prev && !prev.sessions.some((s) => s.id === session.id)
-        ? { ...prev, sessions: [...prev.sessions, session] }
-        : prev,
-    );
-    selectSession(session.id);
+  const createSession = useCallback(
+    async (req: CreateSessionRequest): Promise<HarnessSession> => {
+      const session = await api.createSession(req);
+      // The event bus can deliver this session's first `session.status` before
+      // the POST response resolves (the server broadcasts starting/running
+      // during create) — appending unconditionally then renders a duplicate
+      // tab. When it's already in the list, the bus copy is also the fresher
+      // one, so keep it rather than overwrite with this response's snapshot.
+      setState((prev) =>
+        prev && !prev.sessions.some((s) => s.id === session.id)
+          ? { ...prev, sessions: [...prev.sessions, session] }
+          : prev,
+      );
+      selectSession(session.id);
 
-    // Built from the ref BEFORE touching state, because this value is also the
-    // PATCH body below and must exist synchronously.
-    //
-    // It used to be assigned INSIDE the setSettings updater on the line below.
-    // That worked only by accident: React invokes a useState updater eagerly —
-    // synchronously, inside the dispatch — when that hook has no pending update,
-    // as a bail-out optimization. It is NOT a guarantee. With an update already
-    // queued on this hook (a session create landing near the boot settings
-    // fetch, say) the updater runs later instead, and the PATCH ships the
-    // initializer: `[]`. The server MERGES a settings patch, so that is a real
-    // erasure of the persisted list, not a no-op.
-    //
-    // Verified: reintroducing the old form still passes the e2e below, because
-    // the eager path covers the common case. The bug is the dependence on it.
-    const nextRecentDirs = [
-      req.cwd,
-      ...(settingsRef.current?.recentDirs ?? []).filter((dir) => dir !== req.cwd),
-    ].slice(0, RECENT_DIRS_UI_CAP);
-    setSettings((prev) => (prev ? { ...prev, recentDirs: nextRecentDirs } : prev));
-    // The server is the source of truth for what actually qualifies as a
-    // recent dir (must resolve to a real, existing directory) — replace the
-    // optimistic guess with its sanitized response so invalid input (e.g.
-    // stray free text typed into the directory field) never lingers in the UI.
-    try {
-      const updated = await api.updateSettings({ recentDirs: nextRecentDirs });
-      setSettings((prev) => (prev ? { ...prev, recentDirs: updated.recentDirs } : prev));
-    } catch {
-      // Non-fatal — session creation itself already succeeded.
-    }
-    return session;
-  }, [selectSession]);
+      // Built from the ref BEFORE touching state, because this value is also the
+      // PATCH body below and must exist synchronously.
+      //
+      // It used to be assigned INSIDE the setSettings updater on the line below.
+      // That worked only by accident: React invokes a useState updater eagerly —
+      // synchronously, inside the dispatch — when that hook has no pending update,
+      // as a bail-out optimization. It is NOT a guarantee. With an update already
+      // queued on this hook (a session create landing near the boot settings
+      // fetch, say) the updater runs later instead, and the PATCH ships the
+      // initializer: `[]`. The server MERGES a settings patch, so that is a real
+      // erasure of the persisted list, not a no-op.
+      //
+      // Verified: reintroducing the old form still passes the e2e below, because
+      // the eager path covers the common case. The bug is the dependence on it.
+      const nextRecentDirs = [
+        req.cwd,
+        ...(settingsRef.current?.recentDirs ?? []).filter(
+          (dir) => dir !== req.cwd,
+        ),
+      ].slice(0, RECENT_DIRS_UI_CAP);
+      setSettings((prev) =>
+        prev ? { ...prev, recentDirs: nextRecentDirs } : prev,
+      );
+      // The server is the source of truth for what actually qualifies as a
+      // recent dir (must resolve to a real, existing directory) — replace the
+      // optimistic guess with its sanitized response so invalid input (e.g.
+      // stray free text typed into the directory field) never lingers in the UI.
+      try {
+        const updated = await api.updateSettings({
+          recentDirs: nextRecentDirs,
+        });
+        setSettings((prev) =>
+          prev ? { ...prev, recentDirs: updated.recentDirs } : prev,
+        );
+      } catch {
+        // Non-fatal — session creation itself already succeeded.
+      }
+      return session;
+    },
+    [selectSession],
+  );
 
-  const listTemplates = useCallback((): Promise<TemplateListResponse> => api.listTemplates(), []);
-  const getTemplate = useCallback((id: string): Promise<TemplateDetailView> => api.getTemplate(id), []);
+  const attachFile = useCallback(
+    (
+      sessionId: string,
+      request: AttachFileRequest,
+    ): Promise<AttachFileResponse> => api.attachFile(sessionId, request),
+    [],
+  );
+
+  const listTemplates = useCallback(
+    (): Promise<TemplateListResponse> => api.listTemplates(),
+    [],
+  );
+  const getTemplate = useCallback(
+    (id: string): Promise<TemplateDetailView> => api.getTemplate(id),
+    [],
+  );
   // Stable identity matters here: the past-session pane fetches from an effect
   // keyed on this callback, so a fresh closure per render would refetch forever.
-  const sessionRecord = useCallback((id: string): Promise<SessionRecord | null> => api.sessionRecord(id), []);
+  const sessionRecord = useCallback(
+    (id: string): Promise<SessionRecord | null> => api.sessionRecord(id),
+    [],
+  );
 
   const resumeSession = useCallback(
     async (harnessSessionId: string): Promise<HarnessSession> => {
@@ -764,7 +1243,14 @@ export function useHarnessState(): HarnessStateHook {
       try {
         const session = await api.resumeSession(harnessSessionId);
         setState((prev) =>
-          prev ? { ...prev, sessions: prev.sessions.map((s) => (s.id === session.id ? session : s)) } : prev,
+          prev
+            ? {
+                ...prev,
+                sessions: prev.sessions.map((s) =>
+                  s.id === session.id ? session : s,
+                ),
+              }
+            : prev,
         );
         // Only claim focus if the user hasn't explicitly switched sessions
         // while the resume was in flight — their pick outranks this resolve.
@@ -773,7 +1259,13 @@ export function useHarnessState(): HarnessStateHook {
       } catch (err) {
         // Surface resume failures as a toast so a failed resume is never silent
         // (the caller fires this with void and swallows the rejection).
-        setToast(err instanceof ApiError && err.reason ? err.reason : (err as Error).message);
+        setToast(
+          createToastMessage(
+            err instanceof ApiError && err.reason
+              ? err.reason
+              : (err as Error).message,
+          ),
+        );
         throw err;
       }
     },
@@ -793,10 +1285,27 @@ export function useHarnessState(): HarnessStateHook {
    * continuation.
    */
   const rehydrateSession = useCallback(
-    async ({ cwd, harness, from }: { cwd: string; harness: HarnessKind; from: string }) => {
-      const session = await createSession({ cwd, harness, rehydrateFrom: from });
+    async ({
+      cwd,
+      harness,
+      from,
+    }: {
+      cwd: string;
+      harness: HarnessKind;
+      from: string;
+    }) => {
+      const session = await createSession({
+        cwd,
+        harness,
+        rehydrateFrom: from,
+      });
       if (!session.rehydratedFrom) {
-        setToast("Nothing was recorded for that session, so this one starts fresh.");
+        setToast(
+          createToastMessage(
+            "Nothing was recorded for that session, so this one starts fresh.",
+            "info",
+          ),
+        );
       }
       return session;
     },
@@ -827,7 +1336,9 @@ export function useHarnessState(): HarnessStateHook {
     async (summary: SessionSummary): Promise<HarnessSession> => {
       const harnessSessionId =
         summary.harnessSessionId ??
-        state?.sessions.find((session) => session.agentSessionId === summary.agentSessionId)?.id;
+        state?.sessions.find(
+          (session) => session.agentSessionId === summary.agentSessionId,
+        )?.id;
       if (summary.resumeMode === "rehydrate") {
         // Prefer our own id: it resolves the whole conversation (every harness
         // session that shares this agent session), where the agent session id
@@ -860,7 +1371,13 @@ export function useHarnessState(): HarnessStateHook {
         selectSession(adopted.id);
         return adopted;
       } catch (err) {
-        setToast(err instanceof ApiError && err.reason ? err.reason : (err as Error).message);
+        setToast(
+          createToastMessage(
+            err instanceof ApiError && err.reason
+              ? err.reason
+              : (err as Error).message,
+          ),
+        );
         throw err;
       }
     },
@@ -875,67 +1392,135 @@ export function useHarnessState(): HarnessStateHook {
         // Surface the failure as a toast and keep the user on the dead-session
         // overlay: the re-throw below skips the local removal, so a failed kill
         // never makes the session vanish from the UI as if it had succeeded.
-        setToast(err instanceof ApiError && err.reason ? err.reason : (err as Error).message);
+        setToast(
+          createToastMessage(
+            err instanceof ApiError && err.reason
+              ? err.reason
+              : (err as Error).message,
+          ),
+        );
         throw err;
       }
-      const remaining = (state?.sessions ?? []).filter((session) => session.id !== id);
+      const remaining = (state?.sessions ?? []).filter(
+        (session) => session.id !== id,
+      );
       setState((prev) => (prev ? { ...prev, sessions: remaining } : prev));
       if (activeSessionId === id) {
-        const nextRunning = remaining.find((session) => session.status !== "exited");
+        const nextRunning = remaining.find(
+          (session) => session.status !== "exited",
+        );
         selectSession(nextRunning ? nextRunning.id : null);
       }
     },
     [state, activeSessionId, selectSession],
   );
 
-  const connectWorkflow = useCallback(async (path: string): Promise<WorkflowInfo> => {
-    const workflow = await api.connectWorkflow(path);
-    setState((prev) =>
-      prev ? { ...prev, workflows: [...prev.workflows.filter((w) => w.path !== workflow.path), workflow] } : prev,
-    );
-    return workflow;
-  }, []);
+  const connectWorkflow = useCallback(
+    async (path: string): Promise<WorkflowInfo> => {
+      const workflow = await api.connectWorkflow(path);
+      setState((prev) =>
+        prev
+          ? {
+              ...prev,
+              workflows: [
+                ...prev.workflows.filter((w) => w.path !== workflow.path),
+                workflow,
+              ],
+            }
+          : prev,
+      );
+      // Connecting an existing agent is an import, not a build — baseline it so
+      // it is never counted as newly built.
+      (seenAgentPathsRef.current ??= new Set<string>()).add(workflow.path);
+      return workflow;
+    },
+    [],
+  );
 
   const scanWorkflows = useCallback(
     async (root: string): Promise<WorkflowInfo[]> => {
       const found = await api.scanWorkflows(root);
       // The scan registers server-side; re-list so every discovered agent
       // joins the rail in one shot instead of trickling in per connect.
-      await refreshWorkflows();
+      const workflows = await refreshWorkflows();
+      // Discovered agents already existed — baseline them all so a bulk import
+      // never inflates the built-agents count.
+      const seen = (seenAgentPathsRef.current ??= new Set<string>());
+      for (const workflow of workflows) seen.add(workflow.path);
       return found;
     },
     [refreshWorkflows],
   );
 
-  const listHarnesses = useCallback((): Promise<HarnessEntry[]> => api.listHarnesses(), []);
+  const listHarnesses = useCallback(
+    (): Promise<HarnessEntry[]> => api.listHarnesses(),
+    [],
+  );
 
-  const bindWorkflow = useCallback(async (sessionId: string, workflowPath: string | null): Promise<void> => {
-    const session = await api.bindWorkflow(sessionId, workflowPath);
-    setState((prev) =>
-      prev ? { ...prev, sessions: prev.sessions.map((s) => (s.id === session.id ? session : s)) } : prev,
-    );
-  }, []);
+  const bindWorkflow = useCallback(
+    async (sessionId: string, workflowPath: string | null): Promise<void> => {
+      const session = await api.bindWorkflow(sessionId, workflowPath);
+      setState((prev) =>
+        prev
+          ? {
+              ...prev,
+              sessions: prev.sessions.map((s) =>
+                s.id === session.id ? session : s,
+              ),
+            }
+          : prev,
+      );
+    },
+    [],
+  );
 
-  const updateSettings = useCallback(async (patch: Partial<HarnessSettings>): Promise<HarnessSettings> => {
-    const updated = await api.updateSettings(patch);
-    setSettings(updated);
-    if (patch.telemetryOptIn !== undefined) {
-      setState((prev) => (prev ? { ...prev, telemetryOptIn: updated.telemetryOptIn } : prev));
-    }
-    return updated;
-  }, []);
+  const updateSettings = useCallback(
+    async (patch: Partial<HarnessSettings>): Promise<HarnessSettings> => {
+      const updated = await api.updateSettings(patch);
+      setSettings(updated);
+      if (patch.telemetryOptIn !== undefined) {
+        setState((prev) =>
+          prev ? { ...prev, telemetryOptIn: updated.telemetryOptIn } : prev,
+        );
+      }
+      // Mirror the light-analytics opt-in into AppState so the PostHog consent
+      // gate (App's initAnalytics effect) re-syncs immediately on toggle. Absent
+      // === on, matching the server's resolution.
+      if (patch.productAnalyticsOptIn !== undefined) {
+        setState((prev) =>
+          prev
+            ? {
+                ...prev,
+                productAnalyticsOptIn: updated.productAnalyticsOptIn !== false,
+              }
+            : prev,
+        );
+      }
+      return updated;
+    },
+    [],
+  );
 
-  const runMacro = useCallback(async (id: string, req: RunMacroRequest): Promise<void> => {
-    try {
-      await api.runMacro(id, req);
-    } catch (err) {
-      // App.tsx fires this without awaiting — surface failures as a toast
-      // instead of an invisible unhandled rejection (which is exactly how
-      // the trust-dialog race originally went unnoticed: the macro's input
-      // vanished and nothing told the user why).
-      setToast(err instanceof ApiError && err.reason ? err.reason : (err as Error).message);
-    }
-  }, []);
+  const runMacro = useCallback(
+    async (id: string, req: RunMacroRequest): Promise<void> => {
+      try {
+        await api.runMacro(id, req);
+      } catch (err) {
+        // App.tsx fires this without awaiting — surface failures as a toast
+        // instead of an invisible unhandled rejection (which is exactly how
+        // the trust-dialog race originally went unnoticed: the macro's input
+        // vanished and nothing told the user why).
+        setToast(
+          createToastMessage(
+            err instanceof ApiError && err.reason
+              ? err.reason
+              : (err as Error).message,
+          ),
+        );
+      }
+    },
+    [],
+  );
 
   // Deploy via the direct route: stream build status to the toast, then refresh
   // the registry so a linked/rebuilt workflow's Deployed chip flips. Swallows
@@ -948,7 +1533,19 @@ export function useHarnessState(): HarnessStateHook {
       if (existing) return existing;
 
       const run = (async (): Promise<void> => {
-        setToast("Deploying…");
+        setToast(createToastMessage("Deploying…", "info"));
+        // Product metric — "agents deployed". Slug is the folder basename (never
+        // the absolute path); duration is measured across the stream.
+        const slug = slugFromPath(workflowPath);
+        // Provenance (source/template_id) is computed ONCE from the registry
+        // snapshot at deploy start, so all deploy_* events for this deploy
+        // agree even though refreshWorkflows() runs mid-deploy (on `building`
+        // and after both terminals).
+        const provenance = agentProvenance(
+          workflowsRef.current.find((w) => w.path === workflowPath),
+        );
+        const startedAt = performance.now();
+        trackProduct("agent.deploy_started", { workflow_slug: slug, ...provenance });
         // Which non-terminal phase was last seen, so a terminal `error` can
         // say whether linking or building failed — both are the same wire
         // shape, told apart only by what preceded them.
@@ -960,13 +1557,25 @@ export function useHarnessState(): HarnessStateHook {
         // overwritten before it's ever seen) and gets folded into the success
         // toast instead.
         let pendingWarning: string | null = null;
+        // Emit the deploy outcome (succeeded/failed) exactly once. The terminal
+        // branches set this after emitting so a post-terminal step that throws
+        // — e.g. the `await refreshWorkflows()` below rejecting after a ready
+        // deploy — cannot fall into `catch` and log a contradictory
+        // deploy_failed on top of the deploy_succeeded already recorded.
+        let outcomeSettled = false;
         try {
           const terminal = await api.deploy(workflowPath, (event) => {
             // A never-linked project (a fresh template clone) gets its agent
             // created first — say so, rather than claiming we're building.
             if (event.phase === "linking") {
               lastNonTerminalPhase = "linking";
-              setToast(`Deploying — creating the agent "${event.name}" on Sapiom…`);
+              setDeployProgress(workflowPath, { phase: "linking" });
+              setToast(
+                createToastMessage(
+                  `Deploying — creating the agent "${event.name}" on Sapiom…`,
+                  "info",
+                ),
+              );
             } else if (event.phase === "warning") {
               // Non-terminal and advisory: the agent was created but its id
               // couldn't be written back to sapiom.json. The message is
@@ -975,14 +1584,31 @@ export function useHarnessState(): HarnessStateHook {
               // legitimately replaces this toast, so it's also remembered
               // above to resurface on success.
               pendingWarning = event.message;
-              setToast(event.message);
+              setToast(createToastMessage(event.message));
             } else if (event.phase === "building") {
               lastNonTerminalPhase = "building";
-              setToast("Deploying — building on Sapiom…");
+              setDeployProgress(workflowPath, { phase: "building" });
+              setToast(createToastMessage("Deploying — building on Sapiom…", "info"));
+              // The link is already durable at this point. Pull its mutable
+              // build projection so the chip can say Building, not Deployed.
+              void refreshWorkflows();
             }
           });
           if (terminal.phase === "ready") {
-            setToast(pendingWarning ? `Deployed to Sapiom. ${pendingWarning}` : "Deployed to Sapiom.");
+            setDeployProgress(workflowPath, { phase: "ready" });
+            trackProduct("agent.deploy_succeeded", {
+              workflow_slug: slug,
+              duration_ms: Math.round(performance.now() - startedAt),
+              ...provenance,
+            });
+            outcomeSettled = true;
+            // A resurfaced warning rides the success message — keep the error
+            // tone so the caveat isn't dressed as a clean win.
+            setToast(
+              pendingWarning
+                ? createToastMessage(`Deployed to Sapiom. ${pendingWarning}`)
+                : createToastMessage("Deployed to Sapiom.", "success"),
+            );
             // Clear any prior deploy error for this workflow — it succeeded.
             setLastDeployErrorByPath((prev) => {
               if (!prev.has(workflowPath)) return prev;
@@ -997,21 +1623,53 @@ export function useHarnessState(): HarnessStateHook {
           } else if (terminal.phase === "error") {
             // Same error shape for a link failure and a build failure —
             // distinguish them by whichever non-terminal phase preceded it.
-            const prefix = lastNonTerminalPhase === "linking" ? "Couldn't create the agent" : "Deploy failed";
+            const prefix =
+              lastNonTerminalPhase === "linking"
+                ? "Couldn't create the agent"
+                : "Deploy failed";
             const msg = terminal.hint
               ? `${prefix}: ${terminal.message} (${terminal.hint})`
               : `${prefix}: ${terminal.message}`;
-            setToast(msg);
+            setDeployProgress(workflowPath, { phase: "error", message: msg });
+            trackProduct("agent.deploy_failed", {
+              workflow_slug: slug,
+              error_kind: deployErrorKind(lastNonTerminalPhase, false),
+              ...provenance,
+            });
+            outcomeSettled = true;
+            setToast(createToastMessage(msg));
             // Persist the failure so the action bar can distinguish "last deploy
             // failed" from "never deployed" after the toast is dismissed.
-            setLastDeployErrorByPath((prev) => new Map(prev).set(workflowPath, msg));
+            setLastDeployErrorByPath((prev) =>
+              new Map(prev).set(workflowPath, msg),
+            );
+            // First-link build failures still persist definitionId. Refresh so
+            // the UI sees the linked definition's failed build projection
+            // instead of continuing to show a local draft.
+            await refreshWorkflows();
           }
         } catch (err) {
-          const msg = err instanceof ApiError && err.reason ? err.reason : (err as Error).message;
-          setToast(msg);
+          const msg =
+            err instanceof ApiError && err.reason
+              ? err.reason
+              : (err as Error).message;
+          setDeployProgress(workflowPath, { phase: "error", message: msg });
+          // Only if a terminal ready/error wasn't already recorded — otherwise
+          // this is a post-terminal throw (e.g. refreshWorkflows) and the
+          // outcome is already logged.
+          if (!outcomeSettled) {
+            trackProduct("agent.deploy_failed", {
+              workflow_slug: slug,
+              error_kind: deployErrorKind(lastNonTerminalPhase, true),
+              ...provenance,
+            });
+          }
+          setToast(createToastMessage(msg));
           // An exception from the deploy stream (e.g. network error) also counts
           // as a deploy failure — persist so the action bar reflects it.
-          setLastDeployErrorByPath((prev) => new Map(prev).set(workflowPath, msg));
+          setLastDeployErrorByPath((prev) =>
+            new Map(prev).set(workflowPath, msg),
+          );
         } finally {
           // Signal that a deploy action settled (success or failure) so the
           // SessionStepsBar can clear its pending ring for this button.
@@ -1023,19 +1681,29 @@ export function useHarnessState(): HarnessStateHook {
       inFlightDeploys.current.set(workflowPath, run);
       return run;
     },
-    [refreshWorkflows, bumpDirectActionSettleSeq],
+    [refreshWorkflows, bumpDirectActionSettleSeq, setDeployProgress],
   );
 
   // Prod-run via the direct route: start the execution server-side, then feed
   // the returned executionId into the SAME poller a CLI-launched run uses
   // (startRunPolling) so it lands in the Steps tab / run picker identically.
   const startProdRun = useCallback(
-    async (sessionId: string, definitionId: string, input?: unknown): Promise<void> => {
+    async (
+      sessionId: string,
+      definitionId: string,
+      input?: unknown,
+    ): Promise<void> => {
       try {
         const { executionId } = await api.run({ definitionId, input });
         startRunPolling(sessionId, executionId, "prod");
       } catch (err) {
-        setToast(err instanceof ApiError && err.reason ? err.reason : (err as Error).message);
+        setToast(
+          createToastMessage(
+            err instanceof ApiError && err.reason
+              ? err.reason
+              : (err as Error).message,
+          ),
+        );
       } finally {
         // Signal settle so the SessionStepsBar clears its pending ring for
         // the Prod Run button — the run has been handed off to the poller
@@ -1054,7 +1722,13 @@ export function useHarnessState(): HarnessStateHook {
     try {
       await api.disconnect();
     } catch (err) {
-      setToast(err instanceof ApiError && err.reason ? err.reason : (err as Error).message);
+      setToast(
+        createToastMessage(
+          err instanceof ApiError && err.reason
+            ? err.reason
+            : (err as Error).message,
+        ),
+      );
     }
   }, []);
 
@@ -1063,20 +1737,36 @@ export function useHarnessState(): HarnessStateHook {
   // Unlike runMacro (which swallows errors into a toast), injectInput lets the
   // error propagate so callers can handle 409 "not ready" inline without a
   // generic toast message.
-  const injectInput = useCallback(async (sessionId: string, text: string): Promise<void> => {
-    await api.injectInput(sessionId, { text, submit: true });
-  }, []);
+  const injectInput = useCallback(
+    async (sessionId: string, text: string): Promise<void> => {
+      await api.injectInput(sessionId, { text, submit: true });
+    },
+    [],
+  );
 
-  const showToast = useCallback((message: string): void => {
-    setToast(message);
-  }, []);
+  const showToast = useCallback(
+    (message: string, tone: ToastTone = "error"): void => {
+      setToast(createToastMessage(message, tone));
+    },
+    [],
+  );
 
   const lastDeployErrorFor = useCallback(
-    (workflowPath: string): string | null => lastDeployErrorByPath.get(workflowPath) ?? null,
+    (workflowPath: string): string | null =>
+      lastDeployErrorByPath.get(workflowPath) ?? null,
     [lastDeployErrorByPath],
   );
 
-  const listDir = useCallback((path?: string): Promise<FsListResponse> => api.listDir(path), []);
+  const listDir = useCallback(
+    (path?: string): Promise<FsListResponse> => api.listDir(path),
+    [],
+  );
+
+  const getWorkflowInputContract = useCallback(
+    (workflowPath: string): Promise<WorkflowInputContractResponse> =>
+      api.getWorkflowInputContract(workflowPath),
+    [],
+  );
 
   return {
     state,
@@ -1096,8 +1786,10 @@ export function useHarnessState(): HarnessStateHook {
     historyLoading,
     loadHistory,
     createSession,
+    attachFile,
     listTemplates,
     getTemplate,
+    getWorkflowInputContract,
     sessionRecord,
     resumeSession,
     rehydrateSession,
@@ -1115,6 +1807,11 @@ export function useHarnessState(): HarnessStateHook {
     injectInput,
     showToast,
     lastDeployErrorFor,
+    deployStateByPath,
+    dismissDeployState: (workflowPath: string) => setDeployProgress(workflowPath, null),
+    pendingWorkspaces,
+    addPendingWorkspace,
+    removePendingWorkspace,
     directActionSettleSeq,
     listDir,
     lastMessage,

@@ -48,10 +48,40 @@ export interface ExecutionStore {
     sharedStateAfter: Record<string, unknown>;
     logs?: unknown;
   }): Promise<void>;
-  failStep(args: { stepRowId: string; error: unknown; sharedStateAfter: Record<string, unknown>; logs?: unknown }): Promise<void>;
+  failStep(args: {
+    stepRowId: string;
+    error: unknown;
+    sharedStateAfter: Record<string, unknown>;
+    logs?: unknown;
+  }): Promise<void>;
+
+  /**
+   * Optional atomic capability for terminal platform errors. Hosts that
+   * implement it must fail the exact active dispatched attempt and its
+   * execution together, applying both records or neither so a sweeper cannot
+   * retry a partially settled attempt. The runtime preserves the legacy retry
+   * path when this capability is absent, keeping minor-version upgrades safe
+   * for external stores.
+   *
+   * `error` is a real `Error` decorated with only the recognized platform
+   * payload fields so existing host serializers retain name/message/stack.
+   */
+  failActiveDispatchedStep?(args: {
+    executionId: string;
+    expectedVersion: number;
+    stepRowId: string;
+    error: unknown;
+    sharedState: Record<string, unknown>;
+    logs?: unknown;
+  }): Promise<boolean>;
 
   // ── CAS transitions — boolean = "won the version race?" ──────────────────
-  markStepDispatched(args: { executionId: string; expectedVersion: number; stepRowId: string; deadlineAt: Date }): Promise<boolean>;
+  markStepDispatched(args: {
+    executionId: string;
+    expectedVersion: number;
+    stepRowId: string;
+    deadlineAt: Date;
+  }): Promise<boolean>;
   transitionToStep(args: {
     executionId: string;
     expectedVersion: number;
@@ -59,7 +89,11 @@ export interface ExecutionStore {
     nextStepInput: unknown;
     sharedState: Record<string, unknown>;
   }): Promise<boolean>;
-  retainStepForRetry(args: { executionId: string; expectedVersion: number; sharedState: Record<string, unknown> }): Promise<boolean>;
+  retainStepForRetry(args: {
+    executionId: string;
+    expectedVersion: number;
+    sharedState: Record<string, unknown>;
+  }): Promise<boolean>;
   pauseExecution(args: {
     executionId: string;
     expectedVersion: number;

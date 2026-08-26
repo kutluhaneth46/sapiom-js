@@ -29,6 +29,7 @@ import type {
   WorkflowInfo,
 } from "../shared/types.js";
 import { JSON_BODY_LIMIT_BYTES } from "../shared/types.js";
+import { unhandledRequestErrorHandler } from "./error-handler.js";
 import { resolveStatePaths } from "../core/paths.js";
 import {
   SessionManager,
@@ -74,7 +75,7 @@ import { getOrCreateMachineId } from "../cli/machine-id.js";
 import { loadSettings, pruneDeadRecentDirs } from "../cli/settings.js";
 import type { HarnessIdentity } from "../cli/auth.js";
 import { generateClaudeSettings } from "../core/inject/claude-settings.js";
-import { generateMcpConfig } from "../core/inject/mcp-config.js";
+import { generateMcpConfig, type McpDevServerCommand } from "../core/inject/mcp-config.js";
 import { generateSystemPromptFile } from "../core/inject/system-prompt.js";
 import { generateSkillsPlugin } from "../core/inject/skills-plugin.js";
 import {
@@ -83,12 +84,14 @@ import {
 } from "../core/inject/retention.js";
 import { CanvasWatcherManager } from "../core/canvas-watcher.js";
 import { WorkspaceWatcherManager } from "../core/workspace-watcher.js";
+import { InstallWatcherManager } from "../core/install-watcher.js";
 import { ExecutionDetector } from "../core/execution-detector.js";
 import { PortDetector, portFromUrl } from "../core/port-detector.js";
 import { EventBus } from "../core/event-bus.js";
 import {
+  prepareHarnessContextForResume,
   writeHarnessContext,
-  harnessContextFileExists,
+  writeHarnessContextForLaunch,
 } from "../core/workspace-context.js";
 import { ensureCanvasTemplate } from "../core/canvas-template.js";
 import { renderCanvasForSession } from "../core/canvas-render.js";
@@ -126,6 +129,7 @@ import { createMacrosRouter } from "./macros.js";
 import { createFsRouter } from "./fs.js";
 import { createRunsRouter } from "./runs.js";
 import { createTemplatesRouter } from "./templates.js";
+import { createAccountRouter } from "./account.js";
 import { createActionsRouter } from "./actions.js";
 import {
   createAuthRouter,
@@ -187,6 +191,13 @@ export interface HarnessServerOptions {
   /** Session registry file. Defaults to `<stateRoot>/sessions.json`. */
   sessionsPath?: string;
   buildLaunchOpts?: LaunchOptsBuilder;
+  /** Host-supplied launcher for the local sapiom-dev MCP server, replacing the
+   *  default `npx @sapiom/mcp@latest`. The Electron host passes its own binary
+   *  (GUI-subsystem — allocates no console window on Windows, where the npx
+   *  chain's cmd.exe popped a persistent one that users closed, killing the
+   *  server) plus the entry script it installed into the per-user npm prefix.
+   *  See core/inject/mcp-config.ts. */
+  sapiomDevMcp?: McpDevServerCommand;
   /** Root directory per-session generated agent configs are written under —
    *  and cleaned up from (exit-time delete + boot-time sweep, see
    *  core/inject/retention.ts). Defaults to `<stateRoot>/generated`. */
@@ -276,8 +287,10 @@ function workflowListsEqual(
   // NUL separates the fields because it can't occur in any of them. Keep it
   // written as the escape `\u0000` — a literal NUL byte in the source makes
   // grep and ripgrep classify this whole file as binary and silently skip it.
+  // Mutable cloud-build fields are deliberately enriched at serve/render
+  // time; the registry snapshots compared here never own those fields.
   const key = (w: WorkflowInfo): string =>
-    `${w.path}\u0000${w.name}\u0000${w.definitionId ?? ""}\u0000${w.source}`;
+    `${w.path}\u0000${w.name}\u0000${w.definitionId ?? ""}\u0000${w.definitionSlug ?? ""}\u0000${w.source}`;
   const setA = new Set(a.map(key));
   return b.every((w) => setA.has(key(w)));
 }
@@ -314,6 +327,7 @@ function createDefaultBuildLaunchOpts(
     /** Which channel this harness receives a brief on. */
     deliveryFor: (harness: HarnessKind) => SystemPromptDelivery;
   },
+  sapiomDevMcp?: McpDevServerCommand,
 ): LaunchOptsBuilder {
   return async (harnessSessionId, req) => {
     // Portable continue (SAP-2059). Resolved before the prompt file is
@@ -340,13 +354,27 @@ function createDefaultBuildLaunchOpts(
     const viaSystemPrompt =
       brief !== null && rehydration?.deliveryFor(req.harness) === "launch-flag";
 
+    // Pin Claude's ANSI theme to the app theme so the terminal's own palette
+    // (Terminal.tsx DARK_ANSI/LIGHT_ANSI) controls its colors — matched base or
+    // dim text loses contrast. Only when the theme is known: an unthemed path
+    // (server-side auto-create, a legacy session resumed before this existed)
+    // omits it and Claude keeps its default 256-color rendering, exactly as before.
+    const claudeTheme =
+      req.theme === "light" ? "light-ansi" : req.theme === "dark" ? "dark-ansi" : undefined;
+
     const [settings, mcpConfigFile, systemPromptFile, pluginDir] =
       await Promise.all([
-        generateClaudeSettings({ harnessSessionId, generatedRoot }),
+        generateClaudeSettings({
+          harnessSessionId,
+          generatedRoot,
+          ...(claudeTheme ? { claudeTheme } : {}),
+        }),
         generateMcpConfig(harnessSessionId, {
           environment: process.env.SAPIOM_ENVIRONMENT,
           apiKey,
           generatedRoot,
+          harnessVersion: readVersion(),
+          ...(sapiomDevMcp ? { devServer: sapiomDevMcp } : {}),
         }),
         generateSystemPromptFile(harnessSessionId, {
           generatedRoot,
@@ -405,29 +433,30 @@ export const startServer = async (
   // boot; caches successful id→slug resolutions in-memory (ids are stable).
   // Never throws — a failed resolution leaves definitionSlug as-is.
   const slugResolver = createDefinitionSlugResolver({
-    apiKey: identity?.apiKey ?? null,
+    apiKey: () => apiKeyProvider.getKey(),
     baseUrl: resolveAgentsBaseUrl(),
   });
 
-  /** Returns a copy of the workflow list with definitionSlug filled in from
-   *  the Agents API for any workflow that has a definitionId but no slug.
+  /** Returns a copy of the workflow list with definition metadata filled in
+   *  from the Agents API for every linked workflow. Build status is mutable,
+   *  so it is refreshed even when the stable slug is already present.
    *  Resolves all lookups in parallel. Never mutates the registry. */
   const enrichWorkflows = async (
     workflows: WorkflowInfo[],
   ): Promise<WorkflowInfo[]> => {
     return Promise.all(
       workflows.map(async (workflow) => {
-        if (
-          workflow.definitionId == null ||
-          (workflow.definitionSlug != null && workflow.definitionSlug !== "")
-        ) {
-          return workflow;
-        }
-        const resolved = await slugResolver.resolve(
+        if (workflow.definitionId == null) return workflow;
+        const metadata = await slugResolver.resolveMetadata(
           String(workflow.definitionId),
         );
-        if (resolved == null) return workflow;
-        return { ...workflow, definitionSlug: resolved };
+        if (metadata == null) return workflow;
+        return {
+          ...workflow,
+          definitionSlug: metadata.slug ?? workflow.definitionSlug,
+          activeBuildRunId: metadata.activeBuildRunId,
+          activeBuildRunStatus: metadata.activeBuildRunStatus,
+        };
       }),
     );
   };
@@ -448,9 +477,11 @@ export const startServer = async (
     // preserve-on-failure path: while an agent is mid-edit the sources are
     // transiently un-buildable, and flashing an extraction-error panel over a
     // perfectly good diagram reads as broken. So keep the last good render until
-    // the edit builds cleanly, then swap it in (the write flows back through
-    // onChange above as the iframe reload, with its loading skeleton). Only a
-    // workflow that has never rendered shows the honest error.
+    // a later watched .ts/.tsx edit extracts successfully, then swap it in (the
+    // write flows back through onChange above as the iframe reload). Other fixes
+    // need an explicit Visualize retry because the watcher is intentionally
+    // source-limited. Only a workflow that has never rendered shows the honest
+    // error immediately.
     onSourceChange: (harnessSessionId) => {
       const session = sessionManager.get(harnessSessionId);
       if (session) void autoRenderCanvas(session).catch(() => {});
@@ -491,13 +522,13 @@ export const startServer = async (
       }),
   });
 
-  // Declared before sessionManager: writeSessionContext (sessionManager's
-  // writeWorkspaceContext option) needs workflowsCache in scope to resolve a
-  // session's boundWorkflowPath into a full WorkflowInfo. scanWorkflowsAndBroadcast
-  // stays defined below sessionManager instead, since it needs sessionManager
+  // Declared before sessionManager: its context writers need workflowsCache
+  // in scope to resolve a session's boundWorkflowPath into a full WorkflowInfo.
+  // scanWorkflowsAndBroadcast stays defined below sessionManager instead,
+  // since it needs sessionManager
   // itself (to rewrite every open session's context file on a registry change) —
-  // no circularity, since only writeSessionContext is threaded into SessionManager's
-  // constructor, and it doesn't need sessionManager.
+  // no circularity, since the context callbacks threaded into SessionManager's
+  // constructor don't need sessionManager themselves.
   const workflowRegistry = new WorkflowRegistry(
     options.workflowsRegistryPath ?? statePaths.workflows,
   );
@@ -510,11 +541,11 @@ export const startServer = async (
     const prunedWorkflows = await workflowRegistry.prune();
     for (const workflow of prunedWorkflows) {
       console.error(
-        `[harness] pruned workflow registry entry with missing path: ${workflow.path}`,
+        `[harness] pruned agent registry entry with missing path: ${workflow.path}`,
       );
     }
   } catch (err) {
-    console.error("[harness] workflow registry prune failed:", err);
+    console.error("[harness] agent registry prune failed:", err);
   }
   // Same hygiene for settings.json's recentDirs — dead entries are already
   // filtered from every read, but pruning here persists their removal.
@@ -534,23 +565,35 @@ export const startServer = async (
   }, WORKFLOWS_CACHE_REFRESH_MS);
   workflowsCacheTimer.unref?.();
 
+  const boundWorkflowForSession = (session: HarnessSession): WorkflowInfo | null =>
+    session.boundWorkflowPath
+      ? (workflowsCache.find((workflow) => workflow.path === session.boundWorkflowPath) ?? null)
+      : null;
+
   /**
    * Writes HARNESS_CONTEXT_FILE for a single session, resolving its
    * `boundWorkflowPath` against the live registry so the file always
    * reflects the session's actual current binding (not just what a caller
-   * happened to have on hand) — and the full `workflows` list, so an agent
-   * can answer "what workflows exist" without a UI round-trip. Shared by
-   * SessionManager's create()/resume(), the PATCH bind/unbind route, and
-   * scanWorkflowsAndBroadcast's rewrite-all-open-sessions step below.
+   * happened to have on hand) — and the full agent list. Bind/unbind and
+   * registry refreshes use this best-effort writer; create and resume use
+   * their strict pre-spawn counterparts below.
    */
   const writeSessionContext = async (
     session: HarnessSession,
   ): Promise<void> => {
-    const boundWorkflow = session.boundWorkflowPath
-      ? (workflowsCache.find((w) => w.path === session.boundWorkflowPath) ??
-        null)
-      : null;
-    await writeHarnessContext(session, boundWorkflow, workflowsCache);
+    await writeHarnessContext(session, boundWorkflowForSession(session), workflowsCache);
+  };
+
+  const initializeSessionContext = async (
+    session: HarnessSession,
+  ): Promise<void> => {
+    await writeHarnessContextForLaunch(session, boundWorkflowForSession(session), workflowsCache);
+  };
+
+  const prepareSessionContext = async (
+    session: HarnessSession,
+  ): Promise<void> => {
+    await prepareHarnessContextForResume(session, boundWorkflowForSession(session), workflowsCache);
   };
 
   // Declared before the launch-opts builder (rather than beside the ingest
@@ -667,10 +710,15 @@ export const startServer = async (
 
   const innerBuildLaunchOpts =
     options.buildLaunchOpts ??
-    createDefaultBuildLaunchOpts(identity?.apiKey ?? null, generatedRoot, {
-      buildBrief: resolveRehydrationBrief,
-      deliveryFor: (harness) => systemPromptDeliveryFor(adapters[harness]),
-    });
+    createDefaultBuildLaunchOpts(
+      identity?.apiKey ?? null,
+      generatedRoot,
+      {
+        buildBrief: resolveRehydrationBrief,
+        deliveryFor: (harness) => systemPromptDeliveryFor(adapters[harness]),
+      },
+      options.sapiomDevMcp,
+    );
   const buildLaunchOpts: LaunchOptsBuilder = async (harnessSessionId, req) => {
     await pendingGeneratedRemovals.get(harnessSessionId);
     return innerBuildLaunchOpts(harnessSessionId, req);
@@ -685,15 +733,16 @@ export const startServer = async (
     buildLaunchOpts,
     // Every session gets its initial harness-context.json regardless of
     // entry point (REST, autoCreateSession) — see SessionManager.create().
-    writeWorkspaceContext: writeSessionContext,
-    workspaceContextExists: (cwd) => harnessContextFileExists(cwd),
+    writeWorkspaceContext: initializeSessionContext,
+    prepareWorkspaceContext: prepareSessionContext,
     ensureCanvasTemplate,
   });
   await sessionManager.init();
 
-  const workspaceScopeCatalog = new LocalWorkspaceScopeCatalog(() =>
-    sessionManager.list().map((session) => session.cwd),
-  );
+  const workspaceScopeCatalog = new LocalWorkspaceScopeCatalog(async () => [
+    ...(await loadSettings(statePaths.settings)).recentDirs,
+    ...sessionManager.list().map((session) => session.cwd),
+  ]);
   const systemGraphStore = new SystemGraphStore(
     new StaticSystemGraphBuilder(
       new WorkflowRegistryInventoryReader(() => workflowsCache),
@@ -800,12 +849,12 @@ export const startServer = async (
   // agent scaffolds a new workflow directory, or one gets deleted — and the
   // rail must keep up rather than stay frozen at whatever the boot/session-
   // create scan found. On a (debounced) structural change under a session's
-  // workspace, prune dead paths, re-scan its cwd, and — only when the workflow
+  // workspace, prune dead paths, reconcile its cwd, and — only when the workflow
   // list actually changed — rewrite every open session's context file and
   // broadcast `workflows.changed` (the SPA refetches /api/workflows on it).
-  // Pruning here is what lets a deleted workflow drop out (a plain scan only
-  // ever merges in); it respects the same ENOENT/ENOTDIR-only guard as the
-  // boot prune, so a merely-unbuilt or unreadable project stays put.
+  // Path pruning respects the ENOENT/ENOTDIR-only guard. The scan additionally
+  // removes scan-sourced rows in this cwd's traversal envelope when their
+  // marker disappears or becomes invalid; manually connected folders remain.
   const rescanWorkspaceForSession = async (
     harnessSessionId: string,
   ): Promise<void> => {
@@ -816,6 +865,21 @@ export const startServer = async (
     await workflowRegistry.scan(session.cwd);
     const after = await workflowRegistry.list();
     workflowsCache = after;
+
+    // A removed project must not leave a live session permanently bound to a
+    // path that the registry can no longer resolve. Clear only stale bindings;
+    // the triggering session may immediately auto-bind to another candidate
+    // below its cwd in the block that follows.
+    const registeredPaths = new Set(after.map((workflow) => workflow.path));
+    for (const openSession of sessionManager.list()) {
+      if (
+        openSession.status !== "exited" &&
+        openSession.boundWorkflowPath &&
+        !registeredPaths.has(openSession.boundWorkflowPath)
+      ) {
+        sessionManager.setBoundWorkflowPath(openSession.id, null);
+      }
+    }
 
     // Auto-bind: if this session is still unbound, find the workflow at or
     // directly under its cwd and bind it — same mechanism as
@@ -856,6 +920,34 @@ export const startServer = async (
     },
   });
 
+  // Bridges the scaffold→`npm install` gap: a brand-new project renders a calm
+  // "preparing" placeholder (core/canvas-render.ts's depsMissing path) because
+  // its deps aren't installed yet, and neither watcher above re-fires when
+  // install completes (both ignore node_modules). This one notices deps landing
+  // and re-renders, so the placeholder becomes the step graph with no Retry.
+  const installWatcher = new InstallWatcherManager({
+    onInstalled: (harnessSessionId) => {
+      const session = sessionManager.get(harnessSessionId);
+      if (session && session.status !== "exited") {
+        void autoRenderCanvas(session).catch((err: unknown) => {
+          console.error("[harness] post-install canvas render failed:", err);
+        });
+      }
+    },
+    onTimeout: (harnessSessionId) => {
+      // Install never completed within the window (offline, npm missing on
+      // PATH in a stripped host). Restore the honest error panel so the user
+      // regains the Retry / Ask-coding-agent actions instead of a placeholder
+      // that would wait forever.
+      const session = sessionManager.get(harnessSessionId);
+      if (session && session.status !== "exited") {
+        void renderCanvasSurfacingDepErrors(session).catch((err: unknown) => {
+          console.error("[harness] install-timeout canvas render failed:", err);
+        });
+      }
+    },
+  });
+
   // Sessions that have already had their one-time on-start workspace rescan.
   // onStatusChange also fires on later status broadcasts (including the
   // bind/unbind frames setBoundWorkflowPath emits), so this guard keeps the
@@ -893,6 +985,7 @@ export const startServer = async (
     } else if (session.status === "exited") {
       canvasWatcher.stop(session.id);
       workspaceWatcher.stop(session.id);
+      installWatcher.stop(session.id);
       portDetector.reset(session.id);
       executionDetector.reset(session.id);
       // Let a resumed session get a fresh on-start rescan.
@@ -961,26 +1054,82 @@ export const startServer = async (
     return found;
   };
 
+  /** Enrich only the bound workflow before a Canvas render. Canvas extraction
+   *  needs the registry snapshot to resolve the binding, but its cloud badge
+   *  needs the same mutable build projection exposed by /api/state. Limiting
+   *  the lookup to the bound workflow avoids one remote request per linked
+   *  agent on every source-triggered auto-render. */
+  const canvasWorkflowsForSession = async (
+    session: Pick<HarnessSession, "boundWorkflowPath">,
+  ): Promise<WorkflowInfo[]> => {
+    if (session.boundWorkflowPath == null) return workflowsCache;
+    const boundIndex = workflowsCache.findIndex(
+      (workflow) => workflow.path === session.boundWorkflowPath,
+    );
+    if (boundIndex === -1) return workflowsCache;
+    const [enrichedBound] = await enrichWorkflows([workflowsCache[boundIndex]]);
+    const workflows = [...workflowsCache];
+    workflows[boundIndex] = enrichedBound;
+    return workflows;
+  };
+
   // Renders a session's bound workflow via the fully deterministic pipeline —
-  // always against the live workflowsCache; structure + derived annotations,
-  // no LLM, no user token. A cheap no-op for an unbound session (the canvas
-  // router serves the empty state on its own). Never throws (see
-  // core/canvas-render.ts); best-effort, like every other canvas write here.
+  // against the live workflowsCache plus the bound definition's current cloud
+  // build projection; structure + derived annotations, no LLM, no user token.
+  // A cheap no-op for an unbound session (the canvas router serves the empty
+  // state on its own). Never throws (see core/canvas-render.ts); best-effort,
+  // like every other canvas write here.
   // autoRenderCanvas is the UNPROMPTED variant (session-create/boot) that
   // won't replace a workflow's existing render with an error panel when its
   // extraction fails.
+  // A depsMissing render (fresh scaffold, pre-install) shows the "preparing"
+  // placeholder; arm the install watcher to re-render once deps land. Any other
+  // outcome means we no longer need to wait — cancel a pending watcher (no-op
+  // if none). Shared by every render trigger so the arm/disarm stays in lockstep
+  // with what the pane is actually showing.
+  const reactToRenderOutcome = (
+    session: HarnessSession,
+    outcome: Awaited<ReturnType<typeof renderCanvasForSession>>,
+  ): void => {
+    if (outcome.depsMissing && outcome.workflowPath) {
+      installWatcher.start(session.id, outcome.workflowPath);
+    } else {
+      installWatcher.stop(session.id);
+    }
+  };
   const renderCanvas = async (session: HarnessSession): Promise<void> => {
-    await renderCanvasForSession(session, workflowsCache);
+    const outcome = await renderCanvasForSession(
+      session,
+      await canvasWorkflowsForSession(session),
+    );
+    reactToRenderOutcome(session, outcome);
   };
   const autoRenderCanvas = async (session: HarnessSession): Promise<void> => {
-    await renderCanvasForSession(session, workflowsCache, {
-      preserveExistingOnFailure: true,
-    });
+    const outcome = await renderCanvasForSession(
+      session,
+      await canvasWorkflowsForSession(session),
+      { preserveExistingOnFailure: true },
+    );
+    reactToRenderOutcome(session, outcome);
+  };
+  // Used only by the install-watcher timeout: forces extraction even with deps
+  // missing so the honest esbuild error panel (and its Retry/Ask actions) is
+  // written instead of the placeholder. Does NOT re-arm the watcher — its
+  // outcome is an extraction failure, not depsMissing.
+  const renderCanvasSurfacingDepErrors = async (
+    session: HarnessSession,
+  ): Promise<void> => {
+    const outcome = await renderCanvasForSession(
+      session,
+      await canvasWorkflowsForSession(session),
+      { surfaceErrorOnMissingDeps: true },
+    );
+    reactToRenderOutcome(session, outcome);
   };
 
   const initialWorkflowScan = scanWorkflowsAndBroadcast(launchDir).catch(
     (err: unknown) => {
-      console.error("[harness] initial workflow scan failed:", err);
+      console.error("[harness] initial agent scan failed:", err);
       return [] as WorkflowInfo[];
     },
   );
@@ -1097,6 +1246,7 @@ export const startServer = async (
       identity: identity
         ? {
             userId: identity.userId,
+            tenantId: identity.tenantId,
             organizationName: identity.organizationName,
           }
         : null,
@@ -1121,7 +1271,7 @@ export const startServer = async (
           })
           .catch((err: unknown) => {
             console.error(
-              "[harness] workflow scan on session create failed:",
+              "[harness] agent scan on session create failed:",
               err,
             );
           });
@@ -1157,7 +1307,14 @@ export const startServer = async (
     "/api",
     createCanvasRenderRouter({
       getSession: (harnessSessionId) => sessionManager.get(harnessSessionId),
-      listWorkflows: () => workflowsCache,
+      listWorkflows: canvasWorkflowsForSession,
+      // Keep the install watcher in lockstep with what this route just put on
+      // screen — without this, a depsMissing render through the POST route
+      // showed the "preparing" placeholder with nothing armed to replace it.
+      onOutcome: (harnessSessionId, outcome) => {
+        const session = sessionManager.get(harnessSessionId);
+        if (session) reactToRenderOutcome(session, outcome);
+      },
     }),
   );
   // Wrap the registry so GET /api/workflows also returns enriched slugs —
@@ -1182,6 +1339,14 @@ export const startServer = async (
   // baseUrl omitted: the router self-defaults via resolveCoreBaseUrl().
   app.use(
     createTemplatesRouter({
+      apiKey: apiKeyProvider,
+    }),
+  );
+  // The rail's plan card, relayed from CORE for the same reason as the gallery
+  // above: the key stays server-side and the card can't disagree with the
+  // dashboard's billing views. baseUrl self-defaults via resolveCoreBaseUrl().
+  app.use(
+    createAccountRouter({
       apiKey: apiKeyProvider,
     }),
   );
@@ -1460,17 +1625,7 @@ export const startServer = async (
   const webDir = options.webDir ?? join(packageRoot(), "dist", "web");
   app.use(createStaticRouter(webDir, options.bootToken));
 
-  app.use(
-    (
-      err: unknown,
-      _req: express.Request,
-      res: express.Response,
-      _next: express.NextFunction,
-    ) => {
-      console.error("[harness] unhandled request error:", err);
-      res.status(500).json({ error: "internal error" });
-    },
-  );
+  app.use(unhandledRequestErrorHandler);
 
   const httpServer: HttpServer = createHttpServer(app);
 
@@ -1537,6 +1692,7 @@ export const startServer = async (
       clearInterval(ndjsonRetentionTimer);
       canvasWatcher.stopAll();
       workspaceWatcher.stopAll();
+      installWatcher.stopAll();
       for (const tailer of codexTailers.values()) tailer.stop();
       codexTailers.clear();
       // Closing the HTTP/WS server doesn't touch unrelated child processes

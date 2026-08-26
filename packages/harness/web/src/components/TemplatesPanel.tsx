@@ -4,7 +4,12 @@ import type { JSX } from "react";
 import type { TemplateDetailView, TemplateListResponse } from "@shared/types";
 
 import type { FsListResponse } from "../lib/api";
-import { NO_FILTER, filterTemplates, isFiltered, type TemplateFilter } from "../lib/template-facets";
+import {
+  NO_FILTER,
+  filterTemplates,
+  isFiltered,
+  type TemplateFilter,
+} from "../lib/template-facets";
 import {
   STARTER_TEMPLATES,
   matchesQuery,
@@ -18,6 +23,8 @@ import { TemplateCard } from "./TemplateCard";
 import { TemplateDetail } from "./TemplateDetail";
 import { TemplateFilters } from "./TemplateFilters";
 import { TemplateUseDialog } from "./TemplateUseDialog";
+import { trackingAttrs } from "../lib/analytics/tracking-attrs";
+import { TrackScope } from "./analytics/TrackScope";
 
 interface TemplatesPanelProps {
   /** Seeds the destination suggestion — the resolved project root, shared with
@@ -34,6 +41,14 @@ interface TemplatesPanelProps {
   /** The live catalog fetchers (the server relays core; the key stays there). */
   listTemplates: () => Promise<TemplateListResponse>;
   getTemplate: (id: string) => Promise<TemplateDetailView>;
+  /**
+   * A template id to open on arrival — a `sapiom://templates/<id>` deep link,
+   * routed here by App. Resolved against the live catalog (and bundled starters)
+   * once they load; an unknown id falls through to the gallery. Applied only when
+   * the id changes, so the user can navigate back afterwards without being yanked
+   * forward again.
+   */
+  openTemplateId?: string | null;
 }
 
 /**
@@ -48,13 +63,13 @@ interface TemplatesPanelProps {
  * Three properties are load-bearing and easy to lose in a redesign:
  *
  * 1. **The catalog is fetched, never bundled.** A hardcoded copy is why the
- *    Studio once offered two templates while the dashboard had twenty-six.
+ *    Studio once offered only two templates while the dashboard had the full catalog.
  * 2. **A degraded fetch says so.** Signed out or core unreachable, the notice
  *    names the reason. Silence is what let a short list read as a whole catalog.
- * 3. **Bundled starters keep their own block.** They are the CLI's offline
- *    scaffolds, not catalog entries, and they stay reachable exactly when the
- *    gallery is not. They declare no category or trigger, and inventing one to
- *    tidy the grid would be fabricating registry data.
+ * 3. **Bundled starters keep their own block.** They do not require the live
+ *    gallery or a Sapiom account, and they are not catalog entries. They
+ *    declare no category or trigger, and inventing one to tidy the grid would
+ *    be fabricating registry data.
  *
  * There is no result-count line above the grid: every facet row already carries
  * its own count, and the hero states the total.
@@ -67,6 +82,7 @@ export function TemplatesPanel({
   onUse,
   listTemplates,
   getTemplate,
+  openTemplateId,
 }: TemplatesPanelProps): JSX.Element {
   const [catalog, setCatalog] = useState<TemplateListResponse | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -84,7 +100,8 @@ export function TemplatesPanel({
         if (!cancelled) setCatalog(response);
       })
       .catch((err: unknown) => {
-        if (!cancelled) setLoadError(err instanceof Error ? err.message : String(err));
+        if (!cancelled)
+          setLoadError(err instanceof Error ? err.message : String(err));
       });
     return () => {
       cancelled = true;
@@ -95,10 +112,17 @@ export function TemplatesPanel({
   }, []);
 
   const gallery = useMemo<GalleryTemplate[]>(
-    () => (catalog?.templates ?? []).map((template) => ({ ...template, kind: "gallery" as const })),
+    () =>
+      (catalog?.templates ?? []).map((template) => ({
+        ...template,
+        kind: "gallery" as const,
+      })),
     [catalog],
   );
-  const results = useMemo(() => filterTemplates(gallery, filter, matchesQuery), [gallery, filter]);
+  const results = useMemo(
+    () => filterTemplates(gallery, filter, matchesQuery),
+    [gallery, filter],
+  );
   // Starters answer the query but not the facets: they declare neither axis, so
   // selecting a category or a trigger is a statement about the gallery, and
   // leaving them on screen under one would misrepresent them as matching it.
@@ -106,9 +130,26 @@ export function TemplatesPanel({
     () =>
       filter.category !== null || filter.cadence !== null
         ? []
-        : STARTER_TEMPLATES.filter((template) => matchesQuery(template, filter.query)),
+        : STARTER_TEMPLATES.filter((template) =>
+            matchesQuery(template, filter.query),
+          ),
     [filter],
   );
+
+  // Open a deep-linked template's detail once it can be resolved. Keyed on the id
+  // via a ref so navigating back (setOpened(null)) isn't undone on the next render,
+  // while a later, different deep link still opens. Unknown/not-yet-loaded ids just
+  // leave the gallery showing.
+  const openedByDeepLinkRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!openTemplateId || openedByDeepLinkRef.current === openTemplateId) return;
+    const match =
+      gallery.find((template) => template.id === openTemplateId) ??
+      STARTER_TEMPLATES.find((template) => template.id === openTemplateId);
+    if (!match) return;
+    openedByDeepLinkRef.current = openTemplateId;
+    setOpened(match);
+  }, [openTemplateId, gallery]);
 
   const loading = catalog === null && loadError === null;
 
@@ -117,15 +158,23 @@ export function TemplatesPanel({
     if (loadError) return `Could not load the template gallery: ${loadError}`;
     if (!catalog || catalog.source === "live") return null;
     return catalog.reason === "signed-out"
-      ? "Sign in to Sapiom to browse the template gallery. The bundled starters below work offline."
-      : "The template gallery is unreachable right now. The bundled starters below work offline.";
+      ? "Sign in to Sapiom to browse the template gallery. The bundled starters below remain available."
+      : "The template gallery is unreachable right now. The bundled starters below remain available.";
   })();
 
+  // No `surface` on the panel itself. It hosts two mutually exclusive modes —
+  // the grid and the opened detail — and an outer `surface` would win over the
+  // detail's own, collapsing both into one indistinguishable bucket. Each mode
+  // carries its own instead.
   return (
-    <section className="templates-panel" data-testid="templates-panel" aria-label="Templates">
+    <section
+      className="templates-panel"
+      data-testid="templates-panel"
+      aria-label="Templates"
+    >
       {/* Matches the session bar's height, so the shell's top edge does not
           shift as you enter and leave the browser. */}
-      <div className="templates-bar">
+      <div className="templates-bar" {...trackingAttrs({ surface: "template_gallery" })}>
         <button
           type="button"
           className="theme-toggle templates-back"
@@ -136,7 +185,9 @@ export function TemplatesPanel({
         >
           <Icon name="ArrowLeft" size={14} />
         </button>
-        <span className="templates-bar-title">{opened ? opened.name : "Templates"}</span>
+        <span className="templates-bar-title">
+          {opened ? opened.name : "Templates"}
+        </span>
         {opened && (
           <button
             ref={useTriggerRef}
@@ -155,7 +206,7 @@ export function TemplatesPanel({
           {opened ? (
             <TemplateDetail template={opened} getTemplate={getTemplate} />
           ) : (
-            <>
+            <TrackScope surface="template_gallery">
               <header className="templates-hero">
                 <h2 className="templates-hero-title">Start from a template</h2>
                 <p className="templates-hero-copy">
@@ -163,23 +214,34 @@ export function TemplatesPanel({
                       advertise templates that are not on screen. */}
                   {loading
                     ? "Loading the catalog…"
-                    : `${gallery.length} runnable agent workflows. Open one to read what it does, then use it. A session starts in a new folder and sets it up for you.`}
+                    : `${gallery.length} runnable agents. Open one to read what it does, then use it. A session starts in a new folder and sets it up for you.`}
                 </p>
               </header>
 
               {degraded && (
-                <div className="templates-degraded" data-testid="templates-degraded" role="status">
+                <div
+                  className="templates-degraded"
+                  data-testid="templates-degraded"
+                  role="status"
+                >
                   <Icon name="TriangleAlert" size={14} />
                   <span>{degraded}</span>
                 </div>
               )}
 
               <div className="templates-layout">
-                <TemplateFilters catalog={gallery} filter={filter} onChange={setFilter} />
+                <TemplateFilters
+                  catalog={gallery}
+                  filter={filter}
+                  onChange={setFilter}
+                />
 
                 <div className="templates-results">
                   {results.length > 0 && (
-                    <div className="templates-grid" data-testid="templates-grid">
+                    <div
+                      className="templates-grid"
+                      data-testid="templates-grid"
+                    >
                       {results.map((template) => (
                         <TemplateCard
                           key={template.id}
@@ -214,10 +276,14 @@ export function TemplatesPanel({
                   )}
 
                   {starters.length > 0 && (
-                    <section className="templates-starters" data-testid="templates-starters">
+                    <section
+                      className="templates-starters"
+                      data-testid="templates-starters"
+                    >
                       <span className="facet-title">Bundled starters</span>
                       <p className="templates-starters-copy">
-                        Shipped with the CLI. These scaffold with no account and no network.
+                        Shipped with the CLI. No Sapiom account or capability
+                        spend; setup may access npm.
                       </p>
                       <div className="templates-grid">
                         {starters.map((template) => (
@@ -233,7 +299,7 @@ export function TemplatesPanel({
                   )}
                 </div>
               </div>
-            </>
+            </TrackScope>
           )}
         </div>
       </div>

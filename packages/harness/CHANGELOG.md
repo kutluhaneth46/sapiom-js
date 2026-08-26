@@ -1,5 +1,587 @@
 # @sapiom/harness
 
+## 0.8.8
+
+### Patch Changes
+
+- 672550f: Start fresh same-folder Claude Code or Codex conversations from browser-style session tabs in Agent Studio.
+  - @sapiom/agent@0.12.1
+  - @sapiom/agent-core@0.13.1
+
+## 0.8.7
+
+### Patch Changes
+
+- 5409191: Recognize the Codex CLI 0.143 empty-composer screen so accepting a new
+  directory's trust prompt releases Agent Studio's held initial prompt. Also
+  best-effort recognize future composer copy changes from the input marker and
+  cwd footer while known onboarding fragments remain blocking.
+
+## 0.8.6
+
+### Patch Changes
+
+- 3d79aab: Release held Agent Studio prompts into Codex once its terminal has rendered a
+  stable, non-blocking screen. Partial terminal repaints retain recognized
+  blockers until the empty composer is positively identified, while a bounded
+  fallback prevents animation or an incomplete repaint from waiting forever.
+  Initial prompts remain held through Codex trust, sign-in, and setup flows, and
+  Claude Code's SessionStart readiness behavior is unchanged. Codex may now
+  report `ready: true` before its first rollout/transcript exists: readiness
+  describes an input-safe TUI, not durable conversation metadata.
+
+## 0.8.5
+
+### Patch Changes
+
+- Updated dependencies [555475d]
+- Updated dependencies [52efab3]
+  - @sapiom/agent@0.12.0
+  - @sapiom/agent-core@0.13.0
+  - @sapiom/mcp@0.12.10
+
+## 0.8.4
+
+### Patch Changes
+
+- Updated dependencies [9afeda9]
+  - @sapiom/agent@0.11.0
+  - @sapiom/agent-core@0.12.2
+
+## 0.8.3
+
+### Patch Changes
+
+- 5a8eeea: `DEFAULT_SYSTEM_PROMPT` gains a compact "Calling LLMs from agent code"
+  section — the same LLM call-surface rule taught in the MCP instructions and
+  the `sapiom-agent-authoring` skill, kept to ~8 lines since the prompt is
+  injected fresh into every Studio session's context. Also corrects the
+  adjacent "sapiom (remote, HTTP)" bullet's vague "models" capability mention
+  to point at the new section.
+- Updated dependencies [00b8814]
+- Updated dependencies [5a8eeea]
+- Updated dependencies [5a8eeea]
+  - @sapiom/agent-core@0.12.0
+  - @sapiom/mcp@0.12.8
+  - @sapiom/agent@0.10.1
+
+## 0.8.2
+
+### Patch Changes
+
+- Updated dependencies [af764cd]
+  - @sapiom/agent@0.10.0
+  - @sapiom/agent-core@0.11.4
+  - @sapiom/mcp@0.12.7
+
+## 0.8.1
+
+### Patch Changes
+
+- 7d4f13a: Allow files to be picked, dropped, or pasted into the create-new composer so they arrive with the agent's first request.
+- 13e5867: Start new and resumed interactive Claude Code sessions in Auto mode when the
+  account supports it. Bypass permissions is available as an explicit Shift+Tab
+  choice for accounts without Auto mode; it is never activated silently.
+  Headless tasks keep their existing permission mode.
+  - @sapiom/agent@0.9.4
+  - @sapiom/agent-core@0.11.1
+
+## 0.8.0
+
+### Minor Changes
+
+- b1d791b: Add an artifact-first Studio run workspace for local and cloud agents. Studio now
+  collects schema-driven input, streams chronological attempt evidence, renders
+  bounded outputs with Rendered and Raw views, and provides an isolated Focus mode
+  for inspecting input, output, state, directives, logs, and recorded capability
+  calls.
+
+  Local agent execution now emits start and settled trace events with timing,
+  directive, shared-state, log, and capability-call evidence. Desktop development
+  launches rebuild Harness first so Electron always opens the current Studio UI.
+
+### Patch Changes
+
+- bb0df7d: Canvas: open the right pane when a real step graph renders, not when scaffolding is written
+
+  A canvas WRITE is not a canvas RESULT. The pane revealed itself on every
+  `canvas.reload`, and the "Preparing your agent — installing dependencies"
+  placeholder written while npm runs is exactly such a write — so a fresh
+  scaffold popped the pane open on setup state and presented it as the result
+  (the server's "Rendering agent diagram…" pending document does the same to the
+  mount probe).
+
+  The reveal now waits for the document to post `sapiom-canvas:graph`, which only
+  a real render embeds and the placeholders deliberately omit. Nothing is
+  deferred but the reveal: a collapsed pane is hidden with `display:none`, never
+  unmounted, so the iframe still loads and swaps its document in the background
+  and the board is there the instant it is worth showing. Absence of content is
+  still announced immediately, so an empty pane still hides itself.
+
+- 8ef5374: Restore drag-and-drop of images (and any file) into the Studio terminal. Removing the image composer (#562) left drops with no handler at all — xterm.js has no native drop behavior, so in the desktop app a dropped image was handed to the OS viewer instead of the agent. A drop on the terminal now behaves like a native emulator: the desktop preload resolves the dropped File to its real path (`webUtils.getPathForFile`) and the SPA pastes the quoted path into the pty, which Claude/Codex pick up natively (`[Image #1]`). Stray drops elsewhere in the SPA no longer navigate the page away.
+- f5a67c2: Clicking a link in the terminal opens the actual URL instead of a macOS "no application set to open the URL about:blank" dialog
+
+  The xterm web-links addon's default activation opens a blank window first and
+  assigns `location.href` afterwards. The desktop app's window-open handler
+  intercepts that first call, sees only `about:blank`, and hands it to the OS —
+  which has no handler for that scheme, so the link dies in a system dialog. The
+  terminal now passes the clicked URL directly to `window.open`, and the desktop
+  host additionally refuses to hand anything but `http(s):`/`mailto:` URLs to
+  `shell.openExternal`.
+
+- Updated dependencies [b1d791b]
+  - @sapiom/agent-core@0.11.0
+  - @sapiom/mcp@0.12.6
+
+## 0.7.0
+
+### Minor Changes
+
+- 3cbe957: Command palette: a proper fuzzy finder, redesigned as Command Search
+
+  The Cmd+K palette is rebuilt around the reported search failures ("cannot find
+  this simple agent"): short queries no longer "match" characters scattered
+  across absolute paths, duplicate past sessions no longer flood the list, and
+  what you search is what the rail shows.
+
+  - **Boundary-gated matcher** (`web/src/lib/fuzzy.ts`): every matched character
+    must be contiguous with the previous one or sit at a word/segment boundary,
+    with a substring fallback for mid-word fragments. Scattered-noise matches are
+    rejected outright, not merely down-ranked. Multi-term queries AND across
+    whitespace.
+  - **Ranking model** (`web/src/lib/palette.ts`, new): rows carry display names
+    (`displayAgentName`, `sessionDisplayName` — user renames are searchable);
+    same-title same-folder past sessions collapse to the newest; sections order
+    by their best hit with per-section caps (lifted when only one kind matches);
+    recency is a bounded score bonus that never lifts a path-only match over a
+    name match.
+  - **Command Search surface** (per the design-eng widget): a search bar with a
+    clear button, filter tabs — All / Sessions / Agents / Templates / Docs /
+    Files / Actions — cycled with Tab/Shift+Tab, and a shortcut-bar footer. App
+    verbs (browse templates, toggle theme, panel toggles, new session here) are
+    injected actions; the Templates tab lists the catalog and opens the gallery
+    focused on a template; the Docs tab searches a short list of docs pages with
+    the docs site as the footer destination.
+  - The active session is badged "current", demoted from the unqueried top spot,
+    and never the default selection; matched characters render on an
+    accent-tinted cap that stays legible on selected rows in both themes.
+
+- f21f6a6: Windows: sessions create and deliver their prompt, the canvas refreshes, and nothing pops a console window
+
+  The desktop app was unusable on Windows — every `POST /api/sessions` answered
+  `500 {"error":"internal error"}`, and when a session did start, its first
+  prompt never reached the agent. Root-caused on a real machine and fixed
+  end to end.
+
+  - **Sessions.** Claude Code's own native auto-updater had renamed the running
+    `claude.exe` to `claude.exe.old.<ts>` inside the app-managed npm prefix and
+    never written the replacement, so every spawn failed while `doctor` (which
+    shells `where`) still reported the agent present. Boot now verifies the
+    agent actually spawns, repairs the managed install when it doesn't, and sets
+    `DISABLE_AUTOUPDATER` for installs the app owns. The refusal itself names
+    the situation instead of "target could not be determined".
+  - **The first prompt.** It is held until the session reports ready, which only
+    happens when the generated `SessionStart` hook POSTs back — and Claude Code
+    runs hooks through Git Bash on Windows, which cannot resolve a `.cmd`, so
+    the desktop's `node.cmd`-only shims meant the hook never ran. The host now
+    ships npm's extensionless sh shim too, a 20s hook-timeout fallback rescues a
+    session whose hook chain is broken (gated on Claude's blocking-prompt
+    screens so it can never answer a trust dialog), `emit.cjs` gets budgets a
+    cold loopback survives (SessionStart only — the other hooks block the
+    agent), and multi-line prompts are paste-wrapped under ConPTY, which hides
+    the bracketed-paste announcement.
+  - **Console windows.** The `sapiom-dev` MCP server was launched via `npx`,
+    whose `cmd.exe` sat on screen as a persistent blank window; closing it
+    killed the server and every later tool call hung. The app now installs
+    `@sapiom/mcp` into its own prefix and launches it through the app binary
+    (GUI subsystem — no console can exist), and every `child_process` call
+    across the harness, agent-core, the MCP and the desktop passes
+    `windowsHide`.
+  - **Canvas.** `fs.watch` reports native separators, so the watcher's
+    POSIX-literal comparison never matched on Windows and `canvas.reload` was
+    never published — every canvas hot-reload was silently dead there (the
+    "Preparing your agent" placeholder outliving a finished install was the
+    visible symptom).
+  - **Diagnosis.** 500s now carry the real message (and errno) instead of
+    "internal error", the desktop tees its main-process log to
+    `<userData>/logs/main.log`, and spawn failures map to actionable 4xx.
+  - **Also:** Git is provisioned from git-for-windows' checksum-pinned MinGit
+    when a Windows machine has none (template clone and deploy shell out to a
+    real `git`); client-supplied `cwd` is normalized server-side and the SPA's
+    path helpers understand both separators; gateway requests time out instead
+    of hanging an MCP tool call for minutes; and the updater falls back to
+    HTTP/1.1, names a GitHub 429 for what it is, and bounds every path that can
+    reach GitHub.
+
+### Patch Changes
+
+- 4edcbf5: Update the bottom toast to the design-system widget spec: the tone now lives in a leading icon — a green circled check for success, a neutral ⓘ for information, a red ⚠ for errors — instead of a red edge stripe on every toast (which error-coded even "Path copied."). The card itself is the shared floating surface every popover uses. Toasts default to the error tone; positive results (copy confirmations, deploy success, describe finished, agents found, up-to-date/downloaded update checks) opt into success, and neutral status (deploy progress, editor hand-offs, empty scans) opts into info. Also: spring entrance and a short exit animation, the auto-dismiss timer pauses while hovered or focused, and the dismiss control is the shared 22px icon button.
+- Updated dependencies [f21f6a6]
+  - @sapiom/agent-core@0.10.7
+  - @sapiom/mcp@0.12.5
+
+## 0.6.0
+
+### Minor Changes
+
+- 928a639: Studio: a new agent's workspace folder now appears in the rail the instant you
+  start creating it — from the composer or a template — as an optimistic
+  "Creating agent…" row, pinned to the top and focusable. It stays put through
+  session-landing and the clone, and across the brief window after the session
+  binds but before its `sapiom.json` is registered, so switching sessions
+  mid-creation can never strand the in-progress agent.
+
+  Also fixes two rail/canvas issues:
+
+  - **Canvas no longer clips the terminal step.** A revise loop (a step pointing
+    back to an earlier one) left a gap in the layer numbering; the SVG height was
+    derived from the layer _count_ while nodes were positioned by their raw layer
+    _index_, so the deepest node (a terminal like `deliver`) fell below the
+    viewBox and was drawn off-screen with a dangling edge. Rows are now compacted
+    to consecutive positions, which also removes the empty band the gap produced.
+  - **Cloned agents show a short name in the rail.** The row now reads
+    `newsletter-autopilot` rather than the full package name
+    `@sapiom/example-newsletter-autopilot` (npm scope and a leading `example-`
+    stripped for display only — the full name is on hover, and the raw name still
+    keys testids and lookups).
+
+- 5c0c646: Rail footer: live plan & balance card, and an "Update now" card for a downloaded desktop update
+
+  The rail's footer gains two shaded cards above the account row.
+
+  - **Plan & balance card** (both hosts): the harness server relays core reads at
+    `GET /api/account/plan` — the API key never reaches the page — showing the
+    org's plan name and one honest money line: daily spend against the org's
+    spend-limit rule (the same "$used / $cap" pair the dashboard renders),
+    falling back to the prepaid available balance, else nothing. An Upgrade pill
+    and a ⋮ menu deep-link to billing/usage on the dashboard (checkout is
+    dashboard-session-only). Signed-out or unreachable hides the card — it never
+    invents a number.
+  - **"Update now" card** (desktop only): when an update has finished
+    downloading, the main process pushes state over a new receive-only
+    `onUpdateState` bridge member (re-pushed on page load, buffered in the
+    preload so a reload can't drop it) and the card appears with the target
+    version. Clicking it goes through the existing `checkForUpdates()` — the
+    pending branch re-raises the update window — so there is still no
+    page-reachable install channel. It outlives "Later"; "Skip this version"
+    suppresses and retracts it (and now also disarms auto-install-on-quit for a
+    skipped build that was already staged).
+
+### Patch Changes
+
+- 651c407: Canvas extraction failures now name the project directory they bundled. The Canvas is the only `check()` caller whose directory the user never typed — it comes from the bound workflow row — so a report of "check, run_local and deploy succeed but the Canvas fails on the same project" was unfalsifiable from the panel alone; esbuild's own paths are printed relative to the invoking package, which reads like the bundler resolving `node_modules` from the wrong root.
+- 7bef8b2: Stop the empty-board auto-collapse from closing a canvas pane the user just opened. The collapse fires once per (session, binding), which was meant to make a redundant "still empty" probe harmless — but the pane's expand control is most often used right after starting a session on an agent, i.e. _before_ `activeSessionId` exists, so the probe that follows arrives under a different key and slams the pane shut a beat after the click (measured: 3–5 of 12 runs of the action-bar e2e, on `main`). A manual expand now claims the session, and a claim made while none is active adopts the one that reports next; switching sessions still re-arms the collapse.
+- 95241fb: Give the rail toggle a resting surface while the app window is blurred: macOS hides the traffic lights it sits beside, so the bare glyph read as a gap on the left of the header.
+- 21bb3f0: Let "Open in editor" target the editor you actually use.
+
+  The session menu hardcoded `vscode://file…`, so on a machine with Cursor (or
+  Windsurf, Zed, VS Code Insiders) and no VS Code the item silently did nothing —
+  the OS resolves the scheme and never reports back, so an unhandled scheme is
+  indistinguishable from a working one. Settings now carries an editor picker
+  (`HarnessSettings.editor`, `PATCH /api/settings`), the menu item names the
+  chosen editor ("Open in Cursor"), and a toast says where the folder was sent.
+  Windows paths are normalized to the `/C:/…` shape the handlers expect.
+
+- Updated dependencies [651c407]
+  - @sapiom/agent-core@0.10.6
+
+## 0.5.1
+
+### Patch Changes
+
+- 7612e30: Submit injected prompts as a bracketed paste, so a click that sends a prompt to the CLI chat lands as one prompt and actually sends. Multi-line prompts (the canvas chat prepends step context to every question) no longer submit at their first newline, and the trailing Enter is a keypress rather than a race against the coding agent's paste heuristic — which is why the same click sometimes needed a manual Enter. Sessions whose harness never enables bracketed paste keep the previous raw write.
+
+## 0.5.0
+
+### Minor Changes
+
+- 5aa3e01: Give the account menu's "Overview" its own page — a proper introduction to Agent Studio
+
+  "Overview" used to be an alias for the composer home. It now opens a standalone
+  Overview destination (`OverviewPanel`) that introduces the app: the
+  build-with-your-coding-agent → shape-on-the-Canvas → run-on-Sapiom loop, a
+  "How it works" trio, and a grid of what's in the window (embedded coding agent,
+  Agents rail, Canvas, Templates, deploy, production run, Sapiom capabilities,
+  zero config mutation). It renders as a full-width destination like Templates
+  (`.app.is-browsing` hides the panes) with its own top bar, a Build-an-agent CTA
+  into the composer, and a Start-from-a-template shortcut.
+
+  The page follows the Studio brand: neutral chrome throughout, with the scarce
+  green (`--brand`) spent only on the three "how it works" glyphs. First run warms
+  the eyebrow to a welcome and, when signed out, hints at connecting a Sapiom
+  account. "Create new" (the composer) is unchanged and remains the primary
+  creative action.
+
+### Patch Changes
+
+- 19b8bbb: Install a new agent's dependencies on scaffold, and turn the Canvas's "Could not resolve …" render error into an actionable "run npm install" hint
+
+  The Canvas step-graph extraction (`check` / `loadDefinition`) esbuild-bundles a project's `index.ts` resolving its imports — `@sapiom/agent`, `zod`, … — from the project's own `node_modules`. A newly-scaffolded (or freshly-cloned) agent whose deps were never installed therefore failed its very first, unprompted Canvas render with a raw esbuild wall (`Could not resolve "@sapiom/agent" … Could not resolve "zod"`), which the failure panel relayed verbatim.
+
+  Two fixes:
+
+  - `scaffold()` gains an opt-in `installDependencies` flag (returned as `dependenciesInstalled`), and the `sapiom_dev_agents_scaffold` MCP tool — the Studio's create path — now passes it, so a new agent opens with a working Canvas. Best-effort and non-fatal: a missing/offline npm still yields a successful scaffold. The `installProjectDependencies` helper (previously demo-only inside the harness's example seed) now lives in `@sapiom/agent-core` and is shared by both.
+  - `check` and `loadDefinition` now route bundle failures through `describeBundleFailure`, which detects the "no `node_modules` + unresolved import" case and returns `Dependencies are not installed. Run \`npm install\` in <dir>, then try again.` (preserving the raw esbuild detail). Every other bundle failure's message is unchanged.
+
+- 03d23c8: Hold a new session's first prompt until Claude Code is signed in
+
+  Starting a session from the composer (or a template/clone) created the session and then fired the initial prompt immediately, retrying only on a 409 for ~9s. But a Claude Code session only becomes injectable once its `SessionStart` hook fires — which doesn't happen until the user is past Claude's own login/onboarding. A first-time, not-yet-signed-in user therefore blew past the 9s window and the prompt was silently dropped.
+
+  The prompt is now held per session and sent the moment the session reports ready (i.e. Claude is signed in and interactive). If the session is still not ready after a short grace, a hint points the user at the terminal login ("Sign in to Claude in the terminal — your prompt sends automatically once you're signed in"), so first-run intent is preserved instead of lost.
+
+- Updated dependencies [19b8bbb]
+  - @sapiom/agent-core@0.10.5
+  - @sapiom/mcp@0.12.4
+
+## 0.4.1
+
+### Patch Changes
+
+- e3b2e7a: Studio's top bar, rail icon, and window floor:
+
+  - While the composer home is up there is no session to name, so the bar's first
+    slot carries **Back** (a left arrow) to the session the composer was opened
+    over, replacing the inert `💬 new session` pill — and the composer's own
+    floating Back, which duplicated it and overlapped the heading on a narrow
+    window. With nothing behind the composer (first run, every session closed) the
+    slot is empty rather than offering a Back that goes nowhere.
+  - "Add existing agents" now reads with a folder**+** glyph instead of the open
+    folder it shared with the Workspaces header.
+  - The desktop window refuses to resize below **560×480**: dragged narrower, the
+    app became a strip of overlapping labels. The starter-template row also drops
+    to one column under 640px, where two cards left the names ellipsized past the
+    words that tell templates apart.
+
+- a34bd32: Studio UI fixes from design review:
+
+  - **Canvas chat input**: the "Ask about this agent/step" field is now a clean, boxless single row — no border, padding box, or separator hairline — that auto-grows upward up to five lines (then scrolls) with the Ask button bottom-anchored.
+  - **Canvas overview card**: no longer repeats the step/exit count or the entry/step/terminal legend that the canvas board already shows; the card focuses on the description, Describe-with-AI, notes, and per-step detail.
+  - **Rail brand header (frameless macOS)**: the Sapiom wordmark drops off the traffic-light line and reads inline as "sapiom agent.studio"; only the theme/collapse tools ride the lights' line.
+  - **Account menu**: opening the account menu now collapses the settings card (and vice-versa) so the two never stack; the Workspaces ⋯ menu's Past-sessions sub-card also collapses when a grouping/sort choice is clicked.
+  - **"Create new"**: promoted above Search as the primary affirmative action, restyled to the app's solid ink-button CTA (the Deploy treatment) with the reserved brand-green plus; the empty-rail state keeps a brand halo.
+  - **Rail spacing**: top-level rail rows share one icon size, icon–text gap, and left inset.
+  - **Sign-out**: removed the duplicate Disconnect from the settings panel — signing out now lives once in the account menu, below "Check for updates" and only when signed in.
+  - **Composer**: dropped the redundant "New session" + from the top bar of the create-new composer — you're already starting one there.
+  - **Canvas pane reveal**: an empty agent's board no longer snaps the canvas shut again right after you manually open it (a reveal race that also flaked CI); a live render still re-opens a pane you'd collapsed, and switching agents still follows the new board.
+  - **Collapsed panels**: the expand control is now the mirror of the collapse icon (a panel-open glyph, same quiet style) instead of a menu/list icon; the rail's top tools line up with the icons below them; and the Templates header no longer collides with the macOS traffic lights when the left panel is collapsed.
+
+- Updated dependencies [0bf040f]
+  - @sapiom/agent-core@0.10.4
+  - @sapiom/mcp@0.12.3
+
+## 0.4.0
+
+### Minor Changes
+
+- feaaeaa: Make Test / Run / Deploy observable in Studio: clicking one now reveals the
+  right pane and switches it to the Steps view (the unified activity surface),
+  instead of the action landing silently.
+
+  - **See it move.** A run's steps advance pending → running → passed in view; the
+    acting button carries a `data-running` pulse tied to the real run status (not
+    just the brief hand-off ring); and the demo prod run now progresses across
+    polls on a wall clock rather than snapping to "completed".
+  - **Relevant final data up front.** A run-summary card headlines the Steps
+    surface — outcome, live progress, total duration, and the single most relevant
+    result CTA (the deployed agent's dashboard link → a dev-server preview →
+    URLs the run produced → the final step's output). Honest-absence throughout:
+    no cost fields, no latency on a still-running step, no fabricated values.
+  - **Better payload CTAs.** Input / Output / Logs / Result share one disclosure
+    with a Copy button (the final Result renders expanded); nothing renders for a
+    payload a step never carried.
+  - **Deploy as an action, not a toast.** Deploy lands in the same Steps surface
+    with a live linking → building → deployed banner, then a completion state that
+    links to the dashboard and jumps to the "Trigger from your code" snippet.
+
+  Note: after an action, the persisted right-pane tab is Steps.
+
+- 2c4e8d9: Studio now emits agent-lifecycle product events to PostHog, so the build →
+  templates → deploy funnel is measurable.
+
+  - `agent.created` — a new agent came into existence (a fresh `sapiom.json`
+    appeared in the workspace registry), deduped by path and seeded on first load
+    so pre-existing agents are never counted. This is the "agents built" metric —
+    confirmed existence, not the click that kicked off scaffolding.
+  - `agent.template_cloned` — a template was used to start an agent, carrying the
+    template slug and the on-ramp surface. The "templates used" metric.
+  - `agent.deploy_started` / `agent.deploy_succeeded` (with duration) /
+    `agent.deploy_failed` (coarse `error_kind` enum) — the "agents deployed"
+    metric, fired from the deploy stream.
+
+  Payloads carry ids / enums / counts / durations only — never prompt text, file
+  contents, or absolute paths. Capture stays gated by the existing
+  product-analytics consent tiers and is disabled under mock/e2e.
+
+### Patch Changes
+
+- 38a7327: Studio's canvas pane now simply follows the active session's board: whenever a
+  session has a rendered board, the pane is shown; when it doesn't, it stays
+  closed. This replaces the previous auto-reveal, which fired only once and only
+  for sessions born from the composer — so a resumed session that built an agent,
+  or opening an already-populated agent, left the freshly-rendered board sitting
+  in a collapsed pane the user had to open by hand.
+
+  Now any live render (a `canvas.reload` for the active session — a finished
+  build, a re-render) opens the pane on its own, and switching to a populated
+  session shows its board straight away. Trade-off of the simpler model: a manual
+  collapse of the canvas is no longer a persisted arrangement — it lasts until the
+  next render or session switch (the rail collapse and the Canvas/Steps/Code tab
+  still persist). Exited sessions keep their pane open for the "resume to see it"
+  invite.
+
+- 0b0784c: Fix the Canvas showing a raw "Render failed" esbuild dump (`Could not resolve
+"@sapiom/agent"` / `"zod/v4"`) on a freshly scaffolded agent, before its
+  `npm install` has run. Studio now shows a calm "Preparing your agent…"
+  placeholder while dependencies are missing and auto-renders the step graph the
+  moment they land — no Retry click. Readiness waits for the whole declared
+  dependency set (walking `node_modules` up the tree as esbuild does), so a
+  partial install can't flash the error. The Canvas empty-state and "rendering…"
+  pages are now theme-aware, matching the app's light/dark theme instead of always
+  painting a white panel.
+- 0b0784c: Fix new agents nesting under `projects/<agent>/projects/…` in Studio, deepening
+  on every launch. The desktop host derived its launch dir from the most-recent
+  session dir, which drifted into a project folder — so `<launchDir>/projects`
+  (where new agents are created) appended a second `projects/` inside it, and the
+  new agent's session cwd fed back in to nest even further next time. Pin the
+  launch dir to the harness home so every agent stays flat under one `projects/`
+  and the rail scans them all. The same `projectRoot` pin also fixes the template
+  destination, which nested (and failed with "Couldn't read that directory") for
+  the same reason. The "Add existing agents" folder picker now opens on the
+  project root where agents live.
+- 58f8008: Fix two issues on the Templates screen in Studio:
+
+  - The info (i) spec sheet popover rendered with no surface — its background,
+    border, and shadow were missing, so the Steps / Trigger / Complexity /
+    Capabilities list and the Preview / Use buttons painted directly over the card
+    behind it. `.template-facts` now opts into the shared popover elevation recipe.
+  - The Templates destination hid the workbench, but the rail's other nav actions
+    never cleared it, so clicking Create new, Search, or an agent/session row left
+    you stranded on the browser until you used the back arrow. Navigating anywhere
+    now dismisses the Templates screen the same way the back arrow does.
+
+- 1b3c103: Recolor the embedded terminal so Claude Code's accent colors match the Studio
+  brand, without touching the terminal background.
+
+  Claude Code renders in 256-color by default, so the terminal's own 16-color
+  palette never reached its output — its "blue", "green", etc. were Claude's, not
+  Studio's. Each Claude session is now pinned to Claude Code's `dark-ansi` /
+  `light-ansi` theme (matched to the app theme) through the generated `--settings`
+  file, which routes Claude's colors through the terminal's ANSI ramp. That ramp
+  (`Terminal.tsx`) is retuned to a brand-coherent palette: a calmer blue, the
+  Studio green for success/live state, and harmonized red / yellow / cyan /
+  magenta that read cleanly on the recessed `--bg` surface (which is unchanged).
+
+  The app theme is threaded through session create and persisted on the session so
+  resume keeps the same base; unthemed launches (server-side auto-create, a legacy
+  session resumed from before this existed) omit the theme and keep Claude's
+  default rendering.
+
+## 0.3.0
+
+### Minor Changes
+
+- 533cc88: The Studio "new session" experience is now composer-first. Instead of opening on a terminal-and-canvas workbench (with the canvas showing "nothing generated yet") behind a first-run welcome overlay, a fresh install — and Create new / New session / the + — opens a centered composer: a greeting, **"What should your agent do?"**, quick-idea chips, an input with an agent selector and send, and a **"Start from a template"** row. Describing an outcome starts a session and hands the agent that outcome (the same create+inject path the "start from an idea" door uses); the screen then gives way to the terminal, and the canvas slides in only once that session generates content — the manual show/fold still overrides. The first-run WelcomePanel overlay is retired; its open-folder, browse-templates, docs, and telemetry opt-in fold into the composer, and recent workspaces live in the rail.
+- 7ae67f6: Studio (web app) redesign to match the new brand.
+
+  Adopt the shared design-system's named `sapiom-studio` preset in the web app, vendored into the committed public `ds-neutral` fallback so open-source builds and the packaged desktop app both render the new design with no private-registry dependency. This brings Geist typography, compact IDE control/type density, a scarce green brand (green now signals only live/success/on/confirmed), and neutral ink-based focus and selection chrome (previously green-tinted).
+
+  The rail brand lockup is now the Sapiom wordmark + `agent.studio` (lowercase mono), matching a new terminal masthead (pixel mark + wordmark + working-directory / status facts) that replaces the old status bar.
+
+  The shell reads as three flat blocks — a grey workspace rail, the grey terminal shell, and the raised white graph pane — with no permanent dividers or raised header bands (a header boundary is a lie until content scrolls under it). The affirmative CTA is the theme's ink button, not a green fill; green appears only on genuine state (live, deployed, on, entry/active step, activity).
+
+  Main panel: the session bar, tab lane, and action row merge into ONE header. The active session is a title dropdown (copy path, rename, open in editor, end session); the focused agent's other live sessions sit beside it as side-scrollable switch chips with a trailing `+`. The agent actions are Prod (globe) · Test · Run · Deploy, right-anchored, the primary CTA following state (Deploy for a draft, Run for a deployed agent); Draft/Deployed status shows once, in the graph pane's header, never duplicated in the bar.
+
+  Rail: Search and Templates are labelled destination rows (Search carries a right-aligned ⌘K / Ctrl+K, not a boxed field), and agent rows drop their leading glyph — indentation carries the nesting under the workspace folder. The `⋯` menu files the explorer by Workspace or Deployment and orders it by recent activity or name, with past sessions opening in a sub-card beside the menu rather than a scrolling list inside it. The footer is one continuous block: a plan summary (demo fixture only; live mode shows none) above the account row, no divider.
+
+  Floating menus and dialogs paint an opaque surface (a portaled popover that inherited a translucent inset wash let the rail bleed through it); the canvas board is navigated only by its own zoom/fit/pan controls and never shows native scrollbars; and the canvas resize splitter stays welded to the board's edge at every window width.
+
+  Depth: the raised graph column — its dotted board included — is a lighter white lifted off a slightly darker rail/terminal shell by a soft left-edge shadow, so it reads as the forefront panel instead of a fourth flat grey. The shadow paints the full column height (it must sit above the terminal's opaque, absolutely-positioned scroll viewport, which had been overpainting it from the terminal's top down). In light mode the canvas render's accent and success colour is now the brand green, matching the rest of the app; it had been an off-brand cyan in light only.
+
+  In the packaged desktop app on macOS the window is frameless: it drops the native title bar and insets the OS traffic lights into the rail's 56px top line, which becomes the window's drag handle (every control on it opts back out, so buttons and tabs still click). The rail header splits across two rows — the Sapiom wordmark and the theme/collapse tools beside the lights, `agent.studio` on the line below — while the session bar and graph tabs stay a single top line. This chrome activates only in that host (signalled by a `frame=macos` query param); the `npx` browser app never sets it and is unchanged.
+
+- cc2e4aa: Studio shell polish — left rail, theme, and the session bar:
+
+  - **Even rail spacing.** The workspace panel's top stack (agent.studio → Search → Create new → Templates → Workspaces) now sits on one uniform 8px rhythm instead of three different gaps.
+  - **"Create new" CTA.** A standing button under Search opens the Add menu (new session / workspace / templates). When the rail has no agents yet it becomes the filled brand-green primary with a soft ring, so a first-run workspace has an obvious next step.
+  - **Theme follows the OS by default.** With no saved choice the Studio mirrors the system light/dark preference and keeps tracking it across launches; a manual toggle still wins and persists.
+  - **Session switcher in the title menu.** The current session is a single selector whose ⌄ menu lists every live session (disambiguated by name + last-active time, active one checked), plus New session and the session actions. This replaces the inline chips — sessions that share a base name no longer read as a row of near-identical labels — and the bound-agent line moves into that menu.
+
+- baa6102: Replace the rail's header "+" Add-popover — and the `AddWorkspaceDialog` /
+  `NewSessionModal` doors behind it — with one detection-driven **"Add existing
+  agents"** dialog, reached from a dedicated rail button (and the new-session
+  composer's "Open a folder").
+
+  Point at a folder and detection relabels the single ink action: **Add workspace**
+  (the folder is an agent project), **Add all N** (it's a folder of agent
+  projects), or a disabled "No agent in this folder" when it holds none. No intent
+  step, no doors, and no way to land on two identical folder-picker screens.
+  Creating a NEW agent stays with "Create new" (the composer); this dialog only
+  registers agents that already exist.
+
+  The folder field's **Browse** button opens the OS-native folder chooser in the
+  desktop app (a new sender-guarded `dialog:choose-directory` IPC), falling back to
+  the in-app directory listing under `npx` — the listing stays either way, since
+  only it shows the "✓ Agent" detection badges.
+
+### Patch Changes
+
+- 3ef1454: Keep direct actions independent of coding-agent readiness, distinguish linked agents from ready cloud builds, and make Canvas/Code run and integration evidence accurately reflect the selected agent.
+- 1000510: Describe deploy as a synthesized bundle of current local source, distinguish
+  account-free local validation from metered cloud builds and production runs,
+  and make execution inspection's cost-agnostic evidence boundary explicit.
+- 2485561: Fix Claude Code sessions that exit with code 1 before establishing a session id, and make the cause visible when they do.
+
+  Some users saw a session die within seconds — "Session exited · exit code 1 … it exited before establishing a session id" — with no way to tell why. The session id is only ever set from Claude Code's `SessionStart` hook, so this always means `claude` itself exited before that hook fired. Three independent, environment-specific causes were addressed, each of which is ours to prevent:
+
+  - **Version floor for `claude` (doctor).** The harness injects flags on every launch — notably `--plugin-dir`, which per the Claude Code changelog did not exist before the plugin system shipped in `2.0.12` — but nothing checked the installed version, so an older `claude` (a pre-existing global that shadows the app's install, or a stale one) rejected the unknown flag and exited 1 before the hook. `doctor` now enforces `MIN_CLAUDE_CODE_VERSION` (`2.1.0`, the range the harness's `--plugin-dir` skills usage is verified against): a below-floor `claude` reports NOT ok, so the desktop app installs a current one and the `npx` CLI shows an actionable upgrade remedy instead of every session crash-looping silently. A version we can't parse is left alone, so a future change to `claude --version`'s format can never mass-reject working installs.
+  - **Quote the SessionStart hook command path.** The generated hook command interpolated the emitter-script path unquoted (`node <path> <event>`). Claude Code runs a `command` hook through a shell, so a home directory containing a space (`/Users/First Last/…`) word-split the path — `node` got a truncated path, the hook died, and the session id was never established. The path is now double-quoted.
+  - **Preserve the agent's error line on abnormal exit.** A live pty's scrollback was discarded the instant it exited, so `claude`'s own error ("unknown option '--plugin-dir'", an auth failure, "Cannot find module …") was lost — which is why this was so hard to diagnose from a report. Sessions that exit with a non-zero code now keep a sanitized tail of their last output (`HarnessSession.exitTail`), shown in the exited-session pane. A clean exit keeps nothing.
+
+  The shared ANSI stripper used for this and for Codex trust-prompt detection moved from the Codex adapter into `core/strip-ansi.ts`.
+
+- 25fc26f: Make local agent runs parse step inputs through their Zod schemas like production, normalize relative check directories, stage and retry gallery clones across branch-propagation delays, and clarify that local validation stubs Sapiom capability traffic without sandboxing arbitrary author-code side effects.
+- 9addb66: Keep Agent Studio workspace discovery consistent across scanning, live updates, and the folder picker; preserve Studio state when cloning gallery templates; and clarify bundled starter network requirements.
+- Updated dependencies [1000510]
+- Updated dependencies [25fc26f]
+- Updated dependencies [9addb66]
+  - @sapiom/agent-core@0.10.3
+  - @sapiom/mcp@0.12.2
+
+## 0.2.7
+
+### Patch Changes
+
+- 267598a: Publish `@sapiom/agent-studio` as the branded Agent Studio launcher while
+  keeping `@sapiom/harness` as the supported implementation and compatibility
+  command.
+- 87636c1: Make bundled starters work from a fresh Agent Studio session by preserving Studio-owned state, writing the project discovery marker, and handing Claude the local scaffold MCP tool directly.
+- Updated dependencies [87636c1]
+  - @sapiom/agent-core@0.10.2
+  - @sapiom/mcp@0.12.1
+  - @sapiom/agent@0.9.3
+
+## 0.2.6
+
+### Patch Changes
+
+- 824eb1e: Use Agent terminology across generated Canvas content, server errors, and demo fixtures.
+- 368125b: Normalize Agent Studio shell terminology and route dashboard links to the canonical Agents page.
+- addb63c: Clarify Agent Studio coding-agent prompts, resume metadata, and authoring action labels.
+- 9199e10: Use Agent and Agent run terminology throughout the Canvas and Steps interfaces.
+- 94584a2: Guard visible Agent Studio terminology and share the product name across CLI and desktop hosts.
+- Updated dependencies [40d1c64]
+- Updated dependencies [be2b81b]
+  - @sapiom/agent-core@0.10.0
+  - @sapiom/mcp@0.12.0
+
+## 0.2.5
+
+### Patch Changes
+
+- Updated dependencies [c8072cd]
+  - @sapiom/agent@0.9.0
+  - @sapiom/agent-core@0.9.13
+
 ## 0.2.4
 
 ### Patch Changes

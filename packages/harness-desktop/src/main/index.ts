@@ -12,12 +12,21 @@
 // `spawn ENOTDIR`. See esbuild-binary.ts.
 import "./esbuild-binary.js";
 import { writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { app, dialog, Menu } from "electron";
+import { initFileLog } from "./log-file.js";
 import { resolveInstanceLockAction } from "./single-instance.js";
 import { createSetupWindow } from "./windows.js";
 import { boot, type BootResult } from "./boot.js";
 import { runSmokeChecks, reportSmoke } from "./smoke.js";
-import { initUpdater } from "./updater.js";
+import { initUpdater, previewDownloadedUpdateCard } from "./updater.js";
+import { initDialogs } from "./dialogs.js";
+import { setTrustedWindow } from "./trusted-sender.js";
+import { parseDeepLink, deepLinkFromArgv, DEEP_LINK_SCHEME } from "./deep-link.js";
+import { DEEP_LINK_NAVIGATE } from "./ipc.js";
+// Dev-only: preview the update window without waiting for a real update.
+import { showUpdatePrompt } from "./update-window.js";
+import { loadUpdatePrefs, saveUpdatePrefs, updatePrefsPathIn } from "./update-prefs.js";
 
 const devMode = process.argv.includes("--dev");
 /** `--smoke`: boot, verify the packaged bundle, print results, exit. See smoke.ts. */
@@ -29,6 +38,21 @@ const smokeMode = process.argv.includes("--smoke");
 // left/right panels showed scrollbars in Electron but not in the (overlay-
 // scrollbar) browser. Must be set before app is ready.
 app.commandLine.appendSwitch("enable-features", "OverlayScrollbar");
+
+// Disable HTTP/2 in Chromium's network stack. The auto-updater is the only
+// remote consumer of that stack in this app (electron-updater rides
+// Electron's `net`; the SPA talks to 127.0.0.1 and telemetry goes through
+// Node's fetch), and on a real user machine every update check failed with
+// net::ERR_HTTP2_SERVER_REFUSED_STREAM against GitHub — repeatedly, across
+// hours, while the same machine's browser reached github.com fine. That is
+// the documented Electron/GitHub HTTP/2 failure mode (a refused multiplexed
+// stream surfaces as a hard error instead of retrying on a fresh
+// connection), and falling back to HTTP/1.1 is the accepted workaround. Cost
+// is one extra TCP connection per update check/download. Escape hatch for
+// A/B-testing the theory on an affected machine, not a supported setting.
+if (process.env.SAPIOM_KEEP_HTTP2 !== "1") {
+  app.commandLine.appendSwitch("disable-http2");
+}
 
 let bootResult: BootResult | null = null;
 let quitting = false;
@@ -51,6 +75,45 @@ function shutdownServer(): Promise<void> {
     /* close() is internally race-bounded to 5s; ignore errors on shutdown */
   });
   return shuttingDown;
+}
+
+/**
+ * A `sapiom://` deep link buffered until the main window can receive it (no
+ * window yet, or its first page still loading). Consumed by the cold-start query
+ * param (boot) or the did-finish-load flush below.
+ */
+let pendingDeepLink: string | null = null;
+
+/** Deliver a received deep link: focus the window and push the target, or buffer it. */
+function handleDeepLink(rawUrl: string): void {
+  const target = parseDeepLink(rawUrl);
+  if (!target) return; // not one of ours — ignore
+  const win = bootResult?.mainWindow;
+  if (win && !win.isDestroyed() && !win.webContents.isLoading()) {
+    if (win.isMinimized()) win.restore();
+    win.focus();
+    win.webContents.send(DEEP_LINK_NAVIGATE, target);
+  } else {
+    pendingDeepLink = rawUrl;
+  }
+}
+
+/**
+ * Register Studio as the OS handler for `sapiom://`. Skipped under --smoke (CI
+ * must not mutate LaunchServices/HKCU). electron-builder writes the macOS
+ * Info.plist + Linux .desktop entries at package time; this call covers Windows
+ * (HKCU) and the unpackaged `pnpm dev` case.
+ */
+function registerDeepLinkScheme(): void {
+  if (smokeMode) return;
+  if (process.defaultApp) {
+    // Unpackaged: Electron itself is the launcher, so register execPath + entry.
+    if (process.argv.length >= 2) {
+      app.setAsDefaultProtocolClient(DEEP_LINK_SCHEME, process.execPath, [resolve(process.argv[1])]);
+    }
+  } else {
+    app.setAsDefaultProtocolClient(DEEP_LINK_SCHEME);
+  }
 }
 
 // Single-instance: focus the existing window instead of booting twice — except
@@ -76,15 +139,32 @@ if (lock.action === "fail") {
 } else if (lock.action === "quit") {
   app.quit();
 } else {
-  app.on("second-instance", () => {
+  registerDeepLinkScheme();
+  // macOS delivers deep links to the primary instance via open-url, and it can
+  // fire BEFORE whenReady on a cold start — register at top level so the handler
+  // buffers into pendingDeepLink until the window exists.
+  app.on("open-url", (event, url) => {
+    event.preventDefault();
+    handleDeepLink(url);
+  });
+  app.on("second-instance", (_event, argv) => {
     const win = bootResult?.mainWindow;
     if (win && !win.isDestroyed()) {
       if (win.isMinimized()) win.restore();
       win.focus();
     }
+    // Windows/Linux deliver a deep link as an argv token to this second launch.
+    const link = deepLinkFromArgv(argv);
+    if (link) handleDeepLink(link);
   });
 
   app.whenReady().then(async () => {
+    // FIRST, before boot() and before any early --smoke return: tee console
+    // output into a log file. The packaged Windows app is a GUI-subsystem exe
+    // with no console, so without this every console.error — including the
+    // harness server's "[harness] unhandled request error:" lines, which run
+    // in this process — vanishes and nothing is diagnosable in the field.
+    initFileLog(join(app.getPath("logs"), "main.log"), app.getVersion());
     // No application menu — the harness SPA is the whole UI. Removes the
     // File/Edit/View/Window/Help bar on Linux/Windows. (On macOS the top menu
     // bar is OS-level and can't be removed; this leaves a bare default there —
@@ -92,7 +172,12 @@ if (lock.action === "fail") {
     Menu.setApplicationMenu(null);
     const setupWin = createSetupWindow();
     try {
-      bootResult = await boot(setupWin, { devMode, smoke: smokeMode });
+      // A deep link present at cold start — a macOS open-url already buffered, or
+      // the URL in Windows/Linux argv — rides onto the SPA load URL as ?agent=.
+      const coldLink = pendingDeepLink ?? deepLinkFromArgv(process.argv);
+      pendingDeepLink = null;
+      const coldTarget = coldLink ? parseDeepLink(coldLink) : null;
+      bootResult = await boot(setupWin, { devMode, smoke: smokeMode, deepLink: coldTarget ?? undefined });
       if (devMode || smokeMode) {
         // Dev/smoke hook: print the tokened URL so a harness can verify the
         // server booted without driving the GUI.
@@ -106,12 +191,42 @@ if (lock.action === "fail") {
       // real wiring: it failed with "No handler registered for 'update:check'"
       // against an app that works fine in production. Handler registration must
       // not depend on where in this sequence we happen to return.
+      // The main window's renderer is the ONLY trusted origin for privileged IPC
+      // (update checks, the native folder picker). Set it before registering any
+      // handler that validates the sender, and on every boot path — including
+      // --smoke, which round-trips the bridge to prove the wiring.
+      setTrustedWindow(bootResult.mainWindow);
       initUpdater({
         mainWindow: bootResult.mainWindow,
         devMode,
         smoke: smokeMode,
         shutdown: shutdownServer,
       });
+      // Native OS dialogs (the folder picker behind Browse). Registered here for
+      // the same reason as initUpdater: invoke on an unhandled channel rejects, so
+      // the handler must exist regardless of which branch of boot we exit through.
+      initDialogs({ mainWindow: bootResult.mainWindow });
+      // Dev-only preview: `SAPIOM_PREVIEW_UPDATE_WINDOW=1 pnpm dev` opens the update
+      // window with a sample version so it can be eyeballed (and its toggle/skip
+      // persistence exercised) without a real update. Double-gated on devMode, so it
+      // can never fire in a packaged build.
+      if (devMode && process.env.SAPIOM_PREVIEW_UPDATE_WINDOW) {
+        const prefsPath = updatePrefsPathIn(app.getPath("userData"));
+        void showUpdatePrompt(bootResult.mainWindow, {
+          version: "0.0.0-preview",
+          autoUpdate: (await loadUpdatePrefs(prefsPath)).autoUpdate,
+          onAutoUpdateChange: async (on) => {
+            await saveUpdatePrefs({ ...(await loadUpdatePrefs(prefsPath)), autoUpdate: on }, prefsPath);
+          },
+        }).then((choice) => console.log(`[preview] update window choice: ${choice}`));
+      }
+      // Same idea for the rail's "Update now" card: fake a downloaded update so
+      // the card renders (the did-finish-load re-send covers a page still
+      // loading). Clicking it answers `disabled` in an unpackaged build — the
+      // card's look is what this previews, not the apply path.
+      if (devMode && process.env.SAPIOM_PREVIEW_UPDATE_CARD) {
+        previewDownloadedUpdateCard("0.0.0-preview");
+      }
       if (smokeMode) {
         // Verify the packaged bundle, then leave — never wait for a user. The
         // exit code is the CI signal. `app.exit` skips the before-quit handler,
@@ -123,6 +238,14 @@ if (lock.action === "fail") {
         app.exit(code);
         return;
       }
+      // A deep link that landed during the load gap (window created, first page
+      // not yet finished) was buffered — deliver it once the SPA is ready. Only
+      // on the non-smoke path; the smoke branch returned above.
+      bootResult.mainWindow.webContents.once("did-finish-load", () => {
+        const buffered = pendingDeepLink;
+        pendingDeepLink = null;
+        if (buffered) handleDeepLink(buffered);
+      });
     } catch (err) {
       if (smokeMode) {
         // A boot failure IS the smoke result — report it as one and fail fast

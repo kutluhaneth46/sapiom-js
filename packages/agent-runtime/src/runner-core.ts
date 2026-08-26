@@ -16,8 +16,9 @@ import {
   isPause,
   isRetry,
   isTerminate,
+  parseNonRetryableStepErrorPayload,
 } from '@sapiom/agent';
-import type { NextStepDirective, AgentManifest } from '@sapiom/agent';
+import type { NextStepDirective, AgentManifest, NonRetryableStepErrorPayload } from '@sapiom/agent';
 
 import { ADVANCE_RESULT_KIND } from './advance-result.js';
 import type { AdvanceResult, CompleteDispatchOutcome, CreateExecutionOptions } from './advance-result.js';
@@ -245,25 +246,57 @@ export class AgentRunnerCore {
 
     let result: AdvanceResult;
     if (payload.outcome === STEP_COMPLETION_OUTCOME.THREW) {
-      const err = rehydrateRemoteError(payload.error);
-      await this.deps.store.failStep({
-        stepRowId: stepRow.id,
-        error: err,
-        sharedStateAfter: sharedSnapshot,
-        logs: payload.logs,
-      });
-      // Complete the step's Core spine leg — best-effort.
-      await this.completeObserverStepTransaction(stepRow.id, 'error');
-      this.trackStepFinish({
-        executionId: row.id,
-        workflowName: row.name,
-        stepName: stepRow.stepName,
-        stepRowId: stepRow.id,
-        attempt: stepRow.attempt,
-        outcome: 'error',
-        errorName: err.name,
-      });
-      result = await this.handleRetryOrCap(row, stepRow.stepName, sharedSnapshot, maxAttemptsPerStep);
+      const terminalPayload = parseNonRetryableStepErrorPayload(payload.error);
+      if (terminalPayload && this.deps.store.failActiveDispatchedStep) {
+        const terminalError = rehydrateNonRetryableStepError(terminalPayload);
+        const won = await this.deps.store.failActiveDispatchedStep({
+          executionId: row.id,
+          expectedVersion: row.version,
+          stepRowId: stepRow.id,
+          error: terminalError,
+          sharedState: sharedSnapshot,
+          logs: payload.logs,
+        });
+        if (!won) {
+          this.recordCasLoss('terminal_platform_fail', row.id, row.version);
+          const reloaded = await this.deps.store.loadExecution(row.id);
+          const currentResult: AdvanceResult = reloaded
+            ? outcomeForFinishedRow(reloaded)
+            : { kind: ADVANCE_RESULT_KIND.RUNNING };
+          return { applied: false, result: currentResult };
+        }
+        await this.completeObserverStepTransaction(stepRow.id, 'error');
+        this.trackStepFinish({
+          executionId: row.id,
+          workflowName: row.name,
+          stepName: stepRow.stepName,
+          stepRowId: stepRow.id,
+          attempt: stepRow.attempt,
+          outcome: 'error',
+          errorName: terminalError.name,
+        });
+        result = { kind: ADVANCE_RESULT_KIND.FAILED, error: terminalError };
+      } else {
+        const err = rehydrateRemoteError(payload.error);
+        await this.deps.store.failStep({
+          stepRowId: stepRow.id,
+          error: err,
+          sharedStateAfter: sharedSnapshot,
+          logs: payload.logs,
+        });
+        // Complete the step's Core spine leg — best-effort.
+        await this.completeObserverStepTransaction(stepRow.id, 'error');
+        this.trackStepFinish({
+          executionId: row.id,
+          workflowName: row.name,
+          stepName: stepRow.stepName,
+          stepRowId: stepRow.id,
+          attempt: stepRow.attempt,
+          outcome: 'error',
+          errorName: err.name,
+        });
+        result = await this.handleRetryOrCap(row, stepRow.stepName, sharedSnapshot, maxAttemptsPerStep);
+      }
     } else {
       const stepResult = {
         output: payload.result?.output,
@@ -758,11 +791,7 @@ export class AgentRunnerCore {
     }
   }
 
-  private async openObserverStepTransaction(
-    row: ExecutionState,
-    stepName: string,
-    stepRowId: string,
-  ): Promise<void> {
+  private async openObserverStepTransaction(row: ExecutionState, stepName: string, stepRowId: string): Promise<void> {
     if (!row.tenantId) return;
     try {
       await this.obs.openStep?.({ executionId: row.id, stepName, stepRowId, tenantId: row.tenantId });
@@ -771,10 +800,7 @@ export class AgentRunnerCore {
     }
   }
 
-  private async completeObserverStepTransaction(
-    stepRowId: string,
-    outcome: 'success' | 'error',
-  ): Promise<void> {
+  private async completeObserverStepTransaction(stepRowId: string, outcome: 'success' | 'error'): Promise<void> {
     try {
       await this.obs.completeStep?.({ stepRowId, outcome });
     } catch {
@@ -882,3 +908,7 @@ function rehydrateRemoteError(error: { name: string; message: string; stack?: st
   return err;
 }
 
+/** Preserve Error identity while carrying only registry-normalized platform fields. */
+function rehydrateNonRetryableStepError(payload: NonRetryableStepErrorPayload): Error & NonRetryableStepErrorPayload {
+  return Object.assign(rehydrateRemoteError(payload), payload);
+}

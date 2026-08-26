@@ -17,12 +17,12 @@ plan ─▶ bump ──(pause: models.coding.result → verify)──▶ verify 
    the input. No `repoSlug` → straight to `rejected`.
 2. **bump** — launches a coding agent (`models.coding`) on the repo; it clones
    into a fresh sandbox at `/workspace/<slug>` and bumps the dependencies. Coding
-   runs are long, so the workflow **suspends at $0** and resumes at `verify` when
+   runs are long, so the agent run **suspends at $0** and resumes at `verify` when
    the run finishes.
 3. **verify** — re-attaches the coding run's sandbox, runs `git diff --stat`, then
    installs and runs the test suite (`sandboxes.exec`). A failed coding run, a
    failed install, or a non-zero test exit all route to `rejected`.
-4. **assess** — a model (`models.run`) rates the upgrade `low`/`medium`/`high`
+4. **assess** — a model (`llm.run`) rates the upgrade `low`/`medium`/`high`
    from the dependency diff. Above `maxAutoRisk` (default `medium`) → `held`.
 5. **publish** — pushes the bumped branch from the sandbox and archives the
    triage report. **held** / **rejected** archive the report but never push.

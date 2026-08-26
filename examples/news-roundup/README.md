@@ -7,7 +7,7 @@ A Sapiom agent, authored as code against [`@sapiom/agent`](https://www.npmjs.com
 `search` → `select` → `illustrate` → `publish` (defined in `index.ts`, backed by `lib/`):
 
 1. **search** — `ctx.sapiom.search.webSearch` for `"<companyName>" company news from the last 7 days`. If nothing comes back, the agent terminates gracefully (see "No news" below) instead of failing.
-2. **select** — `ctx.sapiom.models.run` picks 3–5 articles from the search results and returns, per article, a title/url/summary/imagePrompt.
+2. **select** — `ctx.sapiom.llm.run` picks 3–5 articles from the search results and returns, per article, a title/url/summary/imagePrompt.
 3. **illustrate** — `ctx.sapiom.contentGeneration.images.create` generates one image per selected article; each image is uploaded public to Sapiom file storage. A failed generation degrades that article to a text-only card (two attempts, then move on) rather than failing the run.
 4. **publish** — renders the dated HTML page, uploads it to file storage, then rebuilds the company's sandbox site entirely from what's in storage (see "Storage" and "Serving" below) and returns the live URLs.
 
@@ -29,7 +29,12 @@ On success (`publish` terminates with):
   "siteUrl": "https://news-roundup-polsia-<id>.sandbox.sapiom.ai",
   "pageUrl": "https://news-roundup-polsia-<id>.sandbox.sapiom.ai/pages/2026-07-22.html",
   "articles": [
-    { "title": "...", "sourceUrl": "...", "summary": "...", "imageUrl": "https://.../images/2026-07-22-1.png" }
+    {
+      "title": "...",
+      "sourceUrl": "...",
+      "summary": "...",
+      "imageUrl": "https://.../images/2026-07-22-1.png"
+    }
   ]
 }
 ```
@@ -63,7 +68,7 @@ This is the source of truth. The sandbox (below) is a disposable, rebuildable vi
 - Sandbox name: `news-roundup-<companySlug>` (find-or-create — reused across runs for the same company).
 - `ttl: "24h"`, `tier: "xs"`.
 - **Stateless**: on every `publish`, the agent lists all files under the company's storage prefix, mirrors them into the sandbox as `site/pages/...` and `site/images/...`, writes a generated `site/index.html` (links to every dated page) and `site/server.mjs` (a tiny static file server), then calls `deployPreview({ start: "node site/server.mjs", port: 3000 })`.
-- Because the TTL is 24h, the sandbox — and its preview URL — disappear roughly a day after the last run and get recreated (with a **new** preview URL) on the next run. Don't hardcode or bookmark a `siteUrl`/`pageUrl` long-term; re-run or check the latest execution's output for the current one.
+- Because the TTL is 24h, the sandbox — and its preview URL — disappear roughly a day after the last run and get recreated (with a **new** preview URL) on the next run. Don't hardcode or bookmark a `siteUrl`/`pageUrl` long-term; re-run or check the latest agent run's output for the current one.
 
 ## Testing locally (free — no real capability calls)
 
@@ -82,7 +87,7 @@ To exercise the real step code end-to-end against stubs:
 
 ## Running for real
 
-MCP `sapiom_dev_agents_run` with input `{ "companyName": "Polsia" }` runs the deployed agent (slug `news-roundup`) live: real web search, real model call, real image generation, and a real sandbox rebuild/deploy. Inspect the execution's output for the current `siteUrl`/`pageUrl`.
+MCP `sapiom_dev_agents_run` with input `{ "companyName": "Polsia" }` runs the deployed agent (slug `news-roundup`) live: real web search, real model call, real image generation, and a real sandbox rebuild/deploy. Inspect the agent run's output for the current `siteUrl`/`pageUrl`.
 
 ## Schedule
 
@@ -90,6 +95,6 @@ A weekly cron schedule is active for this agent: **every Monday at 08:00 UTC**, 
 
 ## Authoring
 
-The orchestration is defined with `defineAgent({ steps })`; each step is a `defineStep({ name, next, run })`. The `run` body is ordinary code — inside it, the full Sapiom tool catalog is available, pre-auth'd and tenant-scoped, on `ctx.sapiom`. No credentials to wire — a per-execution tenant credential is injected when the orchestration runs.
+The agent is defined with `defineAgent({ steps })`; each step is a `defineStep({ name, next, run })`. The `run` body is ordinary code — inside it, the full Sapiom tool catalog is available, pre-auth'd and tenant-scoped, on `ctx.sapiom`. No credentials to wire — a per-agent-run tenant credential is injected when the agent run starts.
 
 See `AGENTS.md` for the full authoring loop (`check` → `run_local` → `deploy`).

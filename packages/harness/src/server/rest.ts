@@ -15,8 +15,8 @@ import type {
   AdoptSessionRequest,
   AnalyticsEvent,
   AppState,
-  AttachImageRequest,
-  AttachImageResponse,
+  AttachFileRequest,
+  AttachFileResponse,
   BackgroundTask,
   BindWorkflowRequest,
   CreateSessionRequest,
@@ -24,7 +24,6 @@ import type {
   HarnessKind,
   HarnessSession,
   HarnessSettings,
-  ImageMediaType,
   InjectInputRequest,
   MacroDef,
   PastSessionRecord,
@@ -35,39 +34,39 @@ import type {
 } from "../shared/types.js";
 import type { WorkspaceScopeSummary } from "../shared/system-graph.js";
 import {
-  ALLOWED_IMAGE_MEDIA_TYPES,
   HARNESS_UPLOADS_DIR,
   JSON_BODY_LIMIT_BYTES,
-  MAX_IMAGE_UPLOAD_BYTES,
+  MAX_INLINE_ATTACHMENT_BYTES,
   SPAWNABLE_HARNESS_KINDS,
+  EDITOR_KINDS,
 } from "../shared/types.js";
-import { AdapterNotFoundError, ExternalHarnessError, SessionAlreadyLiveError, SessionNotResumeableError } from "../core/errors.js";
+import { AdapterNotFoundError, ExternalHarnessError, SessionAlreadyLiveError, SessionNotResumeableError, SpawnTargetError } from "../core/errors.js";
 import { SessionNotReadyError, UnknownSessionError, type SessionManager } from "../core/session-manager.js";
+import { normalizeCwd } from "./cwd-normalize.js";
 import type { SessionRecordReader } from "../core/session-record.js";
 import { getHarnessAdapter, listHarnessAdapters } from "../core/adapters/registry.js";
 import { resolveWithinRoot } from "../core/path-safety.js";
 import { loadSettings, saveSettings } from "../cli/settings.js";
 
-// Cap image attaches per client so a runaway paste/drop loop can't fill the
-// disk or wedge the pty — the route is otherwise unauthenticated beyond the
-// boot token. (Added by CodeQL's rate-limiting finding.)
-const imageUploadRateLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 30,
-  standardHeaders: true,
-  legacyHeaders: false,
-});
-
-/** File extension to store an accepted image under, keyed by media type. */
-const IMAGE_EXTENSIONS: Record<ImageMediaType, string> = {
-  "image/png": "png",
-  "image/jpeg": "jpg",
-  "image/gif": "gif",
-  "image/webp": "webp",
-};
-
-/** `data:<mediaType>;base64,<payload>` — captures the media type and payload. */
 const DATA_URL_RE = /^data:([a-z0-9.+/-]+);base64,([\s\S]+)$/i;
+
+/** Validate standard padded base64 in one pass and return decoded size. */
+function decodedBase64Size(encoded: string): number | null {
+  if (encoded.length === 0 || encoded.length % 4 !== 0) return null;
+  const padding = encoded.endsWith("==") ? 2 : encoded.endsWith("=") ? 1 : 0;
+  const contentLength = encoded.length - padding;
+  for (let index = 0; index < encoded.length; index += 1) {
+    const code = encoded.charCodeAt(index);
+    const isDataCharacter =
+      (code >= 65 && code <= 90) ||
+      (code >= 97 && code <= 122) ||
+      (code >= 48 && code <= 57) ||
+      code === 43 ||
+      code === 47;
+    if (index < contentLength ? !isDataCharacter : code !== 61) return null;
+  }
+  return (encoded.length / 4) * 3 - padding;
+}
 
 // Derived from SPAWNABLE_HARNESS_KINDS (shared/types.ts) so the zod
 // validation and the TypeScript type can never drift from each other.
@@ -78,6 +77,7 @@ const createSessionSchema = z.object({
   harness: z.enum(SPAWNABLE_HARNESS_KINDS),
   profile: z.string().optional(),
   rehydrateFrom: z.string().min(1).optional(),
+  theme: z.enum(["light", "dark"]).optional(),
 }) satisfies z.ZodType<CreateSessionRequest>;
 
 const injectInputSchema = z.object({
@@ -85,10 +85,10 @@ const injectInputSchema = z.object({
   submit: z.boolean().optional(),
 }) satisfies z.ZodType<InjectInputRequest>;
 
-const attachImageSchema = z.object({
+const attachFileSchema = z.object({
   dataUrl: z.string().min(1),
-  filename: z.string().optional(),
-}) satisfies z.ZodType<AttachImageRequest>;
+  filename: z.string().trim().min(1).max(255),
+}) satisfies z.ZodType<AttachFileRequest>;
 
 const bindWorkflowSchema = z.object({
   workflowPath: z.string().min(1).nullable(),
@@ -96,9 +96,11 @@ const bindWorkflowSchema = z.object({
 
 const settingsPatchSchema = z.object({
   telemetryOptIn: z.boolean().optional(),
+  productAnalyticsOptIn: z.boolean().optional(),
   recentDirs: z.array(z.string()).optional(),
   projectRoot: z.string().optional(),
   rollingSummary: z.boolean().optional(),
+  editor: z.enum(EDITOR_KINDS).optional(),
 }) satisfies z.ZodType<Partial<HarnessSettings>>;
 
 const UI_EVENT_NAMES: readonly UiEventName[] = [
@@ -109,6 +111,7 @@ const UI_EVENT_NAMES: readonly UiEventName[] = [
   "consent.changed",
   "session.created",
   "mcp.install",
+  "plan.upgrade_clicked",
 ];
 
 /**
@@ -170,10 +173,12 @@ export interface RestRouterOptions {
   adapters: Partial<Record<HarnessKind, HarnessAdapter>>;
   version: string;
   /** Sapiom identity from CLI auth; null when unauthenticated / --no-auth. */
-  identity: { userId: string; organizationName: string } | null;
+  identity: { userId: string; tenantId: string; organizationName: string } | null;
   listWorkflows: () => Promise<WorkflowInfo[]>;
   /** Workspace identities backing the folder projection and system-graph route. */
-  listWorkspaceScopes?: () => WorkspaceScopeSummary[];
+  listWorkspaceScopes?: () =>
+    | WorkspaceScopeSummary[]
+    | Promise<WorkspaceScopeSummary[]>;
   listMacros: () => MacroDef[];
   /** Look up a registered workflow by its path; null when not found. Backs
    *  PATCH /sessions/:id/workflow's validation (a bind target must already
@@ -281,6 +286,12 @@ export function createRestRouter(options: RestRouterOptions): Router {
     listMacros,
   } = options;
   const router = Router();
+  const attachmentUploadRateLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 30,
+    standardHeaders: true,
+    legacyHeaders: false,
+  });
   router.use(express.json({ limit: JSON_BODY_LIMIT_BYTES }));
 
   router.get("/state", async (_req, res, next) => {
@@ -290,12 +301,15 @@ export function createRestRouter(options: RestRouterOptions): Router {
         version,
         authenticated: identity !== null,
         userId: identity?.userId ?? null,
+        tenantId: identity?.tenantId ?? null,
         organizationName: identity?.organizationName ?? null,
         telemetryOptIn: settings.telemetryOptIn,
+        // Absent === opted-in: light product analytics is on by default.
+        productAnalyticsOptIn: settings.productAnalyticsOptIn !== false,
         sessions: sessionManager.list(),
         workflows: await listWorkflows(),
         ...(options.listWorkspaceScopes
-          ? { workspaceScopes: options.listWorkspaceScopes() }
+          ? { workspaceScopes: await options.listWorkspaceScopes() }
           : {}),
         macros: listMacros(),
         launchDir: options.launchDir,
@@ -379,7 +393,6 @@ export function createRestRouter(options: RestRouterOptions): Router {
           experimental: adapter.experimental ?? false,
           installed: await adapter.detectInstalled(),
           installMcpPrompt: adapter.installMcpPrompt(),
-          imageInput: adapter.imageInput,
         })),
       );
       res.json(entries);
@@ -394,21 +407,116 @@ export function createRestRouter(options: RestRouterOptions): Router {
       res.status(400).json({ error: parsed.error.message });
       return;
     }
+    // Collapse whatever separators the client sent (see cwd-normalize.ts) so a
+    // mixed-separator path can never reach the pty spawn or sessions.json.
+    const request = { ...parsed.data, cwd: normalizeCwd(parsed.data.cwd) };
     try {
       // sessionManager.create() writes the initial harness-context.json
       // itself (before spawning) so every entry point gets it, not just
       // this REST route — see SessionManager.create().
-      const session = await sessionManager.create(parsed.data);
+      const session = await sessionManager.create(request);
       res.status(201).json(session);
-      options.onSessionCreated?.(parsed.data.cwd, session.id);
+      options.onSessionCreated?.(request.cwd, session.id);
     } catch (err) {
-      if (err instanceof AdapterNotFoundError) {
+      if (err instanceof AdapterNotFoundError || err instanceof SpawnTargetError) {
+        // Both are user-actionable ("install claude", "restart to repair") —
+        // the dialog renders this message verbatim, so a 500 here buried the
+        // one string that tells the user what to do.
         res.status(400).json({ error: err.message, code: err.code });
+        return;
+      }
+      if (err instanceof ExternalHarnessError) {
+        res.status(409).json({ error: err.message, code: err.code });
         return;
       }
       next(err);
     }
   });
+
+  router.post(
+    "/sessions/:id/attachments",
+    attachmentUploadRateLimiter,
+    async (req, res, next) => {
+      const parsed = attachFileSchema.safeParse(req.body);
+      if (!parsed.success) {
+        res.status(400).json({ error: parsed.error.message });
+        return;
+      }
+
+      const session = sessionManager.get(req.params.id);
+      if (!session) {
+        res.status(404).json({ error: "session not found" });
+        return;
+      }
+
+      const match = DATA_URL_RE.exec(parsed.data.dataUrl);
+      if (!match) {
+        res.status(400).json({ error: "dataUrl must be a base64 data: URL" });
+        return;
+      }
+
+      const mediaType = match[1]!.toLowerCase();
+      const encoded = match[2]!;
+      const decodedSize = decodedBase64Size(encoded);
+      if (decodedSize === null) {
+        res
+          .status(400)
+          .json({ error: "attachment payload is not valid base64" });
+        return;
+      }
+      if (decodedSize === 0) {
+        res.status(400).json({ error: "attachment payload is empty" });
+        return;
+      }
+      if (decodedSize > MAX_INLINE_ATTACHMENT_BYTES) {
+        res.status(413).json({
+          error: `Attachment is ${decodedSize} bytes; the limit is ${MAX_INLINE_ATTACHMENT_BYTES} bytes`,
+        });
+        return;
+      }
+      const buffer = Buffer.from(encoded, "base64");
+
+      const uploadsDir = resolveWithinRoot(session.cwd, HARNESS_UPLOADS_DIR);
+      if (!uploadsDir) {
+        res
+          .status(500)
+          .json({ error: "could not resolve the uploads directory" });
+        return;
+      }
+      const requestedExtension = path.extname(
+        path.basename(parsed.data.filename),
+      );
+      const extension = /^\.[a-z0-9]{1,12}$/i.test(requestedExtension)
+        ? requestedExtension.toLowerCase()
+        : ".bin";
+      try {
+        await fs.mkdir(uploadsDir, { recursive: true });
+        const [realCwd, realUploadsDir] = await Promise.all([
+          fs.realpath(session.cwd),
+          fs.realpath(uploadsDir),
+        ]);
+        if (!resolveWithinRoot(realCwd, realUploadsDir)) {
+          res.status(400).json({
+            error: "uploads directory escapes the session cwd",
+          });
+          return;
+        }
+        const filePath = path.join(
+          realUploadsDir,
+          `${randomUUID()}${extension}`,
+        );
+        await fs.writeFile(filePath, buffer);
+        const response: AttachFileResponse = {
+          path: filePath,
+          mediaType,
+          bytes: buffer.byteLength,
+        };
+        res.json(response);
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
 
   router.patch("/sessions/:id/workflow", async (req, res, next) => {
     const parsed = bindWorkflowSchema.safeParse(req.body);
@@ -425,7 +533,7 @@ export function createRestRouter(options: RestRouterOptions): Router {
     const { workflowPath } = parsed.data;
     if (workflowPath !== null && !options.findWorkflow(workflowPath)) {
       res.status(400).json({
-        error: `Unknown workflow path '${workflowPath}' — scan or connect it before binding a session to it`,
+        error: `Unknown agent path '${workflowPath}' — scan or connect it before binding a session to it`,
       });
       return;
     }
@@ -554,9 +662,12 @@ export function createRestRouter(options: RestRouterOptions): Router {
       res.status(404).json({ error: err.message });
       return true;
     }
-    if (err instanceof AdapterNotFoundError) {
-      // A persisted session with an unknown harness kind (e.g. from a future
-      // or removed harness type) cannot be resumed.
+    if (err instanceof AdapterNotFoundError || err instanceof SpawnTargetError) {
+      // AdapterNotFoundError: a persisted session with an unknown harness kind
+      // (e.g. from a future or removed harness type) cannot be resumed.
+      // SpawnTargetError: the agent binary can't be spawned on Windows (not on
+      // PATH / broken install) — resuming spawns too, and the message is the
+      // user-facing remedy.
       res.status(400).json({ error: err.message, code: err.code });
       return true;
     }
@@ -583,7 +694,8 @@ export function createRestRouter(options: RestRouterOptions): Router {
       res.status(400).json({ error: parsed.error.issues.map((i) => i.message).join("; ") });
       return;
     }
-    const { agentSessionId, harness, cwd, title, lastActiveAt } = parsed.data;
+    const { agentSessionId, harness, title, lastActiveAt } = parsed.data;
+    const cwd = normalizeCwd(parsed.data.cwd);
     try {
       // Never take the client's word for resumability — it's re-derived from
       // the agent's own store here, so a stale history row (transcript deleted
@@ -598,9 +710,17 @@ export function createRestRouter(options: RestRouterOptions): Router {
       }
       // Idempotent: a row already tracked by the registry resumes its existing
       // record rather than minting a duplicate on every click.
+      // Compare NORMALIZED cwds: records persisted before cwd normalization
+      // existed (and any written by an older build) can hold the
+      // mixed-separator form the SPA used to send, which never equals the
+      // resolved `cwd` above — so an exact compare re-adopts the same
+      // conversation into a duplicate row on every Resume.
       const existing = sessionManager
         .list()
-        .find((session) => session.agentSessionId === agentSessionId && session.cwd === cwd);
+        .find(
+          (session) =>
+            session.agentSessionId === agentSessionId && normalizeCwd(session.cwd) === cwd,
+        );
       const target = existing ?? sessionManager.registerHistorical({ agentSessionId, harness, cwd, title, lastActiveAt });
       res.json(await sessionManager.resume(target.id));
     } catch (err) {
@@ -679,97 +799,6 @@ export function createRestRouter(options: RestRouterOptions): Router {
         err instanceof SessionNotReadyError ||
         err instanceof ExternalHarnessError
       ) {
-        res.status(409).json({ error: err.message, code: err.code });
-        return;
-      }
-      next(err);
-    }
-  });
-
-  /**
-   * POST /api/sessions/:id/image — attach an image (composer file picker,
-   * paste, or drag-drop) and relay it to the agent.
-   *
-   * The harness has no direct image-content-block channel to a CLI agent, so
-   * "relay as an image" means: write the decoded image into the session's
-   * project directory (under HARNESS_UPLOADS_DIR) and inject its absolute path
-   * into the pty (submit:false) — the supported agents read an image referenced
-   * by path in their prompt. The attach is only offered/accepted for harnesses
-   * whose adapter declares `imageInput`, so an image never gets relayed to an
-   * agent that can't consume it.
-   */
-  router.post("/sessions/:id/image", imageUploadRateLimiter, async (req, res, next) => {
-    const parsed = attachImageSchema.safeParse(req.body);
-    if (!parsed.success) {
-      res.status(400).json({ error: parsed.error.message });
-      return;
-    }
-
-    const session = sessionManager.get(req.params.id);
-    if (!session) {
-      res.status(404).json({ error: "session not found" });
-      return;
-    }
-
-    // Respect the adapter's declared image support — reject rather than write a
-    // file the agent will never look at.
-    if (!getHarnessAdapter(session.harness).imageInput) {
-      res.status(400).json({ error: `Harness '${session.harness}' does not support image input` });
-      return;
-    }
-
-    const match = DATA_URL_RE.exec(parsed.data.dataUrl);
-    if (!match) {
-      res.status(400).json({ error: "dataUrl must be a base64 data: URL" });
-      return;
-    }
-    const mediaType = match[1].toLowerCase();
-    if (!(ALLOWED_IMAGE_MEDIA_TYPES as readonly string[]).includes(mediaType)) {
-      res.status(400).json({
-        error: `Unsupported image type '${mediaType}' — allowed: ${ALLOWED_IMAGE_MEDIA_TYPES.join(", ")}`,
-      });
-      return;
-    }
-    const buffer = Buffer.from(match[2], "base64");
-    if (buffer.byteLength === 0) {
-      res.status(400).json({ error: "image payload is empty" });
-      return;
-    }
-    if (buffer.byteLength > MAX_IMAGE_UPLOAD_BYTES) {
-      res.status(413).json({
-        error: `Image is ${buffer.byteLength} bytes; the limit is ${MAX_IMAGE_UPLOAD_BYTES} bytes`,
-      });
-      return;
-    }
-
-    // Confine the write to the session cwd; the stored name is a fresh uuid
-    // (never the client-supplied filename) so an image can't be written outside
-    // the uploads directory regardless of what the browser reported.
-    const uploadsDir = resolveWithinRoot(session.cwd, HARNESS_UPLOADS_DIR);
-    if (!uploadsDir) {
-      res.status(500).json({ error: "could not resolve the uploads directory" });
-      return;
-    }
-    const ext = IMAGE_EXTENSIONS[mediaType as ImageMediaType];
-    const filePath = path.join(uploadsDir, `${randomUUID()}.${ext}`);
-
-    try {
-      await fs.mkdir(uploadsDir, { recursive: true });
-      await fs.writeFile(filePath, buffer);
-      // A trailing space so the user's own message doesn't run into the path.
-      const injected = await sessionManager.submitInput(req.params.id, `${filePath} `, false);
-      if (!injected) {
-        res.status(404).json({ error: "session not found or has no live pty" });
-        return;
-      }
-      const response: AttachImageResponse = {
-        path: filePath,
-        mediaType: mediaType as ImageMediaType,
-        bytes: buffer.byteLength,
-      };
-      res.json(response);
-    } catch (err) {
-      if (err instanceof SessionNotReadyError || err instanceof ExternalHarnessError) {
         res.status(409).json({ error: err.message, code: err.code });
         return;
       }

@@ -42,7 +42,7 @@ describe("createSystemGraphRouter", () => {
 
   function start() {
     const scopeResolver: WorkspaceScopeResolver = {
-      resolve: vi.fn((key: string) =>
+      resolve: vi.fn(async (key: string) =>
         key === workspaceKey
           ? { workspaceKey: key, root: "/private/workspace" }
           : null,

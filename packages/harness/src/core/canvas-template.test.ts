@@ -125,8 +125,9 @@ describe("renderCanvasDocument", () => {
     // Exact dark-theme accent hex from web/src/styles.css — same palette the
     // rest of the app renders in dark mode.
     expect(html).toContain("#6be195");
-    // Exact light-theme accent hex.
-    expect(html).toContain("#05a9bc");
+    // Exact light-theme accent hex — the Studio light --brand green (aligned
+    // with the dark theme's green; it was an off-brand cyan before).
+    expect(html).toContain("#167e3a");
   });
 
   it("reads the theme from a ?theme= query param client-side, with no server-side dependency", () => {
@@ -159,6 +160,13 @@ describe("renderCanvasDocument", () => {
     expect(html).toContain("sapiom-canvas:graph");
     expect(html).toContain('getElementById("sapiom-graph")');
   });
+
+  it("bridges a deterministic render failure to the workbench error overlay", () => {
+    const html = renderCanvasDocument("");
+    expect(html).toContain("sapiom-canvas:error");
+    expect(html).toContain('getElementById("sapiom-render-error")');
+    expect(html).toContain("bootCanvasError()");
+  });
 });
 
 describe("TEMPLATE_HTML", () => {
@@ -169,6 +177,17 @@ describe("TEMPLATE_HTML", () => {
 
   it("carries a friendly empty-state note, not a blank panel", () => {
     expect(TEMPLATE_HTML).toMatch(/nothing visualized yet/i);
+    expect(TEMPLATE_HTML).toContain("run Visualize on an agent");
+  });
+
+  it("uses Agent Studio terminology in generated authoring copy", () => {
+    expect(TEMPLATE_HTML).toContain("<title>Agent Studio canvas</title>");
+    expect(TEMPLATE_HTML).toContain("AGENT STUDIO CANVAS TEMPLATE");
+    expect(TEMPLATE_HTML).toContain("standalone agent");
+    expect(TEMPLATE_HTML).toContain("Untitled agent");
+    expect(TEMPLATE_HTML).toContain("cross-agent signal/handoff");
+    expect(TEMPLATE_HTML).not.toContain("standalone workflow");
+    expect(TEMPLATE_HTML).not.toContain("Untitled workflow");
   });
 
   it("documents one example of every node kind and edge kind inside an inert <template>", () => {

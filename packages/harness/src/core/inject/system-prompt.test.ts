@@ -24,6 +24,28 @@ describe("generateSystemPromptFile", () => {
 
     const content = await fs.readFile(filePath, "utf8");
     expect(content).toBe(DEFAULT_SYSTEM_PROMPT);
+    expect(content).toContain("coding agent running in Agent Studio");
+    expect(content).toContain('"boundAgent"');
+    expect(content).toContain('"agents"');
+    expect(content).toContain("The Canvas follows that selection");
+    expect(content).toContain("Local Run, Prod Run, and Deploy");
+    // LLM call-surface rule (SAP-2775) — kept in sync with the MCP instructions
+    // (sapiom-js#679) and the backend DEFAULT_MCP_INSTRUCTIONS copy.
+    expect(content).toContain("ctx.sapiom.llm.run");
+    expect(content).toContain("ctx.sapiom.models.run");
+    expect(content).toContain("ctx.sapiom.agents.run");
+    expect(content).toContain("pin the `smart` label");
+    // Structured/forced-tool output has no `text` block — the reply lives in the
+    // `tool_use` block's input. Reading only `type === 'text'` there returns
+    // `undefined` and invites exactly the string-parsing fallback this rule bans.
+    expect(content).toContain("tool_use");
+    // The debugging pointer must point at the guide (the very next line), not
+    // at a "below" that this prompt never actually documents.
+    expect(content).toContain("documented in the guide");
+    expect(content).not.toContain("documented below");
+    expect(content).not.toContain("Visualize button");
+    expect(content).not.toContain("⌘K");
+    expect(content.toLowerCase()).not.toContain("workflow");
   });
 
   it("writes a custom prompt when one is provided", async () => {

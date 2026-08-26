@@ -1,122 +1,185 @@
-import { useRef, useState } from "react";
-import type { JSX } from "react";
+import { useEffect, useRef } from "react";
+import type { JSX, RefObject } from "react";
 import type { HarnessSession } from "@shared/types";
 
+import { trackingAttrs } from "../lib/analytics/tracking-attrs";
 import { HARNESS_LABELS } from "../lib/history-meta";
-import { EndSessionConfirm } from "./EndSessionConfirm";
-import { HarnessBrandIcon } from "./HarnessBrandIcon";
 import { Icon } from "./Icon";
 
 interface SessionTabsProps {
-  /** The focused agent's live sessions, oldest-first — the tab order, and the
-   *  order Cmd/Ctrl+1..9 selects. */
   sessions: HarnessSession[];
   activeSessionId: string | null;
-  /** Sessions streaming output in the last few seconds — their tab swaps the
-   *  live dot for the busy pulse (only meaningful on a non-active tab). */
-  busySessionIds: Set<string>;
-  /** Display name for a tab (rename > transcript title > folder basename). */
+  busySessionIds: ReadonlySet<string>;
   labelOf: (session: HarnessSession) => string;
-  /** The focused agent's name — the + tab's accessible name and tooltip. */
-  agentName: string;
+  subjectName: string;
   onSelect: (id: string) => void;
-  /** Ends a tab's session once the confirm is accepted; App handles the
-   *  active-tab fallback. */
-  onClose: (id: string) => void;
-  /** Opens a new session on the focused agent (the trailing +). */
   onNew: () => void;
+  newSessionPending: boolean;
+  menuOpen: boolean;
+  onToggleMenu: () => void;
+  menuTriggerRef: RefObject<HTMLButtonElement | null>;
+  menuTooltip?: string;
+  renaming: boolean;
+  renameDraft: string;
+  onRenameDraftChange: (value: string) => void;
+  onCommitRename: () => void;
+  onCancelRename: () => void;
 }
 
 /**
- * The main panel's session tab strip: one tab per live session belonging to
- * the FOCUSED agent. This is where session SWITCHING lives now —
- * the rail is a pure explorer of agents, the session bar is the active
- * session's identity header. Anatomy per tab: [agent-kind brand icon][name]
- * [live/busy dot][× close]. A trailing + opens another session on the agent.
+ * Browser-style live-session switching for the focused agent or folder.
+ *
+ * The rail remains the project explorer. This strip owns session selection
+ * and fresh same-folder creation; destructive session actions remain behind
+ * the active tab's options menu rather than becoming per-tab close buttons.
  */
 export function SessionTabs({
   sessions,
   activeSessionId,
   busySessionIds,
   labelOf,
-  agentName,
+  subjectName,
   onSelect,
-  onClose,
   onNew,
+  newSessionPending,
+  menuOpen,
+  onToggleMenu,
+  menuTriggerRef,
+  menuTooltip,
+  renaming,
+  renameDraft,
+  onRenameDraftChange,
+  onCommitRename,
+  onCancelRename,
 }: SessionTabsProps): JSX.Element {
-  // Ending a tab kills a real PTY, so the × opens the shared confirm first.
-  const [confirmingId, setConfirmingId] = useState<string | null>(null);
-  // Captures the × that opened the confirm so Escape hands focus back to it.
-  const lastCloseTrigger = useRef<HTMLButtonElement | null>(null);
+  const activeTabRef = useRef<HTMLDivElement>(null);
+  const cancelRenameOnBlurRef = useRef(false);
+
+  // A newly created session appends to the oldest-first list. Keep its tab in
+  // view without moving the page or introducing a second header row.
+  useEffect(() => {
+    activeTabRef.current?.scrollIntoView({
+      block: "nearest",
+      inline: "nearest",
+    });
+  }, [activeSessionId, sessions.length]);
 
   return (
-    <div className="session-tabs" role="tablist" aria-label="Sessions" data-testid="session-tabs">
-      {sessions.map((session) => {
-        const isActive = session.id === activeSessionId;
-        const busy = busySessionIds.has(session.id);
-        const label = labelOf(session);
-        return (
-          <div
-            key={session.id}
-            className={"session-tab" + (isActive ? " is-active" : "")}
-            data-testid={`session-tab-${session.id}`}
-          >
-            <button
-              type="button"
-              role="tab"
-              aria-selected={isActive}
-              className="session-tab-main"
-              data-testid={`session-tab-main-${session.id}`}
-              title={`${label} · ${HARNESS_LABELS[session.harness]}`}
-              onClick={() => onSelect(session.id)}
+    <div className="session-tabs" data-testid="session-tabs">
+      <div className="session-tabs-list" role="tablist" aria-label="Sessions">
+        {sessions.map((session) => {
+          const active = session.id === activeSessionId;
+          const label = labelOf(session);
+          const provider = HARNESS_LABELS[session.harness];
+          const showRename = active && renaming;
+
+          return (
+            <div
+              ref={active ? activeTabRef : undefined}
+              key={session.id}
+              className={`session-tab${active ? " is-active" : ""}`}
+              data-testid={`session-tab-${session.id}`}
             >
-              <HarnessBrandIcon kind={session.harness} size={13} />
-              <span className="session-tab-label">{label}</span>
-              {busy ? (
-                <span className="session-tab-busy" data-testid={`session-tab-busy-${session.id}`} aria-hidden="true" />
+              {showRename ? (
+                <input
+                  className="group-name-input session-rename-input session-tab-rename"
+                  data-testid="session-rename-input"
+                  aria-label="Rename session"
+                  value={renameDraft}
+                  autoFocus
+                  onFocus={(event) => {
+                    cancelRenameOnBlurRef.current = false;
+                    event.currentTarget.select();
+                  }}
+                  onChange={(event) => onRenameDraftChange(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") onCommitRename();
+                    if (event.key === "Escape") {
+                      cancelRenameOnBlurRef.current = true;
+                      onCancelRename();
+                    }
+                  }}
+                  onBlur={() => {
+                    if (cancelRenameOnBlurRef.current) {
+                      cancelRenameOnBlurRef.current = false;
+                      return;
+                    }
+                    onCommitRename();
+                  }}
+                />
               ) : (
-                <span className="session-tab-dot" data-status={session.status} aria-hidden="true" />
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={active}
+                  className="session-tab-main"
+                  data-testid={`session-tab-main-${session.id}`}
+                  title={`${label} · ${provider}`}
+                  data-tooltip={`${label} · ${provider}`}
+                  onClick={() => onSelect(session.id)}
+                >
+                  {busySessionIds.has(session.id) ? (
+                    <span
+                      className="session-busy"
+                      data-testid={`session-tab-busy-${session.id}`}
+                      aria-hidden="true"
+                    />
+                  ) : (
+                    <span
+                      className="session-dot"
+                      data-status={session.status}
+                      aria-hidden="true"
+                    />
+                  )}
+                  <span
+                    className="session-tab-label"
+                    data-testid={active ? "session-context-title" : undefined}
+                  >
+                    {label}
+                  </span>
+                </button>
               )}
-            </button>
-            <button
-              type="button"
-              className="session-tab-close"
-              data-testid={`session-tab-close-${session.id}`}
-              aria-label={`Close ${label}`}
-              data-tooltip="End session"
-              onClick={(e) => {
-                lastCloseTrigger.current = e.currentTarget;
-                setConfirmingId(session.id);
-              }}
-            >
-              <Icon name="X" size={12} />
-            </button>
-          </div>
-        );
-      })}
+
+              {active && !showRename && (
+                <button
+                  ref={menuTriggerRef}
+                  type="button"
+                  className="theme-toggle session-tab-menu"
+                  data-testid="session-menu"
+                  aria-label="Session options"
+                  aria-haspopup="menu"
+                  aria-expanded={menuOpen}
+                  data-tooltip={menuTooltip}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onToggleMenu();
+                  }}
+                  {...trackingAttrs({ object: "session" })}
+                >
+                  <Icon name="ChevronDown" size={12} />
+                </button>
+              )}
+            </div>
+          );
+        })}
+      </div>
 
       <button
         type="button"
-        className="session-tab-new"
+        className="theme-toggle session-tab-new"
         data-testid="session-tab-new"
-        aria-label={`New session on ${agentName}`}
-        data-tooltip="New session on this agent"
+        aria-label={`New session on ${subjectName}`}
+        aria-busy={newSessionPending}
+        data-tooltip={`New session on ${subjectName}`}
+        disabled={newSessionPending}
         onClick={onNew}
       >
-        <Icon name="Plus" size={14} />
+        {newSessionPending ? (
+          <span className="session-busy" aria-hidden="true" />
+        ) : (
+          <Icon name="Plus" size={14} />
+        )}
       </button>
-
-      {confirmingId && (
-        <EndSessionConfirm
-          triggerRef={lastCloseTrigger}
-          onCancel={() => setConfirmingId(null)}
-          onConfirm={() => {
-            const id = confirmingId;
-            setConfirmingId(null);
-            onClose(id);
-          }}
-        />
-      )}
     </div>
   );
 }

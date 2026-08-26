@@ -5,9 +5,16 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { WorkflowRegistry } from "./workflow-registry.js";
 
-async function writeMarker(dir: string, definitionId: number | null): Promise<void> {
+async function writeMarker(
+  dir: string,
+  definitionId: number | null,
+  extra: Record<string, unknown> = {},
+): Promise<void> {
   await fs.mkdir(dir, { recursive: true });
-  await fs.writeFile(path.join(dir, "sapiom.json"), JSON.stringify({ definitionId }));
+  await fs.writeFile(
+    path.join(dir, "sapiom.json"),
+    JSON.stringify({ definitionId, ...extra }),
+  );
 }
 
 describe("WorkflowRegistry", () => {
@@ -42,9 +49,13 @@ describe("WorkflowRegistry", () => {
     await writeMarker(path.join(tmpRoot, "a", "b", "c"), 7);
     // Depth 4: past the boundary — should NOT be found.
     await writeMarker(path.join(tmpRoot, "d", "e", "f", "g"), 9);
-    // Inside node_modules / .git — should never be scanned.
+    // Inside generated/private trees — should never be scanned.
     await writeMarker(path.join(tmpRoot, "node_modules", "some-pkg"), 1);
     await writeMarker(path.join(tmpRoot, ".git", "worktrees", "x"), 1);
+    await writeMarker(path.join(tmpRoot, ".sapiom", "generated"), 1);
+    await writeMarker(path.join(tmpRoot, "dist", "generated"), 1);
+    await writeMarker(path.join(tmpRoot, "build", "generated"), 1);
+    await writeMarker(path.join(tmpRoot, ".next", "generated"), 1);
 
     const found = await registry.scan(tmpRoot);
     const byPath = new Map(found.map((workflow) => [workflow.path, workflow]));
@@ -54,6 +65,9 @@ describe("WorkflowRegistry", () => {
       path: path.join(tmpRoot, "proj-a"),
       definitionId: 42,
       definitionSlug: null,
+      templateId: null,
+      forkId: null,
+      starterId: null,
       source: "scan",
     });
     expect(byPath.get(path.join(tmpRoot, "proj-b"))).toEqual({
@@ -61,6 +75,9 @@ describe("WorkflowRegistry", () => {
       path: path.join(tmpRoot, "proj-b"),
       definitionId: null,
       definitionSlug: null,
+      templateId: null,
+      forkId: null,
+      starterId: null,
       source: "scan",
     });
     expect(byPath.has(path.join(tmpRoot, "a", "b", "c"))).toBe(true);
@@ -69,6 +86,24 @@ describe("WorkflowRegistry", () => {
       found.some((workflow) => workflow.path.includes("node_modules")),
     ).toBe(false);
     expect(found.some((workflow) => workflow.path.includes(".git"))).toBe(false);
+    expect(found.some((workflow) => workflow.path.includes(".sapiom"))).toBe(false);
+    expect(found.some((workflow) => workflow.path.includes("dist"))).toBe(false);
+    expect(found.some((workflow) => workflow.path.includes("build"))).toBe(false);
+    expect(found.some((workflow) => workflow.path.includes(".next"))).toBe(false);
+  });
+
+  it("requires sapiom.json to contain a top-level JSON object", async () => {
+    const invalidValues = ["not json", "null", "[]", '"project"', "42"];
+    for (const [index, value] of invalidValues.entries()) {
+      const dir = path.join(tmpRoot, `invalid-${index}`);
+      await fs.mkdir(dir, { recursive: true });
+      await fs.writeFile(path.join(dir, "sapiom.json"), value);
+    }
+    await writeMarker(path.join(tmpRoot, "valid-empty-object"), null);
+    await fs.writeFile(path.join(tmpRoot, "valid-empty-object", "sapiom.json"), "{}");
+
+    const found = await registry.scan(tmpRoot);
+    expect(found.map((workflow) => workflow.name)).toEqual(["valid-empty-object"]);
   });
 
   it("persists scan results and reloads them for a fresh registry instance", async () => {
@@ -91,6 +126,9 @@ describe("WorkflowRegistry", () => {
       path: projectDir,
       definitionId: null,
       definitionSlug: null,
+      templateId: null,
+      forkId: null,
+      starterId: null,
       source: "connect",
     });
     expect(await registry.list()).toEqual([info]);
@@ -104,6 +142,55 @@ describe("WorkflowRegistry", () => {
     expect(info.definitionId).toBe(99);
   });
 
+  it("passes marker provenance through both scan and connectPath", async () => {
+    // A gallery clone writes templateId AND forkId; a scaffold writes starterId.
+    const cloned = path.join(tmpRoot, "cloned");
+    await writeMarker(cloned, null, {
+      templateId: "web-research-digest",
+      forkId: "fork-1",
+    });
+    const scaffolded = path.join(tmpRoot, "scaffolded");
+    await writeMarker(scaffolded, null, { starterId: "coding-pause" });
+
+    const byPath = new Map(
+      (await registry.scan(tmpRoot)).map((workflow) => [workflow.path, workflow]),
+    );
+    expect(byPath.get(cloned)).toMatchObject({
+      templateId: "web-research-digest",
+      forkId: "fork-1",
+      starterId: null,
+    });
+    expect(byPath.get(scaffolded)).toMatchObject({
+      templateId: null,
+      forkId: null,
+      starterId: "coding-pause",
+    });
+
+    // The connect flow must carry the same fields — provenance that appears
+    // for scanned agents but not connected ones reads as flaky analytics.
+    expect(await registry.connectPath(cloned)).toMatchObject({
+      templateId: "web-research-digest",
+      forkId: "fork-1",
+      starterId: null,
+    });
+  });
+
+  it("a re-scan refreshes provenance written to the marker after first discovery", async () => {
+    // Clone writes provenance after the files land — a row registered from a
+    // pre-provenance marker must pick the fields up on the next scan's merge.
+    const projectDir = path.join(tmpRoot, "late-provenance");
+    await writeMarker(projectDir, null);
+    await registry.scan(tmpRoot);
+
+    await writeMarker(projectDir, null, { templateId: "tmpl-x" });
+    await registry.scan(tmpRoot);
+
+    const entry = (await registry.list()).find(
+      (workflow) => workflow.path === projectDir,
+    );
+    expect(entry?.templateId).toBe("tmpl-x");
+  });
+
   it("a scan does not overwrite a connect-sourced entry's source", async () => {
     const projectDir = path.join(tmpRoot, "linked");
     await writeMarker(projectDir, 1);
@@ -114,6 +201,66 @@ describe("WorkflowRegistry", () => {
     const list = await registry.list();
     const entry = list.find((workflow) => workflow.path === projectDir);
     expect(entry?.source).toBe("connect");
+  });
+
+  it("reconciles a removed or malformed marker without removing manually connected folders", async () => {
+    const scannedDir = path.join(tmpRoot, "scanned");
+    const connectedDir = path.join(tmpRoot, "connected");
+    await writeMarker(scannedDir, 1);
+    await writeMarker(connectedDir, 2);
+    await registry.scan(tmpRoot);
+    await registry.connectPath(connectedDir);
+
+    await fs.writeFile(path.join(scannedDir, "sapiom.json"), "not-json");
+    await fs.rm(path.join(connectedDir, "sapiom.json"));
+    await registry.scan(tmpRoot);
+
+    expect((await registry.list()).map((workflow) => workflow.path)).toEqual([connectedDir]);
+    expect((await registry.list())[0].source).toBe("connect");
+  });
+
+  it.skipIf(
+    process.platform === "win32" ||
+      (typeof process.getuid === "function" && process.getuid() === 0),
+  )(
+    "keeps a scanned project when its directory is temporarily unreadable",
+    async () => {
+      const projectDir = path.join(tmpRoot, "temporarily-unreadable");
+      await writeMarker(projectDir, 1);
+      await registry.scan(tmpRoot);
+
+      await fs.chmod(projectDir, 0o000);
+      try {
+        await registry.scan(tmpRoot);
+
+        expect(
+          (await registry.list()).map((workflow) => workflow.path),
+        ).toEqual([projectDir]);
+
+        // The protection must apply to persisted state, not only this instance.
+        const reloaded = new WorkflowRegistry(registryPath);
+        expect(
+          (await reloaded.list()).map((workflow) => workflow.path),
+        ).toEqual([projectDir]);
+      } finally {
+        await fs.chmod(projectDir, 0o700);
+      }
+    },
+  );
+
+  it("does not reconcile a valid project outside the current scan envelope", async () => {
+    const left = path.join(tmpRoot, "left", "project");
+    const right = path.join(tmpRoot, "right", "project");
+    await writeMarker(left, 1);
+    await writeMarker(right, 2);
+    await registry.scan(tmpRoot);
+    await fs.rm(path.join(right, "sapiom.json"));
+
+    await registry.scan(path.join(tmpRoot, "left"));
+
+    expect((await registry.list()).map((workflow) => workflow.path).sort()).toEqual(
+      [left, right].sort(),
+    );
   });
 
   describe("prune", () => {

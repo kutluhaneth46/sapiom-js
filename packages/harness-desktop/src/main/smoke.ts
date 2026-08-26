@@ -12,10 +12,15 @@
  * one maps to a real failure we've had:
  *
  *   http-spa        SPA is served from inside app.asar (express static + fs patch)
+ *   host-terminology desktop title and CLI banner use the same product identity
  *   http-state      the REST surface answers with the boot token …
  *   http-authz      … and rejects a request without it
  *   preload-bridge  the setup window's preload actually loaded (an ESM/sandbox
- *                   mismatch once made onboarding hang forever with no error)
+ *                   mismatch once made onboarding hang forever with no error),
+ *                   and that window resolved its design-system layer in the
+ *                   STUDIO brand — that layer is a build-time COPY, so a path
+ *                   regression silently reverts the first screen's entire look
+ *                   (it shipped in the retired teal brand for months)
  *   node-pty        the native module loads under Electron's ABI and can spawn
  *                   (covers the rebuild AND the +x spawn-helper) — no agent needed
  *   unpacked-deps   what the plain-Node Canvas subprocess imports exists ON DISK,
@@ -45,7 +50,7 @@ import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { app } from "electron";
-import { resolveSpawnTarget } from "@sapiom/harness";
+import { AGENT_STUDIO_PRODUCT_NAME, resolveSpawnTarget } from "@sapiom/harness";
 import { createSetupWindow } from "./windows.js";
 import { resolveWebDir } from "./paths.js";
 import { shimDir } from "./runtime-shims.js";
@@ -123,19 +128,69 @@ async function checkPreloadBridge(): Promise<string> {
     // unstyled first-run window that every other check still passes. Assert the
     // tokens RESOLVE rather than that the files exist: a <link> that 404s and a
     // stylesheet that loaded but defined nothing fail identically here.
+    //
+    // Each probe names a token exactly ONE file defines, so nothing here
+    // hardcodes a brand value — the design system owns those and this gate must
+    // not pin them. Three layers, three independent silent failures:
+    //   --bg           tokens.css loaded
+    //   --type-display studio.css loaded AND its [data-product] scope matched,
+    //                  i.e. the window is in the Studio brand and not the old
+    //                  agent-cloud teal it silently shipped in for months
+    //   --violet       agent-cloud.css loaded — reachable ONLY through
+    //                  `@import "./agent-cloud.css"` inside themes/studio.css, so
+    //                  this is the only check that themes/ was copied as a
+    //                  directory rather than flattened. A failed CSS @import
+    //                  throws nothing, anywhere.
+    // Geist is REPORTED, not asserted: --font falls through to system-ui, so a
+    // face the renderer refuses to fetch over file:// is a legible window, not a
+    // broken one — and this line is how we learn, per OS, whether it fetches.
     const theme = (await win.webContents.executeJavaScript(
-      "(() => { const s = getComputedStyle(document.documentElement);" +
-        " return { sheets: document.styleSheets.length, bg: s.getPropertyValue('--bg').trim()," +
-        " brand: s.getPropertyValue('--brand').trim() }; })()",
-    )) as { sheets: number; bg: string; brand: string };
+      "(async () => { const s = getComputedStyle(document.documentElement);" +
+        " const faces = [...document.fonts].map((f) => f.family).join(',');" +
+        " const geist = await document.fonts.load('600 1rem Geist').then((f) => f.length" +
+        " ? 'loaded' : 'no-match', (e) => 'error: ' + e.message);" +
+        " return { sheets: document.styleSheets.length," +
+        " product: document.documentElement.dataset.product || ''," +
+        " mode: document.documentElement.dataset.theme || ''," +
+        " bg: s.getPropertyValue('--bg').trim(), brand: s.getPropertyValue('--brand').trim()," +
+        " display: s.getPropertyValue('--type-display').trim()," +
+        " violet: s.getPropertyValue('--violet').trim(), faces, geist }; })()",
+    )) as {
+      sheets: number;
+      product: string;
+      mode: string;
+      bg: string;
+      brand: string;
+      display: string;
+      violet: string;
+      faces: string;
+      geist: string;
+    };
     if (!theme.bg || !theme.brand) {
       throw new Error(
         `design-system tokens did not resolve (--bg="${theme.bg}", --brand="${theme.brand}", ` +
           `${theme.sheets} stylesheet(s) loaded) — check copy-renderer.mjs`,
       );
     }
+    if (theme.product !== "sapiom-studio" || !theme.display) {
+      throw new Error(
+        `the Studio preset is not applied (data-product="${theme.product}", ` +
+          `--type-display="${theme.display}") — setup.html must carry ` +
+          `data-product="sapiom-studio" on <html> and link ./themes/studio.css`,
+      );
+    }
+    if (!theme.violet) {
+      throw new Error(
+        'themes/studio.css loaded but its `@import "./agent-cloud.css"` did not ' +
+          "(--violet is unset) — copy-renderer.mjs must copy themes/ as a directory",
+      );
+    }
 
-    return `window.sapiomSetup exposes onProgress + submitConsent; tokens resolve (--bg ${theme.bg})`;
+    return (
+      "window.sapiomSetup exposes onProgress + submitConsent; Studio tokens resolve " +
+      `(${theme.mode}, --bg ${theme.bg}, --brand ${theme.brand}); Geist ${theme.geist}` +
+      `${theme.faces.includes("Geist") ? "" : ` (WARNING: no Geist @font-face registered — faces: ${theme.faces || "none"})`}`
+    );
   } finally {
     if (!win.isDestroyed()) win.destroy();
   }
@@ -271,14 +326,35 @@ async function checkSessionCreate(base: string, token: string | null): Promise<s
 
     // The record must be visible in state too — a session that spawned but never
     // registered would leave the UI with nothing to attach to.
-    const state = (await (
-      await fetch(`${base}/api/state`, { headers: { "X-Harness-Token": token } })
-    ).json()) as { sessions?: Array<{ id: string; status?: string }> };
-    const found = state.sessions?.find((s) => s.id === session.id);
+    const readState = async () =>
+      (await (
+        await fetch(`${base}/api/state`, { headers: { "X-Harness-Token": token } })
+      ).json()) as { sessions?: Array<{ id: string; status?: string; ready?: boolean }> };
+    let found = (await readState()).sessions?.find((s) => s.id === session.id);
     if (!found) throw new Error(`session ${session.id} missing from /api/state`);
 
+    // Hook delivery — the readiness chain end-to-end. The stub agent executes
+    // its --settings file's SessionStart hook command the way Claude Code
+    // would (Git Bash on Windows, /bin/sh on POSIX; scripts/smoke.sh), and
+    // that command's POST to /ingest is the ONLY thing that flips `ready`
+    // within this window (the server's own hook-timeout fallback sits at 20s,
+    // outside this 10s deadline, so a pass here can't be the fallback). This
+    // is the seam that broke silently on Windows: sessions looked fine while
+    // `ready` never flipped and every held first prompt was dropped.
+    const deadline = Date.now() + 10_000;
+    while (!found?.ready && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      found = (await readState()).sessions?.find((s) => s.id === session.id);
+    }
+    if (!found?.ready) {
+      throw new Error(
+        `session ${session.id} never became ready — the SessionStart hook command did not reach /ingest ` +
+          `(is \`node\` resolvable from the hook shell? see runtime-shims)`,
+      );
+    }
+
     const inherited = await checkAgentEnvironment(session.id);
-    return `spawned a session in ${path.basename(cwd)} (status ${found.status ?? session.status ?? "?"}); ${inherited}`;
+    return `spawned a session in ${path.basename(cwd)} (status ${found.status ?? session.status ?? "?"}, ready via SessionStart hook); ${inherited}`;
   } finally {
     // Best-effort ONLY, and deliberately so: this directory is the live pty's
     // cwd, and Windows refuses to delete a directory that is a running
@@ -435,15 +511,34 @@ async function checkRuntimeShims(): Promise<string> {
     if (!existsSync(shim)) throw new Error(`no ${name} shim at ${shim}`);
     try {
       // shell on Windows: a .cmd cannot be spawned directly (CVE-2024-27980).
-      const { stdout } = await exec(shim, ["--version"], { shell: process.platform === "win32" });
+      const { stdout } = await exec(shim, ["--version"], { shell: process.platform === "win32", windowsHide: true });
       const version = stdout.trim().split("\n")[0] ?? "";
       if (!version) throw new Error("no version output");
       reports.push(`${name} ${version}`);
     } catch (err) {
       throw new Error(`${name} shim did not run: ${err instanceof Error ? err.message : String(err)}`);
     }
+
+    // Windows also needs the EXTENSIONLESS sh flavor beside the .cmd: Claude
+    // Code runs hook commands through Git Bash, which never resolves a `.cmd`
+    // for a bare `node` — a .cmd-only shim dir meant zero hooks ran on a
+    // machine with no system Node, so sessions never reached "ready" and held
+    // prompts were silently dropped. (npm itself ships three shim flavors for
+    // exactly this reason.) Bash isn't guaranteed here, so assert shape, not
+    // execution — the hook-delivery poll in session-create covers execution.
+    if (process.platform === "win32") {
+      const shShim = path.join(dir, name);
+      if (!existsSync(shShim)) throw new Error(`no extensionless (Git Bash) ${name} shim at ${shShim}`);
+      const body = readFileSync(shShim, "utf8");
+      if (!body.startsWith("#!/bin/sh")) {
+        throw new Error(`${shShim} is not a #!/bin/sh script (starts: ${JSON.stringify(body.slice(0, 20))})`);
+      }
+      if (body.includes("\\")) {
+        throw new Error(`${shShim} embeds backslash paths — sh-unsafe, must be forward-slashed`);
+      }
+    }
   }
-  return reports.join(", ");
+  return reports.join(", ") + (process.platform === "win32" ? " (+ extensionless Git Bash shims)" : "");
 }
 
 /**
@@ -605,20 +700,62 @@ async function checkDesktopBridge(boot: BootResult): Promise<string> {
   const shape = (await win.webContents.executeJavaScript(
     "({ bridge: typeof window.sapiomDesktop," +
       " check: typeof window.sapiomDesktop?.checkForUpdates," +
+      " choose: typeof window.sapiomDesktop?.chooseDirectory," +
+      " deep: typeof window.sapiomDesktop?.onDeepLink," +
+      " updateState: typeof window.sapiomDesktop?.onUpdateState," +
+      " pathForFile: typeof window.sapiomDesktop?.pathForFile," +
       " version: window.sapiomDesktop?.appVersion })",
-  )) as { bridge: string; check: string; version: unknown };
+  )) as {
+    bridge: string;
+    check: string;
+    choose: string;
+    deep: string;
+    updateState: string;
+    pathForFile: string;
+    version: unknown;
+  };
 
   if (shape.bridge !== "object") {
     throw new Error("window.sapiomDesktop is missing — the main window's preload did not run");
   }
   if (shape.check !== "function") {
-    throw new Error(`bridge incomplete: ${JSON.stringify(shape)}`);
+    throw new Error(`bridge incomplete — checkForUpdates missing: ${JSON.stringify(shape)}`);
   }
-  // The bridge must stay MINIMAL as well as present. A restart method would let
-  // same-origin agent-authored content end every running session, which is why
-  // applying an update is a native dialog and has no channel (ipc.ts).
+  // Shape-only for chooseDirectory: unlike checkForUpdates, we must NOT invoke it —
+  // it opens a real OS folder sheet that would block a headless CI run forever. Its
+  // ipcMain handler is registered on every boot path (dialogs.ts, alongside the
+  // updater's), so presence of the wrapped method is the honest thing to assert here.
+  if (shape.choose !== "function") {
+    throw new Error(`bridge incomplete — chooseDirectory missing: ${JSON.stringify(shape)}`);
+  }
+  // Shape-only, like chooseDirectory: onDeepLink is a receive-only subscription
+  // (main → renderer push), so there is nothing to invoke here — asserting the
+  // wrapped method is present is the honest check.
+  if (shape.deep !== "function") {
+    throw new Error(`bridge incomplete — onDeepLink missing: ${JSON.stringify(shape)}`);
+  }
+  // Shape-only again: onUpdateState is the other receive-only subscription
+  // (drives the rail's "Update now" card; the apply path stays native).
+  if (shape.updateState !== "function") {
+    throw new Error(`bridge incomplete — onUpdateState missing: ${JSON.stringify(shape)}`);
+  }
+  // Shape-only: pathForFile needs a real dropped File to return anything, and it
+  // is read-only + local (webUtils.getPathForFile, no IPC) — what a drop on the
+  // terminal uses to type the file's path into the pty.
+  if (shape.pathForFile !== "function") {
+    throw new Error(`bridge incomplete — pathForFile missing: ${JSON.stringify(shape)}`);
+  }
+  // The bridge must stay MINIMAL as well as present. Beyond appVersion the only
+  // members allowed are checkForUpdates (no destructive counterpart — applying
+  // an update is a native dialog, see ipc.ts), chooseDirectory (returns only a
+  // user-picked path, opens no file, and is itself gated by isTrustedSender),
+  // the two receive-only subscriptions (onDeepLink, onUpdateState), and
+  // pathForFile (read-only resolution of a dropped File's path — no IPC, opens
+  // nothing). A restart method, by contrast, would let same-origin
+  // agent-authored content end every running session — so anything new here has
+  // to be a deliberate addition.
   const extra = (await win.webContents.executeJavaScript(
-    "Object.keys(window.sapiomDesktop).filter((k) => k !== 'appVersion' && k !== 'checkForUpdates')",
+    "Object.keys(window.sapiomDesktop).filter((k) => k !== 'appVersion' && k !== 'checkForUpdates' && k !== 'chooseDirectory' && k !== 'onDeepLink' && k !== 'onUpdateState' && k !== 'pathForFile')",
   )) as string[];
   if (extra.length > 0) {
     throw new Error(`bridge exposes unexpected members to page code: ${extra.join(", ")}`);
@@ -668,7 +805,7 @@ async function checkDesktopBridge(boot: BootResult): Promise<string> {
   }
 
   return (
-    `window.sapiomDesktop exposes checkForUpdates only (v${shape.version}); ` +
+    `window.sapiomDesktop exposes checkForUpdates + chooseDirectory + onDeepLink + onUpdateState + pathForFile (v${shape.version}); ` +
     `trusted-sender round-trip returned "${outcome.kind}: ${outcome.reason}"`
   );
 }
@@ -751,6 +888,17 @@ export async function runSmokeChecks(boot: BootResult): Promise<SmokeCheck[]> {
       const html = await fetchOk(`${base}/`, null, 200);
       if (!html.includes('id="root"')) throw new Error("served HTML has no #root — wrong webDir?");
       return `index.html served from ${resolveWebDir()}`;
+    }),
+    await check("host-terminology", async () => {
+      const html = await fetchOk(`${base}/`, null, 200);
+      const title = /<title>\s*([^<]+?)\s*<\/title>/i.exec(html)?.[1];
+      if (title !== AGENT_STUDIO_PRODUCT_NAME) {
+        throw new Error(
+          `desktop title ${JSON.stringify(title)} does not match the CLI product name ` +
+            JSON.stringify(AGENT_STUDIO_PRODUCT_NAME),
+        );
+      }
+      return `desktop title matches CLI banner: ${AGENT_STUDIO_PRODUCT_NAME}`;
     }),
     await check("http-state", async () => {
       if (!token) throw new Error("boot url carried no token");

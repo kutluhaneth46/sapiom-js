@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
+import { DEFAULT_SYSTEM_PROMPT } from "../../profiles/default.js";
 import { CodexAdapter } from "./codex.js";
 
 /** A minimal, synthetic (not real-user-data) rollout line set matching the
@@ -45,7 +46,7 @@ describe("CodexAdapter", () => {
     it("embeds the systemPromptFile's content inline via -c developer_instructions=<value>", async () => {
       const promptDir = await mkdtemp(join(tmpdir(), "harness-codex-prompt-"));
       const promptFile = join(promptDir, "prompt.txt");
-      await writeFile(promptFile, "You are a Sapiom workflow builder.\nBe concise.", "utf8");
+      await writeFile(promptFile, DEFAULT_SYSTEM_PROMPT, "utf8");
 
       const adapter = new CodexAdapter({ binary: "fake-codex" });
       const spec = adapter.launch({ harnessSessionId: "h1", cwd: "/tmp/proj", systemPromptFile: promptFile });
@@ -65,8 +66,17 @@ describe("CodexAdapter", () => {
         "-c",
         'sandbox_mode="workspace-write"',
         "-c",
-        `developer_instructions=${JSON.stringify("You are a Sapiom workflow builder.\nBe concise.")}`,
+        `developer_instructions=${JSON.stringify(DEFAULT_SYSTEM_PROMPT)}`,
       ]);
+
+      const resumed = adapter.resume("019e62d5-a020-75f1-b5e8-253383076f83", {
+        harnessSessionId: "h1",
+        cwd: "/tmp/proj",
+        systemPromptFile: promptFile,
+      });
+      expect(resumed.args.at(-1)).toBe(
+        `developer_instructions=${JSON.stringify(DEFAULT_SYSTEM_PROMPT)}`,
+      );
 
       await rm(promptDir, { recursive: true, force: true });
     });
@@ -143,9 +153,92 @@ describe("CodexAdapter", () => {
       "\x1b[6;1H\x1b[38;5;6;49m› 1. Yes, continue\x1b[7;3H\x1b[39;49m2." +
       "\x1b[7;6HNo,\x1b[7;10Hquit\x1b[9;3H\x1b[2mPress enter to continue";
 
+    // Codex commonly positions words independently. Build that same output
+    // shape around stable copy from codex-cli 0.147.0's checked-in TUI
+    // sources so every signature is also exercised without literal spaces.
+    const cursorPositioned = (...lines: string[]) =>
+      lines
+        .map((line, row) =>
+          line
+            .split(" ")
+            .map((word, column) => `\x1b[${row + 1};${column * 8 + 1}H${word}`)
+            .join(""),
+        )
+        .join("");
+
     it("detects the trust prompt in a real, unmodified pty capture", () => {
       const adapter = new CodexAdapter();
       expect(adapter.detectBlockingPrompt(REAL_TRUST_PROMPT_CAPTURE)).toBe(true);
+    });
+
+    it.each([
+      [
+        "the sign-in chooser",
+        cursorPositioned(
+          "Sign in with ChatGPT to use Codex as part of your paid plan",
+          "or connect an API key for usage-based billing",
+          "Sign in with Device Code",
+          "Provide your own API key",
+        ),
+      ],
+      [
+        "browser authentication",
+        cursorPositioned(
+          "Finish signing in via your browser",
+          "If the link doesn't open automatically, open the following link to authenticate:",
+        ),
+      ],
+      [
+        "device-code authentication",
+        cursorPositioned(
+          "Preparing device code login",
+          "1. Open this link in your browser and sign in",
+          "2. Enter this one-time code after you are signed in",
+        ),
+      ],
+      [
+        "API-key entry",
+        cursorPositioned(
+          "Use your own OpenAI API key for usage-based billing",
+          "Paste or type your API key below. It will be stored locally in auth.json.",
+        ),
+      ],
+      [
+        "the post-login onboarding notice",
+        cursorPositioned(
+          "Before you start:",
+          "Decide how much autonomy you want to grant Codex",
+          "Codex can make mistakes",
+        ),
+      ],
+      [
+        "model migration",
+        cursorPositioned(
+          "Codex just got an upgrade. Introducing GPT-5.5.",
+          "Choose how you'd like Codex to proceed.",
+          "1. Try new model",
+          "2. Use existing model",
+        ),
+      ],
+      [
+        "personality selection",
+        cursorPositioned(
+          "Select Personality",
+          "Choose a communication style for Codex.",
+          "Press enter to confirm or esc to go back",
+        ),
+      ],
+      [
+        "syntax-theme selection",
+        cursorPositioned(
+          "Select Syntax Theme",
+          "Type to filter themes...",
+          "Move up/down to live preview themes",
+        ),
+      ],
+    ])("detects %s as blocking", (_name, capture) => {
+      const adapter = new CodexAdapter();
+      expect(adapter.detectBlockingPrompt(capture)).toBe(true);
     });
 
     it("does not false-positive on ordinary composer/output text", () => {
@@ -154,6 +247,40 @@ describe("CodexAdapter", () => {
         "\x1b]0;my-project\x07\x1b[1;1H\x1b[38;2;231;231;231;49m› Find and fix a bug in @filename" +
         "\x1b[3;1Hgpt-5.5 xhigh · /private/tmp/proj";
       expect(adapter.detectBlockingPrompt(composer)).toBe(false);
+    });
+
+    it("does not treat MCP startup authentication warnings as blocking prompts", () => {
+      const adapter = new CodexAdapter();
+      expect(
+        adapter.detectBlockingPrompt(
+          "MCP client for `notion` failed to start: Auth error: OAuth authorization required\r\n" +
+            "MCP startup incomplete (failed: notion, render)",
+        ),
+      ).toBe(false);
+    });
+
+    it("does not treat one isolated onboarding label in ordinary output as a whole blocking screen", () => {
+      const adapter = new CodexAdapter();
+      expect(
+        adapter.detectBlockingPrompt(
+          "The docs say to trust the contents of this directory.",
+        ),
+      ).toBe(false);
+      expect(
+        adapter.detectBlockingPrompt(
+          "The docs mention Sign in with ChatGPT to use Codex as part of your paid plan.",
+        ),
+      ).toBe(false);
+      expect(
+        adapter.detectBlockingPrompt(
+          "You can choose Provide your own API key during setup.",
+        ),
+      ).toBe(false);
+      expect(
+        adapter.detectBlockingPrompt(
+          "The next heading says Select Personality.",
+        ),
+      ).toBe(false);
     });
 
     it("does not false-positive on an OSC sequence terminated by ST (ESC \\\\) rather than BEL", () => {
@@ -167,7 +294,8 @@ describe("CodexAdapter", () => {
       const capture =
         "\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b]0;proj\x07" +
         "\x1b[3;3HDo\x1b[3;6Hyou\x1b[3;10Htrust\x1b[3;16Hthe\x1b[3;20Hcontents" +
-        "\x1b[3;29Hof\x1b[3;32Hthis\x1b[3;37Hdirectory?";
+        "\x1b[3;29Hof\x1b[3;32Hthis\x1b[3;37Hdirectory?" +
+        "\x1b[6;3HYes,\x1b[6;8Hcontinue\x1b[7;3HNo,\x1b[7;7Hquit";
       const adapter = new CodexAdapter();
       expect(adapter.detectBlockingPrompt(capture)).toBe(true);
     });
@@ -175,6 +303,68 @@ describe("CodexAdapter", () => {
     it("returns false for plain text with no escape sequences at all", () => {
       const adapter = new CodexAdapter();
       expect(adapter.detectBlockingPrompt("just some ordinary agent output, nothing special")).toBe(false);
+    });
+  });
+
+  describe("detectReadyPrompt", () => {
+    it("recognizes the empty Codex composer through cursor-positioned rendering", () => {
+      const adapter = new CodexAdapter();
+      expect(
+        adapter.detectReadyPrompt(
+          "\x1b[?2026h\x1b[12;3HAsk\x1b[12;7HCodex\x1b[12;13Hto\x1b[12;16Hdo" +
+            "\x1b[12;19Hanything\x1b[?2026l",
+        ),
+      ).toBe(true);
+    });
+
+    it("recognizes the Codex 0.143 empty-composer copy", () => {
+      const adapter = new CodexAdapter();
+      expect(
+        adapter.detectReadyPrompt(
+          "\x1b[?2026h\x1b[12;3HUse\x1b[12;7H/skills\x1b[12;15Hto" +
+            "\x1b[12;18Hlist\x1b[12;23Havailable\x1b[12;33Hskills\x1b[?2026l",
+        ),
+      ).toBe(true);
+    });
+
+    it("recognizes a future composer copy from its input marker and cwd footer", () => {
+      const adapter = new CodexAdapter();
+      expect(
+        adapter.detectReadyPrompt(
+          "\x1b[?2026h\x1b[12;3H› A future placeholder\r\n" +
+            "\x1b[14;3Hgpt-next medium · C:\\work\\project\x1b[?2026l",
+        ),
+      ).toBe(true);
+    });
+
+    it("does not treat a selection marker without the cwd footer as a composer", () => {
+      const adapter = new CodexAdapter();
+      expect(
+        adapter.detectReadyPrompt(
+          "\x1b[?2026h\x1b[6;3H› 1. Yes, continue\r\n" +
+            "\x1b[7;3H2. No, quit\x1b[?2026l",
+        ),
+      ).toBe(false);
+    });
+
+    it("vetoes a partial trust repaint even when the underlying cwd footer is visible", () => {
+      const adapter = new CodexAdapter();
+      expect(
+        adapter.detectReadyPrompt(
+          "\x1b[?2026h\x1b[6;3H  1. Yes, continue\r\n" +
+            "\x1b[7;3H› 2. No, quit\r\n" +
+            "\x1b[14;3Hgpt-5.5 default · /tmp/proj\x1b[?2026l",
+        ),
+      ).toBe(false);
+    });
+
+    it("does not mistake an onboarding screen for the empty composer", () => {
+      const adapter = new CodexAdapter();
+      expect(
+        adapter.detectReadyPrompt(
+          "Finish signing in via your browser\r\nopen the following link to authenticate",
+        ),
+      ).toBe(false);
     });
   });
 

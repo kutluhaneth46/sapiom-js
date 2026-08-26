@@ -125,7 +125,7 @@ export function SystemGraphCanvas({
           className="system-graph-svg"
           viewBox={`0 0 ${width} ${height}`}
           role="img"
-          aria-label={`Workspace dependency graph with ${graph.nodes.length} agents`}
+          aria-label="Workspace dependency graph"
         >
           <defs>
             <marker

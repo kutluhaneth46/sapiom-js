@@ -8,7 +8,7 @@ import type { StepDefinition } from "./step.js";
 import type { AgentDefinition } from "./agent.js";
 
 /**
- * Generate a AgentManifest from a workflow definition and build metadata.
+ * Generate an AgentManifest from an agent definition and build metadata.
  *
  * - Walks def.steps; for each step:
  *   - timeoutMs: step.timeoutMs if declared, null otherwise.
@@ -143,7 +143,7 @@ export function assertValidGraph(manifest: AgentManifest): string[] {
   const { errors, warnings } = validateGraph(manifest);
   if (errors.length > 0) {
     throw new Error(
-      `Invalid workflow graph for '${manifest.name}':\n  - ${errors.join("\n  - ")}`,
+      `Invalid agent graph for '${manifest.name}':\n  - ${errors.join("\n  - ")}`,
     );
   }
   return warnings;
@@ -169,8 +169,12 @@ function buildForwardEdges(
           errors.push(
             `step '${name}' has a continue target '${t.target}' that is not in the steps map`,
           );
-      } else if (t.kind === "pause" && names.has(t.resumeStep)) {
-        targets.add(t.resumeStep);
+      } else if (t.kind === "pause") {
+        if (names.has(t.resumeStep)) targets.add(t.resumeStep);
+        else
+          errors.push(
+            `step '${name}' has a pause resumeStep '${t.resumeStep}' that is not in the steps map`,
+          );
       }
     }
     if (step.transitions.length === 0) {
@@ -199,7 +203,7 @@ function terminalReachabilityWarnings(
     .map(([name]) => name);
   if (sinks.length === 0) {
     return [
-      "no step can terminate or fail — the workflow has no terminal state",
+      "no step can terminate or fail — the agent has no terminal state",
     ];
   }
 

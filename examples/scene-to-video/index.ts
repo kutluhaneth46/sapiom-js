@@ -6,7 +6,13 @@ import {
   terminate,
   type AgentExecutionContext,
 } from "@sapiom/agent";
-import { VIDEO_RESULT_SIGNAL, type VideoResultPayload } from "@sapiom/tools";
+import {
+  IMAGE_RESULT_SIGNAL,
+  VIDEO_RESULT_SIGNAL,
+  fileStorage,
+  type ImageResultPayload,
+  type VideoResultPayload,
+} from "@sapiom/tools";
 import { z } from "zod/v4";
 
 /**
@@ -16,31 +22,41 @@ import { z } from "zod/v4";
  * and shows off the async pause/resume + per-shot fan-out machinery that
  * separates a Sapiom agent from a plain script:
  *
- *   decompose ─▶ keyframes ─▶ animate ⇄ collect ─▶ stitch ─▶ finalize
- *   (models.run) (images.create) (video.launch)   (drain)  (video.create) (terminal)
+ *   decompose ─▶ keyframe ⇄ collectKeyframe ─▶ animate ⇄ collect ─▶ stitch ─▶ finalize
+ *   (llm.run) (images.launch)  (drain)     (video.launch) (drain) (video.create) (terminal)
  *
- *   1. decompose — an LLM (`ctx.sapiom.models.run`) turns the scene into a global
+ *   1. decompose — an LLM (`ctx.sapiom.llm.run`) turns the scene into a global
  *      style/identity "bible" plus an ordered shot list.
- *   2. keyframes — one keyframe image per shot (`images.create`), fanned out
- *      in-process, each persisted for a durable `fileId`.
- *   3. animate — one shot at a time: launch an async image-to-video job
- *      (`video.launch`) and `pauseUntilSignal` on it; the FAL webhook resumes
- *      `collect` when that clip is ready.
- *   4. collect — record the finished clip, then loop back to `animate` for the
+ *   2. keyframe — one shot at a time: launch an async keyframe-image job
+ *      (`images.launch`) and `pauseUntilSignal` on it; the webhook resumes
+ *      `collectKeyframe` when that image is ready.
+ *   3. collectKeyframe — record the finished keyframe, then loop back to
+ *      `keyframe` for the next shot, or advance to `animate` once every
+ *      keyframe is in.
+ *   4. animate — one shot at a time: launch an async image-to-video job
+ *      (`video.launch`) and `pauseUntilSignal` on it; the completion webhook
+ *      resumes `collect` when that clip is ready.
+ *   5. collect — record the finished clip, then loop back to `animate` for the
  *      next shot, or advance to `stitch` once every clip is in.
- *   5. stitch — concat the N clips with FAL's synchronous merge endpoint; the
- *      SDK's bounded poll fallback handles an unexpected queue.
- *   6. finalize — terminal; return the stitched video's `videoFileId` when
+ *   6. stitch — concat the N clips with the synchronous video merge capability;
+ *      the SDK's bounded poll fallback handles an unexpected queue.
+ *   7. finalize — terminal; return the stitched video's `videoFileId` when
  *      persistence succeeded, plus the available `downloadUrl`.
  *
- * Why sequential animate rather than launching all clips at once: a paused step
- * waits on a single `(signal, correlationId)` pair. Launching every clip up front
- * and then draining would risk a clip finishing before we've paused on it (its
- * resume signal would have nowhere to land). Launching shot i only after shot
- * i-1 has resumed keeps a paused step always waiting before its job can complete.
+ * Why sequential rather than launching every job at once: a paused step waits
+ * on a single `(signal, correlationId)` pair. Launching every job up front and
+ * then draining would risk one finishing before we've paused on it (its resume
+ * signal would have nowhere to land). Launching job i only after job i-1 has
+ * resumed keeps a paused step always waiting before its job can complete. Both
+ * fan-outs (`keyframe`⇄`collectKeyframe`, `animate`⇄`collect`) follow this same
+ * shape, and `images.launch` — like `video.launch` — submits and returns
+ * immediately rather than holding a routed request open for the full
+ * generate+store, which is what a concurrent `Promise.all` of `images.create`
+ * risked tripping past Core's 30s router cap.
  *
- * A `dryRun` guard short-circuits after `decompose` so authors can trace the
- * graph offline without incurring the (higher) image + video generation cost.
+ * A zero-input run (no `scene`) shoots the built-in sample as a single shot —
+ * real generation, kept cheap. Set `dryRun: true` explicitly to stop right
+ * after planning and skip all image/video generation.
  */
 
 /** A single planned shot, as the LLM returns it (see {@link parsePlan}). */
@@ -61,10 +77,13 @@ interface Plan {
   shots: Shot[];
 }
 
-/** A generated keyframe, carried forward to `animate` as the clip's first frame. */
+/**
+ * A generated keyframe, carried forward to `animate` as the clip's first frame.
+ * Crossed the wire from a resumed `images.launch` job, so — like {@link Clip} —
+ * it carries only the durable/short-lived references, never a bare `url`.
+ */
 interface Keyframe {
   fileId?: string;
-  url: string;
   downloadUrl?: string;
 }
 
@@ -96,6 +115,8 @@ interface Shared extends Record<string, unknown> {
   shots: Shot[];
   keyframes: Keyframe[];
   clips: Clip[];
+  /** Index of the next shot to render a keyframe for; advanced by `collectKeyframe`. */
+  keyframeIndex: number;
   /** Index of the next shot to animate; advanced by `collect`. */
   animateIndex: number;
   /** Set when the run shot the built-in sample scene rather than the caller's. */
@@ -110,11 +131,17 @@ const SAMPLE_SCENE =
   "a paper boat drifting down a rain-soaked city gutter at night";
 
 /**
- * Default FAL image-to-video model. Kling 2.1 Pro is chosen for quality (the v1
+ * Default image-to-video model. Kling 2.1 Pro is chosen for quality (the v1
  * default); swap for a budget model (Wan i2v, Seedance i2v) via the `model` input.
+ *
+ * ⚠️ Raw provider id, uncataloged (SAP-2781 audit): the semantic video catalog has
+ * no image-to-video alias yet, and this template's keyframe→animate design needs
+ * one — so this pin gets no neutral-param normalization and WILL be rejected with
+ * `400 unknown_model` once allowlist enforcement (SAP-2582/E8) closes. Repoint to
+ * the image-to-video semantic alias the moment the catalog grows one.
  */
 const DEFAULT_VIDEO_MODEL = "fal-ai/kling-video/v2.1/pro/image-to-video";
-/** FAL ffmpeg merge endpoint used by `stitch` — concats the clips into one video. */
+/** Video merge model used by `stitch` — concats the clips into one video. */
 const MERGE_MODEL = "fal-ai/ffmpeg-api/merge-videos";
 /** Fan-out bounds on the planned shot list. */
 const DEFAULT_NUM_SHOTS = 3;
@@ -164,6 +191,16 @@ export async function resolveClipInputs(
       return { clip, url };
     }),
   );
+}
+
+/** Resolve a single keyframe's usable URL, re-minting from `fileId` when needed. */
+async function resolveFrameUrl(
+  frame: Keyframe,
+  getDownloadUrl: (fileId: string) => Promise<{ downloadUrl: string }>,
+): Promise<string> {
+  if (frame.downloadUrl) return frame.downloadUrl;
+  if (frame.fileId) return (await getDownloadUrl(frame.fileId)).downloadUrl;
+  throw new Error("keyframe has no usable download URL");
 }
 
 /**
@@ -239,7 +276,9 @@ const entryInput = z.object({
   numShots: z
     .number()
     .default(3)
-    .describe("How many shots to plan (clamped 1–6)."),
+    .describe(
+      "How many shots to plan (clamped 1–6). Ignored in favor of a single shot when `scene` is omitted, to keep a zero-input run cheap.",
+    ),
   aspectRatio: z
     .string()
     .default("16:9")
@@ -259,7 +298,7 @@ const entryInput = z.object({
 const decompose = defineStep({
   name: "decompose",
   inputSchema: entryInput,
-  next: ["keyframes"],
+  next: ["keyframe"],
   terminal: true,
   async run(input: SceneInput, ctx: AgentExecutionContext<Shared>) {
     // An omitted scene shoots the sample one, so a zero-input run really plans and
@@ -272,13 +311,17 @@ const decompose = defineStep({
     }
     const usedSampleScene = input.scene === undefined;
     const scene = input.scene === undefined ? SAMPLE_SCENE : input.scene.trim();
+    // A zero-input run must reach a real, cheap terminal — not a dry run. Clamp
+    // the fan-out to a single shot whenever the scene itself was defaulted, so
+    // `{}` in pays for exactly one LLM call, one keyframe, and one clip rather
+    // than ballooning across `numShots`. Supply your own `scene` to shoot more.
+    const numShots = usedSampleScene ? 1 : clampShots(input.numShots);
     if (usedSampleScene) {
       ctx.shared.set(
         "note",
-        `Shot the built-in sample scene ("${SAMPLE_SCENE}"). Pass your own \`scene\` to shoot yours.`,
+        `Shot the built-in sample scene ("${SAMPLE_SCENE}") as a single shot to keep the zero-setup run cheap. Pass your own \`scene\` (and \`numShots\`) to shoot more.`,
       );
     }
-    const numShots = clampShots(input.numShots);
     const aspectRatio = input.aspectRatio ?? "16:9";
 
     const system =
@@ -293,28 +336,30 @@ const decompose = defineStep({
     const prompt = `Scene: ${scene}\nNumber of shots: ${numShots}\nAspect ratio: ${aspectRatio}`;
 
     ctx.logger.info("decomposing scene", { numShots, aspectRatio });
-    const res = await ctx.sapiom.models.run({
-      prompt,
-      system,
-      maxTokens: 1200,
+    const res = await ctx.sapiom.llm.run({
+      request: {
+        system,
+        messages: [{ role: "user", content: prompt }],
+        max_tokens: 1200,
+      },
     });
-    const plan = parsePlan(res.output, scene, numShots);
+    const plan = parsePlan(ctx.sapiom.llm.textOf(res) ?? null, scene, numShots);
 
     ctx.shared.set("scene", scene);
     ctx.shared.set("aspectRatio", aspectRatio);
     if (input.model) ctx.shared.set("model", input.model);
     ctx.shared.set("bible", plan.bible);
     ctx.shared.set("shots", plan.shots);
+    ctx.shared.set("keyframes", []);
+    ctx.shared.set("keyframeIndex", 0);
     ctx.shared.set("clips", []);
     ctx.shared.set("animateIndex", 0);
     ctx.logger.info("planned shots", { shots: plan.shots.length });
 
-    // dryRun: trace the graph without incurring image/video generation cost. It
-    // defaults on ONLY when the scene was defaulted too — image and video are the
-    // priciest capabilities in the catalog, and a run nobody configured should not
-    // be the most expensive one in the gallery. Supply a scene and it really renders.
-    const dryRun = input.dryRun ?? usedSampleScene;
-    if (dryRun) {
+    // dryRun is an explicit opt-in — trace the graph without incurring image/video
+    // generation cost. It is never the default: image and video are the priciest
+    // capabilities in the catalog, and a zero-input run should still really render.
+    if (input.dryRun === true) {
       ctx.logger.info("dryRun — returning plan only");
       return terminate({
         dryRun: true,
@@ -322,47 +367,79 @@ const decompose = defineStep({
         shots: plan.shots,
         note: [
           ctx.shared.get("note"),
-          "No keyframes or clips were rendered — this is the shot plan only. Pass `dryRun: false` to render the video.",
+          "No keyframes or clips were rendered — this is the shot plan only. Omit `dryRun` to render the video.",
         ]
           .filter(Boolean)
           .join(" "),
       });
     }
-    return goto("keyframes", {});
+    return goto("keyframe", {});
   },
 });
 
-const keyframes = defineStep({
-  name: "keyframes",
-  next: ["animate"],
+const keyframe = defineStep({
+  name: "keyframe",
+  next: [],
+  // Async pause/resume: the launched image job fires IMAGE_RESULT_SIGNAL on
+  // completion, resuming `collectKeyframe` with the image's result. `launch`
+  // submits and returns immediately rather than holding the routed request
+  // open for the full generate+store, so a shot's keyframe never risks Core's
+  // 30s router cap the way a concurrent `images.create` fan-out did.
+  pause: { signal: IMAGE_RESULT_SIGNAL, resumeStep: "collectKeyframe" },
   async run(_input: unknown, ctx: AgentExecutionContext<Shared>) {
     const shots = must(ctx.shared.get("shots"), "shots");
-    ctx.logger.info("generating keyframes", { shots: shots.length });
+    const index = must(ctx.shared.get("keyframeIndex"), "keyframeIndex");
+    const shot = shots[index];
 
-    // Fan-out: one keyframe image per shot, generated concurrently. `storage`
-    // persists each output so we get a durable `fileId` + a ready-to-use URL to
-    // hand the animation step as its first frame.
-    const generated = await Promise.all(
-      shots.map((shot) =>
-        ctx.sapiom.contentGeneration.images.create({
-          prompt: shot.image_prompt,
-          numImages: 1,
-          storage: { visibility: "private" },
-        }),
-      ),
-    );
-    const frames: Keyframe[] = generated.map((result, i) => {
-      const img = result.images?.[0];
-      if (!img) throw new Error(`no keyframe image returned for shot ${i + 1}`);
-      return {
-        ...(img.fileId !== undefined && { fileId: img.fileId }),
-        url: img.url,
-        ...(img.downloadUrl !== undefined && { downloadUrl: img.downloadUrl }),
-      };
+    ctx.logger.info("generating keyframe", {
+      index: index + 1,
+      of: shots.length,
     });
-    ctx.shared.set("keyframes", frames);
-    ctx.logger.info("keyframes ready", { count: frames.length });
-    return goto("animate", {});
+    const handle = await ctx.sapiom.contentGeneration.images.launch({
+      prompt: shot.image_prompt,
+      count: 1,
+      // Intentionally private: a keyframe is never returned or linked to a
+      // caller — it's only ever fed straight into `animate`'s `image_url`,
+      // consumed immediately in-process, so a presigned URL is correct here.
+      storage: { visibility: "private" },
+    });
+    return await pauseUntilSignal(handle, { resumeStep: "collectKeyframe" });
+  },
+});
+
+const collectKeyframe = defineStep({
+  name: "collectKeyframe",
+  next: ["keyframe", "animate"],
+  async run(result: ImageResultPayload, ctx: AgentExecutionContext<Shared>) {
+    const shots = must(ctx.shared.get("shots"), "shots");
+    const frames = must(ctx.shared.get("keyframes"), "keyframes");
+    const index = must(ctx.shared.get("keyframeIndex"), "keyframeIndex");
+
+    const img = result.outputs?.[0];
+    if (!img?.fileId && !img?.downloadUrl) {
+      const storageError = img?.storageError ? `: ${img.storageError}` : "";
+      throw new Error(
+        `keyframe generation completed without a usable output for shot ${index + 1}${storageError}`,
+      );
+    }
+    const frame: Keyframe = {
+      ...(img?.fileId !== undefined && { fileId: img.fileId }),
+      ...(img?.downloadUrl !== undefined && { downloadUrl: img.downloadUrl }),
+    };
+    const nextFrames = [...frames, frame];
+    const nextIndex = index + 1;
+    ctx.shared.set("keyframes", nextFrames);
+    ctx.shared.set("keyframeIndex", nextIndex);
+    ctx.logger.info("collected keyframe", {
+      collected: nextFrames.length,
+      of: shots.length,
+    });
+
+    // More shots need a keyframe? Loop back. Otherwise every keyframe is in —
+    // start animating.
+    return nextIndex < shots.length
+      ? goto("keyframe", {})
+      : goto("animate", {});
   },
 });
 
@@ -370,7 +447,7 @@ const animate = defineStep({
   name: "animate",
   next: [],
   // Async pause/resume: the launched video job fires VIDEO_RESULT_SIGNAL on
-  // completion (the FAL webhook), resuming `collect` with the clip's result.
+  // completion (the routed webhook), resuming `collect` with the clip's result.
   pause: { signal: VIDEO_RESULT_SIGNAL, resumeStep: "collect" },
   async run(_input: unknown, ctx: AgentExecutionContext<Shared>) {
     const shots = must(ctx.shared.get("shots"), "shots");
@@ -378,7 +455,9 @@ const animate = defineStep({
     const index = must(ctx.shared.get("animateIndex"), "animateIndex");
     const shot = shots[index];
     const frame = frames[index];
-    const imageUrl = frame.downloadUrl ?? frame.url;
+    const imageUrl = await resolveFrameUrl(frame, async (fileId) => {
+      return await ctx.sapiom.fileStorage.getDownloadUrl(fileId);
+    });
     const model = ctx.shared.get("model") ?? DEFAULT_VIDEO_MODEL;
 
     ctx.logger.info("animating shot", { index: index + 1, of: shots.length });
@@ -388,12 +467,19 @@ const animate = defineStep({
     const handle = await ctx.sapiom.contentGeneration.video.launch({
       model,
       prompt: shot.motion_prompt,
-      params: {
+      // Kling 2.1 Pro image-to-video isn't in the semantic catalog, so the neutral param
+      // vocabulary doesn't apply here — pass the raw provider keys via `passthrough` (the
+      // escape hatch) rather than the deprecated `params`.
+      passthrough: {
         image_url: imageUrl,
         duration: String(normalizeClipDuration(shot.duration)),
         aspect_ratio: must(ctx.shared.get("aspectRatio"), "aspectRatio"),
       },
-      storage: { visibility: "private" },
+      // Public: this clip may become the run's headline shareable output (the
+      // single-clip bypass in `stitch`, or as merge input otherwise), so it
+      // needs a durable permalink rather than a presigned URL that expires in
+      // ~15min.
+      storage: { visibility: "public" },
     });
     return await pauseUntilSignal(handle, { resumeStep: "collect" });
   },
@@ -416,7 +502,13 @@ const collect = defineStep({
     }
     const clip: Clip = {
       ...(out?.fileId !== undefined && { fileId: out.fileId }),
-      ...(out?.downloadUrl !== undefined && { downloadUrl: out.downloadUrl }),
+      // Durable permalink over a presigned URL — this clip may end up as the
+      // run's headline shareable output.
+      ...(out?.fileId !== undefined
+        ? { downloadUrl: fileStorage.getPublicUrl(out.fileId) }
+        : out?.downloadUrl !== undefined
+          ? { downloadUrl: out.downloadUrl }
+          : {}),
     };
     const nextClips = [...clips, clip];
     const nextIndex = index + 1;
@@ -435,22 +527,25 @@ const collect = defineStep({
 const stitch = defineStep({
   name: "stitch",
   next: ["finalize"],
-  // FAL ffmpeg merge is contractually synchronous today. `create()` returns
+  // Video merge is contractually synchronous today. `create()` returns
   // immediately for that shape; its explicit 12-minute bound only covers an
   // unexpected queue and stays below the runner's 15-minute step deadline.
   async run(_input: unknown, ctx: AgentExecutionContext<Shared>) {
     const scene = must(ctx.shared.get("scene"), "scene");
     const clips = must(ctx.shared.get("clips"), "clips");
-    // Ready-to-use URLs for the merge input. For a longer-lived reference re-mint
-    // from each clip's `fileId` via `ctx.sapiom.fileStorage.getDownloadUrl(fileId)`.
-    const resolved = await resolveClipInputs(
-      clips,
-      async (fileId) => await ctx.sapiom.fileStorage.getDownloadUrl(fileId),
-    );
+    // Ready-to-use URLs for the merge input. Each clip already carries a
+    // durable public permalink from `collect`; this callback only covers the
+    // defensive fallback (a clip with a `fileId` but no `downloadUrl` yet),
+    // re-minting via `getPublicUrl` rather than a presigned URL — the
+    // single-clip bypass below can hand this straight back as the run's
+    // headline output.
+    const resolved = await resolveClipInputs(clips, async (fileId) => ({
+      downloadUrl: fileStorage.getPublicUrl(fileId),
+    }));
     const videoUrls = resolved.map(({ url }) => url);
     ctx.logger.info("stitching clips", { clips: resolved.length });
 
-    // FAL's merge endpoint requires at least two URLs. A one-shot scene is
+    // The merge endpoint requires at least two URLs. A one-shot scene is
     // already a finished video, so bypass the merge rather than making an
     // invalid request.
     if (clips.length === 1) {
@@ -471,8 +566,13 @@ const stitch = defineStep({
     const merged = await ctx.sapiom.contentGeneration.video.create({
       model: MERGE_MODEL,
       prompt: scene,
-      params: { video_urls: videoUrls },
-      storage: { visibility: "private" },
+      // ffmpeg merge is a provider-specific op with no neutral param — use the `passthrough`
+      // escape hatch (not the deprecated `params`).
+      passthrough: { video_urls: videoUrls },
+      // Public: the merged video is the run's headline shareable output below,
+      // so it needs a durable permalink rather than a presigned URL that
+      // expires in ~15min.
+      storage: { visibility: "public" },
       timeoutMs: 12 * 60_000,
     });
     if (
@@ -484,7 +584,9 @@ const stitch = defineStep({
         `video merge completed without a usable output${merged.video?.storageError ? `: ${merged.video.storageError}` : ""}`,
       );
     }
-    const downloadUrl = merged.video.downloadUrl ?? merged.video.url;
+    const downloadUrl = merged.video.fileId
+      ? fileStorage.getPublicUrl(merged.video.fileId)
+      : (merged.video.downloadUrl ?? merged.video.url);
     return goto("finalize", {
       outputs: [
         {
@@ -528,5 +630,13 @@ const finalize = defineStep({
 export const agent = defineAgent<SceneInput, Shared>({
   name: "scene-to-video",
   entry: "decompose",
-  steps: { decompose, keyframes, animate, collect, stitch, finalize },
+  steps: {
+    decompose,
+    keyframe,
+    collectKeyframe,
+    animate,
+    collect,
+    stitch,
+    finalize,
+  },
 });

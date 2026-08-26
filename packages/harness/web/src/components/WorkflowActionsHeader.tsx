@@ -4,10 +4,12 @@ import type { RunView, WorkflowInfo } from "@shared/types";
 
 import type { CanvasGraphNode } from "../lib/canvas-graph";
 import { nodeKindLabel } from "../lib/canvas-graph";
+import { displayAgentName } from "../lib/agent-name";
 import { relativeTimeLabel } from "../lib/relative-time";
 import type { ObservedRun, RunTarget } from "../lib/use-harness-state";
 import { AnchoredPopover } from "./AnchoredPopover";
 import { Icon } from "./Icon";
+import { trackingAttrs } from "../lib/analytics/tracking-attrs";
 
 interface WorkflowActionsHeaderProps {
   workflow: WorkflowInfo;
@@ -45,7 +47,7 @@ function runChipLabel(run: RunView, target: RunTarget | null): string {
  * - Steps list: the workflow name and the real step count, info left, no
  *   competing actions (rows are the interface).
  * - Step detail: 1×1 back left-anchored, the step's name and kind, then the
- *   right-anchored main action (Ask agent) and a ⋯ menu with the rest —
+ *   right-anchored main action (Ask coding agent) and a ⋯ menu with the rest —
  *   the drill-down's chrome lives HERE, not inside the scroll area.
  */
 export function WorkflowActionsHeader({
@@ -71,7 +73,13 @@ export function WorkflowActionsHeader({
 
   if (detailStep) {
     return (
-      <div className="workflow-actions-header" data-testid="workflow-actions-header">
+      // Step names come from the user's own agent code, and this branch renders
+      // one as text, in `More actions for ${label}`, and in two prompts.
+      <div
+        className="workflow-actions-header"
+        data-testid="workflow-actions-header"
+        {...trackingAttrs({ object: "run" })}
+      >
         <button
           className="theme-toggle"
           data-testid="canvas-detail-back"
@@ -89,14 +97,14 @@ export function WorkflowActionsHeader({
         <button
           className="btn-ghost canvas-detail-ask"
           data-testid="canvas-detail-ask"
-          aria-label="Ask agent"
-          data-tooltip="Sends the request to the agent in the terminal"
-          onClick={() => onAskAgent(`Walk me through the "${detailStep.label}" step of this workflow: what it does, its inputs and outputs, and its transitions.`)}
+          aria-label="Ask coding agent"
+          data-tooltip="Ask the coding agent in the terminal"
+          onClick={() => onAskAgent(`Walk me through the "${detailStep.label}" step of this agent: what it does, its inputs and outputs, and its transitions.`)}
         >
           <Icon name="MessageSquare" size={13} />
           {/* Hidden by the subheader's container query when the pane is too
               narrow — icon + tooltip + aria-label keep naming the action. */}
-          <span className="canvas-detail-ask-label">Ask agent</span>
+          <span className="canvas-detail-ask-label">Ask coding agent</span>
         </button>
         <div className="canvas-detail-menu-wrap">
           <button
@@ -124,12 +132,12 @@ export function WorkflowActionsHeader({
                 role="menuitem"
                 className="profile-menu-item"
                 onClick={() => {
-                  onAskAgent(`Modify the "${detailStep.label}" step of this workflow. Show me the step's code first, then propose the change.`);
+                  onAskAgent(`Modify the "${detailStep.label}" step of this agent. Show me the step's code first, then propose the change.`);
                   closeMenu();
                 }}
               >
                 <Icon name="Wand2" size={13} />
-                Ask agent to modify
+                Ask coding agent to modify
               </button>
               <button
                 role="menuitem"
@@ -159,8 +167,15 @@ export function WorkflowActionsHeader({
       <div
         className={"workflow-actions-header" + (run ? " has-run" : "")}
         data-testid="workflow-actions-header"
+        // The agent's name is rendered here (and in `title`), and the step
+        // menu's aria-label interpolates a step name from the user's own agent
+        // code. Neither CanvasPane nor CodePanel — the two hosts — set `object`,
+        // so without this the canvas header ships the agent name on every click.
+        {...trackingAttrs({ object: "agent" })}
       >
-        <span className="workflow-actions-name">{workflow.name}</span>
+        <span className="workflow-actions-name" title={workflow.name}>
+          {displayAgentName(workflow.name)}
+        </span>
         <span className="workflow-actions-count" data-testid="canvas-steps-count">
           {stepsSummary ?? "no steps"}
         </span>

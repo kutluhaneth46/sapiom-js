@@ -14,10 +14,9 @@ vi.mock("node:os", async (importOriginal) => {
 });
 
 import type { HarnessAdapter, HarnessKind, HarnessSession, MacroDef, SessionRecord, SessionSummary, SpawnSpec, WorkflowInfo } from "../shared/types.js";
-import { MAX_IMAGE_UPLOAD_BYTES } from "../shared/types.js";
 import { SessionManager, SessionNotReadyError, UnknownSessionError } from "../core/session-manager.js";
 import type { SessionRecordReader } from "../core/session-record.js";
-import { AdapterNotFoundError, SessionAlreadyLiveError, SessionNotResumeableError } from "../core/errors.js";
+import { AdapterNotFoundError, ExternalHarnessError, SessionAlreadyLiveError, SessionNotResumeableError, SpawnTargetError } from "../core/errors.js";
 import { createRestRouter, type RestRouterOptions } from "./rest.js";
 
 const TOKEN_HEADER = { "X-Harness-Token": "unused-in-router-tests" };
@@ -143,8 +142,10 @@ describe("createRestRouter", () => {
         version: "9.9.9-test",
         authenticated: false,
         userId: null,
+        tenantId: null,
         organizationName: null,
         telemetryOptIn: false,
+        productAnalyticsOptIn: true,
         sessions: [],
         workflows: [],
         macros: [],
@@ -244,7 +245,7 @@ describe("createRestRouter", () => {
 
       start({
         sessionManager: fakeSessionManager([session]),
-        identity: { userId: "user-1", organizationName: "Acme" },
+        identity: { userId: "user-1", tenantId: "user-1", organizationName: "Acme" },
         listWorkflows: async () => [workflow],
         listMacros: () => [macro],
       });
@@ -425,6 +426,214 @@ describe("createRestRouter", () => {
       expect(res.status).toBe(201);
       expect(writeWorkspaceContext).not.toHaveBeenCalled();
     });
+
+    it("normalizes the cwd before create() sees it", async () => {
+      // The SPA can't know the host separator; resolve() at the route makes a
+      // duplicated-separator/traversal path canonical for every consumer
+      // (pty cwd, sessions.json, startsWith containment). Mixed "\\"/"/" is the
+      // Windows shape of this bug; the posix-expressible equivalent is pinned
+      // here since tests run on POSIX CI (win32 case: cwd-normalize.test.ts).
+      const sessionManager = fakeSessionManager();
+      (sessionManager.create as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: "sess-1",
+        cwd: "/tmp/proj",
+        harness: "claude-code",
+        status: "starting",
+      });
+      start({ sessionManager });
+
+      const res = await fetch(`${baseUrl}/sessions`, {
+        method: "POST",
+        headers: { ...TOKEN_HEADER, "content-type": "application/json" },
+        body: JSON.stringify({ cwd: "/tmp//projects/../proj", harness: "claude-code" }),
+      });
+
+      expect(res.status).toBe(201);
+      expect(sessionManager.create).toHaveBeenCalledWith(
+        expect.objectContaining({ cwd: "/tmp/proj" }),
+      );
+    });
+
+    it("maps SpawnTargetError to a 400 carrying the actionable message", async () => {
+      // "claude isn't on PATH" / "self-update broke the install" used to
+      // surface as 500 {"error":"internal error"} — the one string telling the
+      // user what to do was discarded. The dialog renders this body verbatim.
+      const sessionManager = fakeSessionManager();
+      (sessionManager.create as ReturnType<typeof vi.fn>).mockRejectedValue(
+        new SpawnTargetError('cannot spawn "claude" on Windows: not found on PATH'),
+      );
+      start({ sessionManager });
+
+      const res = await fetch(`${baseUrl}/sessions`, {
+        method: "POST",
+        headers: { ...TOKEN_HEADER, "content-type": "application/json" },
+        body: JSON.stringify({ cwd: "/tmp/proj", harness: "claude-code" }),
+      });
+
+      expect(res.status).toBe(400);
+      const body = (await res.json()) as { error: string; code: string };
+      expect(body.code).toBe("SPAWN_TARGET");
+      expect(body.error).toContain("not found on PATH");
+    });
+
+    it("maps ExternalHarnessError to a 409", async () => {
+      const sessionManager = fakeSessionManager();
+      (sessionManager.create as ReturnType<typeof vi.fn>).mockRejectedValue(
+        new ExternalHarnessError("conductor", "Conductor"),
+      );
+      start({ sessionManager });
+
+      const res = await fetch(`${baseUrl}/sessions`, {
+        method: "POST",
+        headers: { ...TOKEN_HEADER, "content-type": "application/json" },
+        body: JSON.stringify({ cwd: "/tmp/proj", harness: "claude-code" }),
+      });
+
+      expect(res.status).toBe(409);
+      expect(((await res.json()) as { code: string }).code).toBe("HARNESS_EXTERNAL");
+    });
+  });
+
+  describe("POST /sessions/:id/attachments", () => {
+    let projectRoot: string;
+    let sessionManager: RestRouterOptions["sessionManager"];
+
+    beforeEach(async () => {
+      projectRoot = path.join(tmpHome, "project");
+      await fs.mkdir(projectRoot, { recursive: true });
+      projectRoot = await fs.realpath(projectRoot);
+      sessionManager = fakeSessionManager([
+        exitedSession({
+          id: "sess-upload",
+          cwd: projectRoot,
+          status: "running",
+          exitCode: null,
+        }),
+      ]);
+      start({ sessionManager });
+    });
+
+    const postAttachment = (
+      body: unknown,
+      sessionId = "sess-upload",
+    ): Promise<Response> =>
+      fetch(`${baseUrl}/sessions/${sessionId}/attachments`, {
+        method: "POST",
+        headers: { ...TOKEN_HEADER, "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+
+    it("materializes clipboard bytes under the session cwd without injecting input", async () => {
+      const res = await postAttachment({
+        filename: "screenshot.png",
+        dataUrl: "data:image/png;base64,cGl4ZWxz",
+      });
+
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        path: string;
+        mediaType: string;
+        bytes: number;
+      };
+      expect(body.mediaType).toBe("image/png");
+      expect(body.bytes).toBe(6);
+      const relativePath = path.relative(projectRoot, body.path);
+      const relativeParts = relativePath.split(path.sep);
+      expect(relativeParts.slice(0, 2)).toEqual([".sapiom", "uploads"]);
+      expect(relativeParts[2]).toMatch(/^[0-9a-f-]+\.png$/);
+      await expect(fs.readFile(body.path, "utf8")).resolves.toBe("pixels");
+      expect(sessionManager.submitInput).not.toHaveBeenCalled();
+    });
+
+    it("uses a server-owned filename for a traversal-shaped display name", async () => {
+      const res = await postAttachment({
+        filename: "../../outside/escape.pdf",
+        dataUrl: "data:application/pdf;base64,UERG",
+      });
+
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { path: string };
+      expect(path.dirname(body.path)).toBe(
+        path.join(projectRoot, ".sapiom", "uploads"),
+      );
+      expect(path.basename(body.path)).toMatch(/^[0-9a-f-]+\.pdf$/);
+      expect(path.basename(body.path)).not.toBe("escape.pdf");
+    });
+
+    it.each([
+      ["image/png", "image.png"],
+      ["application/pdf", "document.pdf"],
+      ["text/plain", "notes.txt"],
+      ["application/octet-stream", "data.bin"],
+    ])("accepts %s clipboard data", async (mediaType, filename) => {
+      const res = await postAttachment({
+        filename,
+        dataUrl: `data:${mediaType};base64,YQ==`,
+      });
+
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({ mediaType, bytes: 1 });
+    });
+
+    it.each([
+      [{ filename: "bad.bin", dataUrl: "not-a-data-url" }, 400],
+      [{ filename: "bad.bin", dataUrl: "data:text/plain;base64,%%%" }, 400],
+      [{ filename: "empty.bin", dataUrl: "data:text/plain;base64," }, 400],
+      [{ dataUrl: "data:text/plain;base64,YQ==" }, 400],
+    ])("rejects an invalid attachment request", async (body, status) => {
+      const res = await postAttachment(body);
+      expect(res.status).toBe(status);
+    });
+
+    it("rejects a decoded payload over 10 MiB", async () => {
+      const encoded = Buffer.alloc(10 * 1024 * 1024 + 1).toString("base64");
+      const res = await postAttachment({
+        filename: "too-large.bin",
+        dataUrl: `data:application/octet-stream;base64,${encoded}`,
+      });
+      expect(res.status).toBe(413);
+    });
+
+    it("rejects an unknown session", async () => {
+      const res = await postAttachment(
+        { filename: "note.txt", dataUrl: "data:text/plain;base64,YQ==" },
+        "missing",
+      );
+      expect(res.status).toBe(404);
+    });
+
+    it.skipIf(process.platform === "win32")(
+      "rejects an uploads symlink that escapes the session cwd",
+      async () => {
+        const outside = path.join(tmpHome, "outside");
+        await fs.mkdir(path.join(projectRoot, ".sapiom"), { recursive: true });
+        await fs.mkdir(outside, { recursive: true });
+        await fs.symlink(outside, path.join(projectRoot, ".sapiom", "uploads"));
+
+        const res = await postAttachment({
+          filename: "escape.txt",
+          dataUrl: "data:text/plain;base64,YQ==",
+        });
+
+        expect(res.status).toBe(400);
+        await expect(fs.readdir(outside)).resolves.toEqual([]);
+      },
+    );
+
+    it("rate limits a runaway attachment client", async () => {
+      for (let index = 0; index < 30; index += 1) {
+        const res = await postAttachment({
+          filename: `note-${index}.txt`,
+          dataUrl: "data:text/plain;base64,YQ==",
+        });
+        expect(res.status).toBe(200);
+      }
+      const limited = await postAttachment({
+        filename: "one-too-many.txt",
+        dataUrl: "data:text/plain;base64,YQ==",
+      });
+      expect(limited.status).toBe(429);
+    });
   });
 
   describe("POST /sessions/:id/input", () => {
@@ -489,168 +698,6 @@ describe("createRestRouter", () => {
       const body = (await res.json()) as { error: string };
       expect(body.error).toMatch(/not ready yet/i);
       expect(body.error).toMatch(/trust the folder/i);
-    });
-  });
-
-  describe("POST /sessions/:id/image", () => {
-    // 1×1 transparent PNG.
-    const PNG_BASE64 =
-      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
-    const PNG_DATA_URL = `data:image/png;base64,${PNG_BASE64}`;
-
-    function seededSession(cwd: string, harness: HarnessKind = "claude-code"): HarnessSession {
-      return {
-        id: "sess-img",
-        agentSessionId: null,
-        harness,
-        cwd,
-        title: "img",
-        status: "running",
-        createdAt: new Date().toISOString(),
-        lastActiveAt: new Date().toISOString(),
-        boundWorkflowPath: null,
-        ready: true,
-      };
-    }
-
-    it("writes the image under the session cwd and relays its path into the pty", async () => {
-      const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "harness-img-"));
-      const sessionManager = fakeSessionManager([seededSession(cwd)]);
-      start({ sessionManager });
-
-      const res = await fetch(`${baseUrl}/sessions/sess-img/image`, {
-        method: "POST",
-        headers: { ...TOKEN_HEADER, "content-type": "application/json" },
-        body: JSON.stringify({ dataUrl: PNG_DATA_URL, filename: "shot.png" }),
-      });
-
-      expect(res.status).toBe(200);
-      const body = (await res.json()) as { path: string; mediaType: string; bytes: number };
-      expect(body.mediaType).toBe("image/png");
-      expect(body.bytes).toBeGreaterThan(0);
-      expect(body.path.startsWith(path.join(cwd, ".sapiom", "uploads"))).toBe(true);
-      expect(body.path.endsWith(".png")).toBe(true);
-      // The file really exists and the path (with a trailing space) was injected
-      // into the pty without submitting, so the user can add a message.
-      await expect(fs.stat(body.path)).resolves.toBeDefined();
-      expect(sessionManager.submitInput).toHaveBeenCalledWith("sess-img", `${body.path} `, false);
-
-      await fs.rm(cwd, { recursive: true, force: true });
-    });
-
-    it("accepts an image body larger than express's 100 KiB JSON default", async () => {
-      // Regression: the JSON parser must be raised above express's 100 KiB
-      // default or any real screenshot 413s before the handler runs.
-      const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "harness-img-"));
-      const sessionManager = fakeSessionManager([seededSession(cwd)]);
-      start({ sessionManager });
-
-      const payload = Buffer.alloc(300 * 1024, 0x42); // 300 KiB decoded — well over 100 KiB
-      const dataUrl = `data:image/png;base64,${payload.toString("base64")}`;
-      const res = await fetch(`${baseUrl}/sessions/sess-img/image`, {
-        method: "POST",
-        headers: { ...TOKEN_HEADER, "content-type": "application/json" },
-        body: JSON.stringify({ dataUrl }),
-      });
-      expect(res.status).toBe(200);
-
-      await fs.rm(cwd, { recursive: true, force: true });
-    });
-
-    it("404s an unknown session", async () => {
-      start();
-      const res = await fetch(`${baseUrl}/sessions/nope/image`, {
-        method: "POST",
-        headers: { ...TOKEN_HEADER, "content-type": "application/json" },
-        body: JSON.stringify({ dataUrl: PNG_DATA_URL }),
-      });
-      expect(res.status).toBe(404);
-    });
-
-    it("400s a harness that doesn't support image input", async () => {
-      const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "harness-img-"));
-      // `pi` is a real registry id with imageInput:false — persist a session as
-      // that harness to exercise the capability gate. (fakeSessionManager's get
-      // just echoes whatever we seed, so the harness kind need not be spawnable.)
-      const session = { ...seededSession(cwd), harness: "pi" as HarnessKind };
-      const sessionManager = fakeSessionManager([session]);
-      start({ sessionManager });
-
-      const res = await fetch(`${baseUrl}/sessions/sess-img/image`, {
-        method: "POST",
-        headers: { ...TOKEN_HEADER, "content-type": "application/json" },
-        body: JSON.stringify({ dataUrl: PNG_DATA_URL }),
-      });
-      expect(res.status).toBe(400);
-      expect(sessionManager.submitInput).not.toHaveBeenCalled();
-
-      await fs.rm(cwd, { recursive: true, force: true });
-    });
-
-    it("400s an unsupported image media type", async () => {
-      const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "harness-img-"));
-      const sessionManager = fakeSessionManager([seededSession(cwd)]);
-      start({ sessionManager });
-
-      const res = await fetch(`${baseUrl}/sessions/sess-img/image`, {
-        method: "POST",
-        headers: { ...TOKEN_HEADER, "content-type": "application/json" },
-        body: JSON.stringify({ dataUrl: "data:image/svg+xml;base64,PHN2Zy8+" }),
-      });
-      expect(res.status).toBe(400);
-
-      await fs.rm(cwd, { recursive: true, force: true });
-    });
-
-    it("400s a body that isn't a base64 data URL", async () => {
-      const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "harness-img-"));
-      const sessionManager = fakeSessionManager([seededSession(cwd)]);
-      start({ sessionManager });
-
-      const res = await fetch(`${baseUrl}/sessions/sess-img/image`, {
-        method: "POST",
-        headers: { ...TOKEN_HEADER, "content-type": "application/json" },
-        body: JSON.stringify({ dataUrl: "https://example.com/cat.png" }),
-      });
-      expect(res.status).toBe(400);
-
-      await fs.rm(cwd, { recursive: true, force: true });
-    });
-
-    it("413s an image over the size limit", async () => {
-      const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "harness-img-"));
-      const sessionManager = fakeSessionManager([seededSession(cwd)]);
-      start({ sessionManager });
-
-      // A base64 payload just over MAX_IMAGE_UPLOAD_BYTES once decoded.
-      const bigBytes = Buffer.alloc(MAX_IMAGE_UPLOAD_BYTES + 16, 0x41);
-      const dataUrl = `data:image/png;base64,${bigBytes.toString("base64")}`;
-      const res = await fetch(`${baseUrl}/sessions/sess-img/image`, {
-        method: "POST",
-        headers: { ...TOKEN_HEADER, "content-type": "application/json" },
-        body: JSON.stringify({ dataUrl }),
-      });
-      expect(res.status).toBe(413);
-
-      await fs.rm(cwd, { recursive: true, force: true });
-    });
-
-    it("409s when the session isn't ready yet (SessionNotReadyError)", async () => {
-      const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "harness-img-"));
-      const sessionManager = fakeSessionManager([seededSession(cwd)]);
-      (sessionManager.submitInput as ReturnType<typeof vi.fn>).mockRejectedValue(
-        new SessionNotReadyError("sess-img"),
-      );
-      start({ sessionManager });
-
-      const res = await fetch(`${baseUrl}/sessions/sess-img/image`, {
-        method: "POST",
-        headers: { ...TOKEN_HEADER, "content-type": "application/json" },
-        body: JSON.stringify({ dataUrl: PNG_DATA_URL }),
-      });
-      expect(res.status).toBe(409);
-
-      await fs.rm(cwd, { recursive: true, force: true });
     });
   });
 
@@ -754,6 +801,9 @@ describe("createRestRouter", () => {
       );
 
       expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({
+        error: "Unknown agent path '/not/registered' — scan or connect it before binding a session to it",
+      });
       expect(sessionManager.setBoundWorkflowPath).not.toHaveBeenCalled();
       expect(writeWorkspaceContext).not.toHaveBeenCalled();
     });
@@ -1179,18 +1229,6 @@ describe("createRestRouter", () => {
         expect(typeof entry.installMcpPrompt).toBe("string");
         expect(entry.installMcpPrompt.length).toBeGreaterThan(0);
       }
-    });
-
-    it("surfaces each adapter's imageInput capability", async () => {
-      start();
-      const res = await fetch(`${baseUrl}/harnesses`);
-      const body = (await res.json()) as Array<{ id: string; imageInput: boolean }>;
-      for (const entry of body) {
-        expect(typeof entry.imageInput).toBe("boolean");
-      }
-      expect(body.find((a) => a.id === "claude-code")!.imageInput).toBe(true);
-      expect(body.find((a) => a.id === "codex")!.imageInput).toBe(true);
-      expect(body.find((a) => a.id === "conductor")!.imageInput).toBe(false);
     });
 
     it("includes both embedded and external adapters", async () => {

@@ -1,5 +1,159 @@
 # @sapiom/orchestration
 
+## 0.12.1
+
+### Patch Changes
+
+- Updated dependencies [065c9ca]
+  - @sapiom/tools@0.32.0
+
+## 0.12.0
+
+### Minor Changes
+
+- 555475d: Make `ctx.shared.set()` on the SDK's `InMemoryContextStore` an atomic
+  whole-snapshot quota gate. `runLocal` now constructs this store with step
+  context; hosts that have not adopted this store version may enforce the contract
+  only at execution boundaries during rollout. The store measures the complete
+  candidate as compact JSON UTF-8 before committing it, so oversized writes throw
+  `CTX_SHARED_SIZE_LIMIT_EXCEEDED` and retain the previous state.
+
+  Publish the bounded `CTX_SHARED_SERIALIZATION_FAILED` terminal error contract
+  for circular references, BigInt values, throwing `toJSON` methods, and other
+  `JSON.stringify` failures. Completion serializers and runners recognize the
+  new code through the closed platform-error registry and fail the step on its
+  current attempt without retrying. Ordinary JSON omission and coercion semantics
+  remain unchanged.
+
+  **Breaking:** `InMemoryContextStore.set()` can now throw synchronously for an
+  oversized or unserializable candidate. Existing local agents that wrote such
+  state now fail non-retryably on attempt 0. Migrate bulk state to durable storage
+  and keep only compact, JSON-compatible values or references in `ctx.shared`. If
+  a store is seeded with legacy invalid state, replace an offending key with a
+  value small enough to bring the complete candidate within the quota;
+  `TypedContextStore` has no `delete()` operation.
+
+## 0.11.0
+
+### Minor Changes
+
+- 9afeda9: Add a closed, versioned retry-classification contract for platform-owned step
+  errors. `CTX_SHARED_SIZE_LIMIT_EXCEEDED` and
+  `STEP_INPUT_VALIDATION_FAILED` now settle executions terminally without
+  consuming workflow retries; unknown, author, and capability errors keep the
+  legacy retry behavior.
+
+  `StepInputValidationError` now exposes a dedicated bounded wire payload with
+  stable `code`, `version`, `stepName`, and `retryable: false` fields while its
+  ordinary JSON representation continues carrying raw Zod issues for in-process
+  callers. Hosts receive a normalizing `parseNonRetryableStepErrorPayload`
+  registry plus `serializeStepCompletionError()` for completion reporters, and
+  may implement the additive atomic active-dispatch failure capability required
+  for terminal settlement. Older stores omit that capability and retain the
+  legacy retry path.
+
+## 0.10.2
+
+### Patch Changes
+
+- Updated dependencies [d7d480a]
+  - @sapiom/tools@0.31.0
+
+## 0.10.1
+
+### Patch Changes
+
+- Updated dependencies [5a8eeea]
+- Updated dependencies [5a8eeea]
+  - @sapiom/tools@0.30.0
+
+## 0.10.0
+
+### Minor Changes
+
+- af764cd: Publish the authoritative 256 KiB `ctx.shared` whole-snapshot contract from
+  `@sapiom/agent`: `CTX_SHARED_QUOTA_CONTRACT`,
+  `MAX_SHARED_SNAPSHOT_BYTES`, `measureCtxSharedSnapshotBytes`,
+  `findCtxSharedSizeViolation`, `CtxSharedSizeLimitExceededError`,
+  `ctxSharedSizeLimitExceededPayloadSchema`, and
+  `isCtxSharedSizeLimitExceededPayload`, plus the
+  `CtxSharedSizeLimitPhase`, `CtxSharedSizeViolation`,
+  `CtxSharedSizeLimitExceededPayload`, and
+  `CtxSharedSizeLimitExceededErrorOptions` types.
+
+  `@sapiom/agent-runtime` now publicly exports `stepCompletionErrorSchema`,
+  preserves compatible structured quota payloads through protocol-1 parsing, and
+  re-exports the canonical compatibility limit.
+
+  Structured quota payloads include the reporting contract `version` and retain
+  unknown non-empty future phases during mixed-version rollouts; current error
+  construction remains limited to the three published enforcement phases.
+
+  This release defines measurement and error contracts; it does not make
+  `ctx.shared.set()` an atomic size gate or add local/final host-boundary
+  enforcement by itself. Host versions must adopt the contract. Authoring skills,
+  scaffolds, and MCP guidance now document compact ID/reference usage and that
+  enforcement can vary during rollout.
+
+## 0.9.6
+
+### Patch Changes
+
+- Updated dependencies [04b7df5]
+  - @sapiom/tools@0.29.0
+
+## 0.9.5
+
+### Patch Changes
+
+- Updated dependencies [b768b18]
+- Updated dependencies [beb0f6f]
+  - @sapiom/tools@0.28.0
+
+## 0.9.4
+
+### Patch Changes
+
+- Updated dependencies [2b133e2]
+- Updated dependencies [beb3139]
+  - @sapiom/tools@0.27.0
+
+## 0.9.3
+
+### Patch Changes
+
+- Updated dependencies [cc1ac0c]
+  - @sapiom/tools@0.26.0
+
+## 0.9.2
+
+### Patch Changes
+
+- Updated dependencies [27a1079]
+  - @sapiom/tools@0.25.0
+
+## 0.9.1
+
+### Patch Changes
+
+- 9ba7b75: Fix: authored `description` (on `defineStep` and `defineAgent`) and step `capabilities` were silently dropped during manifest validation.
+
+  `agentManifestSchema` is a `z.object()`, which strips keys it doesn't declare. The previous release added `description`/`capabilities` to the TS types and to `buildManifest`'s output, but not to the runtime schema — so `agentManifestSchema.parse()` (which `@sapiom/agent-core`'s `check()` runs on every manifest) discarded them. The result: tooling that reads the validated manifest — the harness canvas — always saw empty descriptions, no matter what the source authored.
+
+  Adds `description` (step + workflow) and `capabilities` (step) to the schema as optional fields, so they survive validation and reach consumers. No behavior change for manifests that don't use them.
+
+## 0.9.0
+
+### Minor Changes
+
+- c8072cd: Make the agent input contract first-class: `defineAgent({ inputSchema })`.
+
+  `defineAgent` now accepts an optional agent-level `inputSchema` — one obvious place to declare "what this agent takes". When the entry step declares no `inputSchema` of its own, `defineAgent` folds the agent-level schema onto it, so the built manifest's entry step carries the JSON Schema (and the dashboard renders its fields) without any downstream change. Declaring a _different_ schema at both the agent level and on the entry step is now a build error with a clear message; declaring the identical schema object in both places is allowed.
+
+  The schema is typed `ZodType<TInput>`, so the `defineAgent<TInput>` generic (hence the `run(def, input)` call site) is inferred from the same runtime schema that becomes the contract — the TS annotation and the runtime validation can no longer drift apart (SAP-2226).
+
+  Existing agents that declare the schema on the entry step keep working unchanged.
+
 ## 0.8.0
 
 ### Minor Changes

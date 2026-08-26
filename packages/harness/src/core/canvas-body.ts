@@ -34,7 +34,7 @@ const NODE_KIND_LABEL: Record<CanvasNodeKind, string> = {
   pause: "pause / waits for input",
   "terminal-success": "terminal · success",
   "terminal-warn": "terminal · escalation",
-  "launched-workflow": "launches another workflow",
+  "launched-workflow": "launches another agent",
 };
 
 const NODE_KIND_ORDER: CanvasNodeKind[] = [
@@ -58,11 +58,30 @@ export function buildLegendHtml(nodeKinds: Set<CanvasNodeKind>, edgeKinds: Set<C
   );
   if (edgeKinds.has("cross")) {
     items.push(
-      `<span class="canvas-legend-item"><span class="canvas-legend-marker canvas-legend-marker--cross"></span>cross-workflow signal/handoff</span>`,
+      `<span class="canvas-legend-item"><span class="canvas-legend-marker canvas-legend-marker--cross"></span>cross-agent signal/handoff</span>`,
     );
   }
   if (items.length === 0) return "";
   return `<footer class="canvas-legend">${items.join("")}</footer>`;
+}
+
+/**
+ * The same key as `buildLegendHtml`, as data rather than markup: the app's
+ * overview panel renders it beside the graph instead of the board floating it
+ * over itself.
+ */
+export function buildLegendItems(
+  nodeKinds: Set<CanvasNodeKind>,
+  edgeKinds: Set<CanvasEdgeKind>,
+): Array<{ kind: string; label: string }> {
+  const items = NODE_KIND_ORDER.filter((k) => nodeKinds.has(k)).map((k) => ({
+    kind: k as string,
+    label: NODE_KIND_LABEL[k],
+  }));
+  if (edgeKinds.has("cross")) {
+    items.push({ kind: "cross", label: "cross-agent signal/handoff" });
+  }
+  return items;
 }
 
 /**
@@ -112,14 +131,26 @@ function buildGraphPayload(graph: CanvasGraph, enrichment?: CanvasEnrichment | n
 
 /** The workflow-level overview the Canvas tab's bottom panel shows: a
  *  deterministic stats line ("N steps · M exits · <entry> entry"), the shape
- *  summary as the description, and the graph's validation notes. Embedded as a
- *  JSON data block (read by bootCanvasOverview), the same pattern as the step
- *  graph — everything here is derived from the graph, no LLM. */
-function buildOverviewPayload(graph: CanvasGraph, enrichment?: CanvasEnrichment | null): string {
+ *  summary as the description, the graph's validation notes, and the chrome
+ *  the board used to float over itself — the status badges and the node-kind
+ *  key. Embedded as a JSON data block (read by bootCanvasOverview), the same
+ *  pattern as the step graph — everything here is derived from the graph, no
+ *  LLM. */
+function buildOverviewPayload(
+  graph: CanvasGraph,
+  badges: string[],
+  legend: Array<{ kind: string; label: string }>,
+  enrichment?: CanvasEnrichment | null,
+): string {
   const exits = graph.nodes.filter(
     (n) => n.kind === "terminal-success" || n.kind === "terminal-warn",
   ).length;
-  const steps = graph.nodes.length - exits;
+  const steps = graph.nodes.filter(
+    (n) =>
+      n.kind !== "terminal-success" &&
+      n.kind !== "terminal-warn" &&
+      n.kind !== "launched-workflow",
+  ).length;
   const entryLabel = graph.nodes.find((n) => n.id === graph.entry)?.label ?? graph.entry;
   const parts = [`${steps} ${steps === 1 ? "step" : "steps"}`];
   if (exits > 0) parts.push(`${exits} ${exits === 1 ? "exit" : "exits"}`);
@@ -130,6 +161,8 @@ function buildOverviewPayload(graph: CanvasGraph, enrichment?: CanvasEnrichment 
     description: graph.description ?? "",
     stats: parts.join(" · "),
     notes: enrichment?.notes ?? [],
+    badges,
+    legend,
   };
   // JSON in a <script> block: neutralize any "</script>"/"<" in derived text.
   return JSON.stringify(overview).replace(/</g, "\\u003c");
@@ -144,24 +177,22 @@ export function buildWorkflowPanelHtml(
   meta: WorkflowPanelMeta,
   enrichment?: CanvasEnrichment | null,
 ): string {
-  const badges = (meta.badges ?? [])
-    .map((b) => `<span class="canvas-badge">${esc(b)}</span>`)
-    .join("");
-  const warningBadge =
-    graph.warnings.length > 0
-      ? `<span class="canvas-badge">${graph.warnings.length} warning${graph.warnings.length === 1 ? "" : "s"}</span>`
-      : "";
+  const badgeLabels = [...(meta.badges ?? [])];
+  if (graph.warnings.length > 0) {
+    badgeLabels.push(`${graph.warnings.length} warning${graph.warnings.length === 1 ? "" : "s"}`);
+  }
+  const badges = badgeLabels.map((b) => `<span class="canvas-badge">${esc(b)}</span>`).join("");
   const summary = enrichment?.summary ? `\n    <p class="canvas-subtitle">${esc(enrichment.summary)}</p>` : "";
   const used = usedKinds(graph);
   const legend = buildLegendHtml(used.nodeKinds, used.edgeKinds);
   const legendHtml = legend ? `\n  ${legend}` : "";
   const graphData = buildGraphPayload(graph, enrichment);
-  const overviewData = buildOverviewPayload(graph, enrichment);
+  const overviewData = buildOverviewPayload(graph, badgeLabels, buildLegendItems(used.nodeKinds, used.edgeKinds), enrichment);
   return `<section class="canvas-panel">
   <header class="canvas-header">
     <div class="canvas-title-row">
       <h1 class="canvas-title">${esc(meta.title)}</h1>
-      ${badges}${warningBadge}
+      ${badges}
     </div>${summary}
   </header>
   <div class="canvas-diagram-panel">
@@ -176,6 +207,7 @@ ${renderGraphSvg(graph, enrichment)}
  *  a crash, never a silent fallback to the LLM path, just an honest reason
  *  styled through the same shell. */
 export function buildErrorPanelHtml(title: string, reason: string): string {
+  const errorData = JSON.stringify({ title, reason }).replace(/</g, "\\u003c");
   return `<section class="canvas-panel">
   <header class="canvas-header">
     <div class="canvas-title-row">
@@ -184,7 +216,29 @@ export function buildErrorPanelHtml(title: string, reason: string): string {
     </div>
   </header>
   <div class="canvas-diagram-panel">
-    <p class="canvas-empty-note">Could not extract this workflow's step graph: ${esc(reason)}. Ask your agent to fix the issue (see the terminal for details) — this pane updates automatically once it builds cleanly.</p>
+    <p class="canvas-empty-note">Could not extract this agent's step graph: ${esc(reason)}. Use the workbench actions to ask your coding agent to fix it or retry the deterministic render.</p>
+  </div>
+  <script type="application/json" id="sapiom-render-error">${errorData}</script>
+</section>`;
+}
+
+/** A calm, transient panel for a workflow whose dependencies aren't installed
+ *  yet (a freshly scaffolded project between `scaffold` and `npm install`).
+ *  Extraction WOULD fail here with esbuild "Could not resolve …" noise, so we
+ *  don't run it — we show this instead and let the install watcher re-render
+ *  once `node_modules` lands. Crucially it emits NO `#sapiom-render-error`
+ *  script, so the SPA shows no "render failed" card / Retry buttons: this is a
+ *  normal setup state, not an error the user has to act on. */
+export function buildPreparingPanelHtml(title: string): string {
+  return `<section class="canvas-panel">
+  <header class="canvas-header">
+    <div class="canvas-title-row">
+      <h1 class="canvas-title">${esc(title)}</h1>
+      <span class="canvas-badge">preparing</span>
+    </div>
+  </header>
+  <div class="canvas-diagram-panel">
+    <p class="canvas-empty-note">Preparing your agent — installing dependencies. The step graph appears here automatically once setup finishes.</p>
   </div>
 </section>`;
 }

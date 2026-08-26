@@ -28,11 +28,15 @@ test.describe("command palette sections and highlighting", () => {
     const list = page.getByTestId("command-palette-list");
     await expect(list).toBeVisible();
 
-    // Fixed section order: Sessions, then Past sessions, Workflows, Folders.
+    // Fixed section order: Sessions, then Past sessions, Agents, Folders.
     const sections = page.getByTestId("command-palette-section");
     await expect(sections.first()).toHaveText("Sessions");
     await expect(sections.filter({ hasText: "Past sessions" })).toHaveCount(1);
-    await expect(sections.filter({ hasText: "Workflows" })).toHaveCount(1);
+    await expect(sections.filter({ hasText: "Agents" })).toHaveCount(1);
+    await expect(page.getByTestId("command-palette-input")).toHaveAttribute(
+      "placeholder",
+      "Jump to a session, agent, or path…",
+    );
 
     // The exited fixture session is reachable from the palette now.
     await expect(list).toContainText("Build the leasing pipeline");
@@ -60,128 +64,25 @@ test.describe("command palette sections and highlighting", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Add dialog: scaffold, scan, registry picker, MCP prompts
+// Add existing agents dialog: detection + bulk scan
 // ---------------------------------------------------------------------------
 
-test.describe("add workspace (three doors)", () => {
-  test("a non-existent folder offers the scaffold action, which starts a session and prompts the agent", async ({
-    page,
-  }) => {
-    await page.getByTestId("add-workspace").click();
-    await page.getByTestId("aw-door-have").click();
-    const modal = page.locator(".modal-add-workspace");
-    await expect(modal).toBeVisible();
-
-    await modal.getByTestId("dir-picker-input").fill("/Users/demo/brand-new-agent");
-    await modal.getByTestId("aw-have-continue").click();
-
-    // A folder that doesn't exist can't be registered — only created.
-    await expect(modal.getByTestId("aw-result")).toContainText("doesn't exist yet");
-    await expect(modal.getByTestId("aw-add")).toHaveCount(0);
-    await expect(modal.getByTestId("aw-add-anyway")).toHaveCount(0);
-
-    await modal.getByTestId("aw-scaffold-here").click();
-    await expect(modal).toBeHidden();
-
-    // The new session is live and the scaffold prompt reached its pty.
-    await expect(page.getByTestId("session-context-title")).toContainText("brand-new-agent");
-    await page.waitForFunction(() => {
-      const test = (window as unknown as { __HARNESS_TEST__?: { lastInjectInput?: { req: { text: string } } } })
-        .__HARNESS_TEST__;
-      return test?.lastInjectInput?.req.text.includes("sapiom agents init") ?? false;
-    });
-  });
-
+test.describe("add existing agents (detection-driven)", () => {
   test("a root holding several projects offers to add them all, and toasts the count", async ({ page }) => {
-    await page.getByTestId("add-workspace").click();
-    await page.getByTestId("aw-door-have").click();
-    const modal = page.locator(".modal-add-workspace");
+    await page.getByTestId("add-existing-agents").click();
+    const modal = page.locator(".modal-start");
     await modal.getByTestId("dir-picker-input").fill("/Users/demo");
-    await modal.getByTestId("aw-have-continue").click();
 
-    // Bulk discovery is no longer a permanent button: it is what the dialog
-    // OFFERS once the picked folder turns out to contain projects. Two of the
-    // three fixture workflows sit directly under /Users/demo (the third is
-    // nested in acme-app), so that is what detection reports here.
+    // Bulk discovery is what the dialog OFFERS once the picked folder turns out
+    // to contain projects. Two of the three fixture workflows sit directly under
+    // /Users/demo (the third is nested in acme-app), so that is what detection
+    // reports here.
     await expect(modal.getByTestId("aw-add-all")).toContainText("Add all 2");
     await modal.getByTestId("aw-add-all").click();
     await expect(modal).toBeHidden();
     // The scan itself is recursive, so it finds all three.
     await expect(page.locator(".toast")).toContainText("Found 3 agent projects.");
   });
-
-  test("the MCP setup prompt is copyable and fires mcp.install", async ({ page, context }) => {
-    await context.grantPermissions(["clipboard-read", "clipboard-write"]);
-    await page.getByTestId("add-workspace").click();
-    // Contextual now, not permanent: the offer exists only where it applies —
-    // a folder that exists and has no Sapiom wiring.
-    await page.getByTestId("aw-door-have").click();
-    const modal = page.locator(".modal-add-workspace");
-    await modal.getByTestId("dir-picker-input").fill("/Users/demo/scratch");
-    await modal.getByTestId("aw-have-continue").click();
-
-    const block = page.getByTestId("mcp-install");
-    await expect(block).toBeVisible();
-
-    const copyClaude = page.getByTestId("mcp-install-copy-claude-code");
-    await copyClaude.click();
-    await expect(copyClaude).toHaveText("Copied");
-
-    const clip = await page.evaluate(() => navigator.clipboard.readText());
-    expect(clip).toContain("claude mcp add sapiom");
-
-    // The analytics event rode POST /api/track (intercepted in mock mode).
-    const events = await page.evaluate(
-      () =>
-        (window as unknown as { __HARNESS_TEST__?: { trackEvents?: { event: string }[] } }).__HARNESS_TEST__
-          ?.trackEvents ?? [],
-    );
-    expect(events.some((e) => e.event === "mcp.install")).toBe(true);
-  });
-
-  test("the harness picker renders from the adapter registry", async ({ page }) => {
-    await page.getByTestId("add-workspace").click();
-    await page.getByTestId("new-session-btn").click();
-    const trigger = page.getByTestId("harness-select");
-    await expect(trigger).toBeVisible();
-    await expect(trigger).toContainText("Claude Code");
-
-    // The mock registry mirrors the upstream adapter list: five entries in
-    // registry order, claude-code first.
-    await trigger.click();
-    const menu = page.getByTestId("harness-select-menu");
-    const rows = menu.getByRole("menuitemradio");
-    await expect(rows).toHaveCount(5);
-    await expect(rows.first()).toContainText("Claude Code");
-
-    // The active row carries its leading check and no suffix text; adapters
-    // the Studio can't launch render disabled with the reason on hover.
-    await expect(menu.getByTestId("harness-option-claude-code")).toHaveAttribute("aria-checked", "true");
-    await expect(menu.getByTestId("harness-option-pi")).toHaveAttribute("aria-disabled", "true");
-    await expect(menu.getByTestId("harness-option-conductor")).toHaveAttribute("aria-disabled", "true");
-    // A disabled row never takes the pick (force: Playwright itself refuses
-    // aria-disabled targets — the click still lands on the DOM).
-    await menu.getByTestId("harness-option-conductor").click({ force: true });
-    await expect(menu.getByTestId("harness-option-conductor")).toHaveAttribute("aria-checked", "false");
-
-    // Picking the other spawnable adapter closes the menu and updates the trigger.
-    await menu.getByTestId("harness-option-codex").click();
-    await expect(menu).toHaveCount(0);
-    await expect(trigger).toContainText("Codex");
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Recent-path chips
-// ---------------------------------------------------------------------------
-
-test("recent-path chips middle-truncate long paths and keep the full path in the tooltip", async ({ page }) => {
-  await page.getByTestId("add-workspace").click();
-  await page.getByTestId("new-session-btn").click();
-
-  const chip = page.locator(".recent-dir-chip").first();
-  await expect(chip).toHaveText("/Users/…/acme-app");
-  await expect(chip).toHaveAttribute("title", "/Users/demo/acme-app");
 });
 
 // ---------------------------------------------------------------------------
@@ -190,32 +91,48 @@ test("recent-path chips middle-truncate long paths and keep the full path in the
 
 test("the dead-session pane shows the record's real metadata and the canvas invites a resume", async ({ page }) => {
   await page.getByTestId("history-trigger").click();
+  // Past sessions live in a flyout sub-card that opens on hover of its row.
+  await page.getByTestId("past-sessions-trigger").hover();
+  await expect(page.getByTestId("past-sessions-card")).toBeVisible();
   await page.getByTestId("exited-session-sess-leasing").click();
 
   const detail = page.getByTestId("dead-session-detail");
   await expect(detail).toBeVisible();
-  await expect(detail).toContainText("Agent");
+  await expect(detail).toContainText("Coding agent");
   await expect(detail).toContainText("Claude Code");
   await expect(detail).toContainText("Ended");
 
   // The right pane stops inviting a Visualize that cannot run.
   await expect(page.getByTestId("canvas-empty-exited")).toContainText("Session ended");
+  await expect(page.getByTestId("canvas-empty-exited")).toContainText(
+    "Resume the session to see the agent's diagram here.",
+  );
   await expect(page.getByTestId("canvas-visualize-cta")).toHaveCount(0);
+
+  await page.getByTestId("right-tab-steps").click();
+  await expect(page.getByTestId("canvas-empty-exited")).toContainText(
+    "Resume the session to see the agent's steps here.",
+  );
 });
 
 // ---------------------------------------------------------------------------
-// Overview mode canvas
+// Overview modal
 // ---------------------------------------------------------------------------
 
-test("overview mode shows the fresh-install canvas state, not the previous session's empty state", async ({
-  page,
-}) => {
+test("the Overview opens over the workbench and dismisses on click-out", async ({ page }) => {
   await page.getByTestId("brand-identity").click();
   await page.getByTestId("rail-overview").click();
-  await expect(page.getByTestId("welcome-panel")).toBeVisible();
+  const overview = page.getByTestId("overview-modal");
+  await expect(overview).toBeVisible();
 
-  await expect(page.locator(".canvas-empty")).toContainText("Start a session to see its canvas here.");
-  await expect(page.getByTestId("canvas-visualize-cta")).toHaveCount(0);
+  // A modal over the app, not a destination replacing it: the workbench stays
+  // mounted behind the scrim, so closing costs the session nothing.
+  await expect(page.locator(".right-pane")).toBeVisible();
+
+  // Clicking the scrim (outside the card) closes it, like every other modal.
+  await overview.click({ position: { x: 5, y: 5 } });
+  await expect(overview).toHaveCount(0);
+  await expect(page.getByTestId("session-context")).toHaveAttribute("data-session-id", "sess-boot");
 });
 
 // ---------------------------------------------------------------------------
@@ -226,8 +143,7 @@ test("the directory picker's read failure carries its own Retry", async ({ page 
   await page.goto("/?mockError=listDir");
   await expect(page.locator(".rail-workflows")).toBeVisible();
 
-  await page.getByTestId("add-workspace").click();
-  await page.getByTestId("new-session-btn").click();
+  await page.getByTestId("add-existing-agents").click();
 
   const err = page.getByTestId("dir-picker-error");
   await expect(err).toBeVisible();

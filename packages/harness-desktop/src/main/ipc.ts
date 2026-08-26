@@ -55,13 +55,129 @@ export const APP_VERSION_ARG = "--sapiom-app-version=";
 
 /** SPA → main (invoke): check for an update now. Returns `UpdateCheckOutcome`. */
 export const UPDATE_CHECK = "update:check";
-/*
- * There is deliberately NO "apply the update" channel. The restart is destructive —
- * it ends every running agent session — and the page that would call it is the same
- * origin as the agent-authored files the harness serves at `/canvas/:sessionId/*`.
- * Rather than exposing that and guarding it, the confirmation lives in a native
- * dialog the main process raises: page content cannot reach it at all.
+
+/**
+ * SPA → main (invoke): open the OS-native "choose folder" dialog. Resolves with
+ * the chosen absolute path, or `null` when the user cancels.
+ *
+ * Desktop-only, like everything here: the same SPA served by `npx @sapiom/harness`
+ * has no bridge, so the folder field keeps its in-app directory listing there. The
+ * native picker is strictly a shortcut the SPA feature-detects, never a dependency.
+ *
+ * Guarded by the same `isTrustedSender` check as `UPDATE_CHECK` — a filesystem
+ * chooser triggered by same-origin agent-authored content (served at
+ * `/canvas/:sessionId/*`) would be an escalation, so only the SPA at the top frame
+ * `/` may open it.
  */
+export const CHOOSE_DIRECTORY = "dialog:choose-directory";
+
+/**
+ * main → renderer (push): a `sapiom://` deep link was received; navigate the SPA
+ * to the target (an agent or a template). A main→renderer SEND, not an invoke, so
+ * it is NOT subject to `isTrustedSender` (which guards renderer→main invokes) — it
+ * opens no attack surface, it only pushes a target the SPA is free to act on or ignore.
+ *
+ * Cold-start links (the one that launched the app) are delivered instead as an
+ * `agent=` query param on the load URL, so the first render already has them with
+ * no IPC race; this channel carries links that arrive while the app is running.
+ */
+export const DEEP_LINK_NAVIGATE = "deep-link:navigate";
+
+/**
+ * A parsed `sapiom://` deep link. Discriminated on `kind` so a new target type
+ * can't be silently handled as an agent — the same reasoning the discriminated
+ * `UpdateCheckOutcome` above is built on. Mirrored on the SPA side in
+ * `harness/web/src/lib/desktop.ts`.
+ */
+export type DeepLinkTarget = DeepLinkAgentTarget | DeepLinkTemplateTarget;
+
+/**
+ * `sapiom://agent/<definitionId>`. `definitionId` is the raw URL segment (a
+ * string); the SPA stringifies its numeric `WorkflowInfo.definitionId` to match.
+ * `slug` is a display-only hint; `org` lets the SPA notice a link minted for a
+ * different signed-in organization.
+ */
+export interface DeepLinkAgentTarget {
+  kind: "agent";
+  definitionId: string;
+  slug?: string;
+  org?: string;
+}
+
+/**
+ * `sapiom://templates/<id>` — the web app's template-detail "Open in Studio".
+ * `templateId` is a registry slug (the same id the gallery route uses); `slug` is
+ * an optional display/folder hint.
+ */
+export interface DeepLinkTemplateTarget {
+  kind: "template";
+  templateId: string;
+  slug?: string;
+}
+/*
+ * There is deliberately NO "apply the update" channel reachable from the MAIN
+ * window. The restart is destructive — it ends every running agent session — and
+ * the main window shares its origin with the agent-authored files the harness
+ * serves at `/canvas/:sessionId/*`, so any channel it could reach would be
+ * reachable by that content too.
+ *
+ * The apply confirmation therefore lives in a separate, main-process-owned window
+ * (see `update-window.ts`) that loads ONLY our bundled `update.html` — never remote
+ * or agent content — carries its own dedicated preload (none of `sapiomDesktop`),
+ * and answers on the two channels below. Both are gated on the sender BEING that
+ * exact window's `webContents`, and are registered only while it is open, so no
+ * other renderer — not the SPA, not a canvas/preview window — can reach them. The
+ * invariant is intact: page content still cannot trigger a restart.
+ */
+
+/** The user's choice in the update window. `later` also covers closing the window. */
+export type UpdateChoice = "restart" | "later" | "skip";
+
+/**
+ * update window → main (invoke): the user picked an action, resolving the
+ * `showUpdatePrompt` promise. Sender-gated to the update window (see above), NOT
+ * via `isTrustedSender` — that guard is specific to the main window's SPA.
+ */
+export const UPDATE_DECIDE = "update:decide";
+
+/**
+ * update window → main (invoke): the "Automatically download and install updates"
+ * toggle changed. Persisted (`update-prefs.ts`) and applied live to
+ * `autoUpdater.autoInstallOnAppQuit`. Separate from UPDATE_DECIDE so flipping the
+ * toggle and THEN closing the window still keeps the change. Same sender gate.
+ */
+export const UPDATE_SET_AUTO = "update:set-auto";
+
+/**
+ * argv prefixes carrying the update window's initial state into its preload — the
+ * offered version, and the auto-update toggle state ("1"/"0"). Same documented
+ * `additionalArguments` mechanism as APP_VERSION_ARG (a `process.env` read would
+ * depend on a renderer inheriting a var mutated after startup).
+ */
+export const UPDATE_VERSION_ARG = "--sapiom-update-version=";
+export const UPDATE_AUTO_ARG = "--sapiom-update-auto=";
+
+/**
+ * main → renderer (push): the downloaded-update state changed, or a freshly
+ * loaded page is being told the current state. Carries `UpdateStatePayload`.
+ *
+ * Like DEEP_LINK_NAVIGATE, a SEND rather than an invoke — it opens no attack
+ * surface; it only tells the SPA whether its "Update now" card should exist.
+ * The card's CLICK goes through the existing UPDATE_CHECK invoke, whose
+ * pending branch re-raises the main-process-owned update window above — so
+ * the no-apply-channel rule is untouched: page code still cannot end a session.
+ *
+ * Re-sent on every `did-finish-load` because renderer state dies on reload but
+ * the main process's `pending` does not — without the re-send, a reloaded SPA
+ * would silently lose the card until the next download event.
+ */
+export const UPDATE_STATE = "update:state";
+
+/** What the SPA needs to render (or retract) its "Update now" card. `none`
+ *  retracts it — e.g. an apply failed and the pending update was cleared. */
+export type UpdateStatePayload =
+  | { kind: "none" }
+  | { kind: "downloaded"; version: string };
 
 /**
  * The result of an on-demand check.

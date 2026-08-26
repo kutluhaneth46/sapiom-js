@@ -506,6 +506,37 @@ jobs:
           fi
           echo "All three channel manifests present for \"$channel\"."
 
+      # A present manifest is not a working one. electron-updater resolves every
+      # `url:` in the manifest against the release assets, so a manifest naming a
+      # file that isn't attached 404s on every client — exactly what a
+      # `${productName} Setup ${version}` (spaced) NSIS name did: builder wrote a
+      # hyphenated url, GitHub stored a dotted asset, and Windows updates broke
+      # silently for four releases. The name-match holds pre-upload because our
+      # artifact names are space-free (see electron-builder.yml nsis.artifactName)
+      # — so on-disk == manifest url == the name GitHub will keep.
+      - name: Verify each manifest's referenced assets are attached
+        run: |
+          set -euo pipefail
+          cd dist-artifacts
+          shopt -s nullglob globstar
+          fail=0
+          for manifest in **/latest*.yml **/beta*.yml; do
+            # `url:` lines list the installer(s); dedupe since `path:` repeats one.
+            refs="$(grep -oE 'url:[[:space:]]*[^[:space:]]+' "$manifest" | awk '{print $2}' | sort -u)"
+            while IFS= read -r ref; do
+              [ -n "$ref" ] || continue
+              if [ -z "$(find . -name "$ref" -print -quit)" ]; then
+                echo "::error::$manifest references \"$ref\" but no such asset is attached — installed apps will 404 on update."
+                fail=1
+              fi
+            done < <(printf '%s\n' "$refs")
+          done
+          if [ "$fail" -ne 0 ]; then
+            echo "Attached assets:"; find . -type f -printf '  %f\n' | sort -u
+            exit 1
+          fi
+          echo "Every manifest-referenced asset is attached."
+
       # Make the channels a hierarchy rather than two dead ends.
       #
       # A beta install reads `beta.yml`. Final releases only publish `latest*.yml`,
@@ -554,9 +585,8 @@ jobs:
           body: |
             ${{ needs.prepare.outputs.channel == 'beta' && '> **Pre-release, for testers.** Only installs already following the beta channel are offered this build.' || '' }}
 
-            Sapiom runs your coding agent in a workspace that's already set up: Sapiom tools
-            connected, workflows tracked, one-click deploy and run, and a live canvas for previews.
-            Download it, sign in, pick a folder, and start working — there's nothing to install first.
+            Sapiom runs your coding agent in an Agent project with Sapiom tools connected, agents
+            tracked, one-click deploy and run, and a live Canvas for previews.
 
             ## Download
 
@@ -582,16 +612,19 @@ jobs:
             **Linux** — make the AppImage executable (`chmod +x Sapiom-Linux-x86_64.AppImage`) and
             run it, or install the `.deb` with `sudo apt install ./Sapiom-Linux-amd64.deb`.
 
-            On first launch Sapiom sets itself up: it installs the coding agent if you don't have
-            one, opens your browser once to sign in, and asks which folder to work in.
+            On first launch Sapiom checks for Claude Code or Codex. If neither is available, it
+            tries to install Claude Code and shows manual setup steps if that fails. It reuses a
+            cached Sapiom sign-in when present; otherwise it opens your browser to sign in, then
+            prepares a workspace folder for you.
 
             ## Updates are automatic
 
             Sapiom checks for new versions on its own and downloads them in the background. When one
             is ready it asks whether you'd like to restart — **restarting ends any agent sessions
-            you have running**, so it never does it without asking. You can also check whenever you
-            like: click your account name at the bottom of the left sidebar and choose
-            **Check for updates**.
+            you have running**, so it never does it without asking. If you choose Later, an
+            **Update now** card stays at the bottom of the left sidebar so you can restart when it
+            suits you. You can also check whenever you like: click your account name at the bottom
+            of the left sidebar and choose **Check for updates**.
 
             > Automatic updates began in **0.1.2**. If you're on an older build, install this one by
             > hand once — after that it keeps itself current.

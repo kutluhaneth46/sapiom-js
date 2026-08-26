@@ -1,8 +1,9 @@
 /**
  * Agent authoring tools. Thin wrappers over @sapiom/agent-core.
- * Local tools (scaffold / check / run_local) need no network; networked tools
- * (link / deploy / run / inspect / signal) build a client from the cached
- * credential and the environment's API host.
+ * Local tools (scaffold / check / run_local) need no Sapiom account or real
+ * capability calls; scaffold may query npm for current dependency versions.
+ * Networked tools (link / deploy / run / inspect / signal) build a client from
+ * the cached credential and the environment's API host.
  *
  * Results are returned as JSON text so the calling agent can parse them. In
  * particular, `run_local` returns a per-step trace plus `unusedStubs` /
@@ -17,10 +18,8 @@ import {
   cancelSchedule,
   check,
   clone,
-  createClient,
   createSchedule,
   deploy,
-  GatewayClient,
   getSchedule,
   inspect,
   inspectBuild,
@@ -42,76 +41,15 @@ import {
   type SchedulePolicy,
   type StubFile,
 } from "@sapiom/agent-core";
-import { readCredentials, type ResolvedEnvironment } from "../credentials.js";
+import { type ResolvedEnvironment } from "../credentials.js";
 import { registerTool } from "../register-tool.js";
-
-type ToolResult = {
-  content: Array<{ type: "text"; text: string }>;
-  isError?: boolean;
-};
-
-function ok(data: unknown): ToolResult {
-  let text: string;
-  try {
-    text = JSON.stringify(data, null, 2);
-  } catch (err) {
-    // A value in the result resisted serialization. Don't drop the whole
-    // payload (e.g. a run_local trace) on the floor — emit a sanitized version
-    // that keeps everything serializable and marks the node that failed, so the
-    // result stays actionable instead of surfacing as an opaque crash.
-    text = JSON.stringify(
-      {
-        _serializationError: err instanceof Error ? err.message : String(err),
-        data: sanitize(data),
-      },
-      null,
-      2,
-    );
-  }
-  return { content: [{ type: "text" as const, text }] };
-}
-
-/** Best-effort deep copy that replaces any node which throws on access or
- *  serialization with a marker, so a single bad value can't sink the response. */
-function sanitize(value: unknown, seen = new WeakSet<object>()): unknown {
-  if (value === null || typeof value !== "object") return value;
-  if (seen.has(value)) return "[Circular]";
-  seen.add(value);
-  try {
-    if (Array.isArray(value)) return value.map((v) => sanitize(v, seen));
-    const out: Record<string, unknown> = {};
-    for (const key of Object.keys(value as Record<string, unknown>)) {
-      try {
-        out[key] = sanitize((value as Record<string, unknown>)[key], seen);
-      } catch (err) {
-        out[key] =
-          `[unserializable: ${err instanceof Error ? err.message : String(err)}]`;
-      }
-    }
-    return out;
-  } catch (err) {
-    return `[unserializable: ${err instanceof Error ? err.message : String(err)}]`;
-  }
-}
-
-function fail(err: unknown): ToolResult {
-  const structured =
-    err instanceof AgentOperationError
-      ? err.toStructured()
-      : {
-          code: "UNEXPECTED",
-          message: err instanceof Error ? err.message : String(err),
-        };
-  return {
-    content: [
-      {
-        type: "text" as const,
-        text: JSON.stringify({ error: structured }, null, 2),
-      },
-    ],
-    isError: true,
-  };
-}
+import {
+  INCLUDABLE_FIELDS,
+  projectExecutionForTool,
+  type ProjectExecutionOptions,
+} from "./execution-projection.js";
+import { fail, gatewayClient, NOT_AUTHED, ok } from "./shared.js";
+import { webappRunUrl } from "./webapp-url.js";
 
 /**
  * Coerce a tool argument that may arrive as a JSON string (some MCP clients
@@ -139,22 +77,6 @@ function coreTemplatesDir(): string {
   return path.resolve(path.dirname(entry), "..", "..", "templates");
 }
 
-async function gatewayClient(
-  env: ResolvedEnvironment,
-): Promise<GatewayClient | null> {
-  const creds = await readCredentials(env.name);
-  if (!creds) return null;
-  return createClient({ apiKey: creds.apiKey, host: env.apiURL });
-}
-
-const NOT_AUTHED = fail(
-  new AgentOperationError({
-    code: "NOT_AUTHENTICATED",
-    message: "Not authenticated.",
-    hint: "Use the sapiom_authenticate tool first.",
-  }),
-);
-
 /**
  * Agent-facing one-liner about a schedule's health: surfaces recent fire failures (with the
  * executionId to inspect) or the next fire time, so the agent knows the next action without
@@ -169,25 +91,26 @@ function scheduleHint(schedule: ScheduleDetail): string | undefined {
       : "";
     return `${failed.length} of the last ${schedule.recentFires.length} fires failed${where}.`;
   }
-  if (schedule.status === "active" && schedule.nextFireAt) return `Active — next fire at ${schedule.nextFireAt}.`;
+  if (schedule.status === "active" && schedule.nextFireAt)
+    return `Active — next fire at ${schedule.nextFireAt}.`;
   if (schedule.status === "completed") return "Completed — no further fires.";
   if (schedule.status === "disabled") return "Cancelled — no further fires.";
   return undefined;
 }
 
 export function register(server: McpServer, env: ResolvedEnvironment): void {
-  // ── Local tools (no network) ──────────────────────────────────────────────
+  // ── Local authoring tools (no account or capability spend) ───────────────────
 
   registerTool(
     server,
     "sapiom_dev_agents_scaffold",
-    "Scaffold a new Sapiom agent project into <dir>. Produces an npm-install-ready TypeScript project with a starter agent in index.ts. After scaffolding, the author writes step definitions and uses sapiom_dev_agents_run_local to test them.",
+    "Scaffold a new Sapiom agent project into <dir>. Produces a TypeScript project with a starter agent in index.ts and its dependencies installed (best-effort; if the install was skipped offline, run `npm install` in <dir>). After scaffolding, the author writes step definitions and uses sapiom_dev_agents_run_local to test them.",
     {
       dir: z
         .string()
         .min(1)
         .describe(
-          "Target directory for the new project (created if absent; must be empty).",
+          "Target directory for the new project (created if absent; must otherwise be empty, except for Agent Studio's private .sapiom directory).",
         ),
       template: z
         .string()
@@ -203,6 +126,13 @@ export function register(server: McpServer, env: ResolvedEnvironment): void {
             targetDir: dir,
             template,
             templatesDir: coreTemplatesDir(),
+            // Install deps up front so the Studio Canvas can bundle the new
+            // project on its first (unprompted) render — its extraction resolves
+            // @sapiom/agent, zod, … from the project's own node_modules, so a
+            // never-installed project would otherwise open with a
+            // "Could not resolve …" render error. Best-effort: a failed install
+            // still returns a successful scaffold.
+            installDependencies: true,
           }),
         );
       } catch (err) {
@@ -214,7 +144,7 @@ export function register(server: McpServer, env: ResolvedEnvironment): void {
   registerTool(
     server,
     "sapiom_dev_agents_check",
-    "Validate an agent locally: bundle index.ts, derive the manifest, and check the step graph. Offline and instant. Returns the agent name, step count, the manifest (which contains the full step graph for visualization), and any graph warnings.",
+    "Validate an agent locally: typecheck, bundle and import index.ts, derive the manifest, and check the step graph. Needs no Sapiom account or service call; author-written top-level side effects still run when the definition is imported. Returns the agent name, step count, the manifest (which contains the full step graph for visualization), and any graph warnings.",
     {
       dir: z
         .string()
@@ -236,10 +166,10 @@ export function register(server: McpServer, env: ResolvedEnvironment): void {
     server,
     "sapiom_dev_agents_run_local",
     [
-      "Execute an agent entirely on the local machine, running the author's actual step code with every ctx.sapiom.* capability call resolved from stubs (no real capability calls, no cost, instant).",
-      "Returns { outcome, output, steps[], unusedStubs[], stubWarnings[] }. outcome is 'completed' | 'failed' | 'paused' | 'running'. A paused dispatch (e.g. agent.coding.launch) is auto-resumed locally with its stub result, so the happy path runs end-to-end.",
+      "Execute an agent on the local machine, running the author's actual step code with every ctx.sapiom.* capability call resolved from stubs (no Sapiom account, capability request, or capability spend). Author code is ordinary local code: its own filesystem, process, environment, and network effects remain real.",
+      "Returns { outcome, output, steps[], unusedStubs[], stubWarnings[] }. outcome is 'completed' | 'failed' | 'paused' | 'running'. A paused dispatch (e.g. models.coding.launch) is auto-resumed locally with its stub result, so the happy path runs end-to-end.",
       "Returns `unusedStubs` (supplied stub keys that matched no call — a typo or wrong path form) and `stubWarnings` (a stub key matched but its value was the wrong shape for the capability). Check both: a green run with a non-empty unusedStubs/stubWarnings usually means your stub didn't take effect.",
-      "Stub shape: { version: 1, steps: { <stepName>: { <methodPath>: <response> } } }. The response is the value that call returns verbatim — e.g. `repositories.list` takes the array list() should return ([{ slug, cloneUrl }]), not a wrapped/sequence form. For a dispatched run, stub `agent.coding.run` (or `agent.coding.launch`) in the step that launches it; that value becomes both the run result and the payload the paused step resumes with — set status:'failed' there to exercise the failure branch.",
+      "Stub shape: { version: 1, steps: { <stepName>: { <methodPath>: <response> } } }. The response is the value that call returns verbatim — e.g. `repositories.list` takes the array list() should return ([{ slug, cloneUrl }]), not a wrapped/sequence form. For a dispatched run, stub `models.coding.run` (or `models.coding.launch`) in the step that launches it; that value becomes both the run result and the payload the paused step resumes with — set status:'failed' there to exercise the failure branch.",
     ].join("\n"),
     {
       dir: z
@@ -251,12 +181,12 @@ export function register(server: McpServer, env: ResolvedEnvironment): void {
       input: z
         .unknown()
         .optional()
-        .describe("The workflow's entry-step input (any JSON value)."),
+        .describe("The agent's entry-step input (any JSON value)."),
       stubs: z
         .unknown()
         .optional()
         .describe(
-          "Stub file object: { version, steps: { <step>: { <method.path>: <response> | [<response>] } } }.",
+          "Stub file object: { version, steps: { <step>: { <method.path>: <response> } } }. Each response is returned verbatim; an array is the actual response only for a list-returning method, not a sequence of responses.",
         ),
       maxAttemptsPerStep: z
         .number()
@@ -348,8 +278,8 @@ export function register(server: McpServer, env: ResolvedEnvironment): void {
     server,
     "sapiom_dev_agents_clone",
     [
-      "Materialize a Sapiom workflow locally. Given a template id (from the gallery) it forks the template into a repo you own; given an existing fork id it re-clones that fork; given a deployed workflow's definitionId it clones the engine's live build-repo source directly (no fork step, always current) and pre-links the checkout. Either way it mints a short-lived, repo-scoped clone credential, git-clones the repo into <dir>, and writes sapiom.json recording the provenance.",
-      "After cloning: read the project's AGENTS.md, then _deploy → _run → _inspect. Run sapiom_dev_agents_link first too, UNLESS you cloned by definitionId — that path already writes sapiom.json's definitionId, so the checkout is pre-linked and link would be redundant. The clone appears under 'my workflows' in the dashboard immediately; the build shows once you deploy.",
+      "Materialize a Sapiom agent locally. Given a template id (from the gallery) it forks the template into a repo you own; given an existing fork id it re-clones that fork; given a deployed agent's definitionId it clones the engine's live build-repo source directly (no fork step, always current) and pre-links the checkout. Either way it mints a short-lived, repo-scoped clone credential, git-clones the repo into <dir>, and writes sapiom.json recording the provenance.",
+      "After cloning: read the project's AGENTS.md, install its dependencies, then _check → _run_local. Before cloud work, authenticate and run _link → _deploy → _run → _inspect. A templateId/forkId clone is source only and has no dashboard agent until link/deploy; a definitionId clone is already linked because sapiom.json contains its definitionId.",
       "Pass exactly one of templateId, forkId, or definitionId. The clone credential is single-repo, read-only, and ~1h-lived — it is used for the clone and discarded (never stored in sapiom.json).",
     ].join("\n"),
     {
@@ -357,7 +287,7 @@ export function register(server: McpServer, env: ResolvedEnvironment): void {
         .string()
         .min(1)
         .describe(
-          "Target directory to clone into (created if absent; must be empty).",
+          "Target directory to clone into (created if absent; must otherwise be empty, except for Agent Studio's private .sapiom directory).",
         ),
       templateId: z
         .string()
@@ -375,7 +305,7 @@ export function register(server: McpServer, env: ResolvedEnvironment): void {
         .union([z.string(), z.number()])
         .optional()
         .describe(
-          "Deployed workflow's definition id to pull local (e.g. from the dashboard URL or a prior link/deploy). Clones the engine's current build-repo source directly, skipping the fork step, and pre-links the checkout (sapiom.json is written with this id, so sapiom_dev_agents_link is not needed before deploy). Accepts a number or string — the engine id is a bigint. Mutually exclusive with templateId and forkId.",
+          "Deployed agent's definition id to pull local (e.g. from the dashboard URL or a prior link/deploy). Clones the engine's current build-repo source directly, skipping the fork step, and pre-links the checkout (sapiom.json is written with this id, so sapiom_dev_agents_link is not needed before deploy). Accepts a number or string — the engine id is a bigint. Mutually exclusive with templateId and forkId.",
         ),
     },
     async ({ dir, templateId, forkId, definitionId }) => {
@@ -396,8 +326,8 @@ export function register(server: McpServer, env: ResolvedEnvironment): void {
           client,
         );
         const hint = result.definitionId
-          ? `Cloned into ${result.targetDir}. Already linked to definition ${result.definitionId} — read its AGENTS.md, then _deploy → _run → _inspect (no link needed).`
-          : `Cloned into ${result.targetDir}. Next: read its AGENTS.md, then sapiom_dev_agents_link → _deploy → _run → _inspect.`;
+          ? `Cloned into ${result.targetDir}. Already linked to definition ${result.definitionId} — read AGENTS.md, install dependencies, then _check → _run_local before _deploy → _run → _inspect (no link needed).`
+          : `Cloned into ${result.targetDir}. Next: read AGENTS.md, install dependencies, then _check → _run_local. Authenticate before sapiom_dev_agents_link → _deploy → _run → _inspect.`;
         return ok({ ...result, hint });
       } catch (err) {
         return fail(err);
@@ -408,7 +338,7 @@ export function register(server: McpServer, env: ResolvedEnvironment): void {
   registerTool(
     server,
     "sapiom_dev_agents_deploy",
-    "Deploy the linked agent: push the current git commit, trigger a build, and wait for it to finish. The project must be linked (sapiom.json) and a git repo with at least one commit.",
+    "Deploy the linked agent: bundle the current local source (including uncommitted source), push a synthesized build tree, trigger a metered cloud build, and wait for it to finish. The project must be linked (sapiom.json) and a git repo with at least one commit.",
     {
       dir: z
         .string()
@@ -453,7 +383,7 @@ export function register(server: McpServer, env: ResolvedEnvironment): void {
       input: z
         .unknown()
         .optional()
-        .describe("The workflow's entry-step input (any JSON value)."),
+        .describe("The agent's entry-step input (any JSON value)."),
     },
     async ({ dir, input }) => {
       const client = await gatewayClient(env);
@@ -464,12 +394,20 @@ export function register(server: McpServer, env: ResolvedEnvironment): void {
         // stringify object-valued args), mirroring run_local — the execution API
         // requires an object, so a raw `"{}"` string would be rejected. Default an
         // absent input to {} (the entry step's empty input).
-        return ok(
-          await run(
-            { definitionId: cfg.definitionId, input: coerceJson(input) ?? {} },
-            client,
-          ),
+        const started = await run(
+          { definitionId: cfg.definitionId, input: coerceJson(input) ?? {} },
+          client,
         );
+        // Hand back the webapp link so the caller can open the run it just
+        // started without reconstructing the route.
+        return ok({
+          ...started,
+          webappUrl: webappRunUrl(
+            env.appURL,
+            cfg.definitionId,
+            started.executionId,
+          ),
+        });
       } catch (err) {
         return fail(err);
       }
@@ -479,7 +417,7 @@ export function register(server: McpServer, env: ResolvedEnvironment): void {
   registerTool(
     server,
     "sapiom_dev_agents_inspect",
-    "Inspect a cloud execution (its steps and errors) by executionId, a build by buildRunId, or list recent executions when neither is given. On a failed step, pull its input here to reproduce the failure locally with run_local.\n\nReads are a fresh point-in-time snapshot. To wait for a still-running execution to finish, set wait:true (the tool polls until it settles or the wait window elapses) — do NOT sleep-and-poll this tool yourself. If a wait returns waiting:true, just call inspect again with wait:true.",
+    "Inspect a cloud execution (its steps and errors) by executionId, a build by buildRunId, or list recent executions when neither is given. On a failed step, pull its input here to reproduce the failure locally with run_local. When inspecting an execution, the result includes a `webappUrl` to open that run in the webapp.\n\nBy default the execution is returned COMPACT: identity/status/timestamps + a per-step summary (name/order/attempt/status/error-message) with a `has` flag-set and a `sizes` hint (char counts of the omitted input/output/logs/events/sharedState bodies). Full step bodies are NOT included by default — they can be multiple MB. To pull a specific step's heavy fields, pass `step` (its name or order, from the compact list) with `include` (e.g. ['input','error']); optionally narrow to one `attempt`. Debug loop: inspect(executionId) → see step N failed → inspect(executionId, step:'<name>', include:['input','error']) → feed that input to run_local. Every field is capped to a char budget; an over-budget value is truncated with a marker pointing at `webappUrl`.\n\nReads are a fresh point-in-time snapshot. To wait for a still-running execution to finish, set wait:true (the tool polls until it settles or the wait window elapses) — do NOT sleep-and-poll this tool yourself. If a wait returns waiting:true, just call inspect again with wait:true.",
     {
       dir: z
         .string()
@@ -492,6 +430,25 @@ export function register(server: McpServer, env: ResolvedEnvironment): void {
         .string()
         .optional()
         .describe("Build to inspect (requires a linked project)."),
+      step: z
+        .union([z.string(), z.number()])
+        .optional()
+        .describe(
+          "Expand one step's heavy fields: its stepName or stepOrder (from the compact step list). Pair with `include` to choose which fields.",
+        ),
+      attempt: z
+        .number()
+        .int()
+        .optional()
+        .describe(
+          "Restrict expansion to a single attempt of the selected `step` (a retried step has several). Omit to expand every attempt of that step.",
+        ),
+      include: z
+        .array(z.enum(INCLUDABLE_FIELDS))
+        .optional()
+        .describe(
+          "Heavy step fields to expand for the selected `step`: 'input' | 'output' | 'logs' | 'events' | 'sharedState' | 'error'. Ignored without `step`. Each is capped to the char budget.",
+        ),
       wait: z
         .boolean()
         .optional()
@@ -505,7 +462,16 @@ export function register(server: McpServer, env: ResolvedEnvironment): void {
           "Max seconds to wait when wait:true (default 45, capped at 55). On timeout it returns the latest snapshot with waiting:true — call again to keep waiting.",
         ),
     },
-    async ({ dir, executionId, buildRunId, wait, maxWaitSeconds }) => {
+    async ({
+      dir,
+      executionId,
+      buildRunId,
+      step,
+      attempt,
+      include,
+      wait,
+      maxWaitSeconds,
+    }) => {
       const client = await gatewayClient(env);
       if (!client) return NOT_AUTHED;
       try {
@@ -519,6 +485,13 @@ export function register(server: McpServer, env: ResolvedEnvironment): void {
           );
         }
         if (executionId) {
+          // Compact-by-default projection options, shared by both return
+          // branches so wait:true and the snapshot yield the same bounded shape.
+          const projectOpts: Omit<ProjectExecutionOptions, "webappUrl"> = {
+            step,
+            attempt,
+            include,
+          };
           if (wait) {
             const maxWaitMs =
               Math.min(Math.max(maxWaitSeconds ?? 45, 1), 55) * 1000;
@@ -532,10 +505,19 @@ export function register(server: McpServer, env: ResolvedEnvironment): void {
                 : reason === "needs-signal"
                   ? `Paused on signal '${execution.pausedSignalName ?? "?"}' — deliver it with sapiom_dev_agents_signal to resume.`
                   : undefined;
+            const webappUrl = webappRunUrl(
+              env.appURL,
+              execution.definitionId,
+              execution.id,
+            );
             return ok({
-              execution,
+              execution: projectExecutionForTool(execution, {
+                ...projectOpts,
+                webappUrl,
+              }),
               done,
               waiting: !done,
+              webappUrl,
               ...(hint ? { hint } : {}),
             });
           }
@@ -545,7 +527,19 @@ export function register(server: McpServer, env: ResolvedEnvironment): void {
           const hint = isExecutionTerminal(execution.status)
             ? undefined
             : `Execution is '${execution.status}', not terminal — call inspect with wait:true to block until it finishes instead of polling manually.`;
-          return ok({ execution, ...(hint ? { hint } : {}) });
+          const webappUrl = webappRunUrl(
+            env.appURL,
+            execution.definitionId,
+            execution.id,
+          );
+          return ok({
+            execution: projectExecutionForTool(execution, {
+              ...projectOpts,
+              webappUrl,
+            }),
+            webappUrl,
+            ...(hint ? { hint } : {}),
+          });
         }
         return ok(await listExecutions(client));
       } catch (err) {
@@ -589,31 +583,62 @@ export function register(server: McpServer, env: ResolvedEnvironment): void {
     {
       definition: z
         .string()
-        .describe("The agent's tenant-unique slug (the handle it was deployed under)."),
+        .describe(
+          "The agent's tenant-unique slug (the handle it was deployed under).",
+        ),
       kind: z
         .enum(["schedule_cron", "schedule_once"])
-        .describe("'schedule_cron' = recurring; 'schedule_once' = a single delayed run."),
+        .describe(
+          "'schedule_cron' = recurring; 'schedule_once' = a single delayed run.",
+        ),
       cron: z
         .string()
         .optional()
-        .describe("Cron expression — required for 'schedule_cron'. E.g. '0 9 * * 1-5' = 9am on weekdays."),
+        .describe(
+          "Cron expression — required for 'schedule_cron'. E.g. '0 9 * * 1-5' = 9am on weekdays.",
+        ),
       timezone: z
         .string()
         .optional()
-        .describe("IANA timezone the cron runs in (e.g. 'America/New_York'). Defaults to UTC."),
+        .describe(
+          "IANA timezone the cron runs in (e.g. 'America/New_York'). Defaults to UTC.",
+        ),
       at: z
         .string()
         .optional()
-        .describe("ISO 8601 fire time — required for 'schedule_once'. E.g. '2026-07-01T17:00:00Z'."),
-      input: z.unknown().optional().describe("Execution input passed to each run (any JSON value)."),
-      startAt: z.string().optional().describe("Cron only: ISO time before which no occurrence fires."),
-      endAt: z.string().optional().describe("Cron only: ISO time after which the schedule completes."),
+        .describe(
+          "ISO 8601 fire time — required for 'schedule_once'. E.g. '2026-07-01T17:00:00Z'.",
+        ),
+      input: z
+        .unknown()
+        .optional()
+        .describe("Execution input passed to each run (any JSON value)."),
+      startAt: z
+        .string()
+        .optional()
+        .describe("Cron only: ISO time before which no occurrence fires."),
+      endAt: z
+        .string()
+        .optional()
+        .describe("Cron only: ISO time after which the schedule completes."),
       policy: z
         .unknown()
         .optional()
-        .describe("Cron only: { catchupPolicy?: 'skip'|'all', overlapPolicy?: 'allow', jitterMs?: number }."),
+        .describe(
+          "Cron only: { catchupPolicy?: 'skip'|'all', overlapPolicy?: 'allow', jitterMs?: number }.",
+        ),
     },
-    async ({ definition, kind, cron, timezone, at, input, startAt, endAt, policy }) => {
+    async ({
+      definition,
+      kind,
+      cron,
+      timezone,
+      at,
+      input,
+      startAt,
+      endAt,
+      policy,
+    }) => {
       const client = await gatewayClient(env);
       if (!client) return NOT_AUTHED;
       try {
@@ -644,11 +669,18 @@ export function register(server: McpServer, env: ResolvedEnvironment): void {
     "sapiom_dev_agents_schedule_inspect",
     "Inspect schedules. With scheduleId: returns one schedule's config, next fire time, and recent fire history (each with the run's executionId) — use this to debug a misbehaving schedule, then inspect a failed run's executionId with sapiom_dev_agents_inspect. With definition (slug) and no scheduleId: lists that agent's schedules.",
     {
-      scheduleId: z.string().optional().describe("Inspect one schedule (detail + recent fires + a health hint)."),
+      scheduleId: z
+        .string()
+        .optional()
+        .describe(
+          "Inspect one schedule (detail + recent fires + a health hint).",
+        ),
       definition: z
         .string()
         .optional()
-        .describe("List schedules for this agent slug (used when scheduleId is omitted)."),
+        .describe(
+          "List schedules for this agent slug (used when scheduleId is omitted).",
+        ),
       status: z
         .enum(["active", "paused", "completed", "disabled"])
         .optional()
@@ -669,7 +701,8 @@ export function register(server: McpServer, env: ResolvedEnvironment): void {
         return fail(
           new AgentOperationError({
             code: "BAD_INPUT",
-            message: "Provide scheduleId (to inspect one) or definition (to list an agent's schedules).",
+            message:
+              "Provide scheduleId (to inspect one) or definition (to list an agent's schedules).",
           }),
         );
       } catch (err) {
@@ -701,9 +734,14 @@ export function register(server: McpServer, env: ResolvedEnvironment): void {
     "sapiom_dev_agents_cron_preview",
     "Validate a cron expression and preview its next occurrences, creating nothing. Use before sapiom_dev_agents_schedule to confirm a cron + timezone fire when you expect (cron syntax is easy to get subtly wrong).",
     {
-      cron: z.string().describe("Cron expression to validate, e.g. '0 9 * * 1-5'."),
+      cron: z
+        .string()
+        .describe("Cron expression to validate, e.g. '0 9 * * 1-5'."),
       timezone: z.string().optional().describe("IANA timezone (default UTC)."),
-      count: z.number().optional().describe("How many upcoming occurrences to return (default 5)."),
+      count: z
+        .number()
+        .optional()
+        .describe("How many upcoming occurrences to return (default 5)."),
     },
     async ({ cron, timezone, count }) => {
       const client = await gatewayClient(env);

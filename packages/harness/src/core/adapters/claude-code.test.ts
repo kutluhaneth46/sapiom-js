@@ -3,9 +3,36 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { ClaudeCodeAdapter, encodeProjectPath } from "./claude-code.js";
+import { DEFAULT_SYSTEM_PROMPT } from "../../profiles/default.js";
+import {
+  ClaudeCodeAdapter,
+  encodeProjectPath,
+  isClaudeVersionSupported,
+  parseClaudeVersion,
+  MIN_CLAUDE_CODE_VERSION,
+} from "./claude-code.js";
 
 describe("ClaudeCodeAdapter", () => {
+  describe("readiness fallback surface", () => {
+    it("declares hook-timeout (never immediate) so the SessionStart hook stays primary", () => {
+      const adapter = new ClaudeCodeAdapter({ binary: "fake-claude" });
+      expect(adapter.readyFallback).toBe("hook-timeout");
+      expect(adapter.assumesBracketedPaste).toBe(true);
+    });
+
+    it("detectBlockingPrompt matches Claude's known blocking screens through ANSI noise", () => {
+      const adapter = new ClaudeCodeAdapter({ binary: "fake-claude" });
+      // ANSI-decorated, as a real pty frame renders them.
+      expect(
+        adapter.detectBlockingPrompt("\x1b[1mDo you trust the files in this folder?\x1b[0m"),
+      ).toBe(true);
+      expect(adapter.detectBlockingPrompt("Do you trust the files in this directory?")).toBe(true);
+      expect(adapter.detectBlockingPrompt("Choose the text style that looks best")).toBe(true);
+      expect(adapter.detectBlockingPrompt("Select login method:")).toBe(true);
+      expect(adapter.detectBlockingPrompt("> welcome, composer is ready")).toBe(false);
+    });
+  });
+
   describe("launch/resume — pluginDir flag", () => {
     it("includes --plugin-dir in launch args when pluginDir is set", () => {
       const adapter = new ClaudeCodeAdapter({ binary: "fake-claude" });
@@ -42,7 +69,7 @@ describe("ClaudeCodeAdapter", () => {
     it("builds a launch SpawnSpec with settings/mcp-config/system-prompt flags and unsets CLAUDECODE", async () => {
       const promptDir = await mkdtemp(join(tmpdir(), "harness-claude-test-"));
       const promptFile = join(promptDir, "prompt.txt");
-      await writeFile(promptFile, "You are a Sapiom workflow builder.", "utf8");
+      await writeFile(promptFile, DEFAULT_SYSTEM_PROMPT, "utf8");
 
       const adapter = new ClaudeCodeAdapter({ binary: "fake-claude" });
       const spec = adapter.launch({
@@ -61,8 +88,26 @@ describe("ClaudeCodeAdapter", () => {
         "/tmp/proj/.sapiom/settings.json",
         "--mcp-config",
         "/tmp/proj/.sapiom/mcp.json",
+        "--permission-mode",
+        "auto",
+        "--allow-dangerously-skip-permissions",
         "--append-system-prompt",
-        "You are a Sapiom workflow builder.",
+        DEFAULT_SYSTEM_PROMPT,
+      ]);
+
+      const resumed = adapter.resume("agent-uuid-123", {
+        harnessSessionId: "h1",
+        cwd: "/tmp/proj",
+        systemPromptFile: promptFile,
+      });
+      expect(resumed.args).toEqual([
+        "--resume",
+        "agent-uuid-123",
+        "--permission-mode",
+        "auto",
+        "--allow-dangerously-skip-permissions",
+        "--append-system-prompt",
+        DEFAULT_SYSTEM_PROMPT,
       ]);
 
       await rm(promptDir, { recursive: true, force: true });
@@ -73,7 +118,13 @@ describe("ClaudeCodeAdapter", () => {
       const spec = adapter.resume("agent-uuid-123", { harnessSessionId: "h1", cwd: "/tmp/proj" });
 
       expect(spec.command).toBe("fake-claude");
-      expect(spec.args).toEqual(["--resume", "agent-uuid-123"]);
+      expect(spec.args).toEqual([
+        "--resume",
+        "agent-uuid-123",
+        "--permission-mode",
+        "auto",
+        "--allow-dangerously-skip-permissions",
+      ]);
       expect(spec.env).toEqual({ CLAUDECODE: null });
     });
 
@@ -123,7 +174,7 @@ describe("ClaudeCodeAdapter", () => {
         "stream-json",
         "--verbose",
       ]);
-
+      expect(spec.args).not.toContain("--allow-dangerously-skip-permissions");
       await rm(promptDir, { recursive: true, force: true });
     });
 
@@ -141,6 +192,33 @@ describe("ClaudeCodeAdapter", () => {
       const checks = await adapter.doctor();
       expect(checks).toHaveLength(1);
       expect(checks[0]).toMatchObject({ name: "claude", ok: false });
+    });
+  });
+
+  describe("version floor", () => {
+    it("parses the semver out of a claude --version line", () => {
+      expect(parseClaudeVersion("2.1.3 (Claude Code)")).toEqual([2, 1, 3]);
+      expect(parseClaudeVersion("1.0.62")).toEqual([1, 0, 62]);
+      expect(parseClaudeVersion("")).toBeNull();
+      expect(parseClaudeVersion(null)).toBeNull();
+      expect(parseClaudeVersion("no version here")).toBeNull();
+    });
+
+    it("rejects a version below the floor and accepts the floor and above", () => {
+      expect(isClaudeVersionSupported("1.9.9 (Claude Code)")).toBe(false);
+      expect(isClaudeVersionSupported("0.5.0")).toBe(false);
+      expect(isClaudeVersionSupported("2.1.82 (Claude Code)")).toBe(false);
+      expect(isClaudeVersionSupported(`${MIN_CLAUDE_CODE_VERSION} (Claude Code)`)).toBe(true);
+      expect(isClaudeVersionSupported("2.4.1 (Claude Code)")).toBe(true);
+      expect(isClaudeVersionSupported("10.0.0")).toBe(true);
+    });
+
+    it("treats an absent or unparseable version as supported (never mass-rejects on a format change)", () => {
+      // The floor exists to catch provably-ancient binaries, not to gate on our
+      // own parser's limits — an unreadable version is left alone on purpose.
+      expect(isClaudeVersionSupported(null)).toBe(true);
+      expect(isClaudeVersionSupported("")).toBe(true);
+      expect(isClaudeVersionSupported("some future format with no dotted number")).toBe(true);
     });
   });
 

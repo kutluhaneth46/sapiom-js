@@ -1,5 +1,10 @@
 import { z } from 'zod';
 
+import { isNonRetryableStepErrorPayload, parseNonRetryableStepErrorPayload } from '@sapiom/agent';
+import type { NonRetryableStepErrorPayload } from '@sapiom/agent';
+
+export { MAX_SHARED_SNAPSHOT_BYTES } from '@sapiom/agent';
+
 /**
  * The step-completion wire contract (protocol 1) — what an executor reports
  * back after running one dispatched step body. The directive union mirrors the
@@ -56,6 +61,30 @@ export const STEP_COMPLETION_OUTCOME = {
   THREW: 'threw',
 } as const;
 
+/** Legacy protocol-1 errors remain valid for every non-platform throw. */
+const legacyStepCompletionErrorSchema = z.object({
+  name: z.string(),
+  message: z.string(),
+  stack: z.string().optional(),
+});
+
+/**
+ * Platform-owned terminal errors are parsed first so their structured fields
+ * survive. The transform returns normalized schema data, stripping arbitrary
+ * extra properties. The structural registry also avoids composing schemas from
+ * potentially separate compatible Zod peer instances.
+ */
+const nonRetryableStepCompletionErrorSchema = z
+  .custom<NonRetryableStepErrorPayload>(isNonRetryableStepErrorPayload, {
+    message: 'Invalid non-retryable platform step error payload',
+  })
+  .transform((value) => parseNonRetryableStepErrorPayload(value) as NonRetryableStepErrorPayload);
+
+export const stepCompletionErrorSchema = z.union([
+  nonRetryableStepCompletionErrorSchema,
+  legacyStepCompletionErrorSchema,
+]);
+
 export const stepCompletionPayloadSchema = z
   .object({
     protocol: z.literal(1),
@@ -67,13 +96,7 @@ export const stepCompletionPayloadSchema = z
         directive: wireDirectiveSchema,
       })
       .optional(),
-    error: z
-      .object({
-        name: z.string(),
-        message: z.string(),
-        stack: z.string().optional(),
-      })
-      .optional(),
+    error: stepCompletionErrorSchema.optional(),
     shared: z.record(z.string(), z.unknown()).optional(),
     logs: z
       .array(
@@ -100,9 +123,27 @@ export const stepCompletionPayloadSchema = z
   });
 
 export type StepCompletionPayload = z.infer<typeof stepCompletionPayloadSchema>;
+export type StepCompletionError = z.infer<typeof stepCompletionErrorSchema>;
 
-/** Host ingress cap on the `shared` snapshot. */
-export const MAX_SHARED_SNAPSHOT_BYTES = 256 * 1024;
+/**
+ * Serialize a caught step error for a protocol-1 completion.
+ *
+ * Dispatch hosts must use this boundary helper instead of selecting only
+ * `name`, `message`, and `stack`: it preserves normalized fields for the
+ * closed set of platform errors that the runner may settle without retrying.
+ * Ordinary and unrecognized throws retain the legacy error shape.
+ */
+export function serializeStepCompletionError(error: unknown): StepCompletionError {
+  const platformError = parseNonRetryableStepErrorPayload(error);
+  if (platformError) return platformError;
+
+  const normalized = error instanceof Error ? error : new Error(String(error));
+  return {
+    name: normalized.name,
+    message: normalized.message,
+    ...(normalized.stack === undefined ? {} : { stack: normalized.stack }),
+  };
+}
 
 /** Host ingress cap on the serialized `logs` buffer. */
 export const MAX_LOGS_BYTES = 512 * 1024;

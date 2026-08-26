@@ -33,9 +33,13 @@ const workflow = (overrides: Partial<WorkflowInfo>): WorkflowInfo => ({
   ...overrides,
 });
 
+// The matcher's own behavior (boundary gating, scoring order, the Slack
+// regressions) is pinned in fuzzy.test.ts — this keeps only the palette-visible
+// contract this file always asserted: tighter matches rank higher, absent
+// characters don't match at all.
 describe("fuzzyScore", () => {
-  it("matches subsequences and prefers tighter matches", () => {
-    const loose = fuzzyScore("lsg", "leasing");
+  it("prefers tighter matches", () => {
+    const loose = fuzzyScore("leas", "leasing");
     const exact = fuzzyScore("leasing", "leasing");
     expect(loose).not.toBeNull();
     expect(exact).not.toBeNull();
@@ -44,6 +48,10 @@ describe("fuzzyScore", () => {
 
   it("returns null when characters are missing", () => {
     expect(fuzzyScore("xyz", "leasing")).toBeNull();
+  });
+
+  it("no longer accepts off-boundary scatter (the old matcher did)", () => {
+    expect(fuzzyScore("lsg", "leasing")).toBeNull();
   });
 });
 
@@ -72,6 +80,10 @@ describe("buildWorkspaceTree (explorer: folders > agents)", () => {
     const tree = buildWorkspaceTree(
       [workflow({ path: "/home/dev/app/leasing" })],
       [session({ cwd: "/home/dev/app" })],
+      "workspace",
+      "recent",
+      [],
+      [],
       [{ workspaceKey: "workspace-app", cwd: "/home/dev/app" }],
     );
     expect(tree.workspaces[0]?.workspaceKey).toBe("workspace-app");
@@ -119,9 +131,79 @@ describe("buildWorkspaceTree (explorer: folders > agents)", () => {
     expect(tree.workspaces[0]?.bareSessions).toEqual([]);
   });
 
+  it("files a Windows agent under its Windows folder, even in mixed-separator form", () => {
+    const sessions = [
+      session({
+        id: "w",
+        cwd: "C:\\Users\\demo\\app",
+        // The `/`-joined form the browser used to produce for a native folder.
+        boundWorkflowPath: "C:\\Users\\demo\\app/leasing",
+      }),
+    ];
+    const tree = buildWorkspaceTree([workflow({ path: "C:\\Users\\demo\\app/leasing" })], sessions);
+    expect(tree.workspaces.map((w) => w.cwd)).toEqual(["C:\\Users\\demo\\app"]);
+    expect(tree.workspaces[0]?.label).toBe("app");
+    expect(tree.workspaces[0]?.agents.map((a) => a.workflow.name)).toEqual(["leasing"]);
+    expect(tree.orphanAgents).toEqual([]);
+  });
+
   it("drops a folder with no agents and no live sessions (nothing to show)", () => {
     const sessions = [session({ id: "x", cwd: "/home/dev/gone", status: "exited", boundWorkflowPath: null })];
     const tree = buildWorkspaceTree([], sessions);
+    expect(tree.workspaces).toEqual([]);
+  });
+});
+
+describe("buildWorkspaceTree — optimistic pending workspaces", () => {
+  it("shows a pending folder with no session or agent, marked pending", () => {
+    const tree = buildWorkspaceTree([], [], "workspace", "recent", [], ["/home/dev/new-agent"]);
+    expect(tree.workspaces).toHaveLength(1);
+    expect(tree.workspaces[0]?.cwd).toBe("/home/dev/new-agent");
+    expect(tree.workspaces[0]?.label).toBe("new-agent");
+    expect(tree.workspaces[0]?.pending).toBe(true);
+    expect(tree.workspaces[0]?.agents).toEqual([]);
+    expect(tree.workspaces[0]?.bareSessions).toEqual([]);
+  });
+
+  it("floats a pending folder above real folders on either sort", () => {
+    const sessions = [session({ id: "a", cwd: "/home/dev/aaa", boundWorkflowPath: null })];
+    const workflows = [workflow({ name: "zzz", path: "/home/dev/zzz/zzz" })];
+    const recent = buildWorkspaceTree(workflows, sessions, "workspace", "recent", [], ["/home/dev/mmm"]);
+    expect(recent.workspaces[0]?.cwd).toBe("/home/dev/mmm");
+    const byName = buildWorkspaceTree(workflows, sessions, "workspace", "name", [], ["/home/dev/mmm"]);
+    expect(byName.workspaces[0]?.cwd).toBe("/home/dev/mmm");
+  });
+
+  it("stops being pending once a live unbound session lands (renders bare)", () => {
+    const sessions = [session({ id: "s", cwd: "/home/dev/new-agent", boundWorkflowPath: null })];
+    const tree = buildWorkspaceTree([], sessions, "workspace", "recent", [], ["/home/dev/new-agent"]);
+    expect(tree.workspaces).toHaveLength(1);
+    expect(tree.workspaces[0]?.pending).toBe(false);
+    expect(tree.workspaces[0]?.bareSessions.map((s) => s.id)).toEqual(["s"]);
+  });
+
+  it("stops being pending once the agent is registered under the cwd", () => {
+    const workflows = [workflow({ name: "new-agent", path: "/home/dev/new-agent/new-agent" })];
+    const tree = buildWorkspaceTree(workflows, [], "workspace", "recent", [], ["/home/dev/new-agent"]);
+    expect(tree.workspaces).toHaveLength(1);
+    expect(tree.workspaces[0]?.pending).toBe(false);
+    expect(tree.workspaces[0]?.agents.map((a) => a.workflow.name)).toEqual(["new-agent"]);
+  });
+
+  it("stays visible across the bind→register flicker (bound session, agent not yet listed)", () => {
+    // The server has bound the session to the (soon-to-be) agent path, but the
+    // workflow list has not caught up. Neither bare (bound) nor an agent row
+    // (not listed) — the pending row keeps the folder on screen.
+    const sessions = [
+      session({ id: "s", cwd: "/home/dev/new-agent", boundWorkflowPath: "/home/dev/new-agent/new-agent" }),
+    ];
+    const tree = buildWorkspaceTree([], sessions, "workspace", "recent", [], ["/home/dev/new-agent"]);
+    expect(tree.workspaces).toHaveLength(1);
+    expect(tree.workspaces[0]?.pending).toBe(true);
+  });
+
+  it("ignores pending workspaces in the deployment grouping (no cwd axis)", () => {
+    const tree = buildWorkspaceTree([], [], "deployment", "recent", [], ["/home/dev/new-agent"]);
     expect(tree.workspaces).toEqual([]);
   });
 });
@@ -140,7 +222,7 @@ describe("macro gating", () => {
       id: "open_prod",
       label: "Open",
       icon: "ExternalLink",
-      action: { kind: "open-url", url: "https://app.sapiom.ai/workflows/{{workflow.definitionId}}" },
+      action: { kind: "open-url", url: "https://app.sapiom.ai/agents/{{workflow.definitionId}}" },
       requiresWorkflow: true,
     },
   ];
@@ -154,7 +236,7 @@ describe("macro gating", () => {
   });
 
   it("requires a selected workflow for requiresWorkflow macros", () => {
-    expect(macroDisabledReason(macros[1], null, "sess-1")).toBe("Select a workflow first");
+    expect(macroDisabledReason(macros[1], null, "sess-1")).toBe("Select an agent first");
   });
 
   it("blocks definitionId-dependent macros until deployed", () => {

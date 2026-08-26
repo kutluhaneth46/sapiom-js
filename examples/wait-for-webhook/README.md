@@ -5,7 +5,7 @@ external async job, then **suspends indefinitely at $0** until a webhook/callbac
 fires — no polling loop, no held worker, no billed idle time — and resumes
 exactly where it left off when the external world is ready.
 
-The direct counter to "agents are too expensive to run": a workflow can wait
+The direct counter to "agents are too expensive to run": an agent run can wait
 days on a third-party callback and cost nothing until the signal arrives.
 
 ## What it does
@@ -21,7 +21,7 @@ kickoff  ──(pause: wait for "webhook.callback", $0 while idle)──▶  dec
    suspends here at zero cost.
 2. **(paused)** — nothing runs, nothing is billed, for as long as it takes.
 3. **decide** (resume target) — its **input IS the callback payload**. An LLM
-   (`ctx.sapiom.models.run`) summarizes the payload and branches. Everything set
+   (`ctx.sapiom.llm.run`) summarizes the payload and branches. Everything set
    before the pause is read back from `ctx.shared`.
 4. **accept | reject** — terminal branches keyed off the decision.
 

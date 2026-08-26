@@ -169,6 +169,55 @@ describe("snapshotWorkspaceWorkflows", () => {
     expect(snapshotWorkspaceWorkflows(dir)).toBe(before);
   });
 
+  it("changes when marker identity changes and excludes malformed markers", async () => {
+    const workflow = await scaffoldWorkflow(dir, "flow-a");
+    const before = snapshotWorkspaceWorkflows(dir);
+
+    await fs.writeFile(path.join(workflow, "sapiom.json"), JSON.stringify({ definitionId: 42 }));
+    const linked = snapshotWorkspaceWorkflows(dir);
+    expect(linked).not.toBe(before);
+
+    await fs.writeFile(path.join(workflow, "sapiom.json"), "not-json");
+    expect(snapshotWorkspaceWorkflows(dir)).toBe("");
+  });
+
+  it.skipIf(
+    process.platform === "win32" ||
+      (typeof process.getuid === "function" && process.getuid() === 0),
+  )(
+    "distinguishes an unreadable project from a subsequently invalid marker",
+    async () => {
+      const workflow = await scaffoldWorkflow(dir, "flow-unreadable");
+      const valid = snapshotWorkspaceWorkflows(dir);
+
+      await fs.chmod(workflow, 0o000);
+      let unreadable: string;
+      try {
+        unreadable = snapshotWorkspaceWorkflows(dir);
+        expect(unreadable).not.toBe(valid);
+        expect(unreadable).toContain("<unreadable>");
+        expect(await snapshotWorkspaceWorkflowsAsync(dir)).toBe(unreadable);
+      } finally {
+        await fs.chmod(workflow, 0o700);
+      }
+
+      // No intervening valid snapshot: this models restore + corruption being
+      // coalesced into one debounced watcher check.
+      await fs.writeFile(path.join(workflow, "sapiom.json"), "not-json");
+      const invalid = snapshotWorkspaceWorkflows(dir);
+      expect(invalid).not.toBe(unreadable);
+      expect(invalid).toBe("");
+      expect(await snapshotWorkspaceWorkflowsAsync(dir)).toBe(invalid);
+    },
+  );
+
+  it("uses the registry's ignored-directory contract", async () => {
+    for (const ignored of ["node_modules", ".git", ".sapiom", "dist", "build", ".next"]) {
+      await scaffoldWorkflow(path.join(dir, ignored), "generated");
+    }
+    expect(snapshotWorkspaceWorkflows(dir)).toBe("");
+  });
+
   it("does not descend into a marker directory (a nested marker never double-counts)", async () => {
     await scaffoldWorkflow(dir, "flow-a");
     await fs.writeFile(path.join(dir, "flow-a", "sapiom.json"), JSON.stringify({ definitionId: 2 }));

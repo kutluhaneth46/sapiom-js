@@ -117,7 +117,10 @@ test.describe("chat panel visibility", () => {
     await openChat(page);
     // With no step selected the chat is a general ask — freeform only, no
     // step-specific macros.
-    await expect(page.getByTestId("canvas-freeform-input")).toBeVisible();
+    await expect(page.getByTestId("canvas-freeform-input")).toHaveAttribute(
+      "placeholder",
+      "Ask about this agent…",
+    );
     await expect(page.getByTestId("canvas-macro-debug")).toHaveCount(0);
   });
 
@@ -329,6 +332,7 @@ test.describe("debug macros — offline stub run", () => {
     const btn = page.getByTestId("session-step-local");
     await expect(btn).toBeEnabled();
     await btn.click();
+    await page.getByTestId("run-sheet-submit").click();
 
     // Wait for the run to complete.
     const chip = page.getByTestId("canvas-run-chip");

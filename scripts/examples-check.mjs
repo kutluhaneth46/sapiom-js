@@ -21,9 +21,13 @@
 //      names paths the code's entry `inputSchema` declares — a projection onto
 //      a field the schema never declares is the drift SAP-2226 exists to catch.
 //      See scripts/examples-entry-schema-check.mjs.
-//   6. house-style copy rules the schemas cannot express — see
-//      scripts/examples-copy-check.mjs. (The length caps ARE in the schemas,
-//      as `maxLength`, so they surface through checks 1 and 5.)
+//   5c. a resource marked reusable (`resources[].reuse.key`) has that key read
+//      via `resolveResourceHandle` in index.ts — so the reuse picker (SAP-2320)
+//      can never offer a handle the run ignores. See examples-manifest-check.mjs.
+//   6. house-style copy rules the schemas cannot express, including registered
+//      clone-facing authoring/source assets — see scripts/examples-copy-check.mjs.
+//      (The length caps ARE in the schemas, as `maxLength`, so they surface
+//      through checks 1 and 5.)
 //   6b. setup.provisions[] matches the kinds derived from the manifest's
 //      resources[]; a declared resources[].seed file exists.
 //   7. the authored `complexity` band against the one DERIVED from the declared
@@ -35,22 +39,33 @@
 // Usage:  node scripts/examples-check.mjs   (or `pnpm examples:check`)
 // =============================================================================
 
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import Ajv from "ajv";
 import {
+  checkResourceReuse,
   checkResourceSeeds,
-  checkSetupProvisions,
+  checkSetupSync,
   createManifestChecker,
 } from "./examples-manifest-check.mjs";
-import { checkCopy } from "./examples-copy-check.mjs";
+import {
+  checkCopy,
+  checkRegisteredProjectCopyAsset,
+  isRegisteredProjectCopyAsset,
+  isRegisteredProjectCopyPathIgnored,
+} from "./examples-copy-check.mjs";
 import { checkDiscipline } from "./examples-discipline-check.mjs";
 import { checkEntrySchemaCoverage } from "./examples-entry-schema-check.mjs";
 import {
   complexityBandScore,
   scoreTemplateComplexity,
 } from "./lib/template-complexity.mjs";
+import {
+  ONE_SHOT_LLM_TEMPLATE_IDS,
+  checkLlmCopySurface,
+  checkOneShotLlmTemplate,
+} from "./lib/examples-llm-surface.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const EXAMPLES_DIR = path.join(ROOT, "examples");
@@ -59,6 +74,27 @@ const SCHEMA_PATH = path.join(EXAMPLES_DIR, "registry.schema.json");
 const MANIFEST_SCHEMA_PATH = path.join(EXAMPLES_DIR, "template.schema.json");
 
 const errors = [];
+
+function collectRegisteredProjectCopyAssets(sourceDir, currentDir = sourceDir) {
+  const assets = [];
+  for (const entry of readdirSync(currentDir, { withFileTypes: true })) {
+    const absolutePath = path.join(currentDir, entry.name);
+    const relativePath = path.relative(sourceDir, absolutePath);
+
+    if (entry.isDirectory()) {
+      if (isRegisteredProjectCopyPathIgnored(relativePath)) continue;
+      assets.push(
+        ...collectRegisteredProjectCopyAssets(sourceDir, absolutePath),
+      );
+      continue;
+    }
+
+    if (entry.isFile() && isRegisteredProjectCopyAsset(relativePath)) {
+      assets.push(absolutePath);
+    }
+  }
+  return assets;
+}
 
 const registry = JSON.parse(readFileSync(REGISTRY_PATH, "utf8"));
 const schema = JSON.parse(readFileSync(SCHEMA_PATH, "utf8"));
@@ -76,6 +112,67 @@ if (!validate(payload)) {
 }
 
 const templates = Array.isArray(registry.templates) ? registry.templates : [];
+const templateById = new Map(
+  templates.map((template) => [template.id, template]),
+);
+
+// No example may teach that the gateway-native one-shot surface is absent.
+// Scan every project, not just gallery-registered templates, because these
+// files are also copied or read directly by authors.
+for (const entry of readdirSync(EXAMPLES_DIR, { withFileTypes: true })) {
+  if (!entry.isDirectory()) continue;
+  for (const name of ["AGENTS.md", "README.md", "index.ts"]) {
+    const absolutePath = path.join(EXAMPLES_DIR, entry.name, name);
+    if (!existsSync(absolutePath)) continue;
+    errors.push(
+      ...checkLlmCopySurface({
+        path: path.relative(ROOT, absolutePath),
+        source: readFileSync(absolutePath, "utf8"),
+      }),
+    );
+  }
+}
+
+// Existing one-shot LLM templates must stay on the synchronous gateway surface.
+// This is intentionally explicit: `models.run` remains a valid capability for a
+// genuinely multi-turn managed loop, so a repo-wide string ban would reject
+// future examples that use that different surface correctly.
+for (const id of ONE_SHOT_LLM_TEMPLATE_IDS) {
+  const dir = path.join(EXAMPLES_DIR, id);
+  const indexPath = path.join(dir, "index.ts");
+  const packagePath = path.join(dir, "package.json");
+  const missingPaths = [indexPath, packagePath].filter(
+    (requiredPath) => !existsSync(requiredPath),
+  );
+  if (missingPaths.length > 0) {
+    for (const missingPath of missingPaths) {
+      errors.push(
+        `llm-surface: "${id}" is listed as a one-shot template but is missing ${path.relative(ROOT, missingPath)}.`,
+      );
+    }
+    continue;
+  }
+
+  const indexSource = readFileSync(indexPath, "utf8");
+  const packageJson = JSON.parse(readFileSync(packagePath, "utf8"));
+  const copySources = ["AGENTS.md", "README.md", "template.json"]
+    .map((name) => ({ path: name, absolutePath: path.join(dir, name) }))
+    .filter(({ absolutePath }) => existsSync(absolutePath))
+    .map(({ path: copyPath, absolutePath }) => ({
+      path: copyPath,
+      source: readFileSync(absolutePath, "utf8"),
+    }));
+  copySources.push({ path: "index.ts", source: indexSource });
+  errors.push(
+    ...checkOneShotLlmTemplate({
+      id,
+      indexSource,
+      copySources,
+      packageJson,
+      registryTemplate: templateById.get(id),
+    }),
+  );
+}
 
 // 2. Sorted by id ascending.
 const ids = templates.map((t) => String(t.id));
@@ -96,6 +193,7 @@ for (let i = 0; i < ids.length; i++) {
 const checkManifest = createManifestChecker(ajv, manifestSchema);
 const manifests = new Map(); // id -> parsed manifest, reused by the copy check
 let manifestsChecked = 0;
+let projectCopyAssetsChecked = 0;
 for (const t of templates) {
   if (!t.sourcePath) continue; // required-ness is a schema concern (check 1).
   const dir = path.join(ROOT, t.sourcePath);
@@ -138,6 +236,27 @@ for (const t of templates) {
     : null;
   errors.push(...checkEntrySchemaCoverage(t.id, manifest, indexSource));
 
+  // 5c. A resource marked reusable (`reuse.key`) must have its handle read from
+  // the entry input via `resolveResourceHandle` in the same index.ts — otherwise
+  // the picker offers a control the next run silently ignores (design-v2
+  // § Landmines). Reuses the index source read just above.
+  errors.push(...checkResourceReuse(t.id, manifest, indexSource));
+
+  for (const assetPath of collectRegisteredProjectCopyAssets(dir)) {
+    const repositoryPath = path
+      .relative(ROOT, assetPath)
+      .split(path.sep)
+      .join("/");
+    errors.push(
+      ...checkRegisteredProjectCopyAsset(
+        t,
+        repositoryPath,
+        readFileSync(assetPath, "utf8"),
+      ),
+    );
+    projectCopyAssetsChecked++;
+  }
+
   manifests.set(t.id, manifest);
   manifestsChecked++;
 }
@@ -163,6 +282,33 @@ for (const t of templates) {
   }
 }
 
+// 4c. Onboarding-shelf discipline. `onboarding.eligible` is the STRICTER-than-gallery
+// first-impression bar the app renders as its onboarding suggestion shelf. The schema
+// gives it structure; these two rules give it integrity: (1) a template can only be a
+// good first impression if it runs with zero setup at all, so eligibility requires
+// `setup.runsWithNoSetup`; (2) `order` is the deterministic shelf sequence, so two
+// eligible templates must not claim the same slot.
+const shelfOrders = new Map();
+for (const t of templates) {
+  const ob = t.onboarding;
+  if (!ob || ob.eligible !== true) continue;
+  if (t.setup?.runsWithNoSetup !== true) {
+    errors.push(
+      `onboarding: "${t.id}" is onboarding.eligible but setup.runsWithNoSetup is not true — the shelf is a fresh-tenant first impression, so it must run with zero setup. Verify it, or drop the eligible flag.`,
+    );
+  }
+  if (typeof ob.order === "number") {
+    const prev = shelfOrders.get(ob.order);
+    if (prev) {
+      errors.push(
+        `onboarding: "${t.id}" and "${prev}" both declare onboarding.order ${ob.order} — the shelf order must be unique so the sequence is deterministic.`,
+      );
+    } else {
+      shelfOrders.set(ob.order, t.id);
+    }
+  }
+}
+
 // 4b. `discipline` agrees with `category`. A hard error, not a warning like the
 // complexity divergence below: that one compares an author's judgment against a
 // proxy and the author can be right, whereas a discipline outside its category's
@@ -173,20 +319,21 @@ for (const t of templates) {
 }
 
 // 5. House-style copy rules the schemas cannot express. The length caps live in
-// the schemas as `maxLength` and are reported by check 1/3; these are the two
-// rules a `pattern` could reject but could not explain — naming the offending
+// the schemas as `maxLength` and are reported by check 1/3; these are the rules
+// a `pattern` could reject but could not explain — naming the offending
 // word is the whole value of the message. See scripts/examples-copy-check.mjs.
 for (const t of templates) {
   errors.push(...checkCopy(t, manifests.get(t.id) ?? null));
 }
 
-// 6b. `setup.provisions[]` is DERIVED from the manifest's `resources[]`, so it
-// gets verified rather than trusted. An author-declared mirror with no source of
-// truth is the drift that let `capabilities[]` fill up with SDK method paths
-// instead of catalog ids; this is the same field shape, so it gets a check
-// before it can acquire the same problem.
+// 6b. The whole `registry.setup` block is DERIVED from the manifest (secrets,
+// settings, resources, zeroSetup) by `pnpm examples:sync-setup`, so it gets
+// verified rather than trusted — the drift that let `capabilities[]` fill up
+// with SDK method paths, applied to the entire denormalised block. Only checked
+// for templates that have a manifest (others are already flagged above).
 for (const t of templates) {
-  errors.push(...checkSetupProvisions(t, manifests.get(t.id) ?? null));
+  const manifest = manifests.get(t.id);
+  if (manifest) errors.push(...checkSetupSync(t, manifest));
 }
 
 if (errors.length > 0) {
@@ -267,5 +414,5 @@ for (const [label, ids] of [
 }
 
 console.log(
-  `examples/registry.json OK — ${templates.length} templates, sorted, schema-valid, all sourcePaths present; ${manifestsChecked} template.json manifest(s) schema-valid.`,
+  `examples/registry.json OK — ${templates.length} templates, sorted, schema-valid, all sourcePaths present; ${manifestsChecked} template.json manifest(s) schema-valid; ${projectCopyAssetsChecked} registered project authoring/source asset(s) terminology-checked.`,
 );

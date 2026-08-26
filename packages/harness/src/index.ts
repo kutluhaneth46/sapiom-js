@@ -4,6 +4,7 @@
  */
 
 export * from "./shared/types.js";
+export { AGENT_STUDIO_PRODUCT_NAME } from "./shared/branding.js";
 export {
   HarnessError,
   UnknownSessionError,
@@ -12,6 +13,7 @@ export {
   SessionAlreadyLiveError,
   AdapterNotFoundError,
   ExternalHarnessError,
+  SpawnTargetError,
 } from "./core/errors.js";
 export {
   listHarnessAdapters,

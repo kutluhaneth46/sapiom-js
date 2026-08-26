@@ -1,11 +1,14 @@
 import { useState } from "react";
 import type { JSX } from "react";
-import type { AppState } from "@shared/types";
+import type { AppState, EditorKind } from "@shared/types";
 import { HARNESS_PATHS } from "@shared/types";
 
 import type { AuthStartResponse } from "../lib/api";
+import { isMockMode } from "../lib/api";
+import { EDITOR_OPTIONS, resolveEditor } from "../lib/editors";
 import { Icon } from "./Icon";
 import { track } from "../lib/track";
+import { TrackScope } from "./analytics/TrackScope";
 
 /** Sign-in progress state in the Settings popover. */
 type AuthProgress =
@@ -17,14 +20,20 @@ interface SettingsPopoverProps {
   authenticated: boolean;
   organizationName: string | null;
   telemetryOptIn: boolean;
-  /** How consent was determined - "env-forced-off" locks the toggle. */
+  /** Light product-analytics (PostHog clicks/journeys) opt-in — on by default. */
+  productAnalyticsOptIn: boolean;
+  /** How consent was determined - "env-forced-off" locks BOTH toggles. */
   consentSource?: AppState["consentSource"];
   /** Which env var forced telemetry off, when consentSource is "env-forced-off". */
   consentEnvReason?: string | null;
   onToggleTelemetry: (next: boolean) => Promise<void>;
+  onToggleProductAnalytics: (next: boolean) => Promise<void>;
   /** `HarnessSettings.rollingSummary` — see the toggle's own note below. */
   rollingSummary: boolean;
   onToggleRollingSummary: (next: boolean) => Promise<void>;
+  /** `HarnessSettings.editor` — which editor "Open in editor" targets. */
+  editor: EditorKind;
+  onSelectEditor: (next: EditorKind) => Promise<void>;
   /** Kick off the browser OAuth flow — see HarnessApi.startAuth(). */
   onStartAuth: () => Promise<AuthStartResponse>;
   /** Sign out and clear credentials — see HarnessApi.disconnect(). */
@@ -35,11 +44,15 @@ export function SettingsPopover({
   authenticated,
   organizationName,
   telemetryOptIn,
+  productAnalyticsOptIn,
   consentSource,
   consentEnvReason,
   onToggleTelemetry,
+  onToggleProductAnalytics,
   rollingSummary,
   onToggleRollingSummary,
+  editor,
+  onSelectEditor,
   onStartAuth,
   onDisconnect,
 }: SettingsPopoverProps): JSX.Element {
@@ -49,6 +62,8 @@ export function SettingsPopover({
   // would silently lose to it on the next boot, so the control locks instead.
   const envForced = consentSource === "env-forced-off";
   const effectiveOptIn = envForced ? false : telemetryOptIn;
+  // The env kill-switch turns off ALL telemetry, product analytics included.
+  const effectiveProductAnalytics = envForced ? false : productAnalyticsOptIn;
 
   const handleToggle = async (): Promise<void> => {
     const next = !telemetryOptIn;
@@ -61,10 +76,30 @@ export function SettingsPopover({
     }
   };
 
+  const handleToggleProductAnalytics = async (): Promise<void> => {
+    const next = !productAnalyticsOptIn;
+    setBusy(true);
+    try {
+      await onToggleProductAnalytics(next);
+      track("consent.changed", { productAnalytics: next });
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const handleToggleRollingSummary = async (): Promise<void> => {
     setBusy(true);
     try {
       await onToggleRollingSummary(!rollingSummary);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleSelectEditor = async (next: EditorKind): Promise<void> => {
+    setBusy(true);
+    try {
+      await onSelectEditor(next);
     } finally {
       setBusy(false);
     }
@@ -105,7 +140,10 @@ export function SettingsPopover({
   // No positioned wrapper of its own: the host mounts this inside an
   // AnchoredPopover carrying the .settings-popover recipe and testid.
   return (
-    <>
+    // TrackScope, not a spread: this component's root is a fragment, so there
+    // is no element to attribute. The wrapper is `display: contents`, so it
+    // adds attribution without adding a box.
+    <TrackScope surface="settings">
       <div className="settings-identity">
         {authenticated ? (organizationName ?? "Signed in") : "Not signed in"}
       </div>
@@ -143,7 +181,12 @@ export function SettingsPopover({
         </div>
       )}
 
-      {authenticated && (
+      {/* Sign-out lives in the account menu (below "Check for updates", shown
+          only when signed in) — NOT here. The one exception is the demo/mock
+          build, where that account-menu slot is a "Connect Sapiom account" CTA
+          instead of a sign-out, so Settings carries Disconnect there (and it's
+          the surface the auth e2e suite drives). Hidden in the real app. */}
+      {isMockMode() && authenticated && (
         <div className="settings-auth-row">
           <button
             type="button"
@@ -159,7 +202,7 @@ export function SettingsPopover({
       )}
 
       <label className="settings-toggle-row">
-        <span>Send usage analytics to Sapiom</span>
+        <span>Share session details with Sapiom</span>
         <button
           type="button"
           role="switch"
@@ -173,17 +216,39 @@ export function SettingsPopover({
         </button>
       </label>
 
-      {envForced && (
-        <p className="settings-note settings-env-note" data-testid="telemetry-env-note">
-          Analytics is turned off by {consentEnvReason ? `$${consentEnvReason}` : "an environment variable"}. Unset it
-          and restart the Studio server to manage consent here.
-        </p>
-      )}
+      <p className="settings-note">
+        Help us optimize your experience: with this on, your prompts, tool calls, and session
+        lifecycle events are shared with Sapiom so we can see where Agent Studio gets in your way.
+        Off by default. Always written locally to <code>{HARNESS_PATHS.events}</code> either way.
+      </p>
+
+      <label className="settings-toggle-row">
+        <span>Product analytics (clicks &amp; usage)</span>
+        <button
+          type="button"
+          role="switch"
+          aria-checked={effectiveProductAnalytics}
+          data-testid="product-analytics-toggle"
+          className={"toggle-switch" + (effectiveProductAnalytics ? " is-on" : "")}
+          disabled={busy || envForced}
+          onClick={() => void handleToggleProductAnalytics()}
+        >
+          <span className="toggle-knob" />
+        </button>
+      </label>
 
       <p className="settings-note">
-        Prompts, tool calls, and session lifecycle events are always written locally to{" "}
-        <code>{HARNESS_PATHS.events}</code>. With your consent, they&rsquo;re also sent to Sapiom.
+        Anonymous-by-default usage: which buttons and screens you use, and how you move through the
+        Agent Studio. No prompt text, no file contents, and never a screen recording. On by default; turn
+        it off here anytime.
       </p>
+
+      {envForced && (
+        <p className="settings-note settings-env-note" data-testid="telemetry-env-note">
+          All telemetry is turned off by {consentEnvReason ? `$${consentEnvReason}` : "an environment variable"}. Unset
+          it and restart the Agent Studio server to manage consent here.
+        </p>
+      )}
 
       <label className="settings-toggle-row">
         <span>Summarize sessions in the background</span>
@@ -200,13 +265,42 @@ export function SettingsPopover({
         </button>
       </label>
 
+      <label className="settings-toggle-row">
+        <span>Open in editor uses</span>
+        <span className="settings-select-wrap">
+          <select
+            className="settings-select"
+            data-testid="editor-select"
+            value={resolveEditor(editor)}
+            disabled={busy}
+            onChange={(e) => void handleSelectEditor(e.target.value as EditorKind)}
+          >
+            {EDITOR_OPTIONS.map((option) => (
+              <option key={option.kind} value={option.kind}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+          <span className="settings-select-caret" aria-hidden="true">
+            <Icon name="ChevronDown" size={12} />
+          </span>
+        </span>
+      </label>
+
+      <p className="settings-note">
+        Which editor the session menu&rsquo;s &ldquo;Open in editor&rdquo; hands the project folder
+        to. It opens the editor&rsquo;s own URL scheme, so the app has to be installed — the OS
+        never reports back, and an editor that isn&rsquo;t there simply does nothing.
+      </p>
+
       <p className="settings-note">
         Off by default, because it uses tokens you didn&rsquo;t ask to use: every 10 turns, and
-        once at the end, a cheap one-shot agent run folds the session into a short summary.
-        Continuing a session the agent can no longer reattach to then explains what the work was{" "}
+        once at the end, a cheap one-shot coding-agent pass folds the session into a short summary.
+        Continuing a session the coding agent can no longer reattach to then explains what the work
+        was{" "}
         <em>for</em>, not just what it last did. With this off, continuing still works — it
         carries the last few turns instead.
       </p>
-    </>
+    </TrackScope>
   );
 }

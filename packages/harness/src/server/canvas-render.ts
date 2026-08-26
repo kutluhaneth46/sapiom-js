@@ -12,8 +12,20 @@ import { renderCanvasForSession, type RenderableSession, type RenderableWorkflow
 export interface CanvasRenderRouterDeps {
   /** Look up a session's cwd + current binding; undefined when unknown. */
   getSession(harnessSessionId: string): RenderableSession | undefined;
-  /** The live workflow registry snapshot. */
-  listWorkflows(): RenderableWorkflow[];
+  /** The live workflow registry snapshot, enriched for the session's bound
+   *  workflow when cloud metadata is available. */
+  listWorkflows(session: RenderableSession): readonly RenderableWorkflow[] | Promise<readonly RenderableWorkflow[]>;
+  /**
+   * server/index.ts's reactToRenderOutcome — arms the install watcher after a
+   * depsMissing render and cancels it otherwise, the same as EVERY other
+   * render trigger. This route used to skip it, so a "preparing" placeholder
+   * rendered through here armed nothing and could never auto-advance to the
+   * step graph. Optional only for tests that assert the route in isolation.
+   */
+  onOutcome?(
+    harnessSessionId: string,
+    outcome: Awaited<ReturnType<typeof renderCanvasForSession>>,
+  ): void;
 }
 
 export function createCanvasRenderRouter(deps: CanvasRenderRouterDeps): ExpressRouter {
@@ -25,7 +37,9 @@ export function createCanvasRenderRouter(deps: CanvasRenderRouterDeps): ExpressR
       res.status(404).json({ error: `Unknown session '${req.params.sessionId}'` });
       return;
     }
-    const outcome = await renderCanvasForSession(session, deps.listWorkflows());
+    const workflows = await deps.listWorkflows(session);
+    const outcome = await renderCanvasForSession(session, workflows);
+    deps.onOutcome?.(req.params.sessionId, outcome);
     res.json({ ok: true, ...outcome });
   });
 

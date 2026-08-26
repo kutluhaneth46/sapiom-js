@@ -17,13 +17,14 @@ export function createSystemGraphRouter(
   router.get(
     "/workspaces/:workspaceKey/system-graph",
     async (req, res, next) => {
-      const scope = options.scopeResolver.resolve(req.params.workspaceKey);
-      if (!scope) {
-        res.status(404).json({ error: "Workspace not found" });
-        return;
-      }
-
       try {
+        const scope = await options.scopeResolver.resolve(
+          req.params.workspaceKey,
+        );
+        if (!scope) {
+          res.status(404).json({ error: "Workspace not found" });
+          return;
+        }
         res.json(await options.store.get(scope));
       } catch (err) {
         next(err);

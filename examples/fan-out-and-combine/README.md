@@ -1,18 +1,18 @@
 # Fan Out and Combine
 
-Split a goal into parts, run each part as its own child workflow in parallel, then
-merge the results into one answer — fan out, join, reduce. The canonical "a workflow
-composes other workflows" template, built on `ctx.sapiom.agents.run`.
+Split a goal into parts, run each part as its own child agent run in parallel, then
+merge the results into one answer — fan out, join, reduce. The canonical "an agent
+composes other agents" template, built on `ctx.sapiom.agents.run`.
 
 ## What it does
 
 ```
                  ┌─ agents.run (leaf) ─┐
 plan ─▶ fanOut ──┼─ agents.run (leaf) ─┼─▶ reduce ─▶ done      (coordinate)
-                 └─ agents.run (leaf) ─┘   (models.run) (terminal)
+                 └─ agents.run (leaf) ─┘   (llm.run) (terminal)
 
 plan ─▶ solve ─▶ (terminal)                                    (leaf)
-        (models.run)
+        (llm.run)
 
 plan ─▶ planned ─▶ (terminal)                                  (dryRun)
 ```
@@ -26,9 +26,9 @@ One agent, two roles chosen by `mode`:
    waits for all of them (`Promise.all`). Each dispatch is wrapped, so a child that
    throws or does not complete becomes a failed row instead of sinking the batch.
 3. **reduce** — combines the children's analyses into one answer
-   (`ctx.sapiom.models.run`). If nothing came back with content, it says so rather
+   (`ctx.sapiom.llm.run`). If nothing came back with content, it says so rather
    than inventing a result.
-4. **solve** _(leaf)_ — the unit of work: one `ctx.sapiom.models.run` analysis of a
+4. **solve** _(leaf)_ — the unit of work: one `ctx.sapiom.llm.run` analysis of a
    single item toward the goal, then terminate. A leaf never fans out — that bounds
    the recursion to one level.
 5. **done** / **planned** — terminal. `done` returns the combined answer plus a
@@ -39,7 +39,7 @@ Input:
 
 - `goal` and `items` are the two knobs — what to accomplish, and the parts to fan
   it across (one child run per item).
-- `childDefinition` (optional) is the slug of the workflow to run per item; it
+- `childDefinition` (optional) is the slug of the agent to run per item; it
   defaults to this agent, so the template composes itself with no other deployment.
 - `dryRun: true` returns the resolved fan-out plan without dispatching any children.
 

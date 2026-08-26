@@ -2,12 +2,24 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App.js";
 import { interceptMockTrack } from "./lib/api.js";
+import { observeWindowFocus } from "./lib/window-focus.js";
+import { appFrameFromSearch } from "./lib/window-frame.js";
 import "./styles.css";
 import "./styles/refine.css";
 
 // In mock mode, intercept /api/track calls so Playwright tests can assert
 // that track() events fire without a real server. No-op in real mode.
 interceptMockTrack();
+
+// The window frame the desktop host handed off (macOS = frameless, traffic
+// lights inset into the rail's top line). Set on the root so the window-chrome
+// CSS can scope the header padding + drag region to it; a browser stays "web"
+// and never pays for either.
+document.documentElement.dataset.windowFrame = appFrameFromSearch();
+
+// Frameless macOS hides the traffic lights while the window is blurred, so the
+// rail toggle next to them needs its own surface in that state (styles.css).
+observeWindowFocus();
 
 // The shell is viewport-locked (html/body overflow:hidden) — page scroll is
 // never legitimate. overflow:hidden stops user scrolling but NOT the
@@ -21,6 +33,18 @@ window.addEventListener(
   },
   { passive: true },
 );
+
+// A file dropped anywhere the terminal isn't listening must do nothing — the
+// browser's default is to NAVIGATE to the file, replacing the whole SPA (and
+// in the desktop app, will-navigate hands the file to the OS). Cancelling the
+// default here doesn't interfere with real drop targets: their own handlers
+// still run first.
+window.addEventListener("dragover", (e) => {
+  if (e.dataTransfer?.types.includes("Files")) e.preventDefault();
+});
+window.addEventListener("drop", (e) => {
+  if (e.dataTransfer?.types.includes("Files")) e.preventDefault();
+});
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>

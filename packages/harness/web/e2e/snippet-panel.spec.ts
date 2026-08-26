@@ -35,17 +35,22 @@ test.describe("the Code tab follows the BOUND workflow's deploy state", () => {
     // Opening rfq (no session in its workspace) swaps the tab to the honest
     // "no session" state — no other agent's snippets leak in.
     await page.getByTestId("workflow-rfq").locator(".workflow-item-trigger").click();
+    // Focusing rfq (no live session) auto-collapses the right pane — reopen it to read the Code tab.
+    await page.getByTestId("right-expand").click();
     await expect(page.getByTestId("snippet-panel")).toHaveCount(0);
     await expect(page.getByTestId("right-panel-code")).toContainText("No running session for rfq");
 
-    // Starting the session binds rfq (undeployed) — the deploy-first state.
+    // Starting the session binds rfq (undeployed) — the deploy-first state. The
+    // pane stays open from the expand above (starting a session doesn't re-fold).
     await page.getByTestId("open-agent-start-session").click();
     await expect(page.getByTestId("snippet-panel")).toHaveCount(0);
     await expect(page.getByTestId("right-panel-code")).toContainText("Deploy to trigger from code");
 
-    // Opening leasing again binds + switches back to the boot session's
-    // deployed agent, bringing the snippet panel back.
+    // Opening leasing again switches back to a leasing (deployed) session. It
+    // lands on the most-recent leasing tab, which has an empty board and so
+    // collapses the pane — reopen it to see the deployed agent's snippet panel.
     await page.getByTestId("workflow-leasing").locator(".workflow-item-trigger").click();
+    await page.getByTestId("right-expand").click();
     await expect(page.getByTestId("snippet-panel")).toBeVisible();
   });
 
@@ -93,6 +98,11 @@ test.describe("snippet content", () => {
     expect(text).not.toContain("/triggers");
     expect(text).not.toContain("Bearer");
     expect(text).not.toMatch(/sk_[A-Za-z0-9]/);
+    const hint = page.getByTestId("snippet-hint");
+    await expect(hint).toContainText("Install @sapiom/tools");
+    await expect(hint).toContainText("SAPIOM_API_KEY");
+    await expect(hint).toContainText("waits for a terminal run");
+    await expect(hint).not.toContainText("YOUR_SAPIOM_API_KEY");
   });
 
   test("the cURL tab shows the same endpoint with the placeholder key, never a real one", async ({ page }) => {
@@ -109,6 +119,10 @@ test.describe("snippet content", () => {
     expect(text).not.toContain("/triggers");
     expect(text).not.toContain("Bearer");
     expect(text).not.toMatch(/sk_[A-Za-z0-9]/);
+    const hint = page.getByTestId("snippet-hint");
+    await expect(hint).toContainText("YOUR_SAPIOM_API_KEY");
+    await expect(hint).toContainText("starts a run");
+    await expect(hint).toContainText("execution ID");
   });
 
   test("links to the dashboard's API keys page for the real credential", async ({ page }) => {

@@ -52,9 +52,11 @@ export const HARNESS_PATHS = {
 export const AGENT_PROJECT_MARKER = "sapiom.json";
 
 /**
- * Canvas convention: agents write static HTML here, relative to the session
- * cwd. The server watches this directory and serves it at
- * `/canvas/<harnessSessionId>/`.
+ * Canvas convention: Studio-owned deterministic renders and optional custom
+ * HTML live here, relative to the session cwd. The server watches this
+ * directory and serves the active workflow at `/canvas/<harnessSessionId>/`.
+ * Deterministic workflow files use `CANVAS_RENDERS_DIR`; `index.html` remains
+ * the optional custom-canvas fallback and is never rewritten by that pipeline.
  */
 export const CANVAS_DIR = ".sapiom/canvas";
 export const CANVAS_INDEX = `${CANVAS_DIR}/index.html`;
@@ -69,47 +71,29 @@ export const CANVAS_INDEX = `${CANVAS_DIR}/index.html`;
  */
 export const CANVAS_RENDERS_DIR = `${CANVAS_DIR}/renders`;
 
-/**
- * Composer image attachments (upload / paste / drag-drop) land here, relative
- * to the session cwd, before their path is relayed into the agent's prompt.
- * Co-located under `.sapiom/` with the canvas + context conventions so a single
- * ignore/clean of that directory covers everything the harness writes.
- */
+/** Renderer-only files are materialized here before their paths are included
+ * in a new session's first prompt. Disk-backed attachments never get copied. */
 export const HARNESS_UPLOADS_DIR = ".sapiom/uploads";
 
+/** Hard cap for one pathless clipboard attachment after base64 decoding. */
+export const MAX_INLINE_ATTACHMENT_BYTES = 10 * 1024 * 1024;
+
+/** Renderer-memory cap across all pathless files queued for one new session. */
+export const MAX_INLINE_ATTACHMENTS_TOTAL_BYTES = 50 * 1024 * 1024;
+
 /**
- * Image content types the composer accepts for attach. Kept deliberately small
- * — the formats every supported coding agent can actually read from a file path
- * — and shared by the client (pre-flight validation) and the server (the real
- * gate) so the two can't drift.
+ * Body-parser byte limit for JSON `/api` routes, set well above express's
+ * 100 KiB default so larger prompt / analytics payloads parse without a 413.
+ * Shared by the app-level `/api` parser (server/index.ts) and the rest router
+ * so the two can't disagree; every route still validates its own shape.
  */
-export const ALLOWED_IMAGE_MEDIA_TYPES = [
-  "image/png",
-  "image/jpeg",
-  "image/gif",
-  "image/webp",
-] as const;
-
-export type ImageMediaType = (typeof ALLOWED_IMAGE_MEDIA_TYPES)[number];
-
-/** Hard cap on a single attached image (decoded bytes). 10 MiB. */
-export const MAX_IMAGE_UPLOAD_BYTES = 10 * 1024 * 1024;
+export const JSON_BODY_LIMIT_BYTES = 15 * 1024 * 1024;
 
 /**
- * Body-parser byte limit for JSON `/api` routes. express.json defaults to
- * 100 KiB — far below a base64-encoded image (~1.37× the decoded size). Sized
- * to clear MAX_IMAGE_UPLOAD_BYTES base64'd plus 1 MiB of envelope overhead, and
- * shared by the app-level `/api` parser (server/index.ts) and the rest router
- * so the two can't disagree. The real per-image cap is still enforced (after
- * decode) in the image handler; other routes validate their own small shapes.
- */
-export const JSON_BODY_LIMIT_BYTES = Math.ceil((MAX_IMAGE_UPLOAD_BYTES * 4) / 3) + 1024 * 1024;
-
-/**
- * Workspace-state convention: the harness mirrors this session's binding,
- * the full workflow registry, and its own identity here, relative to the
- * session cwd, so the agent has an always-current, agent-legible answer to
- * "what am I working on" and "what workflows exist" without asking. Written
+ * Workspace-state convention: Agent Studio mirrors this session's binding,
+ * the full agent registry, and its own identity here, relative to the
+ * session cwd, so the coding agent has an always-current answer to
+ * "what am I working on" and "what agents exist" without asking. Written
  * on session create, on every `PATCH /api/sessions/:id/workflow`, and
  * whenever the workflow registry changes (scan/connect) — see
  * HarnessWorkspaceContext. Kept present (never deleted) even on unbind.
@@ -161,11 +145,30 @@ export interface HarnessSession {
   status: SessionStatus;
   createdAt: string;
   lastActiveAt: string;
+  /**
+   * The app's UI theme at launch, mapped to Claude Code's matching ANSI theme
+   * so the terminal palette controls its colors. Persisted so resume reuses the
+   * same base. Absent on sessions created before this existed → server default.
+   */
+  theme?: UiTheme;
   /** Exit code when status === "exited". */
   exitCode?: number | null;
-  /** The workflow (by path) this session is currently bound to, if any. Set
+  /**
+   * The tail of terminal output captured when the session exited ABNORMALLY
+   * (a non-zero `exitCode`). This is the one place the coding agent's own
+   * error line survives: a live pty's scrollback is discarded the moment it
+   * exits, so without this a session that dies at startup — `claude` rejecting
+   * an unknown flag, a failed auth/provider init, a broken hook command —
+   * leaves only a bare exit code with no way to tell WHICH of those happened
+   * (the "exited before establishing a session id" reports). ANSI escapes are
+   * stripped to human-readable text (see `sanitizeExitTail`). Null/absent for
+   * a clean exit (code 0), a synthesized/killed exit, a session that produced
+   * no readable output, or one persisted by a build from before this existed.
+   */
+  exitTail?: string | null;
+  /** The deployable agent (by path) this session is currently bound to, if any. Set
    *  via `PATCH /api/sessions/:id/workflow`; mirrored into
-   *  HARNESS_CONTEXT_FILE in the session's cwd so the agent can read it. */
+   *  HARNESS_CONTEXT_FILE in the session's cwd so the coding agent can read it. */
   boundWorkflowPath: string | null;
   /**
    * The prior session this one was seeded from (portable continue — see
@@ -183,12 +186,16 @@ export interface HarnessSession {
    * directory?") that isn't accepting real input yet. `ready` is the
    * stronger signal: this pty is actually interactive. Reset to `false` on
    * every fresh spawn (including resume) and only ever set by
-   * `SessionManager.setReady()` — see there for what flips it. Injecting
-   * input (macros, `/sessions/:id/input`) against a not-ready session
-   * queues briefly then fails loudly (`SessionNotReadyError`) rather than
-   * silently writing into a TUI that isn't listening; raw terminal
-   * keystrokes (`write()`) are deliberately never gated on this, since a
-   * human must always be able to answer the blocking prompt themselves.
+   * `SessionManager.setReady()` — either from the harness's real lifecycle
+   * signal or an explicitly-declared adapter fallback. A fallback may publish
+   * readiness before the harness has created its first transcript/rollout;
+   * `ready` describes whether the TUI can receive input, not whether durable
+   * conversation metadata already exists. Injecting input (macros,
+   * `/sessions/:id/input`) against a not-ready session queues briefly then
+   * fails loudly (`SessionNotReadyError`) rather than silently writing into a
+   * TUI that isn't listening; raw terminal keystrokes (`write()`) are
+   * deliberately never gated on this, since a human must always be able to
+   * answer the blocking prompt themselves.
    */
   ready: boolean;
 }
@@ -374,16 +381,53 @@ export interface HarnessAdapter {
    */
   canResume(agentSessionId: string, cwd: string): Promise<boolean>;
   /**
-   * Best-effort scrollback check for this harness's own known blocking
-   * prompts (e.g. "trust this directory?"), for harnesses whose real
-   * readiness signal (SessionStart-equivalent) can't be trusted to arrive
-   * before the very first input is worth injecting — see CodexAdapter's
-   * implementation for why. Optional: a harness whose readiness signal IS
-   * trustworthy standalone (Claude Code's SessionStart hook) should leave
-   * this unimplemented rather than have SessionManager fall back to a
-   * scrollback heuristic it doesn't need.
+   * Best-effort check of recent content-bearing terminal output for this
+   * harness's own known blocking prompts (e.g. trust, login, or onboarding
+   * screens). Used by declared readiness fallbacks to avoid input while a
+   * screen the adapter recognizes is visible; it is not a generic terminal-
+   * state guarantee, so adapters are responsible for tracking stable copy
+   * from their startup flows. See CodexAdapter for the immediate-fallback
+   * case. Optional for adapters that never declare a fallback.
    */
-  detectBlockingPrompt?(scrollback: string): boolean;
+  detectBlockingPrompt?(terminalOutput: string): boolean;
+  /**
+   * Best-effort positive match for this harness's empty interactive composer.
+   * Immediate fallbacks use it only after they previously recognized a
+   * blocking screen: a partial TUI repaint cannot erase that blocker latch;
+   * a positively identified composer can. Optional when the adapter's output
+   * is not diff-rendered or it never declares an immediate fallback.
+   */
+  detectReadyPrompt?(terminalOutput: string): boolean;
+  /**
+   * How SessionManager may proactively mark this harness ready WITHOUT its
+   * real readiness signal (SessionStart hook / tailer equivalent). Absent =
+   * never publish fallback readiness; detect-only legacy adapters retain only
+   * their request-time `isReadyEnough` compatibility path.
+   *
+   *  - `"immediate"` (Codex): after the pty has produced output and settled
+   *    (or reached a bounded liveness ceiling), SessionManager proactively
+   *    publishes `ready` when no recognized blocking prompt is visible,
+   *    releasing a held first prompt. `isReadyEnough` applies the same rule
+   *    as a request-time race safeguard. Codex's real signal cannot arrive
+   *    before the first injection needs it (see CodexAdapter).
+   *  - `"hook-timeout"` (Claude Code): the hook is the primary signal, but a
+   *    generously-timed fallback flips `ready` when it never arrives — the
+   *    hook chain runs `node` through whatever shell Claude uses for hooks,
+   *    and on Windows machines where that resolution breaks, the alternative
+   *    was a held first prompt silently dropped. When supplied,
+   *    `detectBlockingPrompt` keeps this fallback waiting on blocking screens
+   *    the adapter recognizes.
+   */
+  readyFallback?: "immediate" | "hook-timeout";
+  /**
+   * Whether this harness's TUI is known to always enable bracketed paste
+   * (DEC mode 2004). Used only when the pty's own output never showed a 2004
+   * set/reset: ConPTY re-renders output rather than passing DEC private-mode
+   * sequences through, so on Windows the observation channel is blind and a
+   * multi-line prompt written raw would submit at its first newline. An
+   * explicit observed reset still wins over this assumption.
+   */
+  assumesBracketedPaste?: boolean;
   /**
    * Builds a one-shot, headless invocation for `TaskManager.run()`: executes
    * `opts.prompt` non-interactively and exits on its own when the turn
@@ -467,7 +511,12 @@ export type TerminalControlMessage = TerminalResizeMessage;
 export type BusMessage =
   | { type: "session.status"; session: HarnessSession }
   | { type: "canvas.reload"; harnessSessionId: string }
-  | { type: "port.detected"; harnessSessionId: string; port: number; url: string }
+  | {
+      type: "port.detected";
+      harnessSessionId: string;
+      port: number;
+      url: string;
+    }
   /**
    * A run just started (the CLI printed `✓ Started execution <id>`, caught by
    * the ExecutionDetector). The SPA starts polling `/api/runs/:id/state` on
@@ -525,7 +574,7 @@ export type BusMessage =
  * `web.search`, `models.coding.run`) — never a provider or model name.
  * `stubUsed` records whether this call was served by a supplied stub instead
  * of a real capability call, which is the single most load-bearing fact when
- * explaining a local (offline) run. Optional fields are ABSENT (not null)
+ * explaining a local stub-served run. Optional fields are ABSENT (not null)
  * when the source does not carry the value — honest absence.
  */
 export interface StepCall {
@@ -552,13 +601,20 @@ export type StepStatus = "pending" | "running" | "passed" | "failed";
 /** One step as the canvas renders it — status plus the deterministically
  *  derived latency/error/log slice. Optional fields are ABSENT (not
  *  `undefined`/`0`) when the decoded projection carries no value — honest
- *  absence. The inspector surfaces logs, latency, and pass/fail only. */
+ *  absence. Studio exposes every recorded field through the shared evidence
+ *  inspector and labels missing fields as not recorded. */
 export interface StepView {
   /** Stable id for keyed rendering — the OTel span id, else a step-order key. */
   id: string;
   /** Human step label (the projection's stepName). */
   name: string;
+  /** Attempt number from the runtime; retries repeat as distinct rows. Absent
+   * only for legacy/synthetic structural rows that predate attempt evidence. */
+  attempt?: number;
   status: StepStatus;
+  /** Runtime timestamps when recorded. */
+  startedAt?: string;
+  finishedAt?: string;
   /** finishedAt − startedAt in ms; absent while running or on bad timestamps. */
   latencyMs?: number;
   /** Terminal error message; present only for a failed step that recorded one. */
@@ -577,6 +633,10 @@ export interface StepView {
    *  output, absent otherwise (a still-running or output-less step shows no
    *  Output block). Any JSON shape. */
   output?: unknown;
+  /** Snapshot of shared state immediately after this attempt settled. */
+  sharedState?: Record<string, unknown>;
+  /** Continue/retry/pause/terminate/fail directive returned by the step. */
+  directive?: unknown;
   /** The capability calls this step made during the run, in call order. Each
    *  entry is capability-scoped and provider-agnostic. Absent (never `[]`)
    *  when the source records no call information for this step — honest
@@ -599,20 +659,29 @@ export interface UnusedStubView {
  *  to the four states the UI distinguishes; `steps` is order-preserving.
  *
  *  Stub fields are RUN-LEVEL and honest-absence: they are set only by
- *  {@link renderLocalRun} for an offline stub run (prod runs from renderRunState
+ *  {@link renderLocalRun} for a local stub-served run (prod runs from renderRunState
  *  never carry them), and only when they carry real signal. A local run is
  *  stub-served by construction — every `ctx.sapiom.*` call resolves from a stub —
  *  so `stubbed` is the honest per-run truth the inspector marks each executed
- *  step with (agent-core records no per-CALL stub attribution, so the chip lives
- *  at the granularity the trace actually supports). `unusedStubs`/`stubWarnings`
+ *  step with. When the local trace records individual calls, `StepCall.stubUsed`
+ *  supplies the finer-grained attribution alongside that run-level signal.
+ *  `unusedStubs`/`stubWarnings`
  *  come from the run's terminal NDJSON summary and are ABSENT (not `[]`) when
  *  empty, so the read-only notice renders nothing when there is nothing wrong. */
 export interface RunView {
   executionId: string;
   status: "running" | "completed" | "failed" | "cancelled";
   steps: StepView[];
-  /** True when this run was served entirely by stub capabilities (an offline
-   *  local run). Absent for real (prod / local-backend) runs. Drives the
+  /** Exact entry input when recorded. */
+  input?: unknown;
+  /** Canonical terminal output when recorded. */
+  output?: unknown;
+  /** Canonical terminal error when recorded. */
+  error?: unknown;
+  startedAt?: string;
+  finishedAt?: string;
+  /** True when this run was served entirely by stub capabilities. Absent for
+   *  real (prod / local-backend) runs. Drives the
    *  per-step "stubbed" chip. */
   stubbed?: boolean;
   /** Supplied stub keys that matched no capability call this run (likely a typo
@@ -622,6 +691,16 @@ export interface RunView {
    *  wrong shape (the silent-wrong-data trap). Absent when none. */
   stubWarnings?: string[];
 }
+
+/** Where a run executed — the server announces it on `execution.started`.
+ *  "local" runs are stubbed (capabilities run against fixtures); "prod" runs
+ *  are real cloud executions.
+ *
+ *  Lives here rather than in the SPA store because three unrelated consumers
+ *  need it: the store, the `execution.started` bus message below, and the
+ *  analytics registry — and the analytics module must not import the store
+ *  (the store imports IT, so that direction is a cycle). */
+export type RunTarget = "prod" | "local";
 
 // ---------------------------------------------------------------------------
 // Adapter registry (GET /api/harnesses)
@@ -640,9 +719,6 @@ export interface HarnessEntry {
   installed: boolean;
   /** Per-agent copy-paste instructions for installing and configuring the Sapiom MCP server. */
   installMcpPrompt: string;
-  /** True when this harness can read an image the composer relays into its
-   *  prompt (as a file path) — the SPA only offers image attach for these. */
-  imageInput: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -668,7 +744,8 @@ export type UiEventName =
   | "visualize.triggered"
   | "consent.changed"
   | "session.created"
-  | "mcp.install";
+  | "mcp.install"
+  | "plan.upgrade_clicked";
 
 export interface UiTrackRequest {
   /** Dot-canonical event name — one of the UiEventName literals. */
@@ -696,7 +773,8 @@ export type AnalyticsEventType =
   | "visualize.triggered"
   | "consent.changed"
   | "session.created"
-  | "mcp.install";
+  | "mcp.install"
+  | "plan.upgrade_clicked";
 
 /**
  * The normalized event — the shape that (with opt-in) is batched to the
@@ -896,7 +974,7 @@ export interface SessionRecord {
 // POST   /api/sessions/:id/resume       → HarnessSession (new pty, --resume)
 // DELETE /api/sessions/:id              → { ok: true }   (kill pty)
 // POST   /api/sessions/:id/input        InjectInputRequest → { ok: true }
-// POST   /api/sessions/:id/image        AttachImageRequest → AttachImageResponse (write + relay path)
+// POST   /api/sessions/:id/attachments  AttachFileRequest → AttachFileResponse (materialize only)
 // PATCH  /api/sessions/:id/workflow     BindWorkflowRequest → HarnessSession
 // GET    /api/workflows                 → WorkflowInfo[]
 // POST   /api/workflows/connect         { path } → WorkflowInfo
@@ -907,9 +985,13 @@ export interface SessionRecord {
 // PATCH  /api/settings                  Partial<HarnessSettings> → HarnessSettings
 // GET    /api/templates                 → TemplateListResponse (relays core's gallery)
 // GET    /api/templates/:id             → TemplateDetailView
+// GET    /api/account/plan              → AccountPlanView (relays core's plan + usage readout)
 // GET    /api/fs/list?path=&hidden=     → FsListResponse (directory autocomplete)
 // POST   /api/track                     UiTrackRequest → { ok: true }  (UI-interaction analytics)
 // POST   /ingest                        (hook payloads; bearer = ingest token)
+
+/** The app's active UI theme, as tracked client-side (web/src/lib/theme.ts). */
+export type UiTheme = "light" | "dark";
 
 export interface CreateSessionRequest {
   cwd: string;
@@ -929,6 +1011,30 @@ export interface CreateSessionRequest {
    * directory) on a summary that was never going to exist.
    */
   rehydrateFrom?: string;
+  /**
+   * The app's active UI theme when this session was launched. The server maps
+   * it to Claude Code's matching ANSI theme (`dark`→`dark-ansi`) so the
+   * terminal's own palette controls Claude's colors and its dim text keeps
+   * contrast. Persisted on the session so resume reuses the same base. Omitted
+   * → server default (see createDefaultBuildLaunchOpts).
+   */
+  theme?: UiTheme;
+}
+
+/** One pathless clipboard file to materialize inside a new session's cwd. */
+export interface AttachFileRequest {
+  /** `data:<mediaType>;base64,<payload>`. */
+  dataUrl: string;
+  /** Display name only; the server always owns the stored filename. */
+  filename: string;
+}
+
+/** Result of materializing a pathless clipboard file. */
+export interface AttachFileResponse {
+  /** Absolute path beneath the session's `.sapiom/uploads` directory. */
+  path: string;
+  mediaType: string;
+  bytes: number;
 }
 
 /**
@@ -961,62 +1067,38 @@ export interface InjectInputRequest {
   submit?: boolean;
 }
 
-/**
- * `POST /api/sessions/:id/image` body — one attached image from the composer
- * (file picker, clipboard paste, or drag-drop). The image rides as a `data:`
- * URL rather than multipart so it flows through the same JSON pipeline as every
- * other endpoint. The server decodes it, writes it under
- * {@link HARNESS_UPLOADS_DIR} in the session cwd, and relays its path into the
- * agent's prompt.
- */
-export interface AttachImageRequest {
-  /** `data:<mediaType>;base64,<payload>` — mediaType must be one of
-   *  {@link ALLOWED_IMAGE_MEDIA_TYPES}; decoded size ≤ {@link MAX_IMAGE_UPLOAD_BYTES}. */
-  dataUrl: string;
-  /** Original filename, if the browser knew one — used only to derive a
-   *  friendly extension; the stored name is always a fresh uuid. */
-  filename?: string;
-}
-
-/** `POST /api/sessions/:id/image` response — where the image landed. */
-export interface AttachImageResponse {
-  /** Absolute path of the written image, relayed into the agent's prompt. */
-  path: string;
-  /** The media type the server accepted the image as. */
-  mediaType: ImageMediaType;
-  /** Decoded bytes written to disk. */
-  bytes: number;
-}
-
 /** `PATCH /api/sessions/:id/workflow` body. `null` unbinds. `workflowPath`
  *  must be a path already known to the workflow registry (scan/connect). */
 export interface BindWorkflowRequest {
   workflowPath: string | null;
 }
 
-/** The trimmed workflow shape embedded in HarnessWorkspaceContext — just
- *  enough for an agent to identify a workflow, not the full WorkflowInfo
- *  (e.g. `source` is registry bookkeeping the agent has no use for). */
-export interface HarnessWorkspaceContextWorkflow {
+/** The trimmed agent shape embedded in HarnessWorkspaceContext — just
+ *  enough for a coding agent to identify a deployable agent, not the full
+ *  internal WorkflowInfo (e.g. `source` is registry bookkeeping it has no
+ *  use for). */
+export interface HarnessWorkspaceContextAgent {
   name: string;
   path: string;
   definitionId: number | null;
 }
+
+/** @deprecated Use {@link HarnessWorkspaceContextAgent}. */
+export type HarnessWorkspaceContextWorkflow = HarnessWorkspaceContextAgent;
 
 /**
  * The shape written to HARNESS_CONTEXT_FILE in a session's cwd. Schemaless
  * by convention elsewhere in the harness, but this one file IS a contract —
  * the default system prompt tells the agent to read it, so its shape is
  * fixed here like any other REST payload. Deliberately small and
- * stable-ordered (`workflows` sorted by path) so an agent can diff it
+ * stable-ordered (`agents` sorted by path) so a coding agent can diff it
  * cheaply across reads rather than re-parsing a growing blob.
  */
 export interface HarnessWorkspaceContext {
-  boundWorkflow: HarnessWorkspaceContextWorkflow | null;
-  /** Every workflow currently known to this harness instance's registry,
-   *  selected or not — lets an agent answer "what workflows exist" without
-   *  a UI action, not just "which one is selected." */
-  workflows: HarnessWorkspaceContextWorkflow[];
+  boundAgent: HarnessWorkspaceContextAgent | null;
+  /** Every deployable agent currently known to this Studio instance's
+   *  registry, selected or not. */
+  agents: HarnessWorkspaceContextAgent[];
   session: { id: string; cwd: string; harness: HarnessKind };
   updatedAt: string;
 }
@@ -1025,8 +1107,24 @@ export interface AppState {
   version: string;
   authenticated: boolean;
   userId: string | null;
+  /**
+   * The Sapiom org/tenant id (SAP-1988). Exposed to the SPA so client PostHog
+   * can `group('organization', tenantId)` — segmenting studio usage by customer
+   * the same way the web app does. Null when unauthenticated. Today this equals
+   * `userId` (identity is org-scoped); kept as a distinct field so a real
+   * per-seat id can diverge later without touching the group binding.
+   */
+  tenantId: string | null;
   organizationName: string | null;
   telemetryOptIn: boolean;
+  /**
+   * Resolved light-product-analytics (PostHog) opt-in (SAP-1988). Defaults to
+   * true (on) when the user hasn't opted out. The SPA gates `posthog` capture
+   * on this AND on `consentSource !== "env-forced-off"` (the hard kill-switch,
+   * which always wins). Always present so the client never has to distinguish
+   * "absent" from "false".
+   */
+  productAnalyticsOptIn: boolean;
   /**
    * How telemetry consent was determined at CLI boot. The UI uses this to
    * decide whether to show the first-run notice: "default-silent" means the
@@ -1161,7 +1259,7 @@ export interface TemplateSummary {
   capabilities: string[];
   /**
    * How involved the template is. Replaced an estimated per-run cost that core
-   * could only compute for 5 of 26 templates; a band is defined for every one.
+   * could only compute for a subset of templates; a band is defined for every one.
    *
    * NULLABLE HERE THOUGH CORE TYPES IT REQUIRED, and that is not belt-and-braces.
    * The Studio is a published npm package: an old copy can point at any backend,
@@ -1227,7 +1325,11 @@ export interface TemplateDetailView extends TemplateSummary {
   notes: string | null;
   examples: Array<{ title: string | null; input: unknown; output: unknown }>;
   /** Credentials the template needs supplied before a deployed run works. */
-  requiredSecrets: Array<{ key: string; label: string; description: string | null }>;
+  requiredSecrets: Array<{
+    key: string;
+    label: string;
+    description: string | null;
+  }>;
 }
 
 /**
@@ -1243,8 +1345,49 @@ export interface TemplateListResponse {
   reason?: "signed-out" | "unreachable";
 }
 
+/**
+ * The rail's plan card, assembled SERVER-SIDE from core reads so the SPA never
+ * sees the API key and never derives money figures itself (the card renders
+ * what it is told or nothing — it does not invent spend, quota, or a plan).
+ *
+ * `readout` is the one money line the card shows, in preference order:
+ *  - `limit`   — today's settled spend against the org's active spend-limit
+ *                rule, the same "$used / $cap" pair the dashboard's balance
+ *                card renders. Present only when such a rule exists.
+ *  - `balance` — the prepaid account's available USD, when no limit rule is
+ *                set but the ledger answered.
+ *  - `none`    — nothing trustworthy to show; the card omits the line (and
+ *                hides entirely when `plan` is also null).
+ */
+export interface AccountPlanView {
+  plan: { name: string; status: "active" | "inactive" } | null;
+  readout:
+    | { kind: "limit"; usedUsd: number; limitUsd: number }
+    | { kind: "balance"; availableUsd: number }
+    | { kind: "none" };
+  source: "live" | "fallback";
+  /** Why the live fetch was not used, when `source` is `fallback`. */
+  reason?: "signed-out" | "unreachable";
+}
+
 export interface HarnessSettings {
+  /**
+   * Opt-in to sending the *invasive* usage telemetry to Sapiom → BigQuery
+   * (prompts, tool calls, session detail). OFF by default (SAP-1988): a desktop
+   * tool that silently ships session content is a reputation risk, so this is
+   * opt-in via the setup screen with benefit-framed copy. Distinct from
+   * `productAnalyticsOptIn` (light PostHog clicks/journeys, on by default).
+   */
   telemetryOptIn: boolean;
+  /**
+   * Opt-OUT of light product analytics — PostHog autocapture clicks, journeys,
+   * and usage metrics with NO recording and NO prompt/user content (SAP-1988).
+   * ON by default (absent === true): this is non-invasive and mirrors the web
+   * app. Hard kill-switches (`SAPIOM_TELEMETRY_DISABLED` / `DO_NOT_TRACK` /
+   * `--no-telemetry`, surfaced as `AppState.consentSource === "env-forced-off"`)
+   * always win regardless of this flag.
+   */
+  productAnalyticsOptIn?: boolean;
   /** Most-recently-used project directories, newest first. */
   recentDirs: string[];
   /**
@@ -1271,7 +1414,30 @@ export interface HarnessSettings {
    * user never asked for. With it off, briefs degrade to last-N-turns.
    */
   rollingSummary?: boolean;
+  /**
+   * Which editor "Open in editor" hands the session directory to. Absent means
+   * `EDITOR_KINDS[0]` (VS Code) — the behaviour before this setting existed.
+   *
+   * A preference rather than a detected value: the schemes below are handled by
+   * the OS, which never tells us whether anything answered, so a wrong guess is
+   * indistinguishable from a working one (the click just does nothing). The user
+   * picking their editor is the only signal we can trust.
+   */
+  editor?: EditorKind;
 }
+
+/**
+ * The editors "Open in editor" can hand a directory to, in menu order.
+ *
+ * Each one registers its own URL scheme (`<kind>://file/<path>`) — the VS Code
+ * forks kept VS Code's shape, which is why one template covers all of them
+ * (see web/src/lib/editors.ts). `HarnessSettings.editor`, the zod enum in
+ * server/rest.ts and the picker are all derived from this tuple, so adding an
+ * editor is a one-line change here plus its label.
+ */
+export const EDITOR_KINDS = ["vscode", "vscode-insiders", "cursor", "windsurf", "zed"] as const;
+
+export type EditorKind = (typeof EDITOR_KINDS)[number];
 
 // ---------------------------------------------------------------------------
 // Filesystem browsing (new-session directory picker autocomplete)
@@ -1325,9 +1491,54 @@ export interface WorkflowInfo {
    *  caches as `name`, used as the executions-API handle
    *  (`/agents/v1/definitions/{slug}/executions`). Null before first link. */
   definitionSlug: string | null;
+  /**
+   * Cloud build evidence from the definition-detail projection. An id alone
+   * only proves that this local project is linked to a cloud definition;
+   * `activeBuildRunStatus === "ready"` is the signal that the definition has a
+   * runnable build. Optional for compatibility with older harness servers.
+   */
+  activeBuildRunId?: string | null;
+  activeBuildRunStatus?: string | null;
+  /**
+   * Provenance from sapiom.json: the gallery template this project was cloned
+   * from. Distinct from `source` below, which records how the REGISTRY learned
+   * of the path. Optional for compatibility with older harness servers; null
+   * when the marker doesn't carry the field.
+   */
+  templateId?: string | null;
+  /** Fork record id from sapiom.json (a gallery clone carries this too). */
+  forkId?: string | null;
+  /** Bundled-starter id from sapiom.json; `"default"` = bare scaffold. */
+  starterId?: string | null;
   /** How it entered the registry. */
   source: "scan" | "connect";
 }
+
+/**
+ * The entry-step contract Studio uses to collect an exact execution input.
+ * `unavailable` is deliberately distinct from `none`: the former means
+ * extraction failed and Studio must preserve a raw-JSON escape hatch, while
+ * the latter means the agent intentionally accepts opaque/no declared input.
+ */
+export type WorkflowInputContractResponse =
+  | {
+      status: "available";
+      jsonSchema: Record<string, unknown>;
+      /** Author example when declared, otherwise a runnable shape skeleton. */
+      example: unknown;
+    }
+  | {
+      status: "none";
+      jsonSchema: null;
+      example: Record<string, never>;
+    }
+  | {
+      status: "unavailable";
+      jsonSchema: null;
+      example: Record<string, never>;
+      /** Safe, user-facing explanation; never raw extraction diagnostics. */
+      reason: string;
+    };
 
 // ---------------------------------------------------------------------------
 // Action macros (right icon rail)

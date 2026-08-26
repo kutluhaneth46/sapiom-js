@@ -1,7 +1,7 @@
 # Authoring Sapiom templates
 
 A **template** is a working Sapiom agent, published in this repo, that anyone can browse in
-the gallery and turn into their own workflow with one click. This guide takes you from an
+the gallery and turn into their own agent with one click. This guide takes you from an
 empty directory to a merged, live template. Contributions are welcome — a human or an agent
 can follow it end to end.
 
@@ -26,12 +26,12 @@ Every template is one directory under `examples/`, named for its `id` (kebab-cas
 `examples/scheduled-research-brief`). Look at an existing one — `examples/hello-agent` is the
 smallest — and copy its shape. A template directory holds:
 
-| File | What it is |
-|---|---|
-| `index.ts` | The agent itself — a `defineAgent` / `defineStep` graph. This is the code that runs. |
-| `template.json` | The rich manifest for the detail page (`longDescription`, `useCases`, `notes`, `examples`, `author`). |
-| `package.json` / `tsconfig.json` | Pinned `@sapiom/*` SDK deps and a `typecheck` script. Copy these from an existing template. |
-| `README.md` | Short, optional — how to run it from the code. |
+| File                             | What it is                                                                                            |
+| -------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `index.ts`                       | The agent itself — a `defineAgent` / `defineStep` graph. This is the code that runs.                  |
+| `template.json`                  | The rich manifest for the detail page (`longDescription`, `useCases`, `notes`, `examples`, `author`). |
+| `package.json` / `tsconfig.json` | Pinned `@sapiom/*` SDK deps and a `typecheck` script. Copy these from an existing template.           |
+| `README.md`                      | Short, optional — how to run it from the code.                                                        |
 
 Plus **one entry** in `examples/registry.json` — the gallery index (see
 [Write the copy](#4-write-the-copy) for every field). That entry's `sourcePath` must point at
@@ -57,19 +57,19 @@ anything is not ready to publish.
 
 "Something real" does not mean "something faked". The rule that resolves every case:
 
-> **Simulate the world's *response*. Never simulate your *effect* on the world.**
+> **Simulate the world's _response_. Never simulate your _effect_ on the world.**
 
 A stand-in search result, sample transcript, or seeded database row is fine — you are supplying
 an input the user would have supplied. Reporting that you sent an email, posted to Slack,
 pushed a commit, or filed an attestation when you did not is never fine, however it is
 labelled. The user's next action is to go and look.
 
-| ✅ Honest | ❌ Dishonest |
-|---|---|
-| `{ posted: false, skipped: "no-credential" }` | `{ posted: true }` with no token |
-| Seeded demo rows in a provisioned database | A hardcoded `rows` array posing as the user's data |
-| `{ status: "draft", previewUrl: null }` | `{ status: "published", url: "…" }` for a site never deployed |
-| `{ outcome: "pending-approval", pending: true }` at a gate | `{ approved: true }` because nobody answered |
+| ✅ Honest                                                  | ❌ Dishonest                                                  |
+| ---------------------------------------------------------- | ------------------------------------------------------------- |
+| `{ posted: false, skipped: "no-credential" }`              | `{ posted: true }` with no token                              |
+| Seeded demo rows in a provisioned database                 | A hardcoded `rows` array posing as the user's data            |
+| `{ status: "draft", previewUrl: null }`                    | `{ status: "published", url: "…" }` for a site never deployed |
+| `{ outcome: "pending-approval", pending: true }` at a gate | `{ approved: true }` because nobody answered                  |
 
 ### Every required input needs a default, and no entry step throws
 
@@ -89,12 +89,47 @@ if (source === "") return goto("rejected", { reason: "`source` is required" });
 ```
 
 **Defaults are safe for settings, never for resources.** A **setting** is non-secret config (a
-topic, a recipient, a row cap) — give it a real default. A **resource** must *exist*: a
+topic, a recipient, a row cap) — give it a real default. A **resource** must _exist_: a
 repository, a database, a sandbox. Never default one to a plausible-looking name;
 `repoSlug: "my-app"` and `dbHandle: "analytics"` do not exist in a new account, and naming them
 turns a clean rejection into a 404 mid-run. Declare it under `resources[]` and provision it, or
 stop with a stated reason. A **connection** is a third-party credential: never default it and
 never fake it — read it, and when it is absent, skip the side effect and say so.
+
+### Provisioning an inbox: never pin a global identifier
+
+Sending email needs an inbox to send from. Provision it, but let the platform pick the address —
+**never pass a fixed `username` to `inboxes.create`.** AgentMail addresses are globally unique, so
+a hardcoded local part (`"newsletter"`, `"outreach"`) can be owned by only ONE account across the
+whole platform: the first tenant to run your template claims it, and every other tenant's `create`
+then 409s with "Email address is already taken" — an uncaught throw that fails the very first
+zero-setup run. Omit `username` so the address is auto-generated, reuse an existing inbox first,
+and treat a 409 as "someone already provisioned one" (the non-atomic window between `list` and
+`create`) rather than a crash:
+
+```ts
+import { EmailHttpError } from "@sapiom/tools";
+
+async function resolveSenderInbox(ctx: Ctx): Promise<string> {
+  const existing = await ctx.sapiom.email.inboxes.list({ limit: 1 });
+  if (existing.inboxes.length > 0) return existing.inboxes[0].inboxId;
+  try {
+    const inbox = await ctx.sapiom.email.inboxes.create({
+      displayName: "My Agent",
+    });
+    return inbox.inboxId;
+  } catch (err) {
+    if (err instanceof EmailHttpError && err.status === 409) {
+      const retry = await ctx.sapiom.email.inboxes.list({ limit: 1 });
+      if (retry.inboxes.length > 0) return retry.inboxes[0].inboxId;
+    }
+    throw err;
+  }
+}
+```
+
+The same caution applies to anything keyed by a platform-global name: prefer a tenant-scoped
+handle or a platform-generated identifier over a string every tenant would otherwise reuse.
 
 ### Pause discipline
 
@@ -116,7 +151,7 @@ return pauseUntilSignal({
 ```
 
 **Human checkpoint** — `kind: "pause"` **and** `checkpoint: true`, at most one per template.
-Where a participant *is* assigned, **keep the pause**: that is correct behaviour, and the run
+Where a participant _is_ assigned, **keep the pause**: that is correct behaviour, and the run
 detail already ships one-click Approve/Reject. Where nobody is assigned, **terminate at the
 gate** with the pending artifact and the signal that continues the run:
 
@@ -151,7 +186,7 @@ Declare each third-party credential under `requiredSecrets[]` and read it as
 `process.env[KEY]`. Sapiom collects it when the user takes the template and injects it into the
 step at dispatch. Do **not** call `ctx.sapiom.vault.get(ref, key)` for a template credential:
 that reads a tenant-wide ref the deploy panel never writes, so a user who fills in the dialog
-still gets `skipped: "no-credential"`. Declaring what a credential *is*, rather than where it
+still gets `skipped: "no-credential"`. Declaring what a credential _is_, rather than where it
 lives, is what lets resolution change without touching your template.
 
 Supplying config or a credential never requires a redeploy: settings are run input read per
@@ -168,9 +203,10 @@ run, and secrets are read at step dispatch.
 
    **Be aware of what it does not check.** Every capability is stubbed, so `database.get`
    returns a `localhost` connection string and `repositories.get` returns a plausible
-   repository — *neither ever fails*. A `run_local` pass proves your control flow, **not** that
+   repository — _neither ever fails_. A `run_local` pass proves your control flow, **not** that
    the resources your template names exist. Pauses are auto-resumed locally too, so a pause
    nothing will ever fire still looks fine.
+
 3. **Then run it deployed, with no input at all.** `deploy` and `run` it with `{}`. It must
    reach a terminal state and produce something real (see [§1a](#1a-make-it-runnable-with-nothing)).
    This is the check that catches what `run_local` cannot: a resource handle that doesn't
@@ -188,8 +224,9 @@ run, and secrets are read at step dispatch.
    order.
 5. **Get the capability ids right.** The `capabilities` array and each `steps[].capability`
    must be the exact `ctx.sapiom.*` ids your code actually calls — see
-   [Capability ids](#capability-ids-correctness-not-style). The LLM path is `models.run`
-   (`models.coding` for a coding agent), **not** `llm.generate`.
+   [Capability ids](#capability-ids-correctness-not-style). One-shot LLM work uses
+   `llm.run`; managed multi-turn loops use `models.run`, and coding agents use
+   `models.coding`. The runtime path is **not** `llm.generate`.
 6. **Keep the manifest runnable, not just honest.** The `examples` you list must be real
    `{ input, output }` pairs the code produces — don't invent fields. And `examples[0].input`
    must **produce a terminal run when deployed**: in particular it must not name a resource (a
@@ -205,19 +242,19 @@ describes your template.
 
 ### `category` — the outcome, not the mechanism
 
-Pick **exactly one**. The question it answers is *"what is the user trying to produce?"* — the
+Pick **exactly one**. The question it answers is _"what is the user trying to produce?"_ — the
 business job, not the platform primitive you're demonstrating. A durable pause-and-resume drip
-that books meetings is `revenue-marketing`, not "durable"; the durability is *how*, not *what*.
+that books meetings is `revenue-marketing`, not "durable"; the durability is _how_, not _what_.
 
-| `category` | What belongs here |
-|---|---|
-| `starter` | Learning the platform — the smallest thing that runs, or a primitive shown on its own. The one category that is about mechanism, because that is its job. |
-| `product-engineering` | Ship and maintain software: code review, dependency work, tests, quality gates. |
-| `reliability-governance` | Keep systems and processes healthy and accountable: triage, self-healing, approvals, fleet oversight. |
-| `revenue-marketing` | Win and keep customers: outreach, proposals, CRM, content, campaigns, creative. |
-| `customer-experience` | Serve an existing customer: support resolution, onboarding, service channels. |
-| `data-knowledge` | Turn data or sources into an answer: research, reporting, querying, backfills. |
-| `finance-legal-people` | Money, compliance, contracts, and employment work. |
+| `category`               | What belongs here                                                                                                                                         |
+| ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `starter`                | Learning the platform — the smallest thing that runs, or a primitive shown on its own. The one category that is about mechanism, because that is its job. |
+| `product-engineering`    | Ship and maintain software: code review, dependency work, tests, quality gates.                                                                           |
+| `reliability-governance` | Keep systems and processes healthy and accountable: triage, self-healing, approvals, fleet oversight.                                                     |
+| `revenue-marketing`      | Win and keep customers: outreach, proposals, CRM, content, campaigns, creative.                                                                           |
+| `customer-experience`    | Serve an existing customer: support resolution, onboarding, service channels.                                                                             |
+| `data-knowledge`         | Turn data or sources into an answer: research, reporting, querying, backfills.                                                                            |
+| `finance-legal-people`   | Money, compliance, contracts, and employment work.                                                                                                        |
 
 Mechanism words — `durable`, `pause-resume`, `hitl`, `evals`, `media`, `orchestration` — belong
 in freeform `tags`, which drive search and the chips on a card. Put them there and they stay
@@ -237,15 +274,15 @@ category routinely differ — `pr-review-bot` and `dependency-upgrade` are both
 Unlike `category`, this string is rendered **verbatim** — it is not an id the app relabels, so
 write it as you want it read. The app supplies only the glyph beside it.
 
-| `category` | Allowed `discipline` |
-|---|---|
-| `starter` | `Starter` |
-| `product-engineering` | `Engineering`, `Release engineering`, `AI operations` |
-| `reliability-governance` | `Reliability`, `Security`, `Governance`, `FinOps` |
-| `revenue-marketing` | `Revenue`, `Marketing`, `Strategy` |
-| `customer-experience` | `Support`, `Customer success`, `Product` |
-| `data-knowledge` | `Data`, `Knowledge`, `Research`, `Operations` |
-| `finance-legal-people` | `Finance`, `Legal`, `People`, `Operations` |
+| `category`               | Allowed `discipline`                                  |
+| ------------------------ | ----------------------------------------------------- |
+| `starter`                | `Starter`                                             |
+| `product-engineering`    | `Engineering`, `Release engineering`, `AI operations` |
+| `reliability-governance` | `Reliability`, `Security`, `Governance`, `FinOps`     |
+| `revenue-marketing`      | `Revenue`, `Marketing`, `Strategy`                    |
+| `customer-experience`    | `Support`, `Customer success`, `Product`              |
+| `data-knowledge`         | `Data`, `Knowledge`, `Research`, `Operations`         |
+| `finance-legal-people`   | `Finance`, `Legal`, `People`, `Operations`            |
 
 The enum in `registry.schema.json` is the union of that whole column, so the schema will accept
 `Support` on a `finance-legal-people` row — `pnpm examples:check` is what rejects it. Pick the
@@ -257,12 +294,12 @@ indistinguishable from its neighbours.
 
 ### `cadence` — what starts a run
 
-| `cadence` | Use when |
-|---|---|
-| `on-demand` | A person or an API call starts it. |
-| `scheduled` | A cron trigger starts it. |
-| `on-webhook` | An inbound webhook event starts it (e.g. a PR opening). |
-| `on-event` | A request to an endpoint the template deploys starts it. |
+| `cadence`    | Use when                                                 |
+| ------------ | -------------------------------------------------------- |
+| `on-demand`  | A person or an API call starts it.                       |
+| `scheduled`  | A cron trigger starts it.                                |
+| `on-webhook` | An inbound webhook event starts it (e.g. a PR opening).  |
+| `on-event`   | A request to an endpoint the template deploys starts it. |
 
 This describes the **entry only**, not what happens mid-run. `wait-for-webhook` is `on-demand`:
 you start it, and it pauses for a callback partway through. `pr-review-bot` is `on-webhook`:
@@ -280,18 +317,18 @@ result. Steps, capabilities and fan-out are a **tiebreak**, never the reason for
 To pick a band, count the template's **judgment points** — the places where something
 non-deterministic is produced:
 
-- a step with `kind: "llm"` (a model call — `models.run`, `models.coding`),
+- a step with `kind: "llm"` (a model call — `llm.run`, `models.run`, `models.coding`),
 - a generated image or video (`content.generation.*`),
 - a capability that synthesizes prose for you, e.g. `web.search`'s `answer` field. It counts
   even with no `llm` step in the graph, because the user still reads model-written output.
 
-| `complexity` | Use when |
-|---|---|
-| `minimal` | **No judgment points.** Re-run it with the same input and you get the same output. A greeting, a Slack post, a health check. |
-| `simple` | **One judgment point**, and you can read the output and tell at a glance whether it's right. Also: any fully deterministic template whose scaffolding is substantial — durable checkpoints, a compensation branch, several capabilities. |
-| `moderate` | **Two judgment points**, or one whose output then drives structured work — a branch, a database write, a rendered artifact — so a bad generation has a consequence past the text itself. |
-| `involved` | **Three judgment points**, or one to two whose output drives something **irreversible or outward-facing**: mail to a real prospect, SQL against your database, a deployed endpoint, a filed attestation. Checking it means checking each stage. |
-| `advanced` | **Chained judgment** — a model consuming another model's output, or a coding agent whose artifact is then built and deployed. Error compounds across stages. Three or more chained generative stages land here regardless of graph size. |
+| `complexity` | Use when                                                                                                                                                                                                                                        |
+| ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `minimal`    | **No judgment points.** Re-run it with the same input and you get the same output. A greeting, a Slack post, a health check.                                                                                                                    |
+| `simple`     | **One judgment point**, and you can read the output and tell at a glance whether it's right. Also: any fully deterministic template whose scaffolding is substantial — durable checkpoints, a compensation branch, several capabilities.        |
+| `moderate`   | **Two judgment points**, or one whose output then drives structured work — a branch, a database write, a rendered artifact — so a bad generation has a consequence past the text itself.                                                        |
+| `involved`   | **Three judgment points**, or one to two whose output drives something **irreversible or outward-facing**: mail to a real prospect, SQL against your database, a deployed endpoint, a filed attestation. Checking it means checking each stage. |
+| `advanced`   | **Chained judgment** — a model consuming another model's output, or a coding agent whose artifact is then built and deployed. Error compounds across stages. Three or more chained generative stages land here regardless of graph size.        |
 
 Then apply the nudge, **at most one band, and only upward**: raise it if the deterministic
 scaffolding around those judgment points is heavy (many distinct capabilities, a resumable
@@ -313,14 +350,14 @@ and the scorer legitimately disagree — the scorer can't see a synthesizing cap
 
 Set `kind` on every step:
 
-| `kind` | Use when |
-|---|---|
-| `capability` | It calls a priced catalog capability. |
-| `llm` | It calls a model (`models.run`, `models.coding`). |
-| `compute` | In-process logic, a branch, or a terminal. |
-| `pause` | It suspends the run at $0 until something wakes it. |
+| `kind`       | Use when                                            |
+| ------------ | --------------------------------------------------- |
+| `capability` | It calls a priced catalog capability.               |
+| `llm`        | It calls a model (`llm.run`, `models.run`, `models.coding`). |
+| `compute`    | In-process logic, a branch, or a terminal.          |
+| `pause`      | It suspends the run at $0 until something wakes it. |
 
-A step that calls a capability *and then* suspends is `pause` — suspending is what defines it.
+A step that calls a capability _and then_ suspends is `pause` — suspending is what defines it.
 
 Then set `checkpoint: true` on the **one** step, if any, where **a person must approve** before
 the run proceeds. This is much narrower than `pause`: most pauses are machine waits — a render
@@ -348,47 +385,47 @@ the same way, at two levels of depth.
 The gallery card has finite room, and the rules below are sized from it — a name that wraps the
 title or a use case that can't sit on a chip is a layout bug, not a matter of taste.
 
-| Field | Limit |
-|---|---|
-| `name` | ≤ 32 chars. No `→`, no `/`, no parentheticals, no mechanism word (`saga`, `engine`, `pipeline`, `runner`, `endpoint`, `gate`, `durable`, `keep-alive`, …). |
-| `description` | ≤ 160 chars — one plain sentence. |
-| `whatItDoes` | ≤ 320 chars, and **lead with the verb**. "Create a cited account brief…", not "For turning a…". |
-| `useCases[]` | ≤ 40 chars each — a short noun phrase ("Relationship graph"), not a sentence. |
+| Field         | Limit                                                                                                                                                      |
+| ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `name`        | ≤ 32 chars. No `→`, no `/`, no parentheticals, no mechanism word (`saga`, `engine`, `pipeline`, `runner`, `endpoint`, `gate`, `durable`, `keep-alive`, …). |
+| `description` | ≤ 160 chars — one plain sentence.                                                                                                                          |
+| `whatItDoes`  | ≤ 320 chars, and **lead with the verb**. "Create a cited account brief…", not "For turning a…".                                                            |
+| `useCases[]`  | ≤ 40 chars each — a short noun phrase ("Relationship graph"), not a sentence.                                                                              |
 
 **Name the outcome, not the machinery.** This is the same rule `category` already follows: the axis
-is *"what am I trying to produce?"* Mechanism words belong in `tags`, which is what drives search —
+is _"what am I trying to produce?"_ Mechanism words belong in `tags`, which is what drives search —
 putting one in the name doesn't make it more findable, it just spends the title on it.
 
-All 26 templates meet these, so they are hard failures — the lengths come from the schemas
+Every current template meets these, so they are hard failures — the lengths come from the schemas
 (`maxLength`, reported with a JSON pointer) and the style rules from the check, which names the
 offending word.
 
 ### `examples/registry.json` — the gallery index (one entry per template)
 
-| Field | Shows up as | Write it as |
-|---|---|---|
-| `name` | Card title, detail H1 | Title Case, human, ≤32 chars. Name the **outcome**: "Approval Before Action", not "Human-in-the-Loop Approval" and not the slug. |
-| `description` | Card subtitle, detail subtitle | **One sentence.** What it does, in plain words. See "The tagline" below. |
-| `tags` | Chips under the title | 3–4 lowercase, kebab or single words. Concrete, searchable ("approval", "hitl", "fallback"). This is where mechanism words go. |
-| `category` | Which gallery group it files under | One id from the enum. The **outcome**, not the mechanism — see [Categorize](#3-categorize). |
-| `discipline` | The badge printed on the card | One value from **your category's** row, rendered verbatim — see [Categorize](#3-categorize). |
-| `cadence` | The "Trigger" fact | One id from the enum. What **starts** a run, not what it does mid-run — see [Categorize](#3-categorize). |
-| `complexity` | The "Complexity" band | One id from the enum. Variance and judgment in the output, **not** graph size — see [Categorize](#3-categorize). |
-| `capabilities` | Capability chips + est. cost | The exact `ctx.sapiom.*` capability ids the source calls. Must match the code (see "Capability ids"). |
-| `steps[].description` | Node labels in the Definition graph | One plain sentence per step: what THIS step does. Preserve `name`/`next`/`terminal`/`capability` exactly. |
-| `steps[].kind` | The step's glyph in the graph | `capability` / `llm` / `compute` / `pause`, one per step — see [Categorize](#3-categorize). |
-| `steps[].checkpoint` | The "Checkpoint" fact | `true` on the single step where a **person** approves, or omit. Never on a machine wait. |
+| Field                 | Shows up as                         | Write it as                                                                                                                      |
+| --------------------- | ----------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `name`                | Card title, detail H1               | Title Case, human, ≤32 chars. Name the **outcome**: "Approval Before Action", not "Human-in-the-Loop Approval" and not the slug. |
+| `description`         | Card subtitle, detail subtitle      | **One sentence.** What it does, in plain words. See "The tagline" below.                                                         |
+| `tags`                | Chips under the title               | 3–4 lowercase, kebab or single words. Concrete, searchable ("approval", "hitl", "fallback"). This is where mechanism words go.   |
+| `category`            | Which gallery group it files under  | One id from the enum. The **outcome**, not the mechanism — see [Categorize](#3-categorize).                                      |
+| `discipline`          | The badge printed on the card       | One value from **your category's** row, rendered verbatim — see [Categorize](#3-categorize).                                     |
+| `cadence`             | The "Trigger" fact                  | One id from the enum. What **starts** a run, not what it does mid-run — see [Categorize](#3-categorize).                         |
+| `complexity`          | The "Complexity" band               | One id from the enum. Variance and judgment in the output, **not** graph size — see [Categorize](#3-categorize).                 |
+| `capabilities`        | Capability chips + est. cost        | The exact `ctx.sapiom.*` capability ids the source calls. Must match the code (see "Capability ids").                            |
+| `steps[].description` | Node labels in the Definition graph | One plain sentence per step: what THIS step does. Preserve `name`/`next`/`terminal`/`capability` exactly.                        |
+| `steps[].kind`        | The step's glyph in the graph       | `capability` / `llm` / `compute` / `pause`, one per step — see [Categorize](#3-categorize).                                      |
+| `steps[].checkpoint`  | The "Checkpoint" fact               | `true` on the single step where a **person** approves, or omit. Never on a machine wait.                                         |
 
 ### `examples/<slug>/template.json` — the rich manifest (detail page)
 
-| Field | Shows up as | Write it as |
-|---|---|---|
-| `whatItDoes` | "What it does" (the card's lead) | ≤320 chars, about three sentences, **verb first**. "Create a cited account brief…", never "For turning a…". See "What it does". |
-| `longDescription` | "About" | 2–4 short paragraphs. The fuller story. Plain first; name the mechanism once, casually. |
-| `useCases` | "Use cases" (chips) | Exactly 3, each ≤40 chars. Short noun phrases — "Relationship graph", not a sentence. |
-| `notes` | "Notes" | **How to run it.** Easy path first (Use this template), advanced path second. See "How to run it". |
-| `examples` | "Examples" | Real `{ input, output }` pairs. Keep these accurate to the code; don't invent fields. |
-| `author` | "By …" | `{ "name": "Sapiom", "url": "https://sapiom.ai/" }` for first-party. |
+| Field             | Shows up as                      | Write it as                                                                                                                     |
+| ----------------- | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `whatItDoes`      | "What it does" (the card's lead) | ≤320 chars, about three sentences, **verb first**. "Create a cited account brief…", never "For turning a…". See "What it does". |
+| `longDescription` | "About"                          | 2–4 short paragraphs. The fuller story. Plain first; name the mechanism once, casually.                                         |
+| `useCases`        | "Use cases" (chips)              | Exactly 3, each ≤40 chars. Short noun phrases — "Relationship graph", not a sentence.                                           |
+| `notes`           | "Notes"                          | **How to run it.** Easy path first (Use this template), advanced path second. See "How to run it".                              |
+| `examples`        | "Examples"                       | Real `{ input, output }` pairs. Keep these accurate to the code; don't invent fields.                                           |
+| `author`          | "By …"                           | `{ "name": "Sapiom", "url": "https://sapiom.ai/" }` for first-party.                                                            |
 
 #### What the template needs to run (all optional, all machine-read)
 
@@ -397,13 +434,13 @@ A declaration says what a thing **is**, never where it is stored — there is no
 `connectorId`, no `store`, and there never will be. Storage belongs to the resolver, which is what
 lets it change without touching your template.
 
-| Field | Shows up as | Write it as |
-|---|---|---|
-| `resources` | "Sapiom will provision" in the setup panel, and the cost/lifetime line on the card | The managed things a run creates — a Postgres, a sandbox, a repo, an inbox. Each needs a `kind` and a `handle` (the slug your step code passes to `ctx.sapiom.database.get()`; unique within a template). `duration` is postgres-only, caps at **7d, and there is no renew verb** — if your template needs state that outlives that, say so in `notes` and set `ephemeral: false`. `seed` is read-side only; see below. |
-| `requiredSecrets` | The credential dialog on "Use this template" | Only credentials **Sapiom cannot broker** — a Slack token, the customer's own DB. Never a Sapiom API key, never a non-secret value. Each needs `key`, `label`, `provider`; `key` follows process-env rules — not `PATH`, not `SAPIOM_*`, not `WORKFLOWS_*`. Mark `optional: true` only when the run still reaches a terminal state without it and says what it skipped. |
-| `settings` | Ordinary form fields, merged into the run input | Non-secret config — a recipient, a lookback window, a row cap. **This is where a `RECIPIENT` belongs, not the vault**, which can't be listed, validated, or prompted for. `default` is required: a setting without one can't support a zero-interaction run, which is the point. |
-| `defaultInput` | The one-click Run path | The input a run starts with when the user supplies nothing. Merged **under** the user's input and under `settings` defaults, so an explicit value always wins. **Not the same as `examples[0].input`**, which is documentation and may legitimately hold a repo slug or a live URL that won't work on a fresh tenant. It never overrides your code's own defaults. |
-| `zeroSetup` | The shelf's "runs with no setup" claim | What an unconfigured run actually reaches: a `terminalState`, optional `expect[]` assertions over the terminal artifact (`nonEmptyArray`, `nonEmptyString`, `minLength`, `matches`, `equals`, `absent`), and a one-sentence `narrative`. Assert that the pattern **demonstrably ran and the output is honest about it** — not that the result is production-grade. The narrative renders verbatim, so it must never imply a send that won't happen. |
+| Field             | Shows up as                                                                        | Write it as                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| ----------------- | ---------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `resources`       | "Sapiom will provision" in the setup panel, and the cost/lifetime line on the card | The managed things a run creates — a Postgres, a sandbox, a repo, an inbox. Each needs a `kind` and a `handle` (the slug your step code passes to `ctx.sapiom.database.get()`; unique within a template). `duration` is postgres-only, caps at **7d, and there is no renew verb** — if your template needs state that outlives that, say so in `notes` and set `ephemeral: false`. `seed` is read-side only; see below.                             |
+| `requiredSecrets` | The credential dialog on "Use this template"                                       | Only credentials **Sapiom cannot broker** — a Slack token, the customer's own DB. Never a Sapiom API key, never a non-secret value. Each needs `key`, `label`, `provider`; `key` follows process-env rules — not `PATH`, not `SAPIOM_*`, not `WORKFLOWS_*`. Mark `optional: true` only when the run still reaches a terminal state without it and says what it skipped.                                                                             |
+| `settings`        | Ordinary form fields, merged into the run input                                    | Non-secret config — a recipient, a lookback window, a row cap. **This is where a `RECIPIENT` belongs, not the vault**, which can't be listed, validated, or prompted for. `default` is required: a setting without one can't support a zero-interaction run, which is the point.                                                                                                                                                                    |
+| `defaultInput`    | The one-click Run path                                                             | The input a run starts with when the user supplies nothing. Merged **under** the user's input and under `settings` defaults, so an explicit value always wins. **Not the same as `examples[0].input`**, which is documentation and may legitimately hold a repo slug or a live URL that won't work on a fresh tenant. It never overrides your code's own defaults.                                                                                  |
+| `zeroSetup`       | The shelf's "runs with no setup" claim                                             | What an unconfigured run actually reaches: a `terminalState`, optional `expect[]` assertions over the terminal artifact (`nonEmptyArray`, `nonEmptyString`, `minLength`, `matches`, `equals`, `absent`), and a one-sentence `narrative`. Assert that the pattern **demonstrably ran and the output is honest about it** — not that the result is production-grade. The narrative renders verbatim, so it must never imply a send that won't happen. |
 
 #### `seed`: only seed what your template READS
 
@@ -411,12 +448,12 @@ A freshly-provisioned database is empty, so a template that reads from one runs 
 produces nothing — terminal, honest-looking, and useless as a first impression. `seed` fixes
 exactly that case and no other.
 
-**The rule is not "give every resource a seed."** Look at what the table is *for*:
+**The rule is not "give every resource a seed."** Look at what the table is _for_:
 
-| Your table is… | Seed it? | Why |
-|---|---|---|
-| **Input** the template reads and did not write — a leads list, a metrics table, a corpus to query | **Yes** | Otherwise the first run has nothing to work on. `nl-db-query-endpoint`, `scheduled-db-insight-report`, `personalized-media-at-scale`, `durable-backfill`. |
-| **Output** the template itself writes — a log, a CRM store, a dedupe index, an audit trail | **No** | Seeding fabricates records a user might act on. `approval-chain`, `cold-outreach-engine`, `error-triage-digest`, `meeting-notes-crm`, `the-brain` all create and insert their own tables; an empty one on the first run is correct. |
+| Your table is…                                                                                    | Seed it? | Why                                                                                                                                                                                                                                 |
+| ------------------------------------------------------------------------------------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Input** the template reads and did not write — a leads list, a metrics table, a corpus to query | **Yes**  | Otherwise the first run has nothing to work on. `nl-db-query-endpoint`, `scheduled-db-insight-report`, `personalized-media-at-scale`, `durable-backfill`.                                                                           |
+| **Output** the template itself writes — a log, a CRM store, a dedupe index, an audit trail        | **No**   | Seeding fabricates records a user might act on. `approval-chain`, `cold-outreach-engine`, `error-triage-digest`, `meeting-notes-crm`, `the-brain` all create and insert their own tables; an empty one on the first run is correct. |
 
 If you're unsure, ask whether a user reading the row would think a real thing happened. If yes,
 don't seed it.
@@ -436,11 +473,11 @@ means a real run — nothing pretends.
 - **Short declarative sentences.** One idea each. Cut clauses.
 - **No pitch.** Delete "the sharpest showcase of the platform's differentiator", "seamless", "powerful", "robust", "the X pattern, done right". State what it does; the reader decides if it's impressive.
 - **Concrete over abstract.** "offer the job to your top pick, then fall down the shortlist" beats "a ranked sequential-fallback loop".
-- **You can name a capability or primitive** (`models.run`, `pauseUntilSignal`, `web.search`) — once, in passing, not as the headline.
+- **You can name a capability or primitive** (`llm.run`, `pauseUntilSignal`, `web.search`) — once, in passing, not as the headline.
 
 ### Before → after (the house style, from a real edit)
 
-> ❌ "The agent does reversible prep — parse the request (models.run), rank the candidates by
+> ❌ "The agent does reversible prep — parse the request (llm.run), rank the candidates by
 > fit, and notify the approver (email) — then blocks on a durable pauseUntilSignal so the run
 > survives the wait at $0. The sharpest showcase of the platform's durability differentiator."
 
@@ -468,7 +505,7 @@ it produces, then walk the flow in plain terms. Name capabilities in passing, ne
 words on who it's for instead of what it makes. 19 of the original 26 did this; none do now, and
 `pnpm examples:check` rejects a leading "For".
 
-Think of it as **named beats** — each sentence is one move the workflow makes:
+Think of it as **named beats** — each sentence is one move the agent makes:
 
 > Do the legwork, then wait for a person before spending money or doing anything irreversible.
 > It ranks your candidates by fit and emails the top pick for approval, falling to the next on
@@ -481,7 +518,7 @@ detail belongs in `longDescription` instead:
 > request, ranks your options, and emails the approver its recommendation — then pauses and
 > waits, costing nothing while idle. Say no and it backs out cleanly; say yes and it offers
 > the job to your top pick, falling down the shortlist until someone accepts. The irreversible
-> step only happens after a human approved *and* a candidate said yes — and if nobody does, it
+> step only happens after a human approved _and_ a candidate said yes — and if nobody does, it
 > escalates to a person instead of failing quietly.
 
 ## About (`longDescription`)
@@ -505,11 +542,11 @@ This is the field users hit when they want to actually run the thing. **Lead wit
 one-click webapp path; put the code/MCP path second, clearly optional.**
 
 1. **Use this template.** "Click **Use this template** — Sapiom builds and deploys it for you,
-   then run it from the workflow page. Your $5 signup credit covers first runs."
+   then run it from the agent page. Your $5 signup credit covers first runs."
 2. **Anything template-specific** the user must know to see it work — e.g. required inputs,
    a secret to set (BYO-API templates), or that it pauses on a real signal.
 3. **Advanced (only if relevant):** "Prefer to work from the code? Run it locally with
-   `run_local` to trace the whole flow for free, or edit and deploy it with the Sapiom MCP."
+   `run_local` to trace the whole flow with no Sapiom capability spend, or edit and deploy it with the Sapiom MCP."
 
 For templates that **pause on a live signal** (human-in-the-loop, wait-for-webhook), say so
 plainly and show how to send the signal (today that's the MCP `workflow_signal` tool / the
@@ -523,8 +560,9 @@ The `capabilities` array and each `steps[].capability` **must be the real `ctx.s
 the source calls.** Mismatches make the gallery advertise a capability the deployed run never
 uses, and skew the estimated cost.
 
-- The LLM path is **`models.run`** (and `models.coding` for coding). It is **not** `llm.generate`
-  — that is a catalog id that reads `coming_soon` and is never the runtime path.
+- One-shot LLM work uses **`llm.run`**. Use `models.run` only for a managed
+  multi-turn loop, and `models.coding` for a coding agent. None of these runtime
+  paths is `llm.generate`, a catalog id that reads `coming_soon`.
 - Cross-check against `index.ts`: grep for `ctx.sapiom.<x>` and list exactly those ids.
 - Don't add a capability to the array that no step calls.
 
@@ -561,7 +599,7 @@ Never present the MCP path as the only way to build and run — the webapp does 
 
 - [ ] One directory `examples/<id>/` with `index.ts`, `template.json`, `package.json`, `tsconfig.json`.
 - [ ] `npm run typecheck` passes in the template directory.
-- [ ] Traced a `run_local` end to end (free), understanding that it stubs every capability.
+- [ ] Traced a `run_local` end to end with no Sapiom capability spend, understanding that it stubs every capability while ordinary author-code side effects remain real.
 - [ ] **Deployed it and ran it with `{}` — it reached a terminal state and produced something real.**
 - [ ] Every entry-step input has a default; no entry step `throw`s.
 - [ ] No default names a resource a new account wouldn't have.
@@ -581,7 +619,7 @@ Never present the MCP path as the only way to build and run — the webapp does 
 - [ ] `description`: one plain sentence, ≤160 chars, no internal jargon.
 - [ ] `whatItDoes`: ≤320 chars, verb-first, capability named in passing, no pitch words.
 - [ ] `steps[].description`: one plain sentence each; `name`/`next`/`terminal`/`capability` unchanged.
-- [ ] `capabilities`: exactly the `ctx.sapiom.*` ids the source calls (`models.run`, not `llm.generate`).
+- [ ] `capabilities`: exactly the `ctx.sapiom.*` ids the source calls (`llm.run`, not `llm.generate`).
 - [ ] `longDescription`: 2–4 short paragraphs; cost stated simply at the end.
 - [ ] `useCases`: exactly 3, each ≤40 chars, short noun phrases.
 - [ ] `notes`: Use-this-template first; template-specific gotcha; advanced local path last.

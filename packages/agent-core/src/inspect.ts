@@ -6,8 +6,17 @@
  * programmatic consumers; the CLI alias these as "logs" on its command surface.
  */
 import { GatewayClient } from "./client.js";
-import { decodeExecutionProjection, decodeExecutionRef } from "./decode.js";
-import type { ExecutionProjection, ExecutionRef, SseEvent } from "./types.js";
+import {
+  decodeExecutionProjection,
+  decodeExecutionRef,
+  decodeStepIoDetail,
+} from "./decode.js";
+import type {
+  ExecutionProjection,
+  ExecutionRef,
+  SseEvent,
+  StepIoDetail,
+} from "./types.js";
 import { watchExecution } from "./watch.js";
 
 export interface BuildDetail {
@@ -23,11 +32,12 @@ export interface InspectOptions {
 }
 
 /**
- * Fetch the full {@link ExecutionProjection} for a single execution — the same
- * tree + per-node cost + trace refs the REST DTO returns (Module P / SAP-1138).
- * The SDK is a thin passthrough of the REST shape; the body is only NORMALIZED
- * (see {@link decodeExecutionProjection}) so pre-seam runs decode without error
- * (degraded tree from lineage, flat cost fallback) — never reshaped or recosted.
+ * Fetch the full execution audit for a single run: status, pinned build, step
+ * attempts, logs/events, output/error, trace refs, and dispatch lineage. The
+ * SDK is a thin passthrough of the REST shape; the body is only NORMALIZED (see
+ * {@link decodeExecutionProjection}) so pre-seam runs decode without error.
+ * This endpoint is cost-agnostic today, so missing run/step cost stays `null`
+ * rather than being fabricated or fetched from another endpoint.
  *
  * Throws `AgentOperationError` (code `HTTP_*` | `NETWORK`) on gateway errors.
  */
@@ -37,6 +47,43 @@ export async function inspect(
 ): Promise<ExecutionProjection> {
   const raw = await client.get<unknown>(`/executions/${opts.executionId}`);
   return decodeExecutionProjection(raw);
+}
+
+// ── Inspect one step attempt's full-fidelity I/O ───────────────────────────────
+
+export interface InspectStepOptions {
+  executionId: string;
+  /**
+   * A step attempt's row id — `ExecutionProjection.steps[].id` from
+   * {@link inspect}. That field is optional and may be absent or `null` (a
+   * server that doesn't yet report it, or a step attempt from before this id
+   * existed) — there is no fallback for that case here; fall back to Run
+   * Inspector or the projection's own `input`/`output`/`logs` instead of
+   * calling `inspectStep`.
+   */
+  stepExecutionId: string;
+}
+
+/**
+ * Fetch one step attempt's `input` / `output` / `error` / `logs` at a higher
+ * size cap than {@link inspect}'s own `steps[]` bounds its aggregate read to —
+ * reach for this when a step's fields on the execution projection look
+ * truncated (SAP-2778). The SDK is a thin passthrough of the REST shape,
+ * normalized (see {@link decodeStepIoDetail}) so a degraded body decodes
+ * rather than throwing.
+ *
+ * Throws `AgentOperationError` (code `HTTP_*` | `NETWORK`) on gateway errors —
+ * including a 404 for an unknown execution/step or one outside the caller's
+ * tenant (no existence leak).
+ */
+export async function inspectStep(
+  opts: InspectStepOptions,
+  client: GatewayClient,
+): Promise<StepIoDetail> {
+  const raw = await client.get<unknown>(
+    `/executions/${opts.executionId}/steps/${opts.stepExecutionId}/io`,
+  );
+  return decodeStepIoDetail(raw);
 }
 
 // ── Wait for an execution to settle ────────────────────────────────────────────
@@ -163,9 +210,10 @@ export async function waitForExecution(
   const abort = new AbortController();
   const timer = setTimeout(() => abort.abort(), Math.max(0, deadline - now()));
   timer.unref?.();
-  const events = watch({ executionId: opts.executionId, signal: abort.signal }, client)[
-    Symbol.asyncIterator
-  ]();
+  const events = watch(
+    { executionId: opts.executionId, signal: abort.signal },
+    client,
+  )[Symbol.asyncIterator]();
   try {
     for (;;) {
       const next = await events.next(); // resolves on each SSE event (heartbeats filtered)
@@ -173,7 +221,8 @@ export async function waitForExecution(
       execution = await read();
       settled = settledResult(execution, autoResume);
       if (settled) return { execution, ...settled };
-      if (now() >= deadline) return { execution, reason: "timeout", done: false };
+      if (now() >= deadline)
+        return { execution, reason: "timeout", done: false };
     }
     if (now() >= deadline) return { execution, reason: "timeout", done: false };
   } catch {

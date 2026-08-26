@@ -7,6 +7,7 @@ import {
   terminate,
   type AgentExecutionContext,
 } from "@sapiom/agent";
+import { EmailHttpError } from "@sapiom/tools";
 import postgres from "postgres";
 import { z } from "zod/v4";
 
@@ -24,9 +25,9 @@ import { z } from "zod/v4";
  *     polling loop, no billed idle.
  *
  * Then, in one legible graph:
- *   intake ──▶ extract (models.run) ──▶ upsert (database) ──▶ summary (email)
+ *   intake ──▶ extract (llm.run) ──▶ upsert (database) ──▶ summary (email)
  *
- *   - **extract** hands the transcript to an LLM (`ctx.sapiom.models.run` — the
+ *   - **extract** hands the transcript to an LLM (`ctx.sapiom.llm.run` — the
  *     live x402-served model) to pull the contact it's about, the CRM fields to
  *     change (deal stage, next step), and the action items, as structured JSON.
  *   - **upsert** writes to a small Postgres CRM store the template owns. It
@@ -57,8 +58,6 @@ const SAMPLE_TRANSCRIPT =
   "rollout and wants a security review before signing. I'll send the SOC 2 " +
   "report by Friday and Dana will loop in their CISO next week. Deal looks like " +
   "it's moving to contract stage.";
-/** Username for the inbox we send from (created once, then reused). */
-const SENDER_USERNAME = "meeting-crm";
 /** The named signal a note-taker fires to push a finished transcript in. */
 const SIGNAL = "transcript.ready";
 /** Cap the transcript the model sees — full-call transcripts can be enormous. */
@@ -179,15 +178,32 @@ function stableId(input: string): string {
   return `ai_${h.toString(16)}`;
 }
 
-/** Reuse an existing inbox to send from, else provision one. */
+/**
+ * Reuse an existing inbox to send from, else provision one.
+ *
+ * We deliberately omit `username`. AgentMail addresses are globally unique, so a
+ * fixed local part can only ever be owned by ONE account across the whole
+ * platform — every other tenant's `create` 409s with "Email address is already
+ * taken", which fails the step. Omitting it lets AgentMail auto-generate a
+ * globally-unique address, so a fresh tenant's first run succeeds and two
+ * tenants never collide. `create` still isn't atomic against the `list`, so a
+ * 409 is treated as "someone already provisioned one" — re-list and reuse.
+ */
 async function resolveSenderInbox(ctx: Ctx): Promise<string> {
   const existing = await ctx.sapiom.email.inboxes.list({ limit: 1 });
   if (existing.inboxes.length > 0) return existing.inboxes[0].inboxId;
-  const inbox = await ctx.sapiom.email.inboxes.create({
-    username: SENDER_USERNAME,
-    displayName: "Meeting Notes CRM",
-  });
-  return inbox.inboxId;
+  try {
+    const inbox = await ctx.sapiom.email.inboxes.create({
+      displayName: "Meeting Notes CRM",
+    });
+    return inbox.inboxId;
+  } catch (err) {
+    if (err instanceof EmailHttpError && err.status === 409) {
+      const retry = await ctx.sapiom.email.inboxes.list({ limit: 1 });
+      if (retry.inboxes.length > 0) return retry.inboxes[0].inboxId;
+    }
+    throw err;
+  }
 }
 
 /** Open a Postgres client for a live run, or null in dryRun / when unavailable. */
@@ -352,8 +368,14 @@ const extract = defineStep({
       '[{"description":string,"owner":string|null,"dueDate":string|null}]}.';
     const prompt = `MEETING TRANSCRIPT:\n${transcript}`;
 
-    const res = await ctx.sapiom.models.run({ system, prompt, maxTokens: 900 });
-    const extraction = parseExtraction(res.output);
+    const res = await ctx.sapiom.llm.run({
+      request: {
+        system,
+        messages: [{ role: "user", content: prompt }],
+        max_tokens: 900,
+      },
+    });
+    const extraction = parseExtraction(ctx.sapiom.llm.textOf(res) ?? null);
     ctx.logger.info("extracted meeting notes", {
       contact: extraction.contact.name,
       actionItems: extraction.actionItems.length,

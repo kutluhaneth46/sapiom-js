@@ -29,17 +29,31 @@
  *    installer is trying to replace. So the update path calls the caller's
  *    `shutdown()` and awaits it, rather than relying on the quit hook.
  */
-import { BrowserWindow, app, dialog, ipcMain, type IpcMainInvokeEvent } from "electron";
+import { BrowserWindow, app, dialog, ipcMain } from "electron";
 // CJS: default-import then read the property. See trap 1 above.
 import electronUpdater from "electron-updater";
 import type { UpdateInfo } from "electron-updater";
-import { UPDATE_CHECK, type UpdateCheckOutcome } from "./ipc.js";
+import { UPDATE_CHECK, UPDATE_STATE, type UpdateCheckOutcome, type UpdateStatePayload } from "./ipc.js";
+// Shared with the folder-picker channel — the "only the SPA at `/` may ask" rule
+// lives in one place rather than being copied per privileged channel.
+import { isTrustedSender } from "./trusted-sender.js";
 import {
   CHANNEL_ENV_VAR,
   classifyUpdateError,
   resolveUpdateChannel,
   shouldEnableUpdater,
 } from "./update-policy.js";
+// The custom "update ready" window that replaced the native offer dialog.
+import { showUpdatePrompt } from "./update-window.js";
+// Persisted, desktop-only update prefs: the auto-install toggle + skipped versions.
+import {
+  DEFAULT_UPDATE_PREFS,
+  addSkippedVersion,
+  clearSkippedVersions,
+  loadUpdatePrefs,
+  saveUpdatePrefs,
+  updatePrefsPathIn,
+} from "./update-prefs.js";
 
 /**
  * How often to look for a new build. Four hours: the app is a long-lived desktop
@@ -109,6 +123,39 @@ let checkInFlight: Promise<UpdateCheckOutcome> | null = null;
 const HANDOFF_GRACE_MS = 15 * 1_000;
 
 /**
+ * Tell the SPA whether its "Update now" card should exist — the state that
+ * mirrors `pending`. Push-only (see UPDATE_STATE in ipc.ts): the card's click
+ * comes back through the existing UPDATE_CHECK invoke, so this adds no
+ * privileged surface. Called on `update-downloaded`, on a failed apply (to
+ * retract), and on every `did-finish-load` so a reloaded page re-learns what
+ * the main process still knows.
+ */
+function pushUpdateState(): void {
+  const win = host?.mainWindow;
+  if (!win || win.isDestroyed()) return;
+  const payload: UpdateStatePayload = pending
+    ? { kind: "downloaded", version: pending.version }
+    : { kind: "none" };
+  // Rare and load-bearing when a user reports "the card never shows" — same
+  // rationale as every other line this module logs.
+  log(`card state → ${payload.kind === "downloaded" ? payload.version : "none"}`);
+  win.webContents.send(UPDATE_STATE, payload);
+}
+
+/**
+ * Dev-only preview twin of SAPIOM_PREVIEW_UPDATE_WINDOW (see index.ts): fake a
+ * downloaded update so the rail's "Update now" card can be eyeballed without a
+ * real release. Only `version` is ever read off `pending` on this path (the
+ * card push and the on-demand check's `downloaded` answer), so the sparse cast
+ * is honest — and clicking the card in an unpackaged build answers `disabled`,
+ * which is the truth. Never called outside the devMode gate.
+ */
+export function previewDownloadedUpdateCard(version: string): void {
+  pending = { version } as UpdateInfo;
+  pushUpdateState();
+}
+
+/**
  * Hand off to the platform installer, having first closed the harness server.
  *
  * Two hard-won constraints pull in opposite directions here:
@@ -174,44 +221,83 @@ function relaunchAfterFailedHandoff(): void {
   app.exit(0);
 }
 
+/** The persisted-prefs file for this install (Electron's per-user userData dir). */
+function updatePrefsFile(): string {
+  return updatePrefsPathIn(app.getPath("userData"));
+}
+
 /**
- * Offer the update, and apply it only if the user agrees.
+ * Persist an "auto-install on quit" toggle change AND apply it live. Passed to the
+ * update window (which holds no autoUpdater reference); the window calls it the
+ * moment the toggle flips, so the change sticks even if the user then just closes
+ * the window rather than pressing a button.
+ */
+async function setAutoUpdatePref(on: boolean): Promise<void> {
+  const prefs = await loadUpdatePrefs(updatePrefsFile());
+  await saveUpdatePrefs({ ...prefs, autoUpdate: on }, updatePrefsFile());
+  if (active) active.autoUpdater.autoInstallOnAppQuit = on;
+  log(`auto-install on quit ${on ? "enabled" : "disabled"} by user`);
+}
+
+/**
+ * Offer the update, and act on the user's choice.
  *
- * A native dialog, not something injected into the page: this fires whenever a
- * background download finishes, and it must work regardless of what the main
- * window happens to be showing. (The SPA's Settings popover has its own,
- * *user-initiated* path — see `checkForUpdatesNow`.)
+ * A custom window (see `update-window.ts`), not something injected into the page:
+ * this fires whenever a background download finishes, and it must work regardless
+ * of what the main window happens to be showing. (The SPA's Settings popover has
+ * its own, *user-initiated* path — see `checkForUpdatesNow`.)
  *
- * Declining is remembered per version FOR THIS RUN only. Re-prompting on every
- * check would nag someone who already said no; forgetting entirely across
- * launches would mean a deferred update is never mentioned again. Prompting once
- * per launch is the middle that needs no extra state on disk — and an explicit
- * "check for updates" clears it, because asking IS undeclining.
+ * Three outcomes:
+ *  - **restart** → apply now.
+ *  - **later** → remembered per version FOR THIS RUN only. Re-prompting on every
+ *    check would nag someone who already said no; forgetting across launches would
+ *    mean a deferred update is never mentioned again. Prompting once per launch is
+ *    the middle that needs no state on disk — and an explicit "check for updates"
+ *    clears it, because asking IS undeclining.
+ *  - **skip** → remembered ACROSS launches (persisted): the user doesn't want this
+ *    version at all. A newer one is still offered; "check for updates" clears skips.
  */
 async function offerUpdate(info: UpdateInfo, deps: UpdaterDeps): Promise<void> {
   const { version } = info;
+  // Skipped versions are never re-offered — checked first, before the per-run
+  // guards, so a skip persisted last launch is honored on this one too.
+  const prefs = await loadUpdatePrefs(updatePrefsFile());
+  if (prefs.skippedVersions.includes(version)) {
+    log(`skipping ${version} (user chose Skip this version)`);
+    return;
+  }
   if (declined.has(version) || promptOpen) return;
   if (deps.mainWindow.isDestroyed()) return;
 
   promptOpen = true;
-  // Held across the apply, not just the dialog: shutdown takes seconds, and
-  // releasing early let a second `update-downloaded` stack another dialog on top
+  // Held across the apply, not just the window: shutdown takes seconds, and
+  // releasing early let a second `update-downloaded` stack another prompt on top
   // of an app that was already installing.
   try {
-    const { response } = await dialog.showMessageBox(deps.mainWindow, {
-      type: "info",
-      buttons: ["Restart now", "Later"],
-      defaultId: 0,
-      cancelId: 1,
-      message: `Sapiom ${version} is ready to install.`,
-      // The session warning is the point of this dialog, not a footnote: the
-      // user may have an agent mid-task, and restarting ends it. Burying that is
-      // how a well-meaning update destroys someone's work.
-      detail:
-        "Restarting will end any running agent sessions. " +
-        "Choose Later to keep working — Sapiom stays on the current version until you restart.",
+    const choice = await showUpdatePrompt(deps.mainWindow, {
+      version,
+      autoUpdate: prefs.autoUpdate,
+      onAutoUpdateChange: setAutoUpdatePref,
     });
-    if (response !== 0) {
+
+    if (choice === "skip") {
+      await addSkippedVersion(version, updatePrefsFile());
+      log(`user skipped ${version}`);
+      // Honor the skip even under auto-install: a staged update would otherwise
+      // install on the next quit. Drop it and stop that for this session — the
+      // pref itself is untouched, so next launch restores it and a manual check
+      // (which clears skips) re-offers.
+      if (pending?.version === version) {
+        pending = null;
+        if (active) active.autoUpdater.autoInstallOnAppQuit = false;
+      }
+      // A skip also retracts the rail's "Update now" card — it mirrors
+      // `pending`, and "skip this version" means exactly "stop showing me
+      // ways back to it".
+      pushUpdateState();
+      return;
+    }
+    if (choice !== "restart") {
       declined.add(version);
       log(`user deferred ${version}`);
       return;
@@ -221,8 +307,12 @@ async function offerUpdate(info: UpdateInfo, deps: UpdaterDeps): Promise<void> {
     if (!result.ok) {
       // Never silently: the user pressed "Restart now" and nothing happened, so
       // say what and why. Their sessions are still alive in the refuse-up-front
-      // case, which is exactly what the message needs to tell them.
+      // case, which is exactly what the message needs to tell them. The rare
+      // failure stays a native dialog — an OK-only acknowledgement.
       pending = null;
+      // The SPA's card mirrors `pending` — retract it, or it wedges on a
+      // "ready to install" that can never install.
+      pushUpdateState();
       await dialog.showMessageBox(deps.mainWindow, {
         type: "warning",
         buttons: ["OK"],
@@ -242,8 +332,8 @@ async function offerUpdate(info: UpdateInfo, deps: UpdaterDeps): Promise<void> {
  * scheduled check in three ways, and each one is a thing users notice:
  *  - it REPORTS an outcome. A silent background check is fine; a button that
  *    appears to do nothing is broken.
- *  - it clears the declined set, so someone who chose "Later" can change their
- *    mind without restarting the app.
+ *  - it clears the declined set AND the persisted skip list, so someone who chose
+ *    "Later" or "Skip this version" can change their mind without restarting.
  *  - it answers "downloaded" for an update already waiting, rather than the
  *    literally-true-but-useless "you're up to date".
  *
@@ -256,10 +346,13 @@ export async function checkForUpdatesNow(): Promise<UpdateCheckOutcome> {
   // Asking is undeclining — and it has to happen BEFORE the `pending` shortcut
   // below, or it never happens in the one case that matters: choosing "Later"
   // sets `pending`, so returning early would leave the version declined for the
-  // rest of the run and the native prompt would never come back.
+  // rest of the run and the update prompt would never come back.
   declined.clear();
+  // ...and un-skip: an explicit ask is the user reconsidering, so a version they
+  // chose "Skip this version" for is offered again too.
+  await clearSkippedVersions(updatePrefsFile());
   // Something already downloaded and waiting to be applied: report that instead of
-  // asking GitHub again, and RE-RAISE the native prompt. That prompt is the only
+  // asking GitHub again, and RE-RAISE the update window. That window is the only
   // way to actually apply an update — the SPA has no restart channel, by design —
   // and it already carries the wording that matters ("this ends running agent
   // sessions"). Re-offering here is what `declined.clear()` above exists for: a
@@ -273,16 +366,42 @@ export async function checkForUpdatesNow(): Promise<UpdateCheckOutcome> {
     }
     return { kind: "downloaded", version: info.version };
   }
+  // Replay a very recent SUCCESSFUL answer instead of asking again. One check
+  // costs ~3 unauthenticated GitHub requests, and nothing else in this module
+  // is unbounded — but serial clicks were, limited only by how fast a human
+  // can click, which is how an IP earns a 429. A failed check is never
+  // replayed: retrying after a failure is precisely what the button is for,
+  // and the window is short enough that "nothing happened" is not a thing a
+  // user can perceive (the same answer still toasts).
+  const now = Date.now();
+  if (lastGoodCheck && now - lastGoodCheck.at < CHECK_REPLAY_WINDOW_MS) {
+    return lastGoodCheck.outcome;
+  }
   // Coalesce concurrent asks rather than firing two requests at GitHub.
   checkInFlight ??= runCheck(active);
   try {
-    return await checkInFlight;
+    const outcome = await checkInFlight;
+    if (outcome.kind === "up-to-date" || outcome.kind === "available") {
+      lastGoodCheck = { at: Date.now(), outcome };
+    }
+    return outcome;
   } finally {
     checkInFlight = null;
   }
 }
 
-async function runCheck(current: NonNullable<typeof active>): Promise<UpdateCheckOutcome> {
+/** See `checkForUpdatesNow`: how long a successful answer stands in for a new ask. */
+const CHECK_REPLAY_WINDOW_MS = 60_000;
+/** The last check that actually reached GitHub and got an answer. */
+let lastGoodCheck: { at: number; outcome: UpdateCheckOutcome } | null = null;
+
+/** One quick second chance for a dropped connection — see runCheck's catch. */
+const CHECK_RETRY_DELAY_MS = 2_000;
+
+async function runCheck(
+  current: NonNullable<typeof active>,
+  attempt = 1,
+): Promise<UpdateCheckOutcome> {
   try {
     const result = await current.autoUpdater.checkForUpdates();
     if (!result) {
@@ -301,6 +420,16 @@ async function runCheck(current: NonNullable<typeof active>): Promise<UpdateChec
     // electron-updater appends the whole releases Atom feed and a stack trace, so
     // it is kilobytes of XML — which went straight into a toast once.
     const { kind, summary } = classifyUpdateError(err instanceof Error ? err.message : String(err));
+    // A network-class failure gets ONE quick retry before it reaches the user:
+    // the first outbound connection of a fresh process is the one AV/proxies/
+    // cold TLS eat (measured: an ERR_EMPTY_RESPONSE first check whose immediate
+    // successor succeeded — the user saw "could not reach GitHub" for a
+    // connection drop the very next attempt absorbed).
+    if (kind === "offline" && attempt === 1) {
+      log(`check failed (${kind}): ${summary} — retrying once in ${CHECK_RETRY_DELAY_MS / 1000}s`);
+      await new Promise((resolve) => setTimeout(resolve, CHECK_RETRY_DELAY_MS));
+      return runCheck(current, attempt + 1);
+    }
     log(`on-demand check failed (${kind}): ${summary}`);
     if (kind === "no-release") return { kind: "no-release", channel: current.channel };
     return { kind: "failed", message: summary };
@@ -323,52 +452,16 @@ export function initUpdater(deps: UpdaterDeps): void {
   // — so skipping registration for a build with updates disabled would turn a
   // clear "updates are off in this build" into an opaque renderer-side error.
   registerHandlers();
+  // Also regardless of the gate: a reload wipes renderer state but not
+  // `pending`, so every finished load re-learns the current update state (an
+  // honest `none` when updates are off — the card simply never appears).
+  deps.mainWindow.webContents.on("did-finish-load", pushUpdateState);
   try {
     startUpdater(deps);
   } catch (err) {
     disabledReason = `initialisation failed: ${err instanceof Error ? err.message : String(err)}`;
     log(`could not initialise: ${err instanceof Error ? err.message : String(err)}`);
   }
-}
-
-/**
- * Only the harness SPA, in the main window's top frame, may drive these.
- *
- * A check reaches the network and reveals that this machine runs Sapiom, so "which
- * renderer asked?" is a security question, not bookkeeping. (The destructive half —
- * applying an update — has no channel at all; see ipc.ts.) Two things could
- * otherwise ask:
- *  - another window — a pop-out inherits webPreferences unless we prevent it
- *    (windows.ts does now, and this is the check that still holds if that ever
- *    regresses);
- *  - the main window itself after navigating to agent-authored content, which the
- *    harness serves at `/canvas/:sessionId/*` on this same origin.
- *
- * Hence both an identity check and a path check. The SPA lives at `/` and never
- * navigates the top frame over http (its one `location.href` is an editor scheme,
- * which `will-navigate` sends to the OS), so requiring `/` is exact today. If the
- * SPA ever adopts routing this fails CLOSED and says why, rather than quietly
- * widening.
- */
-function isTrustedSender(event: IpcMainInvokeEvent): boolean {
-  const win = host?.mainWindow ?? null;
-  if (!win || win.isDestroyed()) return false;
-  if (event.sender !== win.webContents) {
-    log("rejected an update IPC from a non-main-window renderer");
-    return false;
-  }
-  // The top frame, not the calling frame: a subframe must never qualify even if
-  // `nodeIntegrationInSubFrames` is switched on later.
-  const frameUrl = event.sender.mainFrame.url;
-  try {
-    if (new URL(frameUrl).pathname !== "/") {
-      log(`rejected an update IPC from ${frameUrl} — only the SPA root may ask`);
-      return false;
-    }
-  } catch {
-    return false;
-  }
-  return true;
 }
 
 /** Idempotent: `ipcMain.handle` throws if a channel is registered twice. */
@@ -384,7 +477,23 @@ function registerHandlers(): void {
   });
 }
 
+/**
+ * Structural one-shot guard, not a convention.
+ *
+ * `startUpdater` arms a boot timeout AND a 4h interval, and nothing clears
+ * them. A second call would therefore double the check rate permanently —
+ * the classic way a polite cadence turns into a request storm — while
+ * `handlersRegistered` above silently masked the double-init. Unreachable
+ * today (one `app.whenReady`, single-instance lock), so this exists to keep
+ * it unreachable when a future caller appears.
+ */
+let updaterStarted = false;
+
 function startUpdater(deps: UpdaterDeps): void {
+  if (updaterStarted) {
+    log("startUpdater called twice — ignoring the second (timers are already armed)");
+    return;
+  }
   const gate = shouldEnableUpdater({
     isPackaged: app.isPackaged,
     devMode: deps.devMode,
@@ -410,10 +519,23 @@ function startUpdater(deps: UpdaterDeps): void {
   autoUpdater.channel = decision.channel;
   autoUpdater.allowPrerelease = decision.allowPrerelease;
   autoUpdater.autoDownload = true;
-  // We own the restart (the user asked to be notified, not surprised), so an
-  // ordinary quit must NOT install. Leaving this at its default would apply the
-  // update on quit — silently — which is the behaviour we deliberately declined.
-  autoUpdater.autoInstallOnAppQuit = false;
+  // Whether an ordinary quit installs a downloaded update is now USER-controlled,
+  // via the update window's "Automatically download and install updates" toggle
+  // (persisted in update-prefs). Default ON: a ready update installs on the next
+  // quit — never a surprise mid-session restart, since the running app is only ever
+  // restarted by an explicit "Restart now". This reverses the former hardcoded
+  // `false` ("the behaviour we deliberately declined"), now that the user owns it.
+  // Set the default synchronously (loading prefs is async and the first check is
+  // 30s out), then reconcile with the persisted value; a failed read keeps the
+  // default — prefs are a convenience, never load-bearing.
+  autoUpdater.autoInstallOnAppQuit = DEFAULT_UPDATE_PREFS.autoUpdate;
+  void loadUpdatePrefs(updatePrefsFile())
+    .then((prefs) => {
+      autoUpdater.autoInstallOnAppQuit = prefs.autoUpdate;
+    })
+    .catch(() => {
+      /* keep the default */
+    });
   // Only when forced on from an unpackaged build: read dev-app-update.yml
   // instead of the app-update.yml that only packaging writes.
   if (gate.forced) autoUpdater.forceDevUpdateConfig = true;
@@ -436,8 +558,27 @@ function startUpdater(deps: UpdaterDeps): void {
     // on disk and applying it is a restart away — which is what the SPA's button
     // needs to know to say "restart" instead of "up to date".
     pending = info;
-    void offerUpdate(info, deps).catch((err: unknown) => {
-      log(`failed to apply ${info.version}: ${err instanceof Error ? err.message : String(err)}`);
+    void (async () => {
+      // A persisted skip is honored BEFORE anything becomes visible: no rail
+      // card, no prompt (offerUpdate re-checks, but by then the card would
+      // already be up), and no silent install of the very version the user
+      // refused — with the staged artifact left as `pending` under an ON
+      // auto-install toggle, the next ordinary quit would apply it.
+      const prefs = await loadUpdatePrefs(updatePrefsFile());
+      if (prefs.skippedVersions.includes(info.version)) {
+        log(`skipping ${info.version} (user chose Skip this version)`);
+        if (pending?.version === info.version) pending = null;
+        autoUpdater.autoInstallOnAppQuit = false;
+        pushUpdateState();
+        return;
+      }
+      // The rail's "Update now" card appears now and OUTLIVES the prompt
+      // below: a user who chooses "Later" keeps a visible way back to the
+      // restart.
+      pushUpdateState();
+      await offerUpdate(info, deps);
+    })().catch((err: unknown) => {
+      log(`failed to offer ${info.version}: ${err instanceof Error ? err.message : String(err)}`);
     });
   });
   autoUpdater.on("error", (err) => {
@@ -463,6 +604,10 @@ function startUpdater(deps: UpdaterDeps): void {
   // only once everything above has been configured without throwing.
   active = { autoUpdater, channel: decision.channel, deps };
   disabledReason = null;
+  // Set with the timers, so the guard covers exactly the thing that must not
+  // happen twice (an enabled build arming a second interval). A gated-off
+  // build returns above without marking, and stays free to be re-inited.
+  updaterStarted = true;
   // .unref() so a pending check can't hold the process alive during quit.
   setTimeout(check, FIRST_CHECK_DELAY_MS).unref();
   setInterval(check, CHECK_INTERVAL_MS).unref();

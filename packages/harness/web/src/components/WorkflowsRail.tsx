@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { JSX } from "react";
 import type {
   AppState,
+  EditorKind,
   HarnessEntry,
   HarnessKind,
   HarnessSession,
@@ -9,25 +10,32 @@ import type {
   SessionSummary,
   WorkflowInfo,
 } from "@shared/types";
+import type { WorkspaceKey } from "@shared/system-graph";
 
 import type { AuthStartResponse, FsListResponse } from "../lib/api";
+import type { ToastTone } from "../lib/toast";
 import { AnchoredPopover } from "./AnchoredPopover";
 import { BrandHeader } from "./BrandHeader";
 import { EmptyState } from "./EmptyState";
 import { HarnessBrandIcon } from "./HarnessBrandIcon";
 import { Icon } from "./Icon";
-import { AddWorkspaceDialog, DoorList, DoorRow } from "./AddWorkspaceDialog";
-import type { Door } from "./AddWorkspaceDialog";
-import { NewSessionModal } from "./NewSessionModal";
+import { StartDialog } from "./StartDialog";
+import { PlanCard } from "./PlanCard";
+import { UpdateCard } from "./UpdateCard";
+import { MenuChoice } from "./MenuChoice";
 import { SettingsPopover } from "./SettingsPopover";
 import { describeUpdateOutcome, getDesktopBridge } from "../lib/desktop";
 import { WorkflowRow } from "./WorkflowRow";
 import { isMockMode } from "../lib/api";
+import { useAccountPlan } from "../lib/use-account-plan";
 import { HARNESS_LABELS, historyDirs, historyRowMeta, sessionRowState } from "../lib/history-meta";
 import { loadUiPrefs, saveUiPrefs } from "../lib/ui-prefs";
 import { buildWorkspaceTree } from "../lib/workspace-tree";
-
-const SAPIOM_DASHBOARD_URL = "https://app.sapiom.ai/workflows";
+import type { RailGrouping, RailSort } from "../lib/workspace-tree";
+import type { PendingWorkspace } from "../lib/use-harness-state";
+import { SAPIOM_AGENTS_URL } from "../lib/urls";
+import { getTheme, subscribeTheme, toggleTheme } from "../lib/theme";
+import { trackingAttrs } from "../lib/analytics/tracking-attrs";
 
 interface WorkflowsRailProps {
   /** Resizable width (px) — the rail can shrink to minWidth under pressure. */
@@ -35,27 +43,42 @@ interface WorkflowsRailProps {
   minWidth: number;
   workflows: WorkflowInfo[];
   sessions: HarnessSession[];
-  workspaceScopes: AppState["workspaceScopes"];
+  /** Folders whose agent is being created but has not yet landed in
+   *  `workflows`/`sessions` — rendered as optimistic "Creating agent…" rows so
+   *  a mid-creation agent is always findable in the rail. */
+  pendingWorkspaces: PendingWorkspace[];
   /** The active session — highlights its own row in the history menu. */
   activeSessionId: string | null;
   /** The focused agent (or bare folder) path — the single filled selection. */
   focusedAgentPath: string | null;
+  /** Opaque server-issued identities that join real workspace folders to the
+   * local system-graph endpoint. */
+  workspaceScopes: AppState["workspaceScopes"];
+  /** The workspace whose dependency graph currently owns the right Canvas. */
+  selectedWorkspaceKey: WorkspaceKey | null;
+  /** Selects a workspace graph without changing the active session or center
+   * pane. */
+  onSelectWorkspace: (workspaceKey: WorkspaceKey) => void;
   /** Focuses an agent (or a bare-scaffold folder): swaps the main panel's
    *  session tab strip to that subject's sessions. */
   onFocusAgent: (path: string) => void;
-  /** The populated folder whose dependency graph owns the right Canvas. */
-  selectedWorkspaceKey: string | null;
-  onSelectWorkspace: (workspaceKey: string) => void;
   onOpenPalette: () => void;
   onConnect: (path: string) => Promise<void>;
   /** Collapses the rail — the session bar grows an expand affordance. */
   onCollapse: () => void;
+  canGoBack: boolean;
+  canGoForward: boolean;
+  onGoBack: () => void;
+  onGoForward: () => void;
   /** Selects a session from the history menu (a past/exited session). */
   onSelectSession: (id: string) => void;
-  /** Overview lives in the account menu: it shows the intro panel in the
-   *  main slot. Selecting any session leaves it. */
+  /** Overview lives in the account menu: it opens the Overview destination —
+   *  an introduction to the app — in the main slot. Selecting any session,
+   *  agent, or other destination leaves it. */
   overviewSelected: boolean;
   onSelectOverview: () => void;
+  /** The "Create new" CTA opens the composer-first "new session" home. */
+  onNewSession: () => void;
   /** Opens the past-session review pane for a history entry. */
   onReviewSummary: (summary: SessionSummary) => void;
   history: SessionSummary[];
@@ -82,16 +105,21 @@ interface WorkflowsRailProps {
   /** True while that destination is the visible view, so the nav row can say so. */
   templatesActive: boolean;
   onScanWorkflows: (root: string) => Promise<number>;
-  /** Push a message onto the app's toast rail (copy confirmations etc.). */
-  onToast: (message: string) => void;
+  /** Push a message onto the app's toast rail (copy confirmations etc.).
+   *  Defaults to the "error" tone; result announcements opt into "info". */
+  onToast: (message: string, tone?: ToastTone) => void;
   telemetryOptIn: boolean;
+  productAnalyticsOptIn: boolean;
   rollingSummary: boolean;
   consentSource?: AppState["consentSource"];
   consentEnvReason?: string | null;
   authenticated: boolean;
   organizationName: string | null;
   onToggleTelemetry: (next: boolean) => Promise<void>;
+  onToggleProductAnalytics: (next: boolean) => Promise<void>;
   onToggleRollingSummary: (next: boolean) => Promise<void>;
+  editor: EditorKind;
+  onSelectEditor: (next: EditorKind) => Promise<void>;
   /** Kick off the browser OAuth flow for the in-app Connect button. */
   onStartAuth: () => Promise<AuthStartResponse>;
   /** Sign out and clear credentials. */
@@ -104,12 +132,14 @@ const IS_MAC = typeof navigator !== "undefined" && navigator.platform.toUpperCas
 const SHORTCUT_HINT = IS_MAC ? "⌘K" : "Ctrl+K";
 
 /**
- * LEVEL 1 workspace folder header. The label selects that workspace's system
- * graph; the dedicated chevron is the only collapse/expand target.
+ * LEVEL 1 workspace folder header. Its label selects the folder's dependency
+ * graph in the right Canvas; the dedicated chevron is the only control that
+ * folds its agent children. A trailing hover action copies the real path.
  */
 function FolderHeader({
   label,
   cwd,
+  isDirectory = true,
   workspaceKey,
   selected,
   collapsed,
@@ -119,10 +149,14 @@ function FolderHeader({
 }: {
   label: string;
   cwd: string;
-  workspaceKey: string | null;
+  /** A real directory (Workspace grouping) carries a folder glyph and the
+   *  copy-path action; a deployment FACET bucket has no path behind it, so it
+   *  is a bare label + caret. */
+  isDirectory?: boolean;
+  workspaceKey: WorkspaceKey | null;
   selected: boolean;
   collapsed: boolean;
-  onSelect: (workspaceKey: string) => void;
+  onSelect: (workspaceKey: WorkspaceKey) => void;
   onToggleCollapsed: () => void;
   onCopyPath: (path: string) => void;
 }): JSX.Element {
@@ -134,38 +168,44 @@ function FolderHeader({
         (collapsed ? " is-collapsed" : "")
       }
       data-testid={`workspace-group-${label}`}
+      {...trackingAttrs({ object: "workspace" })}
     >
       <button
         className="workspace-row-main"
-        onClick={() => {
-          if (workspaceKey) onSelect(workspaceKey);
-        }}
-        disabled={workspaceKey === null}
-        title={cwd}
+        data-testid={`workspace-select-${label}`}
+        onClick={() => workspaceKey && onSelect(workspaceKey)}
+        disabled={!isDirectory || workspaceKey === null}
+        title={isDirectory ? cwd : label}
         aria-pressed={selected}
       >
-        <Icon name="Folder" size={13} />
+        {isDirectory && <Icon name={collapsed ? "Folder" : "FolderOpen"} size={13} />}
         <span className="tree-row-label">{label}</span>
       </button>
       <button
         className="workspace-row-action workspace-row-disclosure"
+        data-testid={`workspace-disclosure-${label}`}
         aria-label={`${collapsed ? "Expand" : "Collapse"} ${label}`}
         aria-expanded={!collapsed}
-        data-testid={`workspace-disclosure-${label}`}
+        data-tooltip={`${collapsed ? "Expand" : "Collapse"} folder`}
         onClick={onToggleCollapsed}
       >
-        <span className={"disclosure-caret" + (collapsed ? "" : " is-open")} aria-hidden="true">
+        <span
+          className={"disclosure-caret" + (collapsed ? "" : " is-open")}
+          aria-hidden="true"
+        >
           <Icon name="ChevronDown" size={13} />
         </span>
       </button>
-      <button
-        className="workspace-row-action"
-        aria-label={`Copy path for ${label}`}
-        data-tooltip="Copy path"
-        onClick={() => onCopyPath(cwd)}
-      >
-        <Icon name="Copy" size={13} />
-      </button>
+      {isDirectory && (
+        <button
+          className="workspace-row-action"
+          aria-label={`Copy path for ${label}`}
+          data-tooltip="Copy path"
+          onClick={() => onCopyPath(cwd)}
+        >
+          <Icon name="Copy" size={13} />
+        </button>
+      )}
     </div>
   );
 }
@@ -197,6 +237,7 @@ function BareFolderRow({
     <div
       className={"workspace-row" + (isFocused ? " is-selected" : "")}
       data-testid={`workspace-group-${label}`}
+      {...trackingAttrs({ object: "workspace" })}
     >
       <button
         className="workspace-row-main"
@@ -226,6 +267,47 @@ function BareFolderRow({
       >
         <Icon name="Copy" size={13} />
       </button>
+    </div>
+  );
+}
+
+/**
+ * Optimistic folder for an agent still being created: its session and definition
+ * have not landed yet, so nothing else in the rail would show it. It reads as
+ * busy (a spinner + "Creating agent…") but stays focusable, so switching away
+ * mid-creation never loses the in-progress agent — clicking it returns focus to
+ * the folder. The real bare-folder / agent rows replace it the moment they
+ * arrive (same `cwd` key), so there is no flip or duplicate.
+ */
+function PendingFolderRow({
+  label,
+  cwd,
+  isFocused,
+  onFocus,
+}: {
+  label: string;
+  cwd: string;
+  isFocused: boolean;
+  onFocus: (path: string) => void;
+}): JSX.Element {
+  return (
+    <div
+      className={"workspace-row" + (isFocused ? " is-selected" : "")}
+      data-testid={`workspace-group-${label}`}
+      {...trackingAttrs({ object: "workspace" })}
+    >
+      <button
+        className="workspace-row-main"
+        data-testid={`workspace-pending-${label}`}
+        aria-label={`Creating agent in ${label}`}
+        aria-busy="true"
+        data-tooltip="Creating agent…"
+        onClick={() => onFocus(cwd)}
+      >
+        <Icon name="Folder" size={13} />
+        <span className="tree-row-label">{label}</span>
+      </button>
+      <span className="workspace-row-spinner" aria-hidden="true" />
     </div>
   );
 }
@@ -280,6 +362,9 @@ function PastSessionRow({
       data-resumable={resumableAttr}
       title={cwd}
       onClick={onOpen}
+      // `title` is the absolute path and the row renders the session title,
+      // which is the user's first prompt.
+      {...trackingAttrs({ object: "session" })}
     >
       <span className="session-item-icon">
         <HarnessBrandIcon kind={harness} size={13} />
@@ -303,18 +388,24 @@ export function WorkflowsRail({
   minWidth,
   workflows,
   sessions,
-  workspaceScopes,
+  pendingWorkspaces,
   activeSessionId,
   focusedAgentPath,
-  onFocusAgent,
+  workspaceScopes,
   selectedWorkspaceKey,
   onSelectWorkspace,
+  onFocusAgent,
   onOpenPalette,
   onConnect,
   onCollapse,
+  canGoBack,
+  canGoForward,
+  onGoBack,
+  onGoForward,
   onSelectSession,
   overviewSelected,
   onSelectOverview,
+  onNewSession,
   onReviewSummary,
   history,
   historyLoading,
@@ -333,40 +424,75 @@ export function WorkflowsRail({
   onScanWorkflows,
   onToast,
   telemetryOptIn,
+  productAnalyticsOptIn,
   rollingSummary,
   consentSource,
   consentEnvReason,
   authenticated,
   organizationName,
   onToggleTelemetry,
+  onToggleProductAnalytics,
   onToggleRollingSummary,
+  editor,
+  onSelectEditor,
   onStartAuth,
   onDisconnect,
   settingsOpen,
   onSetSettingsOpen,
 }: WorkflowsRailProps): JSX.Element {
-  const [addDialogMode, setAddDialogMode] = useState<"session" | "workspace" | null>(null);
+  // The footer's plan card. Keyed on the auth state the rail already receives,
+  // so sign-in/out re-reads without a second events subscription. MockApi
+  // serves the demo fixture, which is what the static Pages build renders.
+  const accountPlan = useAccountPlan(authenticated);
+  // The footer's "Update now" card — exists only while the desktop app says a
+  // downloaded update is waiting. The push protocol re-sends current state on
+  // every page load, so subscribing at mount is the whole handshake; a browser
+  // (no bridge) or an older desktop build (no subscription) never sets this.
+  const [updateReady, setUpdateReady] = useState<{ version: string } | null>(null);
+  useEffect(() => {
+    const bridge = getDesktopBridge();
+    if (!bridge?.onUpdateState) return;
+    return bridge.onUpdateState((state) => {
+      setUpdateReady(state.kind === "downloaded" ? { version: state.version } : null);
+    });
+  }, []);
+  // "Add existing agents" opens the detection-driven StartDialog (register a
+  // folder that already holds an agent project). "Create new" goes to the
+  // composer home instead. connectTriggerRef anchors Escape focus return.
+  const [startOpen, setStartOpen] = useState(false);
   const connectTriggerRef = useRef<HTMLButtonElement>(null);
+  // The ⋯ menu opens BESIDE the rail (not over it), so it clears the whole
+  // rail's right edge rather than just the header glyph's.
+  const railRef = useRef<HTMLElement>(null);
 
-  /**
-   * The Add menu — the intent question, asked in a popover hanging off the +
-   * rather than in a full modal.
-   *
-   * A centred, scrimmed dialog to pick one of three words was the heaviest
-   * possible container for the lightest possible choice, and it read as a
-   * different surface from the History menu one button to its left. Same
-   * primitive, same card, same rows now.
-   *
-   * `addDoor` is which door the modal that follows opens at. Only ever set from
-   * here, so the modal is never re-asked the question this menu just answered.
-   */
-  const [addMenuOpen, setAddMenuOpen] = useState(false);
-  const [addDoor, setAddDoor] = useState<Door>("have");
-  const closeAddMenu = useCallback(() => setAddMenuOpen(false), []);
-
+  // The ⋯ overflow menu: how the tree is grouped, how it is sorted, and the
+  // sessions that have ended. Grouping and sort are persisted so the explorer
+  // resumes as the user left it (docs/IA.md).
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [pastOpen, setPastOpen] = useState(false);
+  const [grouping, setGrouping] = useState<RailGrouping>(
+    () => loadUiPrefs().railGrouping ?? "workspace",
+  );
+  const [sort, setSort] = useState<RailSort>(() => loadUiPrefs().railSort ?? "recent");
+  const pickGrouping = (next: RailGrouping): void => {
+    setGrouping(next);
+    saveUiPrefs({ railGrouping: next });
+    // A click that changes the section also collapses the Past-sessions
+    // sub-card, matching the hover behaviour on the fixed choices.
+    setPastOpen(false);
+  };
+  const pickSort = (next: RailSort): void => {
+    setSort(next);
+    saveUiPrefs({ railSort: next });
+    setPastOpen(false);
+  };
   const historyTriggerRef = useRef<HTMLButtonElement>(null);
-  const closeHistory = useCallback(() => setHistoryOpen(false), []);
+  // Closing the menu also folds its Past-sessions sub-card, so it never
+  // reopens already flown out.
+  const closeHistory = useCallback(() => {
+    setHistoryOpen(false);
+    setPastOpen(false);
+  }, []);
 
   // Per-workspace collapse, restored across reloads.
   const [collapsedCwds, setCollapsedCwds] = useState<Set<string>>(
@@ -388,9 +514,8 @@ export function WorkflowsRail({
 
   const toggleHistory = (): void => {
     const next = !historyOpen;
-    // Two popovers hanging off adjacent buttons: opening one closes the other,
-    // or they overlap and the top one looks like a child of the wrong trigger.
-    if (next) setAddMenuOpen(false);
+    // Every open lands on the menu, never mid-flyout.
+    setPastOpen(false);
     setHistoryOpen(next);
     if (next) {
       const dirs = historyDirs(sessions, recentDirs, activeSessionId);
@@ -427,232 +552,318 @@ export function WorkflowsRail({
   const { workspaces, orphanAgents } = buildWorkspaceTree(
     workflows,
     sessions,
+    grouping,
+    sort,
+    recentDirs,
+    pendingWorkspaces.map((p) => p.cwd),
     workspaceScopes ?? [],
   );
+
+  // A first-run rail (no agents, no orphans) promotes the Create-new CTA to the
+  // primary style — the one action that gets the user their first agent.
+  const isEmpty = workspaces.length === 0 && orphanAgents.length === 0;
 
   const copyPath = (path: string): void => {
     void navigator.clipboard
       ?.writeText(path)
-      .then(() => onToast("Path copied."))
+      .then(() => onToast("Path copied.", "success"))
       .catch(() => onToast("Couldn't copy the path."));
   };
 
   return (
-    <aside className="rail rail-workflows" style={{ width, minWidth }}>
-      <BrandHeader onCollapse={onCollapse} />
+    <aside
+      ref={railRef}
+      className="rail rail-workflows"
+      style={{ width, minWidth }}
+      {...trackingAttrs({ surface: "agent_rail" })}
+    >
+      <BrandHeader
+        onCollapse={onCollapse}
+        canGoBack={canGoBack}
+        canGoForward={canGoForward}
+        onGoBack={onGoBack}
+        onGoForward={onGoForward}
+      />
 
-      <div className="rail-search">
+      {/* The rail's top stack of labelled destinations. "Create new" leads as
+          the primary affirmative action (a solid ink button — the app's primary
+          CTA, like Deploy); Search opens the command palette (carrying the
+          unboxed ⌘K / Ctrl+K shortcut) and Templates opens the catalog. Search
+          and Templates read as rows, not a boxed field or a bare magnifier — a
+          destination is not chrome. */}
+      <nav className="rail-nav" aria-label="Primary">
+        {/* The primary creative action, promoted out of the header + ABOVE
+            Search: the fastest path to a new agent. It opens the composer-first
+            "new session" home. A standing ink-button CTA; when the rail has
+            nothing yet it gains a soft brand halo so an empty workspace has an
+            obvious next step. */}
         <button
-          className="palette-trigger"
+          type="button"
+          className={"rail-nav-cta" + (isEmpty ? " is-empty" : "")}
+          data-testid="rail-create-new"
+          aria-label="Create a new agent"
+          onClick={() => {
+            setHistoryOpen(false);
+            onNewSession();
+          }}
+        >
+          <Icon name="Plus" size={14} />
+          <span>Create new</span>
+        </button>
+
+        <button
+          type="button"
+          className="rail-nav-row"
           data-testid="palette-trigger"
-          aria-label="Jump to session, workflow, or path"
+          aria-label="Search sessions, agents, and paths"
           onClick={onOpenPalette}
         >
-          <Icon name="Search" size={13} />
-          <span className="palette-trigger-text">Jump to…</span>
-          <span className="palette-trigger-hint">{SHORTCUT_HINT}</span>
+          <Icon name="Search" size={14} />
+          <span>Search</span>
+          <span className="rail-nav-kbd">{SHORTCUT_HINT}</span>
         </button>
-      </div>
 
-      {/* Templates is a destination the rail navigates to, so it gets a nav row
-          of its own above the tree rather than hiding behind the "+" — the
-          catalog is how someone with an empty rail gets their first workflow,
-          and a surface reachable only from inside a dialog was the reason it
-          went unfound. */}
-      <button
-        type="button"
-        className={"rail-nav-row" + (templatesActive ? " is-selected" : "")}
-        data-testid="rail-templates"
-        aria-current={templatesActive ? "page" : undefined}
-        onClick={onBrowseTemplates}
-      >
-        <Icon name="LayoutTemplate" size={14} />
-        <span>Templates</span>
-      </button>
+        <button
+          type="button"
+          className={"rail-nav-row" + (templatesActive ? " is-selected" : "")}
+          data-testid="rail-templates"
+          aria-current={templatesActive ? "page" : undefined}
+          onClick={onBrowseTemplates}
+        >
+          <Icon name="LayoutTemplate" size={14} />
+          <span>Templates</span>
+        </button>
+
+        {/* Add EXISTING agents — a folder that already holds an agent project.
+            Creating a new one is "Create new" (the composer). */}
+        <button
+          type="button"
+          ref={connectTriggerRef}
+          className="rail-nav-row"
+          data-testid="add-existing-agents"
+          aria-haspopup="dialog"
+          aria-expanded={startOpen}
+          onClick={() => {
+            setHistoryOpen(false);
+            setStartOpen(true);
+          }}
+        >
+          <Icon name="FolderPlus" size={14} />
+          <span>Add existing agents</span>
+        </button>
+      </nav>
 
       <div className="rail-header">
-        Workspaces
+        <Icon name="Folder" size={14} />
+        <span className="rail-header-label">Workspaces</span>
         <div className="rail-header-actions">
           <button
             ref={historyTriggerRef}
             className="theme-toggle rail-header-btn"
             data-testid="history-trigger"
-            aria-label="Sessions and history"
-            title="Sessions and history"
+            aria-label="Workspace options"
+            aria-haspopup="menu"
+            aria-expanded={historyOpen}
+            data-tooltip="Grouping, sorting and past sessions"
             onClick={toggleHistory}
           >
-            <Icon name="History" size={14} />
-            {exitedSessions.length > 0 && (
-              <span className="session-history-badge" data-testid="session-history-badge">
-                {exitedSessions.length}
-              </span>
-            )}
-          </button>
-
-          <button
-            ref={connectTriggerRef}
-            className="theme-toggle rail-header-btn"
-            data-testid="add-workspace"
-            aria-label="Add workspace"
-            aria-expanded={addMenuOpen}
-            title="Add a workspace: a folder containing an agent project (sapiom.json). Its agent appears in the rail."
-            onClick={() => {
-              setHistoryOpen(false);
-              setAddMenuOpen((open) => !open);
-            }}
-          >
-            <Icon name="Plus" size={14} />
+            <Icon name="MoreHorizontal" size={14} />
           </button>
         </div>
       </div>
       <div className="rail-tree">
-        {/* The intent question. Same primitive and same card as the History
-            menu beside it — and the SAME rows the dialog used to show, so the
-            list moved out of the modal rather than being reworded into a
-            second copy of itself. Picking a door opens the dialog already at
-            that door; picking templates leaves for the destination that owns
-            the catalog. */}
-        <AnchoredPopover
-          open={addMenuOpen}
-          anchorRef={connectTriggerRef}
-          onDismiss={closeAddMenu}
-          // Beside the rail, not over it. The + is pinned to the rail's right
-          // edge, so a downward panel grows back across the workspace tree it
-          // is about to add to — covering the list you are checking against.
-          placement="right-start"
-          className="connect-card add-card"
-          testid="add-menu"
-        >
-          <div className="connect-card-header">
-            <span>Add</span>
-            <button
-              className="theme-toggle connect-card-close"
-              onClick={closeAddMenu}
-              aria-label="Close"
-              title="Close"
-            >
-              <Icon name="X" size={13} />
-            </button>
-          </div>
-          <div className="connect-card-body">
-            <DoorList
-              // "New session…" leads the menu: it is the most common thing the
-              // + is pressed for, and it is an ADD — it was only ever in the
-              // Sessions menu because that menu existed first. That put the
-              // one action you take daily behind the button for reviewing
-              // finished work, and split "start something" across two popovers.
-              leading={
-                <DoorRow
-                  icon="Plus"
-                  title="New session…"
-                  sub="Start an agent in a folder"
-                  testid="new-session-btn"
-                  onClick={() => {
-                    setAddMenuOpen(false);
-                    setAddDialogMode("session");
-                  }}
-                />
-              }
-              onPick={(door) => {
-                setAddMenuOpen(false);
-                if (door === "template") {
-                  onBrowseTemplates();
-                  return;
-                }
-                setAddDoor(door);
-                setAddDialogMode("workspace");
-              }}
-            />
-          </div>
-        </AnchoredPopover>
-
+        {/* The ⋯ overflow menu. The popover is the TRACK, not the card: it
+            opens BESIDE the rail (never over the tree it configures), and its
+            one unbounded set — Past sessions — opens as a sub-card beside the
+            options card rather than a scrolling list nailed under four fixed
+            choices. */}
         <AnchoredPopover
           open={historyOpen}
           anchorRef={historyTriggerRef}
           onDismiss={closeHistory}
-          placement="down-end"
-          className="connect-card history-card"
+          placement="right-start"
+          besideRef={railRef}
+          noClip
+          className="menu-flyer"
           testid="history-menu"
         >
-          <div className="connect-card-header">
-            <span>Sessions</span>
-            <button
-              className="theme-toggle connect-card-close"
-              onClick={closeHistory}
-              aria-label="Close"
-              title="Close"
-            >
-              <Icon name="X" size={13} />
-            </button>
-          </div>
-          <div className="connect-card-body history-card-body">
-            {/* "New session…" used to lead this menu; it lives in the Add menu
-                now. This popover reviews work that already happened — the one
-                thing you do here is reopen a past session. */}
-            <div className="session-dropdown-section">Past sessions</div>
-            {pastRows.map((row) => {
-              if (row.kind === "exited") {
-                // No agentSessionId at all: the agent never established a
-                // session, so there is provably nothing to resume — no need to
-                // wait on history to say so.
-                const summary =
-                  row.session.agentSessionId == null
-                    ? undefined
-                    : historyByAgentId.get(row.session.agentSessionId);
-                const resumeMode =
-                  row.session.agentSessionId == null ? ("rehydrate" as const) : summary?.resumeMode;
-                return (
-                  <PastSessionRow
-                    key={row.session.id}
-                    testid={`exited-session-${row.session.id}`}
-                    harness={row.session.harness}
-                    title={row.session.title}
-                    meta={historyRowMeta(
-                      {
-                        ...row.session,
-                        gitBranch: summary?.gitBranch,
-                        turnCount: summary?.turnCount,
-                        messageCount: summary?.messageCount,
-                      },
-                      undefined,
-                      {
-                        includeHarness: false,
-                        state: sessionRowState({ resumeMode, turnCount: summary?.turnCount }),
-                      },
-                    )}
-                    cwd={row.session.cwd}
-                    resumeMode={resumeMode}
-                    isSelected={row.session.id === activeSessionId}
-                    onOpen={() => {
-                      onSelectSession(row.session.id);
-                      setHistoryOpen(false);
-                    }}
+          <div className="menu-flyer-track">
+            <div className="connect-card history-card">
+              <div className="connect-card-header">
+                <span>Workspaces</span>
+                <button
+                  className="theme-toggle connect-card-close"
+                  onClick={closeHistory}
+                  aria-label="Close"
+                  title="Close"
+                >
+                  <Icon name="X" size={13} />
+                </button>
+              </div>
+              <div className="connect-card-body" role="menu">
+                {/* Hovering the fixed choices closes the Past-sessions flyout,
+                    so moving off that row collapses its sub-card — the
+                    hover-open's natural inverse. (A plain wrapper would flatten
+                    the row gap; menu-choice-group re-states the column.) */}
+                <div className="menu-choice-group" onMouseEnter={() => setPastOpen(false)}>
+                  {/* Only axes the registry actually sends: a folder and a
+                      deployment state are real groupings; a repository is not
+                      (sapiom.json holds repoFullName, but the registry drops
+                      it). */}
+                  <div className="session-dropdown-section">Group by</div>
+                  <MenuChoice
+                    testid="group-workspace"
+                    icon="FolderOpen"
+                    label="Workspace"
+                    checked={grouping === "workspace"}
+                    onPick={() => pickGrouping("workspace")}
                   />
-                );
-              }
-              return (
-                <PastSessionRow
-                  key={row.summary.agentSessionId}
-                  testid={`history-${row.summary.agentSessionId}`}
-                  harness={row.summary.harness}
-                  title={row.summary.title}
-                  meta={historyRowMeta(row.summary, undefined, {
-                    includeHarness: false,
-                    state: sessionRowState(row.summary),
-                  })}
-                  cwd={row.summary.cwd}
-                  resumeMode={row.summary.resumeMode}
-                  isSelected={false}
-                  onOpen={() => {
-                    onReviewSummary(row.summary);
-                    setHistoryOpen(false);
-                  }}
-                />
-              );
-            })}
-            {historyLoading && <div className="session-dropdown-empty">Loading…</div>}
-            {!historyLoading && pastRows.length === 0 && (
-              <div className="session-dropdown-empty">No past sessions yet</div>
+                  <MenuChoice
+                    testid="group-deployment"
+                    icon="Cloud"
+                    label="Deployment"
+                    checked={grouping === "deployment"}
+                    onPick={() => pickGrouping("deployment")}
+                  />
+
+                  <div className="session-dropdown-section">Sort</div>
+                  <MenuChoice
+                    testid="sort-recent"
+                    icon="History"
+                    label="Recent activity"
+                    checked={sort === "recent"}
+                    onPick={() => pickSort("recent")}
+                  />
+                  <MenuChoice
+                    testid="sort-name"
+                    icon="ArrowDown"
+                    label="Name"
+                    checked={sort === "name"}
+                    onPick={() => pickSort("name")}
+                  />
+                </div>
+
+                {/* One row that opens a sub-card beside the menu — the set is
+                    unbounded (every session this install has finished), so a
+                    list nailed here would give a card of four choices a
+                    scrollbar. The count rides the row, not the ⋯ trigger.
+                    Opens on hover (moving onto it) as well as click. */}
+                <button
+                  type="button"
+                  className={"session-dropdown-item nested-trigger" + (pastOpen ? " is-open" : "")}
+                  data-testid="past-sessions-trigger"
+                  aria-haspopup="menu"
+                  aria-expanded={pastOpen}
+                  onMouseEnter={() => setPastOpen(true)}
+                  onClick={() => setPastOpen((open) => !open)}
+                >
+                  <span className="session-item-icon">
+                    <Icon name="History" size={13} />
+                  </span>
+                  <span className="session-item-copy">
+                    <span className="session-item-title">Past sessions</span>
+                  </span>
+                  {exitedSessions.length > 0 && (
+                    <span className="session-history-badge" data-testid="session-history-badge">
+                      {exitedSessions.length}
+                    </span>
+                  )}
+                  <Icon name="ChevronRight" size={13} />
+                </button>
+              </div>
+            </div>
+
+            {pastOpen && (
+              <>
+                {/* A real, hit-testable 2px bridge, not a margin: crossing it
+                    with the pointer must not drop the hover and close the card
+                    being reached for. */}
+                <div className="menu-flyer-bridge" aria-hidden="true" />
+                <div className="connect-card menu-flyer-nested">
+                  <div className="connect-card-header">
+                    <span>Past sessions</span>
+                    <button
+                      className="theme-toggle connect-card-close"
+                      onClick={() => setPastOpen(false)}
+                      aria-label="Back"
+                      title="Back"
+                    >
+                      <Icon name="X" size={13} />
+                    </button>
+                  </div>
+                  <div
+                    className="connect-card-body past-sessions-list"
+                    data-testid="past-sessions-card"
+                  >
+                    {pastRows.map((row) => {
+                      if (row.kind === "exited") {
+                        // No agentSessionId at all: the agent never established
+                        // a session, so there is provably nothing to resume —
+                        // no need to wait on history to say so.
+                        const summary =
+                          row.session.agentSessionId == null
+                            ? undefined
+                            : historyByAgentId.get(row.session.agentSessionId);
+                        const resumeMode =
+                          row.session.agentSessionId == null
+                            ? ("rehydrate" as const)
+                            : summary?.resumeMode;
+                        return (
+                          <PastSessionRow
+                            key={row.session.id}
+                            testid={`exited-session-${row.session.id}`}
+                            harness={row.session.harness}
+                            title={row.session.title}
+                            meta={historyRowMeta(
+                              {
+                                ...row.session,
+                                gitBranch: summary?.gitBranch,
+                                turnCount: summary?.turnCount,
+                                messageCount: summary?.messageCount,
+                              },
+                              undefined,
+                              {
+                                includeHarness: false,
+                                state: sessionRowState({ resumeMode, turnCount: summary?.turnCount }),
+                              },
+                            )}
+                            cwd={row.session.cwd}
+                            resumeMode={resumeMode}
+                            isSelected={row.session.id === activeSessionId}
+                            onOpen={() => {
+                              onSelectSession(row.session.id);
+                              closeHistory();
+                            }}
+                          />
+                        );
+                      }
+                      return (
+                        <PastSessionRow
+                          key={row.summary.agentSessionId}
+                          testid={`history-${row.summary.agentSessionId}`}
+                          harness={row.summary.harness}
+                          title={row.summary.title}
+                          meta={historyRowMeta(row.summary, undefined, {
+                            includeHarness: false,
+                            state: sessionRowState(row.summary),
+                          })}
+                          cwd={row.summary.cwd}
+                          resumeMode={row.summary.resumeMode}
+                          isSelected={false}
+                          onOpen={() => {
+                            onReviewSummary(row.summary);
+                            closeHistory();
+                          }}
+                        />
+                      );
+                    })}
+                    {historyLoading && <div className="session-dropdown-empty">Loading…</div>}
+                    {!historyLoading && pastRows.length === 0 && (
+                      <div className="session-dropdown-empty">No past sessions yet</div>
+                    )}
+                  </div>
+                </div>
+              </>
             )}
           </div>
         </AnchoredPopover>
@@ -669,8 +880,25 @@ export function WorkflowsRail({
 
           {workspaces.map((workspace) => {
             const collapsed = collapsedCwds.has(workspace.cwd);
+            // Being created: the folder is known but its session/agent has not
+            // landed yet. A focusable, busy placeholder so the in-progress agent
+            // is always findable — replaced by the bare/agent rows below once
+            // real content arrives at the same cwd.
+            if (workspace.pending) {
+              return (
+                <div key={workspace.cwd} className="workspace-group">
+                  <PendingFolderRow
+                    label={workspace.label}
+                    cwd={workspace.cwd}
+                    isFocused={workspace.cwd === focusedAgentPath}
+                    onFocus={onFocusAgent}
+                  />
+                </div>
+              );
+            }
             // Bare case: no agents, a live scaffold session — the folder row
-            // itself is the focus target (the only clickable folder row).
+            // itself remains a center-pane focus target rather than opening an
+            // empty dependency graph.
             const bare = workspace.agents.length === 0 && workspace.bareSessions.length > 0;
             if (bare) {
               const primary = workspace.bareSessions[0];
@@ -693,6 +921,7 @@ export function WorkflowsRail({
                 <FolderHeader
                   label={workspace.label}
                   cwd={workspace.cwd}
+                  isDirectory={workspace.isDirectory}
                   workspaceKey={workspace.workspaceKey}
                   selected={workspace.workspaceKey === selectedWorkspaceKey}
                   collapsed={collapsed}
@@ -738,16 +967,32 @@ export function WorkflowsRail({
       </div>
 
       <div className="rail-footer">
+        {/* Update card over plan card over account row — all in the SAME
+            footer block. The update card exists only while the desktop app
+            holds a downloaded update (see the onUpdateState subscription). */}
+        {updateReady && (() => {
+          const bridge = getDesktopBridge();
+          return bridge ? (
+            <UpdateCard desktop={bridge} version={updateReady.version} onToast={onToast} />
+          ) : null;
+        })()}
+        {/* The plan summary: the server's /api/account/plan relay (MockApi's
+            fixture in demo); a view with nothing to state renders nothing. */}
+        <PlanCard plan={accountPlan} />
         <ProfileRow
           onToast={onToast}
           authenticated={authenticated}
           organizationName={organizationName}
           telemetryOptIn={telemetryOptIn}
+          productAnalyticsOptIn={productAnalyticsOptIn}
           rollingSummary={rollingSummary}
           consentSource={consentSource}
           consentEnvReason={consentEnvReason}
           onToggleTelemetry={onToggleTelemetry}
+          onToggleProductAnalytics={onToggleProductAnalytics}
           onToggleRollingSummary={onToggleRollingSummary}
+          editor={editor}
+          onSelectEditor={onSelectEditor}
           onStartAuth={onStartAuth}
           onDisconnect={onDisconnect}
           settingsOpen={settingsOpen}
@@ -757,44 +1002,19 @@ export function WorkflowsRail({
         />
       </div>
 
-      {/* Two intents, two dialogs — deliberately not one component with a
-          `mode`. The workspace intent is three doors (AddWorkspaceDialog); a
-          session is one question (which folder) plus which agent. They shared
-          375 lines and almost no UI, which is how the workspace side ended up
-          showing five jobs at once.
-
-          The workspace dialog now always opens AT a door: the Add popover above
-          is the door list, so reaching here means the intent is already known. */}
-      {addDialogMode === "workspace" && (
-        <AddWorkspaceDialog
-          recentDirs={recentDirs}
-          projectRoot={projectRoot}
-          listDir={listDir}
-          onClose={() => setAddDialogMode(null)}
-          onConnect={async (cwd) => {
-            await onConnect(cwd);
-          }}
-          onScan={onScanWorkflows}
-          onScaffold={onScaffoldSession}
-          onSaveProjectRoot={onSaveProjectRoot}
-          listHarnesses={listHarnesses}
-          onBrowseTemplates={() => {
-            setAddDialogMode(null);
-            onBrowseTemplates();
-          }}
-          triggerRef={connectTriggerRef}
-          initialDoor={addDoor}
-        />
-      )}
-      {addDialogMode === "session" && (
-        <NewSessionModal
+      {/* Add EXISTING agents: one detection-driven dialog that registers a
+          folder holding an agent project (or a folder of them). Creating a NEW
+          agent is "Create new" → the composer home (onNewSession). */}
+      {startOpen && (
+        <StartDialog
           recentDirs={recentDirs}
           launchDir={launchDir}
+          projectRoot={projectRoot}
           listDir={listDir}
-          onClose={() => setAddDialogMode(null)}
-          onCreate={onCreateSession}
-          listHarnesses={listHarnesses}
-          triggerRef={historyTriggerRef}
+          onClose={() => setStartOpen(false)}
+          onConnect={onConnect}
+          onScan={onScanWorkflows}
+          triggerRef={connectTriggerRef}
         />
       )}
 
@@ -817,11 +1037,15 @@ function ProfileRow({
   authenticated,
   organizationName,
   telemetryOptIn,
+  productAnalyticsOptIn,
   rollingSummary,
   consentSource,
   consentEnvReason,
   onToggleTelemetry,
+  onToggleProductAnalytics,
   onToggleRollingSummary,
+  editor,
+  onSelectEditor,
   onStartAuth,
   onDisconnect,
   settingsOpen,
@@ -833,20 +1057,26 @@ function ProfileRow({
   authenticated: boolean;
   organizationName: string | null;
   telemetryOptIn: boolean;
+  productAnalyticsOptIn: boolean;
   rollingSummary: boolean;
   consentSource?: AppState["consentSource"];
   consentEnvReason?: string | null;
   onToggleTelemetry: (next: boolean) => Promise<void>;
+  onToggleProductAnalytics: (next: boolean) => Promise<void>;
   onToggleRollingSummary: (next: boolean) => Promise<void>;
+  editor: EditorKind;
+  onSelectEditor: (next: EditorKind) => Promise<void>;
   onStartAuth: () => Promise<AuthStartResponse>;
   onDisconnect: () => Promise<void>;
   settingsOpen: boolean;
   onSetSettingsOpen: (open: boolean) => void;
   overviewSelected: boolean;
   onSelectOverview: () => void;
-  onToast: (message: string) => void;
+  onToast: (message: string, tone?: ToastTone) => void;
 }): JSX.Element {
   const [menuOpen, setMenuOpen] = useState(false);
+  const [theme, setTheme] = useState(getTheme());
+  useEffect(() => subscribeTheme(setTheme), []);
   const [authProgress, setAuthProgress] = useState<ProfileAuthProgress>({ status: "idle" });
   const triggerRef = useRef<HTMLButtonElement>(null);
   const closeMenu = useCallback(() => setMenuOpen(false), []);
@@ -866,10 +1096,22 @@ function ProfileRow({
     try {
       // A toast, because the menu closes on click and the outcome is the entire
       // point of pressing this. When an update is already downloaded the main
-      // process ALSO re-raises its native "Restart now / Later" prompt — that
+      // process ALSO re-raises its own update window ("Restart now / Later /
+      // Skip this version") — that
       // dialog is the only way to apply one, deliberately (see the desktop app's
       // ipc.ts: page code has no restart channel).
-      onToast(describeUpdateOutcome(await desktop.checkForUpdates()).text);
+      const result = await desktop.checkForUpdates();
+      const view = describeUpdateOutcome(result);
+      // Positive terminals (already current, or on disk awaiting a restart)
+      // get the green check; in-flight and empty outcomes stay neutral.
+      onToast(
+        view.text,
+        view.tone === "error"
+          ? "error"
+          : result.kind === "up-to-date" || result.kind === "downloaded"
+            ? "success"
+            : "info",
+      );
     } catch {
       onToast("Couldn't check for updates.");
     } finally {
@@ -920,17 +1162,29 @@ function ProfileRow({
         aria-haspopup="menu"
         aria-expanded={menuOpen}
         title={demo ? "Static demo. No Sapiom account, server, or agent is connected." : "Account"}
-        onClick={() => setMenuOpen((open) => !open)}
+        onClick={() => {
+          // Opening the account menu collapses the settings card so the two
+          // never stack — one section of the profile is open at a time.
+          const willOpen = !menuOpen;
+          setMenuOpen(willOpen);
+          if (willOpen) closeSettings();
+        }}
       >
         <span className="rail-profile-avatar" aria-hidden="true">
           {initial}
         </span>
         <span className="rail-profile-copy">
           <span className="rail-profile-name">{name}</span>
-          <span className="rail-profile-meta">{meta}</span>
+          <span className="rail-profile-meta">
+            <span
+              className="identity-dot"
+              data-authenticated={demo ? false : authenticated}
+              data-pending={isPending}
+            />
+            {meta}
+          </span>
         </span>
-        <span className="identity-dot" data-authenticated={demo ? false : authenticated} data-pending={isPending} />
-        <Icon name="ChevronDown" size={13} />
+        <Icon name="ChevronDown" size={14} />
       </button>
 
       <AnchoredPopover
@@ -946,11 +1200,15 @@ function ProfileRow({
           authenticated={authenticated}
           organizationName={organizationName}
           telemetryOptIn={telemetryOptIn}
+          productAnalyticsOptIn={productAnalyticsOptIn}
           rollingSummary={rollingSummary}
           consentSource={consentSource}
           consentEnvReason={consentEnvReason}
           onToggleTelemetry={onToggleTelemetry}
+          onToggleProductAnalytics={onToggleProductAnalytics}
           onToggleRollingSummary={onToggleRollingSummary}
+          editor={editor}
+          onSelectEditor={onSelectEditor}
           onStartAuth={onStartAuth}
           onDisconnect={onDisconnect}
         />
@@ -983,7 +1241,7 @@ function ProfileRow({
           className="profile-menu-item"
           data-testid="profile-open-dashboard"
           onClick={() => {
-            window.open(SAPIOM_DASHBOARD_URL, "_blank", "noopener,noreferrer");
+            window.open(SAPIOM_AGENTS_URL, "_blank", "noopener,noreferrer");
             closeMenu();
           }}
         >
@@ -1002,6 +1260,20 @@ function ProfileRow({
           <Icon name="Settings" size={13} />
           Settings
         </button>
+        {/* Appearance sits with the rest of the workspace preferences: the
+            rail's chrome line belongs to window controls and navigation. */}
+        <button
+          role="menuitem"
+          className="profile-menu-item"
+          data-testid="theme-toggle"
+          onClick={() => {
+            toggleTheme();
+            closeMenu();
+          }}
+        >
+          <Icon name={theme === "dark" ? "Sun" : "Moon"} size={13} />
+          {theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
+        </button>
         {desktop && (
           <button
             role="menuitem"
@@ -1012,6 +1284,14 @@ function ProfileRow({
           >
             <Icon name={checkingUpdate ? "Loader" : "RefreshCw"} size={13} />
             {checkingUpdate ? "Checking…" : "Check for updates"}
+            {/* The app's own version, so the user always sees which build they're
+                on right where they'd check for a newer one. Empty on older
+                desktop builds that predate the appVersion bridge field. */}
+            {desktop.appVersion && (
+              <span className="profile-menu-version" data-testid="app-version">
+                v{desktop.appVersion}
+              </span>
+            )}
           </button>
         )}
         {!demo && !authenticated && (
@@ -1046,7 +1326,7 @@ function ProfileRow({
             className="profile-menu-item"
             data-testid="profile-switch-account"
             onClick={() => {
-              window.open(SAPIOM_DASHBOARD_URL, "_blank", "noopener,noreferrer");
+              window.open(SAPIOM_AGENTS_URL, "_blank", "noopener,noreferrer");
               closeMenu();
             }}
           >

@@ -6,6 +6,7 @@ import {
   type AgentExecutionContext,
 } from "@sapiom/agent";
 import type { Sapiom } from "@sapiom/tools";
+import { EmailHttpError } from "@sapiom/tools";
 import { z } from "zod/v4";
 
 /**
@@ -13,14 +14,14 @@ import { z } from "zod/v4";
  * `web-research-digest`.
  *
  * On each tick it searches the web for a `topic`, scrapes the top candidates for
- * full article text, asks an LLM (`ctx.sapiom.models.run` — the live x402-served
+ * full article text, asks an LLM (`ctx.sapiom.llm.run` — the live x402-served
  * model, NOT a hardcoded formatter) to rank + curate the findings into a short
  * sourced brief, then delivers that brief by email. It ships with a `schedule`
  * input so it reads as a standing "morning brief" agent rather than a manual
  * one-shot.
  *
  * Composition, in one legible graph:
- *   search (web.search) → scrape (web.scrape) → curate (models.run) → deliver (email)
+ *   search (web.search) → scrape (web.scrape) → curate (llm.run) → deliver (email)
  *
  * vs. `web-research-digest`: fork THAT for a one-shot digest that formats
  * in-process (no LLM, no delivery); fork THIS for a standing, LLM-curated brief
@@ -32,7 +33,7 @@ import { z } from "zod/v4";
  *     graph offline (capabilities stubbed) for free before a billed, delivering
  *     deploy + run.
  *   - The recipient is ordinary run input (a declared setting), not a secret, and
- *     persisted in execution state — the same seam you'd read a delivery secret
+ *     persisted in agent-run state — the same seam you'd read a delivery secret
  *     from if you swapped in a bring-your-own channel (see `AGENTS.md`).
  *   - Each edge carries a slim payload; the large scraped bodies stay bounded and
  *     die at the `curate` boundary — they never enter `ctx.shared` (big shared
@@ -54,8 +55,6 @@ const MAX_BODY_CHARS = 1200;
  * brief that follows a successful run.
  */
 const DEFAULT_TOPIC = "AI agent reliability incidents";
-/** Username for the inbox we send from (created once, then reused). */
-const SENDER_USERNAME = "research-brief";
 
 // ─────────────────────────────────────────────────────────────── shapes ──
 interface EntryInput {
@@ -105,15 +104,32 @@ interface Shared extends Record<string, unknown> {
 type Ctx = AgentExecutionContext<Shared>;
 
 // ─────────────────────────────────────────────────────────────── helpers ──
-/** Reuse an existing inbox to send from, else provision one. */
+/**
+ * Reuse an existing inbox to send from, else provision one.
+ *
+ * We deliberately omit `username`. AgentMail addresses are globally unique, so a
+ * fixed local part can only ever be owned by ONE account across the whole
+ * platform — every other tenant's `create` 409s with "Email address is already
+ * taken", which fails the step. Omitting it lets AgentMail auto-generate a
+ * globally-unique address, so a fresh tenant's first run succeeds and two
+ * tenants never collide. `create` still isn't atomic against the `list`, so a
+ * 409 is treated as "someone already provisioned one" — re-list and reuse.
+ */
 async function resolveSenderInbox(ctx: Ctx): Promise<string> {
   const existing = await ctx.sapiom.email.inboxes.list({ limit: 1 });
   if (existing.inboxes.length > 0) return existing.inboxes[0].inboxId;
-  const inbox = await ctx.sapiom.email.inboxes.create({
-    username: SENDER_USERNAME,
-    displayName: "Research Brief",
-  });
-  return inbox.inboxId;
+  try {
+    const inbox = await ctx.sapiom.email.inboxes.create({
+      displayName: "Research Brief",
+    });
+    return inbox.inboxId;
+  } catch (err) {
+    if (err instanceof EmailHttpError && err.status === 409) {
+      const retry = await ctx.sapiom.email.inboxes.list({ limit: 1 });
+      if (retry.inboxes.length > 0) return retry.inboxes[0].inboxId;
+    }
+    throw err;
+  }
 }
 
 // ─────────────────────────────────────────────────────────────── steps ──
@@ -244,20 +260,27 @@ const curate = defineStep({
         .join("\n\n");
       // The live, x402-served model does the ranking + synthesis — this is the
       // capability web-research-digest deliberately avoids (it formats in-process).
-      const curation = await ctx.sapiom.models.run({
-        system:
-          "You are a research analyst writing a short morning brief. Given a " +
-          "TOPIC and a set of web SOURCES (each: [n] title, url, extracted text), " +
-          "rank them by relevance and credibility, drop thin or duplicate items, " +
-          "and write markdown with: a 2-3 sentence summary, then 3-5 bullet " +
-          "takeaways that each cite their source as a [n] reference, then a " +
-          "'## Sources' list mapping each [n] to its title and url. Output ONLY " +
-          "the markdown brief — no preamble, no code fences.",
-        prompt: `TOPIC: ${topic}\n\nSOURCES:\n${research}`,
-        maxTokens: 800,
+      const curation = await ctx.sapiom.llm.run({
+        request: {
+          system:
+            "You are a research analyst writing a short morning brief. Given a " +
+            "TOPIC and a set of web SOURCES (each: [n] title, url, extracted text), " +
+            "rank them by relevance and credibility, drop thin or duplicate items, " +
+            "and write markdown with: a 2-3 sentence summary, then 3-5 bullet " +
+            "takeaways that each cite their source as a [n] reference, then a " +
+            "'## Sources' list mapping each [n] to its title and url. Output ONLY " +
+            "the markdown brief — no preamble, no code fences.",
+          messages: [
+            {
+              role: "user",
+              content: `TOPIC: ${topic}\n\nSOURCES:\n${research}`,
+            },
+          ],
+          max_tokens: 800,
+        },
       });
       brief =
-        (curation.output ?? "").trim() ||
+        (ctx.sapiom.llm.textOf(curation) ?? "").trim() ||
         `# Research brief: ${topic}\n\n_The model returned no content._`;
     }
 
@@ -288,44 +311,44 @@ const deliver = defineStep({
     // as a `deliverTo` setting in template.json) rather than from a write-only
     // secret store nothing in the product can populate.
     const deliverTo = ctx.shared.get("deliverTo");
+    const note = ctx.shared.get("note");
 
-    // The safe path: a dry run — or a live run with no recipient configured yet —
-    // returns the computed brief without sending anything.
-    if (dryRun || !deliverTo) {
-      ctx.logger.info("skipping delivery", {
-        dryRun,
-        hasRecipient: Boolean(deliverTo),
-      });
+    // dryRun is an explicit author opt-in: compute the brief and return it as a
+    // preview without emailing anyone.
+    if (dryRun) {
+      ctx.logger.info("dry run — skipping delivery", {});
       return terminate({
         topic,
         schedule,
         delivered: false,
-        dryRun,
-        reason: dryRun ? "dry-run" : "no-recipient",
-        ...(dryRun ? {} : { unmet: ["deliverTo"] }),
-        note: [
-          dryRun
-            ? "`dryRun` was set, so nothing was emailed."
-            : "Nothing was emailed: no `deliverTo` address is set, so the brief is returned inline below.",
-          ctx.shared.get("note"),
-        ]
+        dryRun: true,
+        reason: "dry-run",
+        note: ["`dryRun` was set, so nothing was emailed.", note]
           .filter(Boolean)
           .join(" "),
-        to: deliverTo ?? null,
+        to: null,
         subject,
         brief,
         sources,
       });
     }
 
+    // The "email" headline must fire on a zero-setup run, so with no `deliverTo`
+    // we deliver to this agent's own Sapiom-hosted inbox — a real, inspectable
+    // mailbox the platform provisions for us via `resolveSenderInbox` (an
+    // `inboxId` IS its email address). A caller-supplied `deliverTo` is the
+    // upgrade that sends to a real external address instead.
     const inboxId = await resolveSenderInbox(ctx);
+    const toDemoInbox = !deliverTo;
+    const recipient = deliverTo ?? inboxId;
     const sent = await ctx.sapiom.email.messages.send(inboxId, {
-      to: deliverTo,
+      to: recipient,
       subject,
       text: brief,
     });
     ctx.logger.info("brief delivered", {
-      to: deliverTo,
+      to: recipient,
+      demo: toDemoInbox,
       messageId: sent.messageId,
     });
     return terminate({
@@ -333,11 +356,21 @@ const deliver = defineStep({
       schedule,
       delivered: true,
       dryRun: false,
-      to: deliverTo,
+      demo: toDemoInbox,
+      to: recipient,
       subject,
       messageId: sent.messageId,
+      brief,
       sources,
-      ...(ctx.shared.get("note") ? { note: ctx.shared.get("note") } : {}),
+      note:
+        [
+          toDemoInbox
+            ? `Emailed the brief to this agent's Sapiom-hosted demo inbox (${recipient}) — the message above is real and inspectable. Set \`deliverTo\` to send it to your own address instead.`
+            : null,
+          note,
+        ]
+          .filter(Boolean)
+          .join(" ") || undefined,
     });
   },
 });

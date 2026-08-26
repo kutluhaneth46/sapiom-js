@@ -79,10 +79,31 @@ export interface ManifestCheckFailure {
 
 export type ManifestCheckResult = ManifestCheckSuccess | ManifestCheckFailure;
 
+/**
+ * Names the directory the extraction actually bundled, unless the reason
+ * already does.
+ *
+ * The Canvas is the one caller whose project directory the user never typed:
+ * it comes from the bound workflow row, while their `check` / `run_local` /
+ * `deploy` run wherever their coding agent sits. When those succeed and only
+ * the Canvas fails on "the same project", the two are usually not the same
+ * directory at all (a workspace clone with no `node_modules`, a project since
+ * moved) — and esbuild's own message can't settle it, because it prints paths
+ * relative to whatever cwd invoked it. Reported as: the bundler resolves
+ * node_modules from somewhere other than the project root.
+ */
+function withProjectContext(sourceDir: string, reason: string): string {
+  return reason.includes(sourceDir)
+    ? reason
+    : `${reason} (project: ${sourceDir})`;
+}
+
 /** Runs `check({ sourceDir })` in a child `node` process; never throws or
  *  rejects — a crash, timeout, or unparsable output all come back as a
  *  `ManifestCheckFailure` with a human-readable reason. */
-export function runManifestCheck(sourceDir: string): Promise<ManifestCheckResult> {
+export function runManifestCheck(
+  sourceDir: string,
+): Promise<ManifestCheckResult> {
   return new Promise((resolve) => {
     execFile(
       process.execPath,
@@ -100,22 +121,44 @@ export function runManifestCheck(sourceDir: string): Promise<ManifestCheckResult
         },
         timeout: CHECK_TIMEOUT_MS,
         maxBuffer: MAX_BUFFER_BYTES,
+        // windowsHide: a console child of our console-less GUI process would
+        // otherwise open a visible window.
+        windowsHide: true,
       },
       (err, stdout, stderr) => {
         if (err) {
-          const timedOut = (err as NodeJS.ErrnoException & { killed?: boolean }).killed && err.signal === "SIGTERM";
+          const timedOut =
+            (err as NodeJS.ErrnoException & { killed?: boolean }).killed &&
+            err.signal === "SIGTERM";
           resolve({
             ok: false,
-            reason: timedOut
-              ? `Extraction timed out after ${CHECK_TIMEOUT_MS / 1000}s.`
-              : (stderr.trim() || err.message),
+            reason: withProjectContext(
+              sourceDir,
+              timedOut
+                ? `Extraction timed out after ${CHECK_TIMEOUT_MS / 1000}s.`
+                : stderr.trim() || err.message,
+            ),
           });
           return;
         }
         try {
-          resolve(JSON.parse(stdout) as ManifestCheckResult);
+          const parsed = JSON.parse(stdout) as ManifestCheckResult;
+          resolve(
+            parsed.ok
+              ? parsed
+              : {
+                  ok: false,
+                  reason: withProjectContext(sourceDir, parsed.reason),
+                },
+          );
         } catch {
-          resolve({ ok: false, reason: `Unexpected output from the check process: ${stdout.slice(0, 500)}` });
+          resolve({
+            ok: false,
+            reason: withProjectContext(
+              sourceDir,
+              `Unexpected output from the check process: ${stdout.slice(0, 500)}`,
+            ),
+          });
         }
       },
     );

@@ -16,8 +16,9 @@ description: Build, test, and deploy a Sapiom agent — a controlled, multi-step
 A Sapiom **agent** is a small TypeScript project you author with your coding agent: a
 `defineAgent({ name, entry, steps })` where each step's `run(input, ctx)` does work — calling
 paid Sapiom capabilities through the typed `ctx.sapiom.*` client — and returns a directive.
-You test it locally for free, then deploy it to run on Sapiom's cloud: on demand, on a
-schedule, or resumed by signals. All from the terminal; no dashboard required.
+You test it locally without a Sapiom account or capability spend, then deploy it to run on
+Sapiom's cloud: on demand, on a schedule, or resumed by signals. All from the terminal; no
+dashboard required.
 
 **Load this skill before scaffolding — it drives the whole lifecycle from zero.** Inside a
 scaffolded project, `AGENTS.md` is the quick reference; this skill is the deep guide.
@@ -36,13 +37,7 @@ Other clients: run `npx -y @sapiom/mcp` as a local (stdio) MCP server — see
 
 ## Lifecycle from Zero
 
-### 1. Authenticate (required before deploy/run)
-
-Run `sapiom_authenticate` — it opens a browser login and caches an API key in
-`~/.sapiom/credentials.json`. Confirm with `sapiom_status`. This makes your coding agent an
-API-key principal; deployed agents inherit that authority to call paid capabilities.
-
-### 2. Scaffold
+### 1. Scaffold
 
 Call `sapiom_dev_agents_scaffold` with a target directory. The scaffold writes:
 
@@ -59,34 +54,44 @@ my-agent/
 Install deps: `npm install`. Templates: `"default"` (minimal two-step starter) or
 `"coding-pause"` (launch + pause/resume coding-model pattern).
 
-### 3. Write steps → typecheck → check → run_local → deploy
+### 2. Write steps → typecheck → check → run_local
 
-| Command | What it does |
-|---|---|
-| `npm run typecheck` | Confirms types compile and every `ctx.sapiom.*` call exists |
-| `sapiom_dev_agents_check` | Bundles `index.ts` + validates the step graph (offline, instant) |
-| `sapiom_dev_agents_run_local` | Runs real step code with all capabilities stubbed — free, no spend |
+| Command                       | What it does                                                                                                         |
+| ----------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `npm run typecheck`           | Confirms types compile and every `ctx.sapiom.*` call exists                                                          |
+| `sapiom_dev_agents_check`     | Typechecks, bundles and imports `index.ts`, then validates the manifest and graph; no Sapiom account or service call |
+| `sapiom_dev_agents_run_local` | Runs real step code with `ctx.sapiom.*` calls stubbed — no Sapiom capability spend                                   |
 
-Then ship:
+`check` imports your definition, and `run_local` executes your real step bodies. Neither
+contacts a Sapiom service, but author-written top-level or step code can still use the local
+filesystem, process, environment, network, and third-party services.
 
-| Command | What it does |
-|---|---|
-| `sapiom_dev_agents_link` | Registers the agent under your tenant |
-| `sapiom_dev_agents_deploy` | Builds and deploys to Sapiom's cloud |
-| `sapiom_dev_agents_run` | Starts a real (billed) execution |
-| `sapiom_dev_agents_inspect` | Watch an execution's status, steps, and spend |
+### 3. Authenticate before cloud work
+
+Run `sapiom_authenticate` — it opens a browser login and caches an API key in
+`~/.sapiom/credentials.json`. Confirm with `sapiom_status`. This makes your coding agent an
+API-key principal; link, deploy, and cloud run require it.
+
+### 4. Link → deploy → run → inspect
+
+| Command                     | What it does                                        |
+| --------------------------- | --------------------------------------------------- |
+| `sapiom_dev_agents_link`    | Registers the agent under your tenant               |
+| `sapiom_dev_agents_deploy`  | Builds and deploys to Sapiom's cloud                |
+| `sapiom_dev_agents_run`     | Starts a real (billed) execution                    |
+| `sapiom_dev_agents_inspect` | Watch status, pinned build, steps, logs, and output |
 
 ## The Step Model — Hard Rules
 
 ### Canonical API
 
-| Import | From |
-|---|---|
-| `defineAgent` | `@sapiom/agent` |
-| `defineStep` | `@sapiom/agent` |
+| Import                                               | From            |
+| ---------------------------------------------------- | --------------- |
+| `defineAgent`                                        | `@sapiom/agent` |
+| `defineStep`                                         | `@sapiom/agent` |
 | `goto / terminate / fail / retry / pauseUntilSignal` | `@sapiom/agent` |
-| `AgentExecutionContext` | `@sapiom/agent` |
-| `CODING_RESULT_SIGNAL / CodingResultPayload` | `@sapiom/tools` |
+| `AgentExecutionContext`                              | `@sapiom/agent` |
+| `CODING_RESULT_SIGNAL / CodingResultPayload`         | `@sapiom/tools` |
 
 `@sapiom/agent` is the only authoring package.
 
@@ -94,8 +99,8 @@ Then ship:
 
 ```typescript
 export const agent = defineAgent({
-  name: "my-agent",      // string — used for logging and inspect
-  entry: "start",        // must name a key in steps
+  name: "my-agent", // string — used for logging and inspect
+  entry: "start", // must name a key in steps
   steps: { start, finish },
 });
 ```
@@ -104,29 +109,29 @@ Export exactly one `defineAgent(...)` from `index.ts`.
 
 ### `defineStep` fields
 
-| Field | Type | Required | Notes |
-|---|---|---|---|
-| `name` | `string` | yes | Step's id; must match its key in the steps object |
-| `next` | `readonly string[]` | yes | Step names this step may `goto`. Empty array if terminal |
-| `terminal` | `boolean` | no | `true` if this step ends the agent's execution |
-| `canFail` | `boolean` | no | Must be `true` to return `fail()` |
-| `pause` | `{ signal, resumeStep }` | no | Required when returning `pauseUntilSignal(...)` |
-| `inputSchema` | `ZodType` | no | Zod schema validating this step's input. On the **entry** step it is the agent's public API (see [The Entry Input Contract](#the-entry-input-contract--your-agents-public-api)) |
-| `timeoutMs` | `number` | no | Per-step timeout; no automatic retry cap |
-| `run(input, ctx)` | `async function` | yes | Returns a directive |
+| Field             | Type                     | Required | Notes                                                                                                                                                                           |
+| ----------------- | ------------------------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `name`            | `string`                 | yes      | Step's id; must match its key in the steps object                                                                                                                               |
+| `next`            | `readonly string[]`      | yes      | Step names this step may `goto`. Empty array if terminal                                                                                                                        |
+| `terminal`        | `boolean`                | no       | `true` if this step ends the agent's execution                                                                                                                                  |
+| `canFail`         | `boolean`                | no       | Must be `true` to return `fail()`                                                                                                                                               |
+| `pause`           | `{ signal, resumeStep }` | no       | Required when returning `pauseUntilSignal(...)`                                                                                                                                 |
+| `inputSchema`     | `ZodType`                | no       | Zod schema validating this step's input. On the **entry** step it is the agent's public API (see [The Entry Input Contract](#the-entry-input-contract--your-agents-public-api)) |
+| `timeoutMs`       | `number`                 | no       | Per-attempt step timeout; the engine separately caps attempts (three by default)                                                                                                |
+| `run(input, ctx)` | `async function`         | yes      | Returns a directive                                                                                                                                                             |
 
 Import Zod via the `zod/v4` subpath — `import { z } from "zod/v4"` — to match the SDK's
 schema types. Don't import from bare `"zod"` or add a second zod dependency.
 
 ### Directives — what `run` must return
 
-| Directive | Function | Constraint |
-|---|---|---|
-| `goto(target, output?)` | Advance to another step | `target` must be in `next[]` |
-| `terminate(output?, opts?)` | End the execution successfully | Step must have `terminal: true` |
-| `fail(reason?, opts?)` | End the execution as failed | Step must have `canFail: true` |
-| `retry(opts?)` | Re-run this step | Bound with `ctx.attempts` — no automatic cap |
-| `pauseUntilSignal(handle, opts?)` | Suspend until a signal fires | Step must declare `pause: { signal, resumeStep }` |
+| Directive                         | Function                       | Constraint                                                |
+| --------------------------------- | ------------------------------ | --------------------------------------------------------- |
+| `goto(target, output?)`           | Advance to another step        | `target` must be in `next[]`                              |
+| `terminate(output?, opts?)`       | End the execution successfully | Step must have `terminal: true`                           |
+| `fail(reason?, opts?)`            | End the execution as failed    | Step must have `canFail: true`                            |
+| `retry(opts?)`                    | Re-run this step               | Explicit retry, capped at three total attempts by default |
+| `pauseUntilSignal(handle, opts?)` | Suspend until a signal fires   | Step must declare `pause: { signal, resumeStep }`         |
 
 TypeScript enforces these constraints at compile time — a `terminate` in a non-terminal step,
 or a `fail` without `canFail: true`, is a type error.
@@ -172,7 +177,7 @@ reads to describe what the agent accepts. It drives every input surface:
   entry step dispatches, so a malformed payload is rejected up front, not mid-run.
 
 Declare it on the entry step even when the agent looks input-free: an entry step with **no**
-`inputSchema` tells the platform the agent takes *no* input, so the dashboard renders an
+`inputSchema` tells the platform the agent takes _no_ input, so the dashboard renders an
 empty Run form and callers have nothing to fill in (and `check` warns). Give every field a
 `.default()` so a zero-input run — the dashboard "Run" button with an empty form — still
 validates:
@@ -229,25 +234,45 @@ const taskId = ctx.shared.get("taskId"); // typed as string | undefined
 
 `ctx.shared` API: `get(key)`, `set(key, value)`, `has(key)`, `snapshot()`.
 
+The **whole snapshot** has an inclusive **256 KiB (262,144-byte)** quota,
+measured as the UTF-8 byte length of compact `JSON.stringify(snapshot)`. Keys,
+JSON punctuation, all existing values, and the value being set count together.
+Exactly 262,144 bytes is valid; 262,145 bytes is rejected. Keep compact state,
+IDs, and durable-storage references in `ctx.shared`; put bulk API responses,
+documents, or research data in durable storage and carry only the ID/reference.
+Hosts that construct this SDK version's `InMemoryContextStore` get setter-time
+validation: `ctx.shared.set()` synchronously measures the complete candidate
+snapshot before committing it. An oversized or unserializable write throws and
+leaves the previous snapshot unchanged. Measurement follows `JSON.stringify`:
+circular references, BigInt values, and throwing `toJSON` methods fail, while
+values JSON normally omits or coerces retain those semantics. Hosts that have
+not adopted this store version may temporarily enforce the contract only at
+execution boundaries during rollout. If you catch a failure, use the exported
+structural payload guards rather than `instanceof`, because host and definition
+bundles can contain separate SDK copies. There is no `delete()` operation; to
+recover from legacy invalid state, replace an offending key with a compact,
+JSON-compatible value that brings the complete candidate within the quota.
+
 **A step's `run(input, ctx)` first argument is its inbound input** — the entry input at the
 entry step, or the previous step's `goto(target, payload)` value at later steps. The entry
-input reaches only the entry step's argument; to use it in later steps, write it into
-`ctx.shared` from the entry step.
+input reaches only the entry step's argument; if it is compact and later steps need it,
+write it into `ctx.shared` from the entry step. Persist bulk input separately and carry a
+reference instead.
 
 ## `ctx` Reference
 
-| Field | Type | Notes |
-|---|---|---|
-| `ctx.executionId` | `string` | Unique id for this execution |
-| `ctx.agentName` | `string` | The agent's `name` |
-| `ctx.input` | `unknown` | The execution's entry input — same value the entry step's `run` arg receives. Use `ctx.shared` to carry it forward; don't rely on `ctx.input` downstream. |
-| `ctx.shared` | `TypedContextStore<TShared>` | Cross-step key/value store |
-| `ctx.history` | `readonly StepExecutionRecord[]` | Previous steps' records |
-| `ctx.attempts` | `number` | How many times this step has run (0-indexed) |
-| `ctx.logger` | `StepLogger` | `info / warn / error / debug(msg, meta?)` |
-| `ctx.sapiom` | `Sapiom` | The typed capability client — the `Sapiom` interface from `@sapiom/tools`, installed in your `node_modules` (see "Capabilities" below) |
-| `ctx.organizationId` | `string \| null` | Tenant org |
-| `ctx.tenantId` | `string \| null` | Tenant id |
+| Field                | Type                             | Notes                                                                                                                                                     |
+| -------------------- | -------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ctx.executionId`    | `string`                         | Unique id for this execution                                                                                                                              |
+| `ctx.agentName`      | `string`                         | The agent's `name`                                                                                                                                        |
+| `ctx.input`          | `unknown`                        | The execution's entry input — same value the entry step's `run` arg receives. Use `ctx.shared` to carry it forward; don't rely on `ctx.input` downstream. |
+| `ctx.shared`         | `TypedContextStore<TShared>`     | Cross-step key/value store                                                                                                                                |
+| `ctx.history`        | `readonly StepExecutionRecord[]` | Previous steps' records                                                                                                                                   |
+| `ctx.attempts`       | `number`                         | How many times this step has run (0-indexed)                                                                                                              |
+| `ctx.logger`         | `StepLogger`                     | `info / warn / error / debug(msg, meta?)`                                                                                                                 |
+| `ctx.sapiom`         | `Sapiom`                         | The typed capability client — the `Sapiom` interface from `@sapiom/tools`, installed in your `node_modules` (see "Capabilities" below)                    |
+| `ctx.organizationId` | `string \| null`                 | Tenant org                                                                                                                                                |
+| `ctx.tenantId`       | `string \| null`                 | Tenant id                                                                                                                                                 |
 
 ## Capabilities from Steps
 
@@ -258,6 +283,186 @@ types are the source of truth.** The full surface is the `Sapiom` interface in `
 — installed in your project's `node_modules`, so its types match the exact version you're on.
 `ctx.sapiom.` autocompletes what exists, `npm run typecheck` rejects what doesn't, and the full
 catalog with pricing lives at [docs.sapiom.ai/capabilities](https://docs.sapiom.ai/capabilities).
+
+### Coding Repository Errors
+
+Use a repository returned by `repositories.create()`, `repositories.get()`, or
+`repositories.list()`. `repositories.attach()` rehydrates one of those handles; it does not import
+an external Git repository.
+
+Coding requests throw `CodingRunHttpError` for HTTP failures. A step with `canFail: true` can handle
+`repository_not_found` with `fail()` and rethrow other errors:
+
+```typescript
+import { fail, pauseUntilSignal } from "@sapiom/agent";
+import { CodingRunHttpError } from "@sapiom/tools";
+
+try {
+  const handle = await ctx.sapiom.models.coding.launch({
+    task,
+    gitRepository: repo,
+  });
+  return pauseUntilSignal(handle, { resumeStep: "finalize" });
+} catch (error) {
+  if (
+    error instanceof CodingRunHttpError &&
+    error.code === "repository_not_found"
+  ) {
+    return fail(error.message);
+  }
+  throw error;
+}
+```
+
+## Calling LLMs from Steps
+
+Three DIFFERENT capabilities call an LLM from step code — picking the wrong one for the
+job is the most common mistake in authored agents:
+
+| Capability              | Use for                                                                                            | Never for                                                          |
+| ------------------------ | ---------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
+| `ctx.sapiom.llm.run`    | ONE LLM call — summarize, extract, classify, one-shot generate                                       | A multi-turn task, or anything needing its own tool-calling loop      |
+| `ctx.sapiom.models.run` | A platform-driven multi-turn reasoning + tool-calling loop (minutes, not seconds). `models.coding.run` for sandboxed coding tasks. | A one-shot completion — it will loop and overthink                    |
+| `ctx.sapiom.agents.run` | Dispatching a DEPLOYED agent by slug — composing systems from small deployed agents                  | Anything that isn't itself a deployed agent                           |
+
+**⚠️ The mistake to never repeat:** sending single-shot, fixed-shape intent through
+`models.run`'s multi-turn loop instead of one `llm.run` call. The symptom: the run takes
+far longer than the task needs, "overthinks" a trivial extraction, and — if the caller just
+grabs the first content block hoping it's the answer — returns a `thinking` block instead.
+
+### Worked example: a trivial fixed-shape-JSON task
+
+**Wrong** — one-shot intent sent through the multi-turn loop, then the answer string-parsed
+out of free text:
+
+```typescript
+// DON'T: models.run for a one-shot extraction — it loops and overthinks, and
+// "reply with only JSON" is brittle (prose, invalid JSON, or a leading
+// `thinking` block all break a naive `JSON.parse(content[0])`).
+const run = await ctx.sapiom.models.run({
+  prompt: `Reply with ONLY JSON: {"priority": "...", "category": "..."} for: ${input.text}`,
+});
+const parsed = JSON.parse(run.output ?? "{}"); // brittle, and pays for a reasoning loop
+```
+
+**Right** — `llm.run` with `output` for the fixed shape, read back with `structuredOf`
+(forced tool-use output has no `text` block — the result lives in `tool_use`, never
+`content[0]`):
+
+```typescript
+const response = await ctx.sapiom.llm.run({
+  request: {
+    messages: [{ role: "user", content: `Classify this support ticket: ${input.text}` }],
+    max_tokens: 256,
+  },
+  // No `model` — omit it and let the platform choose (recommended; passing
+  // "smart" would be a no-op — it already is the default — and a raw provider
+  // model id is never honored).
+  output: {
+    name: "classify_ticket",
+    schema: {
+      type: "object",
+      properties: {
+        priority: { type: "string", enum: ["low", "medium", "high"] },
+        category: { type: "string" },
+      },
+      required: ["priority", "category"],
+    },
+  },
+});
+
+const { priority, category } = ctx.sapiom.llm.structuredOf<{
+  priority: string;
+  category: string;
+}>(response)!;
+```
+
+`output` automates the forced tool call and its `tool_choice` wiring; `structuredOf` reads
+the result back out. For a **plain-text** reply instead, use
+`ctx.sapiom.llm.textOf(response)` — it reads only the `type === 'text'` block, skipping a
+`thinking` block that may precede it.
+
+### The label rule
+
+**You never pick a model.** Every `model`/`label` field across `llm.*`, `models.run`, and
+`models.coding.run` takes a **routing label** (e.g. `"smart"`) that the platform resolves
+against its configured label set — never a raw provider model id (never honored, on any
+surface). Omit it entirely to let the platform choose (the recommended default) — passing
+`"smart"` is a no-op: it already is the default. The result discloses what actually served, in the platform's own
+vocabulary — `servedClass` (the billing size the label resolved to) and `lane` (the billing
+lane it executed in) — never a model or provider id.
+
+### Debugging a run
+
+Find the run in the dashboard's run detail view, find the suspicious step's row id, then
+open the **Run Inspector** for that step's full-fidelity input/output/error/logs.
+
+Full guide: [Choose a call surface](https://docs.sapiom.ai/guides/choose-a-call-surface).
+
+## Composing Deployed Agents (System Design)
+
+**One agent per project — but a system is several projects.** The "keep exactly one
+`defineAgent(...)` export" rule is a statement about a PROJECT, not about your system. A
+multi-stage system ("research → write script → voiceover → assemble → post") is not one
+big agent with five steps: it is several small agents, each its own project, deployed
+separately, composed by a thin coordinator that dispatches them by slug. A small deployed
+agent is independently testable, versioned, and reusable from more than one caller; a
+monolith couples every stage into a single deploy unit and step graph, so any stage change
+redeploys — and risks — all of them.
+
+**Wrong** — one project inlining every stage as a step:
+
+```typescript
+// DON'T: video-pipeline/index.ts with research, script, voiceover, assemble,
+// post as five steps of ONE defineAgent. No stage is reusable or
+// independently testable, and every stage change redeploys all five.
+```
+
+**Right** — each stage its own deployed project; a coordinator composes them:
+
+```typescript
+// research-topic/, write-script/, generate-voiceover/, assemble-video/,
+// post-video/: five small projects, each deployed on its own slug.
+// video-pipeline/ is then just the coordinator:
+const research = await ctx.sapiom.agents.run({
+  definition: "research-topic", // the deployed child's slug
+  input: { topic: input.topic },
+});
+// agents.run resolves on ANY terminal status (completed | failed | cancelled)
+// and does NOT throw — a non-completed child is data the coordinator must
+// branch on, or a failed stage silently feeds `null` downstream.
+if (research.status !== "completed") {
+  // (fail() requires this step to declare canFail: true)
+  return fail(`research-topic ${research.status}: ${String(research.error)}`);
+}
+const script = await ctx.sapiom.agents.run({
+  definition: "write-script",
+  input: { research: research.output },
+});
+// …and so on. Use agents.launch + pauseUntilSignal for a long-running child
+// so the coordinator's step doesn't time out.
+```
+
+Building a system in one session? Scaffold the stages as separate projects and deploy
+bottom-up — children first, the coordinator last (it dispatches them by their slugs).
+
+## Naming Conventions
+
+Several words are overloaded across this platform. Know which meaning a given context
+uses — conflating two costs you a wrong capability choice, not just a wrong word:
+
+| Term         | Meaning(s) on this platform                                                                                                                                                                                                                                                                                                    |
+| ------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **agent**    | (1) `@sapiom/agent` — this authoring framework (`defineAgent`, this skill). (2) A **deployed agent** — one project's compiled definition, dispatched by `ctx.sapiom.agents.run`/`launch` (addressed by its slug via `AgentRunSpec.definition`) — the customer-facing name is always "agent." (3) `ctx.sapiom.models.run`'s managed multi-turn loop — a managed loop the platform runs for you; you call it, you never author it. (4) A **Claude Code subagent** — an unrelated feature of the coding tool itself, not part of the Sapiom SDK. |
+| **run**      | (1) `ctx.sapiom.llm.run` — one synchronous LLM call. (2) `ctx.sapiom.models.run` / `agents.run` — `launch()` + `wait()`, blocking until terminal (vs. `launch()` alone, which returns a pausable handle). (3) An execution instance/row of any of the above — the thing you inspect/debug. (4) The dashboard's Run button / Local Run / Prod Run (Studio UI actions, not an API call).                                                                                                                                                                                                                                       |
+| **task**     | `CodingRunSpec.task` — the coding agent's prompt-equivalent field. Deliberately not called `prompt`: it's handed to a sandboxed coding agent, not a bare LLM call.                                                                                                                                                            |
+| **session**  | (1) `ctx.sapiom.llm.createSession`/`callSession` — reserved LLM capacity accepting repeated drop-in calls until its TTL/budget ends it (replacing the deferred `submit`/`redeem` lane). (2) A Studio harness terminal session — unrelated, no LLM-capacity semantics.                                                                |
+| **dispatch** | The structural contract (`DispatchHandle`) a long-running capability's `launch()` handle satisfies so a step can `pauseUntilSignal(handle, …)` and resume on completion. Every dispatched capability (coding, `models.run`, `agents.run`, more later) shares this ONE contract — "dispatch" always means this pattern, never anything else.  |
+| **label**    | The author-facing term for a `model:`/`label:` *input* value (e.g. `"smart"`) — never a raw provider model id (never honored, on any surface). Not a contradiction that a result's `servedClass` field says "class": that field *reports* the billing class the platform resolved your label to — it's a disclosure field, not author-facing input vocabulary. You still write `label`; the platform still reports back `servedClass`.                                                                                                     |
+
+**The rule new capabilities must follow:** don't re-overload "agent" or "run" further. If a
+new capability needs its own verb, name it something else (`dispatch`, `launch`, `submit`,
+`create*`) rather than adding a sixth meaning to a word that already has five.
 
 ## Failure Handling & Retries
 
@@ -293,8 +498,8 @@ async run(input, ctx) {
 }
 ```
 
-`timeoutMs` on a step caps how long its `run` may take. There is no engine-level retry cap —
-you own the bound.
+`timeoutMs` caps one attempt of a step's `run`. The engine allows three attempts per step by
+default, counting the initial attempt; keep author-controlled retry logic inside that ceiling.
 
 ## Pause & Resume (Long-Running Dispatched Steps)
 
@@ -305,7 +510,11 @@ IS the result payload.
 
 ```typescript
 import {
-  defineAgent, defineStep, goto, pauseUntilSignal, terminate,
+  defineAgent,
+  defineStep,
+  goto,
+  pauseUntilSignal,
+  terminate,
   type AgentExecutionContext,
 } from "@sapiom/agent";
 import { CODING_RESULT_SIGNAL, type CodingResultPayload } from "@sapiom/tools";
@@ -321,8 +530,11 @@ const launch = defineStep({
   pause: { signal: CODING_RESULT_SIGNAL, resumeStep: "collect" },
   async run(input: { task: string }, ctx: AgentExecutionContext<Shared>) {
     const repo = await ctx.sapiom.repositories.create("my-repo");
-    ctx.shared.set("repoSlug", repo.slug);               // stash before pausing
-    const run = await ctx.sapiom.models.coding.launch({ task: input.task, gitRepository: repo });
+    ctx.shared.set("repoSlug", repo.slug); // stash before pausing
+    const run = await ctx.sapiom.models.coding.launch({
+      task: input.task,
+      gitRepository: repo,
+    });
     return pauseUntilSignal(run, { resumeStep: "collect" }); // pass the handle, not the signal name
   },
 });
@@ -338,7 +550,9 @@ const collect = defineStep({
     }
     // Re-attach the sandbox — the payload crossed a wire boundary, so there are no live handles.
     if (result.executionEnvironment?.type === "blaxel_sandbox") {
-      const sandbox = ctx.sapiom.sandboxes.attach(result.executionEnvironment.id);
+      const sandbox = ctx.sapiom.sandboxes.attach(
+        result.executionEnvironment.id,
+      );
       // … push from sandbox, read files, etc.
     }
     return terminate({ status: result.status, summary: result.summary });
@@ -367,13 +581,13 @@ Key rules:
 return pauseUntilSignal({
   signal: "my.approval",
   resumeStep: "finalize",
-  correlationId: ctx.executionId,  // makes the awaited signal unique to this execution
+  correlationId: ctx.executionId, // makes the awaited signal unique to this execution
 });
 ```
 
 Under `run_local`, a dispatch pause auto-resumes with the stub result; a manual gate
-auto-resumes with `{}` unless stubbed — type the resumed step's input with optional fields
-accordingly.
+auto-resumes with `{}`. There is no manual-signal payload override in the local runner, so
+type the resumed step's input with optional fields accordingly.
 
 ## Determinism
 
@@ -393,12 +607,18 @@ via `goto` input or `ctx.shared`.
   "steps": {
     // Stub the coding run under the LAUNCHING step (here `launch`), not the resume step.
     "launch": {
-      "models.coding.run": { "status": "completed", "summary": "done", "result": null, "error": null, "executionEnvironment": null }
+      "models.coding.run": {
+        "status": "completed",
+        "summary": "done",
+        "result": null,
+        "error": null,
+        "executionEnvironment": null,
+      },
     },
     "check": {
-      "repositories.list": [{ "slug": "my-repo", "cloneUrl": "https://..." }]
-    }
-  }
+      "repositories.list": [{ "slug": "my-repo", "cloneUrl": "https://..." }],
+    },
+  },
 }
 ```
 
@@ -409,13 +629,20 @@ Stub naming rules:
 - To stub a coding run's resume payload, override `models.coding.run` (or
   `models.coding.launch`) in the **launching step** — that value is both the inline result
   and the payload the paused step resumes with.
+- The default model path works the same: `models.run` (or `models.launch`) controls both
+  `models.launch()`'s inline result and its resume payload. A partial value (e.g.
+  `{ "output": "..." }`) is merged over the built-in defaults, so the result stays a full
+  `ModelRunResult`.
 - `run_local` reports `unusedStubs` (key matched nothing — usually a typo or plural/singular
   slip) and `stubWarnings` (key matched but wrong shape). A green run with either non-empty
   means the stub silently didn't apply.
-- **Local retry cap:** the `run_local` tool defaults to `maxAttemptsPerStep: 3`. If a step's
-  own retry bound allows ≥3 retries, pass a higher `maxAttemptsPerStep` so the local harness
-  doesn't stop the loop before your `fail()` fires. This cap is local-test only — production
-  has no engine-level retry cap.
+- **Attempt cap:** local and production execution both allow three attempts per step by
+  default, counting the initial attempt. The local tool exposes `maxAttemptsPerStep` for
+  targeted testing, but raising it does not change production's default ceiling.
+
+Only `ctx.sapiom.*` calls are replaced. The definition import and each step body are ordinary
+local code, so direct network requests, filesystem writes, environment reads, and child
+processes still happen. Inspect those effects and any third-party billing before running.
 
 Write each step the way it should run in production — never weaken logic to shape a local run.
 
@@ -436,22 +663,23 @@ Write each step the way it should run in production — never weaken logic to sh
 
 ## Troubleshooting
 
-| Symptom | Cause | Fix |
-|---|---|---|
-| `Cannot find module '@sapiom/agent'` | Deps not installed | `npm install` inside the scaffolded dir |
-| Type error: `fail(...)` not assignable | Step missing `canFail: true` | Add `canFail: true` to `defineStep` |
-| Type error: `terminate(...)` not assignable | Step missing `terminal: true` | Add `terminal: true` to `defineStep` |
-| `goto` target rejected by types | Target not in `next[]` | Add the target name to `next` |
-| `check` fails: step missing from graph | `steps` object key doesn't match `name` field | Match the key in `steps: { start }` to `defineStep({ name: "start" })` |
-| `run_local` reports `unusedStubs` | Stub path typo or namespace/handle mix-up | Namespace path for calls (`repositories.list`), singular for handles (`repository.pushFromSandbox`) |
-| Paused step resumes with empty input | Manual gate; `run_local` auto-resumes with `{}` | Type the resumed step's input with optional fields |
-| `sapiom_authenticate` → credential not found at deploy | Authenticated in a different shell | Re-run `sapiom_authenticate`; credential is per-machine in `~/.sapiom/credentials.json` |
+| Symptom                                                | Cause                                           | Fix                                                                                                 |
+| ------------------------------------------------------ | ----------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| `Cannot find module '@sapiom/agent'`                   | Deps not installed                              | `npm install` inside the scaffolded dir                                                             |
+| Type error: `fail(...)` not assignable                 | Step missing `canFail: true`                    | Add `canFail: true` to `defineStep`                                                                 |
+| Type error: `terminate(...)` not assignable            | Step missing `terminal: true`                   | Add `terminal: true` to `defineStep`                                                                |
+| `goto` target rejected by types                        | Target not in `next[]`                          | Add the target name to `next`                                                                       |
+| `check` fails: step missing from graph                 | `steps` object key doesn't match `name` field   | Match the key in `steps: { start }` to `defineStep({ name: "start" })`                              |
+| `run_local` reports `unusedStubs`                      | Stub path typo or namespace/handle mix-up       | Namespace path for calls (`repositories.list`), singular for handles (`repository.pushFromSandbox`) |
+| Paused step resumes with empty input                   | Manual gate; `run_local` auto-resumes with `{}` | Type the resumed step's input with optional fields                                                  |
+| `sapiom_authenticate` → credential not found at deploy | Authenticated in a different shell              | Re-run `sapiom_authenticate`; credential is per-machine in `~/.sapiom/credentials.json`             |
 
 ## References
 
-| Resource | What it covers |
-|---|---|
+| Resource                                                   | What it covers                                               |
+| ---------------------------------------------------------- | ------------------------------------------------------------ |
 | [Authoring guide](https://docs.sapiom.ai/agents/authoring) | Full step model, failure patterns, pause/resume, determinism |
-| [Quickstart](https://docs.sapiom.ai/agents/quick-start) | Scaffold → write → test → deploy walkthrough |
-| [Capabilities](https://docs.sapiom.ai/capabilities) | The full `ctx.sapiom.*` catalog with pricing |
-| `AGENTS.md` in your scaffold | The quick in-project reference |
+| [Quickstart](https://docs.sapiom.ai/agents/quick-start)    | Scaffold → write → test → deploy walkthrough                 |
+| [Capabilities](https://docs.sapiom.ai/capabilities)        | The full `ctx.sapiom.*` catalog with pricing                 |
+| [Choose a call surface](https://docs.sapiom.ai/guides/choose-a-call-surface) | `llm.run` vs `models.run` vs `agents.run` — which to call and why |
+| `AGENTS.md` in your scaffold                               | The quick in-project reference                               |

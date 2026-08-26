@@ -6,10 +6,11 @@
  * server.
  */
 import type {
+  AccountPlanView,
   AdoptSessionRequest,
   AppState,
-  AttachImageRequest,
-  AttachImageResponse,
+  AttachFileRequest,
+  AttachFileResponse,
   BindWorkflowRequest,
   CreateSessionRequest,
   FsDirEntry,
@@ -25,21 +26,45 @@ import type {
   TemplateDetailView,
   TemplateListResponse,
   RunView,
+  StepView,
+  WorkflowInputContractResponse,
   WorkflowInfo,
 } from "@shared/types";
-import type { SystemGraph, WorkspaceKey, WorkspaceScopeSummary } from "@shared/system-graph";
+import type {
+  SystemGraph,
+  WorkspaceKey,
+  WorkspaceScopeSummary,
+} from "@shared/system-graph";
 
 import type { LocalStepTrace, LocalRunOutcome } from "@sapiom/agent-core";
 
-import { MOCK_FS_TREE, MOCK_HARNESSES, MOCK_HISTORY, MOCK_LAUNCH_DIR, MOCK_MACROS, MOCK_SESSION_RECORDS, MOCK_SESSIONS, MOCK_SETTINGS, MOCK_TEMPLATE_GRAPHS, MOCK_TEMPLATES, MOCK_WORKFLOWS } from "./mock-data";
+import { getTheme } from "./theme";
 import { parseSystemGraph } from "./system-graph";
 
+import {
+  MOCK_ACCOUNT_PLAN,
+  MOCK_FS_TREE,
+  MOCK_HARNESSES,
+  MOCK_HISTORY,
+  MOCK_LAUNCH_DIR,
+  MOCK_MACROS,
+  MOCK_SEARCH_HISTORY,
+  MOCK_SEARCH_WORKFLOWS,
+  MOCK_SESSION_RECORDS,
+  MOCK_SESSIONS,
+  MOCK_SETTINGS,
+  MOCK_TEMPLATE_GRAPHS,
+  MOCK_TEMPLATES,
+  MOCK_WORKFLOWS,
+} from "./mock-data";
+
 /**
- * Body for `POST /api/runs/local` — run the agent project at `sourceDir`
- * entirely offline against stub capabilities. `sourceDir` is the only required
- * field; the rest are forwarded to the run-local bootstrap as-is. Needs no API
- * key and makes no network call (zero cost) — mirrors the server's
- * `RunLocalRequest` without importing a server module into the browser bundle.
+ * Body for `POST /api/runs/local` — run the agent project at `sourceDir` with
+ * Sapiom capability calls served by stubs. `sourceDir` is the only required
+ * field; the rest are forwarded to the run-local bootstrap as-is. The runner
+ * needs no API key and makes no Sapiom capability request; arbitrary user step
+ * code still executes locally and may use the machine's network. Mirrors the
+ * server's `RunLocalRequest` without importing it into the browser bundle.
  */
 export interface RunLocalArgs {
   /** Absolute path to the agent project directory (contains `index.ts`). */
@@ -56,13 +81,19 @@ export interface RunLocalArgs {
 
 /**
  * One parsed line of the `/api/runs/local` NDJSON stream. Either a per-step
- * trace (a {@link LocalStepTrace}, discriminated by the ABSENCE of `kind`) or a
- * terminal line: a `summary` for a run that executed (carrying the outcome and
+ * trace wrapped with its start/settle phase, a legacy unwrapped trace
+ * (discriminated by the absence of `kind`), or a terminal line: a `summary`
+ * for a run that executed (carrying the outcome and
  * the two stub-hygiene signals), or an `error` for a run that could not be
  * invoked at all. The shapes mirror the bootstrap's own wire contract.
  */
 export type RunLocalLine =
   | ({ kind?: undefined } & LocalStepTrace)
+  | {
+      kind: "step";
+      phase: "started" | "settled";
+      trace: LocalStepTrace;
+    }
   | {
       kind: "summary";
       outcome: LocalRunOutcome;
@@ -116,7 +147,23 @@ export function isMockMode(): boolean {
  * welcome panel without a real server.
  */
 export function isFreshMockState(): boolean {
-  return isMockMode() && new URLSearchParams(window.location.search).get("mockState") === "fresh";
+  return (
+    isMockMode() &&
+    new URLSearchParams(window.location.search).get("mockState") === "fresh"
+  );
+}
+
+/**
+ * Mock mode only: `?mockFixtures=search` additionally seeds the shapes from
+ * the search bug report (a scoped agent name, a scatter-path agent, duplicate
+ * and raw-prompt history titles) so Playwright can exercise the palette's
+ * ranking. Additive-only, so every fixture-count assertion elsewhere holds.
+ */
+export function isSearchFixturesEnabled(): boolean {
+  return (
+    isMockMode() &&
+    new URLSearchParams(window.location.search).get("mockFixtures") === "search"
+  );
 }
 
 /** The mock session the demo seed drives (the auto-created boot session). */
@@ -144,7 +191,8 @@ export function isDemoSeedEnabled(): boolean {
  */
 export function mockErrorTargets(): Set<string> {
   if (!isMockMode()) return new Set();
-  const raw = new URLSearchParams(window.location.search).get("mockError") ?? "";
+  const raw =
+    new URLSearchParams(window.location.search).get("mockError") ?? "";
   return new Set(
     raw
       .split(",")
@@ -154,7 +202,9 @@ export function mockErrorTargets(): Set<string> {
 }
 
 /** `session.boundWorkflowPath` is nullable already, but keeps callers safe against a missing session. */
-export function boundWorkflowPathOf(session: HarnessSession | null | undefined): string | null {
+export function boundWorkflowPathOf(
+  session: HarnessSession | null | undefined,
+): string | null {
   return session?.boundWorkflowPath ?? null;
 }
 
@@ -180,7 +230,8 @@ export class ApiError extends Error {
 
 /** Read once at module load: `window.__HARNESS__ = {token}` (baked in by the server), falling back to `?token=`. */
 export function getBootToken(): string {
-  const injected = (window as unknown as { __HARNESS__?: { token?: string } }).__HARNESS__;
+  const injected = (window as unknown as { __HARNESS__?: { token?: string } })
+    .__HARNESS__;
   if (injected?.token) return injected.token;
   return new URLSearchParams(window.location.search).get("token") ?? "";
 }
@@ -217,8 +268,10 @@ export interface HarnessApi {
    */
   authStatus(): Promise<AuthStatusResponse>;
   getState(): Promise<AppState>;
+  /** Static local dependency projection for one server-issued workspace key. */
   getSystemGraph(workspaceKey: WorkspaceKey): Promise<SystemGraph>;
   createSession(req: CreateSessionRequest): Promise<HarnessSession>;
+  attachFile(id: string, req: AttachFileRequest): Promise<AttachFileResponse>;
   listSessions(): Promise<HarnessSession[]>;
   sessionHistory(cwd: string): Promise<SessionSummary[]>;
   /**
@@ -239,12 +292,11 @@ export interface HarnessApi {
   adoptSession(req: AdoptSessionRequest): Promise<HarnessSession>;
   killSession(id: string): Promise<void>;
   injectInput(id: string, req: InjectInputRequest): Promise<void>;
-  /** Attach an image (composer picker/paste/drop) to a session: the server
-   *  writes it into the project dir and relays its path into the agent's pty.
-   *  Only offered when the session's HarnessEntry declares imageInput — the
-   *  harness-launch server (eebb95c) has no /image route at all. */
-  attachImage(id: string, req: AttachImageRequest): Promise<AttachImageResponse>;
   listWorkflows(): Promise<WorkflowInfo[]>;
+  /** Entry-step JSON Schema used by Studio's unified run sheet. */
+  getWorkflowInputContract(
+    workflowPath: string,
+  ): Promise<WorkflowInputContractResponse>;
   connectWorkflow(path: string): Promise<WorkflowInfo>;
   scanWorkflows(root: string): Promise<WorkflowInfo[]>;
   /** Adapter registry (GET /api/harnesses): every known harness with its
@@ -256,25 +308,35 @@ export interface HarnessApi {
   getSettings(): Promise<HarnessSettings>;
   updateSettings(patch: Partial<HarnessSettings>): Promise<HarnessSettings>;
   listDir(path?: string): Promise<FsListResponse>;
-  bindWorkflow(sessionId: string, workflowPath: string | null): Promise<HarnessSession>;
+  bindWorkflow(
+    sessionId: string,
+    workflowPath: string | null,
+  ): Promise<HarnessSession>;
   /** The live template gallery, relayed by the server from core (key stays
    *  server-side). Never rejects on a degraded catalog — inspect `source`. */
   listTemplates(): Promise<TemplateListResponse>;
   /** One template's manifest + declared graph. Rejects 404 on an unknown id. */
   getTemplate(id: string): Promise<TemplateDetailView>;
+  /** The rail's plan card view, relayed by the server from core (key stays
+   *  server-side). Never rejects on a degraded read — inspect `source`. */
+  getAccountPlan(): Promise<AccountPlanView>;
   /** Live run render state (upstream feat/harness-runtime-analytics):
    *  GET /api/runs/:id/state = inspect -> decode -> renderRunState. Poll
    *  after an execution.started bus message until the run is terminal. */
   getRunState(executionId: string): Promise<RunView>;
   /**
-   * Run the workflow at `args.sourceDir` OFFLINE against stub capabilities and
+   * Run the workflow at `args.sourceDir` locally against stub capabilities and
    * stream its NDJSON result (`POST /api/runs/local`): `onLine` is called once
    * per parsed line, in order — each per-step {@link LocalStepTrace} as it
    * arrives, then a terminal `summary` (or `error`) line. Resolves when the
    * stream ends; rejects only on a transport failure (never on a failed *run* —
-   * a failed run is a normal terminal line). Fully offline: no key, no cost.
+   * a failed run is a normal terminal line). It needs no Sapiom key and creates
+   * no Sapiom capability spend; author code's own side effects remain real.
    */
-  runLocal(args: RunLocalArgs, onLine: (line: RunLocalLine) => void): Promise<void>;
+  runLocal(
+    args: RunLocalArgs,
+    onLine: (line: RunLocalLine) => void,
+  ): Promise<void>;
   /**
    * Deploy the agent linked to `workflowPath` (Deploy button) — POST
    * /api/workflows/:id/deploy. The server holds the API key and drives the
@@ -284,7 +346,10 @@ export interface HarnessApi {
    * request itself failing (e.g. 409 not-linked) — a build *failure* resolves
    * with a `phase: "error"` terminal event, since the request succeeded.
    */
-  deploy(workflowPath: string, onEvent?: StreamLineHandler<DeployStreamEvent>): Promise<DeployStreamEvent>;
+  deploy(
+    workflowPath: string,
+    onEvent?: StreamLineHandler<DeployStreamEvent>,
+  ): Promise<DeployStreamEvent>;
   /**
    * Start a real prod execution (Prod-run button) — POST /api/runs. Runs
    * server-side with the held key; NO Claude Code. Returns the new
@@ -295,11 +360,15 @@ export interface HarnessApi {
 
 class RealApi implements HarnessApi {
   startAuth(): Promise<AuthStartResponse> {
-    return this.request<AuthStartResponse>("/api/auth/start", { method: "POST" });
+    return this.request<AuthStartResponse>("/api/auth/start", {
+      method: "POST",
+    });
   }
 
   disconnect(): Promise<{ ok: true }> {
-    return this.request<{ ok: true }>("/api/auth/disconnect", { method: "POST" });
+    return this.request<{ ok: true }>("/api/auth/disconnect", {
+      method: "POST",
+    });
   }
 
   authStatus(): Promise<AuthStatusResponse> {
@@ -320,7 +389,11 @@ class RealApi implements HarnessApi {
       let reason: string | undefined;
       try {
         const parsed: unknown = body ? JSON.parse(body) : undefined;
-        if (parsed && typeof parsed === "object" && typeof (parsed as { error?: unknown }).error === "string") {
+        if (
+          parsed &&
+          typeof parsed === "object" &&
+          typeof (parsed as { error?: unknown }).error === "string"
+        ) {
           reason = (parsed as { error: string }).error;
         }
       } catch {
@@ -342,7 +415,9 @@ class RealApi implements HarnessApi {
 
   async getSystemGraph(workspaceKey: WorkspaceKey): Promise<SystemGraph> {
     const graph = parseSystemGraph(
-      await this.request<unknown>(`/api/workspaces/${encodeURIComponent(workspaceKey)}/system-graph`),
+      await this.request<unknown>(
+        `/api/workspaces/${encodeURIComponent(workspaceKey)}/system-graph`,
+      ),
     );
     if (graph.scope.workspaceKey !== workspaceKey) {
       throw new Error("Invalid system graph response");
@@ -351,7 +426,22 @@ class RealApi implements HarnessApi {
   }
 
   createSession(req: CreateSessionRequest): Promise<HarnessSession> {
-    return this.request<HarnessSession>("/api/sessions", { method: "POST", body: JSON.stringify(req) });
+    // Default the launch theme to the app's live theme so the terminal palette
+    // controls Claude's colors (Terminal.tsx). An explicit req.theme still wins.
+    return this.request<HarnessSession>("/api/sessions", {
+      method: "POST",
+      body: JSON.stringify({ theme: getTheme(), ...req }),
+    });
+  }
+
+  attachFile(id: string, req: AttachFileRequest): Promise<AttachFileResponse> {
+    return this.request<AttachFileResponse>(
+      `/api/sessions/${encodeURIComponent(id)}/attachments`,
+      {
+        method: "POST",
+        body: JSON.stringify(req),
+      },
+    );
   }
 
   listSessions(): Promise<HarnessSession[]> {
@@ -359,57 +449,81 @@ class RealApi implements HarnessApi {
   }
 
   sessionHistory(cwd: string): Promise<SessionSummary[]> {
-    return this.request<SessionSummary[]>(`/api/sessions/history?cwd=${encodeURIComponent(cwd)}`);
+    return this.request<SessionSummary[]>(
+      `/api/sessions/history?cwd=${encodeURIComponent(cwd)}`,
+    );
   }
 
   async sessionRecord(id: string): Promise<SessionRecord | null> {
     try {
-      return await this.request<SessionRecord>(`/api/sessions/${encodeURIComponent(id)}/record`);
+      return await this.request<SessionRecord>(
+        `/api/sessions/${encodeURIComponent(id)}/record`,
+      );
     } catch (err) {
       // 404 = no events recorded for this session; 501 = an older server with
       // no record route at all. Both mean "there is no transcript to show",
       // which the pane renders as an empty state — not a failure.
-      if (err instanceof ApiError && (err.status === 404 || err.status === 501)) return null;
+      if (err instanceof ApiError && (err.status === 404 || err.status === 501))
+        return null;
       throw err;
     }
   }
 
   resumeSession(id: string): Promise<HarnessSession> {
-    return this.request<HarnessSession>(`/api/sessions/${encodeURIComponent(id)}/resume`, { method: "POST" });
+    return this.request<HarnessSession>(
+      `/api/sessions/${encodeURIComponent(id)}/resume`,
+      { method: "POST" },
+    );
   }
 
   adoptSession(req: AdoptSessionRequest): Promise<HarnessSession> {
-    return this.request<HarnessSession>("/api/sessions/adopt", { method: "POST", body: JSON.stringify(req) });
+    return this.request<HarnessSession>("/api/sessions/adopt", {
+      method: "POST",
+      body: JSON.stringify(req),
+    });
   }
 
   async killSession(id: string): Promise<void> {
-    await this.request<{ ok: true }>(`/api/sessions/${encodeURIComponent(id)}`, { method: "DELETE" });
+    await this.request<{ ok: true }>(
+      `/api/sessions/${encodeURIComponent(id)}`,
+      { method: "DELETE" },
+    );
   }
 
   async injectInput(id: string, req: InjectInputRequest): Promise<void> {
-    await this.request<{ ok: true }>(`/api/sessions/${encodeURIComponent(id)}/input`, {
-      method: "POST",
-      body: JSON.stringify(req),
-    });
-  }
-
-  attachImage(id: string, req: AttachImageRequest): Promise<AttachImageResponse> {
-    return this.request<AttachImageResponse>(`/api/sessions/${encodeURIComponent(id)}/image`, {
-      method: "POST",
-      body: JSON.stringify(req),
-    });
+    await this.request<{ ok: true }>(
+      `/api/sessions/${encodeURIComponent(id)}/input`,
+      {
+        method: "POST",
+        body: JSON.stringify(req),
+      },
+    );
   }
 
   listWorkflows(): Promise<WorkflowInfo[]> {
     return this.request<WorkflowInfo[]>("/api/workflows");
   }
 
+  getWorkflowInputContract(
+    workflowPath: string,
+  ): Promise<WorkflowInputContractResponse> {
+    return this.request<WorkflowInputContractResponse>(
+      `/api/workflows/${encodeURIComponent(workflowPath)}/input-contract`,
+    );
+  }
+
   connectWorkflow(path: string): Promise<WorkflowInfo> {
-    return this.request<WorkflowInfo>("/api/workflows/connect", { method: "POST", body: JSON.stringify({ path }) });
+    return this.request<WorkflowInfo>("/api/workflows/connect", {
+      method: "POST",
+      body: JSON.stringify({ path }),
+    });
   }
 
   scanWorkflows(root: string): Promise<WorkflowInfo[]> {
-    return this.request<WorkflowInfo[]>("/api/workflows/scan", { method: "POST", body: JSON.stringify({ root }) });
+    return this.request<WorkflowInfo[]>("/api/workflows/scan", {
+      method: "POST",
+      body: JSON.stringify({ root }),
+    });
   }
 
   listHarnesses(): Promise<HarnessEntry[]> {
@@ -421,10 +535,13 @@ class RealApi implements HarnessApi {
   }
 
   async runMacro(id: string, req: RunMacroRequest): Promise<void> {
-    await this.request<{ ok: true }>(`/api/macros/${encodeURIComponent(id)}/run`, {
-      method: "POST",
-      body: JSON.stringify(req),
-    });
+    await this.request<{ ok: true }>(
+      `/api/macros/${encodeURIComponent(id)}/run`,
+      {
+        method: "POST",
+        body: JSON.stringify(req),
+      },
+    );
   }
 
   getSettings(): Promise<HarnessSettings> {
@@ -432,7 +549,10 @@ class RealApi implements HarnessApi {
   }
 
   updateSettings(patch: Partial<HarnessSettings>): Promise<HarnessSettings> {
-    return this.request<HarnessSettings>("/api/settings", { method: "PATCH", body: JSON.stringify(patch) });
+    return this.request<HarnessSettings>("/api/settings", {
+      method: "PATCH",
+      body: JSON.stringify(patch),
+    });
   }
 
   listDir(path?: string): Promise<FsListResponse> {
@@ -440,12 +560,18 @@ class RealApi implements HarnessApi {
     return this.request<FsListResponse>(`/api/fs/list${query}`);
   }
 
-  bindWorkflow(sessionId: string, workflowPath: string | null): Promise<HarnessSession> {
+  bindWorkflow(
+    sessionId: string,
+    workflowPath: string | null,
+  ): Promise<HarnessSession> {
     const body: BindWorkflowRequest = { workflowPath };
-    return this.request<HarnessSession>(`/api/sessions/${encodeURIComponent(sessionId)}/workflow`, {
-      method: "PATCH",
-      body: JSON.stringify(body),
-    });
+    return this.request<HarnessSession>(
+      `/api/sessions/${encodeURIComponent(sessionId)}/workflow`,
+      {
+        method: "PATCH",
+        body: JSON.stringify(body),
+      },
+    );
   }
 
   listTemplates(): Promise<TemplateListResponse> {
@@ -453,14 +579,25 @@ class RealApi implements HarnessApi {
   }
 
   getTemplate(id: string): Promise<TemplateDetailView> {
-    return this.request<TemplateDetailView>(`/api/templates/${encodeURIComponent(id)}`);
+    return this.request<TemplateDetailView>(
+      `/api/templates/${encodeURIComponent(id)}`,
+    );
+  }
+
+  getAccountPlan(): Promise<AccountPlanView> {
+    return this.request<AccountPlanView>("/api/account/plan");
   }
 
   getRunState(executionId: string): Promise<RunView> {
-    return this.request<RunView>(`/api/runs/${encodeURIComponent(executionId)}/state`);
+    return this.request<RunView>(
+      `/api/runs/${encodeURIComponent(executionId)}/state`,
+    );
   }
 
-  async runLocal(args: RunLocalArgs, onLine: (line: RunLocalLine) => void): Promise<void> {
+  async runLocal(
+    args: RunLocalArgs,
+    onLine: (line: RunLocalLine) => void,
+  ): Promise<void> {
     const res = await fetch("/api/runs/local", {
       method: "POST",
       headers: {
@@ -475,7 +612,11 @@ class RealApi implements HarnessApi {
     // terminal `error`/`summary` line the caller handles in onLine.
     if (!res.ok || !res.body) {
       const body = await res.text().catch(() => "");
-      throw new ApiError(res.status, `POST /api/runs/local → ${res.status}${body ? `: ${body}` : ""}`, undefined);
+      throw new ApiError(
+        res.status,
+        `POST /api/runs/local → ${res.status}${body ? `: ${body}` : ""}`,
+        undefined,
+      );
     }
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
@@ -512,8 +653,14 @@ class RealApi implements HarnessApi {
     return terminalDeployEvent(events);
   }
 
-  async run(req: { definitionId: string; input?: unknown }): Promise<RunResponse> {
-    return this.request<RunResponse>("/api/runs", { method: "POST", body: JSON.stringify(req) });
+  async run(req: {
+    definitionId: string;
+    input?: unknown;
+  }): Promise<RunResponse> {
+    return this.request<RunResponse>("/api/runs", {
+      method: "POST",
+      body: JSON.stringify(req),
+    });
   }
 
   /**
@@ -543,7 +690,11 @@ class RealApi implements HarnessApi {
       let reason: string | undefined;
       try {
         const parsed: unknown = body ? JSON.parse(body) : undefined;
-        if (parsed && typeof parsed === "object" && typeof (parsed as { error?: unknown }).error === "string") {
+        if (
+          parsed &&
+          typeof parsed === "object" &&
+          typeof (parsed as { error?: unknown }).error === "string"
+        ) {
           reason = (parsed as { error: string }).error;
         }
       } catch {
@@ -612,7 +763,10 @@ export function parseNdjsonLine<T>(raw: string): T | undefined {
  * so a final line without a trailing newline is not lost. Pure — no I/O — so
  * the incremental parsing is unit-testable without a live stream.
  */
-export function splitNdjson(buffer: string, flush: boolean): { lines: string[]; rest: string } {
+export function splitNdjson(
+  buffer: string,
+  flush: boolean,
+): { lines: string[]; rest: string } {
   const parts = buffer.split("\n");
   if (flush) {
     return { lines: parts.filter((line) => line.trim() !== ""), rest: "" };
@@ -640,22 +794,62 @@ export function parseRunLocalLine(raw: string): RunLocalLine | null {
   }
   // A contract line is a JSON OBJECT — reject null and arrays (a bare array or
   // scalar is noise, not a trace/summary/error line).
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed))
+    return null;
   return parsed as RunLocalLine;
 }
 
 /** The terminal deploy event (the `ready`/`error` line), or a synthesized
  *  `error` when the stream ended without one — the button always gets a
  *  definite outcome. */
-export function terminalDeployEvent(events: DeployStreamEvent[]): DeployStreamEvent {
+export function terminalDeployEvent(
+  events: DeployStreamEvent[],
+): DeployStreamEvent {
   for (let i = events.length - 1; i >= 0; i--) {
     const event = events[i];
     if (event.phase === "ready" || event.phase === "error") return event;
   }
-  return { phase: "error", code: "NO_OUTPUT", message: "deploy produced no terminal status" };
+  return {
+    phase: "error",
+    code: "NO_OUTPUT",
+    message: "deploy produced no terminal status",
+  };
 }
 
-const delay = (ms = 180): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+const delay = (ms = 180): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
+// The demo leasing run's five steps (id, name, authored latency). Shared by the
+// terminal completed fixture and the progressive prod-run timeline so both tell
+// the same story. Latency is per-step duration only — there is no cost anywhere.
+const LEASING_RUN_STEPS: { id: string; name: string; latencyMs: number }[] = [
+  { id: "intake", name: "intake", latencyMs: 240 },
+  { id: "screen", name: "screen", latencyMs: 610 },
+  { id: "credit-check", name: "credit-check", latencyMs: 1900 },
+  { id: "approve", name: "approve", latencyMs: 130 },
+  { id: "draft-lease", name: "draft-lease", latencyMs: 800 },
+];
+
+// Wall-clock so the demo prod run visibly ADVANCES across the 2s poll cadence:
+// step i is `running` from i·STEP_MS and `passed` from (i+1)·STEP_MS, so the run
+// completes in ~6s no matter how the polls fall. Honest-absence: a `running`
+// step carries NO `latencyMs` (it isn't finished); latency appears only once it
+// passes; nothing carries cost. Used exclusively for `run()`-minted
+// `exec-mock-prod-*` ids, never the terminal default other ids rely on.
+export const PROGRESSIVE_STEP_MS = 900;
+export function progressiveLeasingRun(executionId: string, elapsedMs: number): RunView {
+  const steps: StepView[] = LEASING_RUN_STEPS.map((step, i) => {
+    if (elapsedMs >= (i + 1) * PROGRESSIVE_STEP_MS) {
+      return { id: step.id, name: step.name, status: "passed", latencyMs: step.latencyMs };
+    }
+    if (elapsedMs >= i * PROGRESSIVE_STEP_MS) {
+      return { id: step.id, name: step.name, status: "running" };
+    }
+    return { id: step.id, name: step.name, status: "pending" };
+  });
+  const done = steps.every((s) => s.status === "passed");
+  return { executionId, status: done ? "completed" : "running", steps };
+}
 
 /** In-memory, mutable copies of the fixtures — mutations persist for the tab's lifetime, reset on reload. */
 class MockApi implements HarnessApi {
@@ -663,12 +857,23 @@ class MockApi implements HarnessApi {
   // can drive the full sign-in flow deterministically without a real browser.
   private _authenticated = false;
   private _organizationName: string | null = null;
+  // First-poll wall-clock per progressive prod run, so the timeline is measured
+  // from when the run was first observed (not module load) — see getRunState.
+  private progressiveRunStart = new Map<string, number>();
+  /** Stable for the lifetime of the mock process, mirroring server-issued
+   * opaque keys without putting filesystem paths into graph payloads. */
+  private workspaceKeys = new Map<string, WorkspaceKey>();
 
   async startAuth(): Promise<AuthStartResponse> {
     // Record the call for Playwright assertions (same pattern as runMacro/deploy).
     if (typeof window !== "undefined") {
-      const win = window as unknown as { __HARNESS_TEST__?: Record<string, unknown> };
-      win.__HARNESS_TEST__ = { ...(win.__HARNESS_TEST__ ?? {}), lastAuthStart: Date.now() };
+      const win = window as unknown as {
+        __HARNESS_TEST__?: Record<string, unknown>;
+      };
+      win.__HARNESS_TEST__ = {
+        ...(win.__HARNESS_TEST__ ?? {}),
+        lastAuthStart: Date.now(),
+      };
     }
     // Simulate a brief browser round-trip then flip to authenticated.
     // The real server is async (returns immediately, resolves via bus), but
@@ -704,9 +909,11 @@ class MockApi implements HarnessApi {
 
   async authStatus(): Promise<AuthStatusResponse> {
     await delay(120);
-    return { authenticated: this._authenticated, organizationName: this._organizationName };
+    return {
+      authenticated: this._authenticated,
+      organizationName: this._organizationName,
+    };
   }
-
 
   // `?mockState=fresh` = brand-new install: nothing yet, firstRun set — see isFreshMockState().
   private readonly fresh = isFreshMockState();
@@ -714,11 +921,24 @@ class MockApi implements HarnessApi {
   // telemetryOptIn starts true so the chip shows "analytics on" from the first render.
   private readonly promptedConsent =
     typeof window !== "undefined" &&
-    new URLSearchParams(window.location.search).get("mockConsentSource") === "prompted";
-  private sessions = this.fresh ? [] : MOCK_SESSIONS.map((session) => ({ ...session }));
-  private workflows = this.fresh ? [] : MOCK_WORKFLOWS.map((workflow) => ({ ...workflow }));
-  private readonly workspaceKeyByCwd = new Map<string, WorkspaceKey>();
-  private nextWorkspaceKey = 1;
+    new URLSearchParams(window.location.search).get("mockConsentSource") ===
+      "prompted";
+  // Playwright-only fixture shape: retain the persisted workspace/agent
+  // inventory while removing every session, so the folder graph's
+  // no-active-session contract is exercised without fabricating UI state.
+  private readonly noLiveSessions =
+    typeof window !== "undefined" &&
+    new URLSearchParams(window.location.search).get("mockNoLiveSessions") ===
+      "1";
+  private sessions = this.fresh || this.noLiveSessions
+    ? []
+    : MOCK_SESSIONS.map((session) => ({ ...session }));
+  private workflows = this.fresh
+    ? []
+    : [
+        ...MOCK_WORKFLOWS,
+        ...(isSearchFixturesEnabled() ? MOCK_SEARCH_WORKFLOWS : []),
+      ].map((workflow) => ({ ...workflow }));
   private settings: HarnessSettings = this.fresh
     ? { ...MOCK_SETTINGS, recentDirs: [] }
     : {
@@ -727,17 +947,22 @@ class MockApi implements HarnessApi {
         ...(this.promptedConsent ? { telemetryOptIn: true } : {}),
       };
 
+  private workspaceKey(cwd: string): WorkspaceKey {
+    const existing = this.workspaceKeys.get(cwd);
+    if (existing) return existing;
+    const key = `workspace-mock-${this.workspaceKeys.size + 1}`;
+    this.workspaceKeys.set(cwd, key);
+    return key;
+  }
+
   private workspaceScopes(): WorkspaceScopeSummary[] {
-    return [...new Set(this.sessions.map((session) => session.cwd))]
+    const roots = new Set([
+      ...this.settings.recentDirs,
+      ...this.sessions.map((session) => session.cwd),
+    ]);
+    return [...roots]
       .sort((left, right) => left.localeCompare(right))
-      .map((cwd) => {
-        let workspaceKey = this.workspaceKeyByCwd.get(cwd);
-        if (!workspaceKey) {
-          workspaceKey = `mock-workspace-${this.nextWorkspaceKey++}`;
-          this.workspaceKeyByCwd.set(cwd, workspaceKey);
-        }
-        return { workspaceKey, cwd };
-      });
+      .map((cwd) => ({ cwd, workspaceKey: this.workspaceKey(cwd) }));
   }
 
   async getState(): Promise<AppState> {
@@ -754,7 +979,8 @@ class MockApi implements HarnessApi {
       const win = window as unknown as {
         __MOCK_BOOT_401_CALL_COUNT__?: number;
       };
-      const boot401 = new URLSearchParams(window.location.search).get("mockBoot401") === "1";
+      const boot401 =
+        new URLSearchParams(window.location.search).get("mockBoot401") === "1";
       if (boot401) {
         // NOTE: relies on React 18 StrictMode's double-invoke of the boot effect;
         // valid only in VITE_MOCK=1 + the Vite dev server.
@@ -764,7 +990,11 @@ class MockApi implements HarnessApi {
         const prev = win.__MOCK_BOOT_401_CALL_COUNT__ ?? 0;
         win.__MOCK_BOOT_401_CALL_COUNT__ = prev + 1;
         if (prev + 1 === 2) {
-          throw new ApiError(401, "GET /api/state → 401: credential rejected (mock)", "credential rejected");
+          throw new ApiError(
+            401,
+            "GET /api/state → 401: credential rejected (mock)",
+            "credential rejected",
+          );
         }
       }
     }
@@ -773,12 +1003,17 @@ class MockApi implements HarnessApi {
     //   ?mockConsentSource=default-silent  → shows TelemetryNotice
     //   ?mockConsentSource=stored-explicit → off chip (telemetryOptIn=false)
     //   ?mockConsentSource=prompted        → on chip (telemetryOptIn=true in mock)
-    const mockConsentSource = typeof window !== "undefined"
-      ? new URLSearchParams(window.location.search).get("mockConsentSource") as AppState["consentSource"] ?? "stored-explicit"
-      : "stored-explicit";
-    const mockEnvReason = typeof window !== "undefined"
-      ? new URLSearchParams(window.location.search).get("mockEnvReason") ?? null
-      : null;
+    const mockConsentSource =
+      typeof window !== "undefined"
+        ? ((new URLSearchParams(window.location.search).get(
+            "mockConsentSource",
+          ) as AppState["consentSource"]) ?? "stored-explicit")
+        : "stored-explicit";
+    const mockEnvReason =
+      typeof window !== "undefined"
+        ? (new URLSearchParams(window.location.search).get("mockEnvReason") ??
+          null)
+        : null;
     // When consent was answered via a TTY prompt ("prompted"), the user
     // necessarily said yes — mirror that in the mock so the chip shows "on".
     const telemetryOptIn =
@@ -787,8 +1022,18 @@ class MockApi implements HarnessApi {
       version: "0.0.1-mock",
       authenticated: true,
       userId: "user_mock",
+      tenantId: "tenant_mock",
       organizationName: "Acme (mock)",
       telemetryOptIn,
+      // Light product analytics defaults on; e2e can force off with
+      // ?mockProductAnalytics=off to assert the PostHog opt-out gate.
+      productAnalyticsOptIn:
+        typeof window !== "undefined" &&
+        new URLSearchParams(window.location.search).get(
+          "mockProductAnalytics",
+        ) === "off"
+          ? false
+          : true,
       sessions: this.sessions,
       workflows: this.workflows,
       workspaceScopes: this.workspaceScopes(),
@@ -805,24 +1050,41 @@ class MockApi implements HarnessApi {
   }
 
   async getSystemGraph(workspaceKey: WorkspaceKey): Promise<SystemGraph> {
-    await delay();
+    await delay(180);
     if (!this.workspaceScopes().some((scope) => scope.workspaceKey === workspaceKey)) {
-      throw new ApiError(404, "GET system graph → 404", "Workspace not found");
+      throw new ApiError(404, "Workspace not found", "Workspace not found");
     }
     if (typeof window !== "undefined") {
-      const win = window as unknown as { __HARNESS_TEST__?: Record<string, unknown> };
-      const previous = (win.__HARNESS_TEST__?.systemGraphRequests as string[]) ?? [];
+      const win = window as unknown as {
+        __HARNESS_TEST__?: Record<string, unknown>;
+        __MOCK_SYSTEM_GRAPH_FAIL_ONCE__?: boolean;
+      };
+      const previous =
+        (win.__HARNESS_TEST__?.systemGraphRequests as WorkspaceKey[] | undefined) ??
+        [];
       win.__HARNESS_TEST__ = {
         ...(win.__HARNESS_TEST__ ?? {}),
         systemGraphRequests: [...previous, workspaceKey],
       };
+      if (win.__MOCK_SYSTEM_GRAPH_FAIL_ONCE__) {
+        win.__MOCK_SYSTEM_GRAPH_FAIL_ONCE__ = false;
+        throw new ApiError(
+          500,
+          "System graph projection failed",
+          "System graph projection failed",
+        );
+      }
     }
     return {
       kind: "system",
       scope: { kind: "working-tree", workspaceKey },
       nodes: [
-        { id: "agent:research", agentKey: "research", label: "Research" },
         { id: "agent:growth", agentKey: "growth", label: "Growth" },
+        {
+          id: "agent:research",
+          agentKey: "research",
+          label: "Research",
+        },
       ],
       edges: [
         {
@@ -839,6 +1101,24 @@ class MockApi implements HarnessApi {
 
   async createSession(req: CreateSessionRequest): Promise<HarnessSession> {
     await delay(300);
+    if (typeof window !== "undefined") {
+      const win = window as unknown as {
+        __HARNESS_TEST__?: Record<string, unknown>;
+        __MOCK_CREATE_SESSION_FAIL_ONCE__?: boolean;
+      };
+      const previous =
+        (win.__HARNESS_TEST__?.createSessionCalls as unknown[] | undefined) ??
+        [];
+      win.__HARNESS_TEST__ = {
+        ...(win.__HARNESS_TEST__ ?? {}),
+        lastCreateSession: { req },
+        createSessionCalls: [...previous, { req }],
+      };
+      if (win.__MOCK_CREATE_SESSION_FAIL_ONCE__) {
+        win.__MOCK_CREATE_SESSION_FAIL_ONCE__ = false;
+        throw new Error("mock: couldn't create session");
+      }
+    }
     const session: HarnessSession = {
       id: `sess-mock-${this.sessions.length + 1}`,
       agentSessionId: null,
@@ -853,7 +1133,9 @@ class MockApi implements HarnessApi {
       // context when a record for that id exists. The fixtures have records for
       // MOCK_SESSION_RECORDS' keys and nothing else.
       rehydratedFrom:
-        req.rehydrateFrom && MOCK_SESSION_RECORDS[req.rehydrateFrom] ? req.rehydrateFrom : null,
+        req.rehydrateFrom && MOCK_SESSION_RECORDS[req.rehydrateFrom]
+          ? req.rehydrateFrom
+          : null,
       ready: false,
     };
     this.sessions = [...this.sessions, session];
@@ -862,7 +1144,7 @@ class MockApi implements HarnessApi {
     // mock-created session would stay unready forever and gate the action
     // bar. Reads the CURRENT copy at fire time so a bind that landed in
     // between is never clobbered.
-    setTimeout(() => {
+    const promote = (): void => {
       void import("./events").then(({ publishMockBusMessage }) => {
         const current = this.sessions.find((s) => s.id === session.id);
         if (!current || current.status === "exited") return;
@@ -872,11 +1154,80 @@ class MockApi implements HarnessApi {
           ready: true,
           lastActiveAt: new Date().toISOString(),
         };
-        this.sessions = this.sessions.map((s) => (s.id === promoted.id ? promoted : s));
+        this.sessions = this.sessions.map((s) =>
+          s.id === promoted.id ? promoted : s,
+        );
         publishMockBusMessage({ type: "session.status", session: promoted });
       });
-    }, 700);
+    };
+    // Test-only: a session that never reaches ready on its own, so Playwright
+    // can exercise the hold-the-prompt-until-agent-ready path (for example,
+    // Claude login or Codex directory trust). The test fires readiness by hand
+    // via window.__HARNESS_TEST__.promoteReady().
+    const win =
+      typeof window === "undefined"
+        ? undefined
+        : (window as unknown as {
+            __MOCK_WITHHOLD_READY__?: boolean;
+            __HARNESS_TEST__?: Record<string, unknown>;
+          });
+    if (win?.__MOCK_WITHHOLD_READY__) {
+      win.__HARNESS_TEST__ = {
+        ...(win.__HARNESS_TEST__ ?? {}),
+        promoteReady: promote,
+      };
+    } else {
+      setTimeout(promote, 700);
+    }
     return session;
+  }
+
+  async attachFile(
+    id: string,
+    req: AttachFileRequest,
+  ): Promise<AttachFileResponse> {
+    await delay();
+    const session = this.sessions.find((item) => item.id === id);
+    if (!session)
+      throw new ApiError(404, "session not found", "session not found");
+
+    const testWindow =
+      typeof window === "undefined"
+        ? undefined
+        : (window as unknown as {
+            __MOCK_ATTACH_FILE_FAIL_ONCE__?: boolean;
+          });
+    if (testWindow?.__MOCK_ATTACH_FILE_FAIL_ONCE__) {
+      testWindow.__MOCK_ATTACH_FILE_FAIL_ONCE__ = false;
+      throw new ApiError(
+        500,
+        "attachment materialization failed",
+        "attachment materialization failed",
+      );
+    }
+
+    const match = /^data:([^;]+);base64,([\s\S]+)$/i.exec(req.dataUrl);
+    if (!match)
+      throw new ApiError(400, "invalid attachment", "invalid attachment");
+    const filename = req.filename.split(/[\\/]/).pop() || "pasted-file";
+    const response: AttachFileResponse = {
+      path: `${session.cwd}/.sapiom/uploads/mock-${filename}`,
+      mediaType: match[1]!,
+      bytes: atob(match[2]!).length,
+    };
+
+    if (typeof window !== "undefined") {
+      const win = window as unknown as {
+        __HARNESS_TEST__?: Record<string, unknown>;
+      };
+      const previous =
+        (win.__HARNESS_TEST__?.attachFileCalls as unknown[] | undefined) ?? [];
+      win.__HARNESS_TEST__ = {
+        ...(win.__HARNESS_TEST__ ?? {}),
+        attachFileCalls: [...previous, { id, req, response }],
+      };
+    }
+    return response;
   }
 
   async listSessions(): Promise<HarnessSession[]> {
@@ -886,7 +1237,8 @@ class MockApi implements HarnessApi {
 
   async sessionHistory(cwd: string): Promise<SessionSummary[]> {
     await delay();
-    return MOCK_HISTORY[cwd] ?? [];
+    const searchExtras = isSearchFixturesEnabled() ? (MOCK_SEARCH_HISTORY[cwd] ?? []) : [];
+    return [...(MOCK_HISTORY[cwd] ?? []), ...searchExtras];
   }
 
   async sessionRecord(id: string): Promise<SessionRecord | null> {
@@ -898,10 +1250,18 @@ class MockApi implements HarnessApi {
 
   async resumeSession(id: string): Promise<HarnessSession> {
     await delay(300);
-    const existing = this.sessions.find((session) => session.agentSessionId === id || session.id === id);
+    const existing = this.sessions.find(
+      (session) => session.agentSessionId === id || session.id === id,
+    );
     if (!existing) throw new Error(`mock: no session to resume for ${id}`);
-    const resumed = { ...existing, status: "running" as const, lastActiveAt: new Date().toISOString() };
-    this.sessions = this.sessions.map((session) => (session.id === resumed.id ? resumed : session));
+    const resumed = {
+      ...existing,
+      status: "running" as const,
+      lastActiveAt: new Date().toISOString(),
+    };
+    this.sessions = this.sessions.map((session) =>
+      session.id === resumed.id ? resumed : session,
+    );
     return resumed;
   }
 
@@ -911,7 +1271,9 @@ class MockApi implements HarnessApi {
   async adoptSession(req: AdoptSessionRequest): Promise<HarnessSession> {
     await delay(300);
     const existing = this.sessions.find(
-      (session) => session.agentSessionId === req.agentSessionId && session.cwd === req.cwd,
+      (session) =>
+        session.agentSessionId === req.agentSessionId &&
+        session.cwd === req.cwd,
     );
     const adopted: HarnessSession = {
       ...(existing ?? {
@@ -929,7 +1291,9 @@ class MockApi implements HarnessApi {
       lastActiveAt: new Date().toISOString(),
     };
     this.sessions = existing
-      ? this.sessions.map((session) => (session.id === adopted.id ? adopted : session))
+      ? this.sessions.map((session) =>
+          session.id === adopted.id ? adopted : session,
+        )
       : [...this.sessions, adopted];
     return adopted;
   }
@@ -937,8 +1301,21 @@ class MockApi implements HarnessApi {
   async killSession(id: string): Promise<void> {
     await delay();
     this.sessions = this.sessions.map((session) =>
-      session.id === id ? { ...session, status: "exited" as const, exitCode: 0 } : session,
+      session.id === id
+        ? { ...session, status: "exited" as const, exitCode: 0 }
+        : session,
     );
+    if (typeof window !== "undefined") {
+      const win = window as unknown as {
+        __HARNESS_TEST__?: Record<string, unknown>;
+      };
+      const previous =
+        (win.__HARNESS_TEST__?.killSessionCalls as string[] | undefined) ?? [];
+      win.__HARNESS_TEST__ = {
+        ...(win.__HARNESS_TEST__ ?? {}),
+        killSessionCalls: [...previous, id],
+      };
+    }
   }
 
   async injectInput(id: string, req: InjectInputRequest): Promise<void> {
@@ -953,43 +1330,77 @@ class MockApi implements HarnessApi {
       // Consumed exactly once — cleared immediately so the next submit succeeds.
       if (win.__MOCK_INJECT_FAIL_ONCE__) {
         win.__MOCK_INJECT_FAIL_ONCE__ = false;
-        throw new ApiError(409, `POST /api/sessions/${id}/input → 409: Session is still initialising`, "Session is still initialising");
+        throw new ApiError(
+          409,
+          `POST /api/sessions/${id}/input → 409: Session is still initialising`,
+          "Session is still initialising",
+        );
       }
       // Record the submission for Playwright to assert on — same pattern as
       // runMacro's lastMacroRun.
+      const previous =
+        (win.__HARNESS_TEST__?.injectInputCalls as
+          | Array<{ id: string; req: InjectInputRequest }>
+          | undefined) ?? [];
       win.__HARNESS_TEST__ = {
         ...(win.__HARNESS_TEST__ ?? {}),
         lastInjectInput: { id, req },
+        injectInputCalls: [...previous, { id, req }],
       };
     }
-  }
-
-  async attachImage(id: string, req: AttachImageRequest): Promise<AttachImageResponse> {
-    await delay();
-    const mediaType = /^data:([^;]+);/.exec(req.dataUrl)?.[1] ?? "image/png";
-    // base64 → decoded size: 4 chars encode 3 bytes.
-    const bytes = Math.max(0, Math.floor((req.dataUrl.split(",")[1]?.length ?? 0) * 0.75));
-    const response: AttachImageResponse = {
-      path: `/mock/cwd/.sapiom/uploads/${id}-${req.filename ?? "image"}`,
-      mediaType: mediaType as AttachImageResponse["mediaType"],
-      bytes,
-    };
-    // Test-only escape hatch, mock mode only — same pattern as lastInjectInput:
-    // Playwright reads this back to assert an attach actually fired.
-    if (typeof window !== "undefined") {
-      const win = window as unknown as { __HARNESS_TEST__?: Record<string, unknown> };
-      const prev = (win.__HARNESS_TEST__?.attachImageCalls as unknown[]) ?? [];
-      win.__HARNESS_TEST__ = {
-        ...(win.__HARNESS_TEST__ ?? {}),
-        attachImageCalls: [...prev, { id, filename: req.filename, mediaType }],
-      };
-    }
-    return response;
   }
 
   async listWorkflows(): Promise<WorkflowInfo[]> {
     await delay();
     return this.workflows;
+  }
+
+  async getWorkflowInputContract(
+    workflowPath: string,
+  ): Promise<WorkflowInputContractResponse> {
+    await delay(120);
+    const workflow = this.workflows.find((item) => item.path === workflowPath);
+    if (!workflow) throw new ApiError(404, "Agent not found", "Agent not found");
+    if (typeof window !== "undefined") {
+      const testWindow = window as unknown as {
+        __MOCK_INPUT_CONTRACT_MODE__?: "throw" | "unavailable";
+        __MOCK_INPUT_CONTRACT__?: WorkflowInputContractResponse;
+      };
+      if (testWindow.__MOCK_INPUT_CONTRACT__) return testWindow.__MOCK_INPUT_CONTRACT__;
+      const mode = testWindow.__MOCK_INPUT_CONTRACT_MODE__;
+      if (mode === "throw") {
+        throw new ApiError(
+          500,
+          "GET /api/workflows/:id/input-contract → 500 (mock)",
+          "Input contract could not be loaded",
+        );
+      }
+      if (mode === "unavailable") {
+        return {
+          status: "unavailable",
+          jsonSchema: null,
+          example: {},
+          reason: "Input contract extraction failed in the mock runtime.",
+        };
+      }
+    }
+    return {
+      status: "available",
+      jsonSchema: {
+        type: "object",
+        title: `${workflow.name} input`,
+        properties: {
+          topic: {
+            type: "string",
+            title: "Topic",
+            description: "The subject this run should work on.",
+            default: "indie game development",
+          },
+        },
+        required: ["topic"],
+      },
+      example: { topic: "indie game development" },
+    };
   }
 
   async connectWorkflow(path: string): Promise<WorkflowInfo> {
@@ -1010,7 +1421,9 @@ class MockApi implements HarnessApi {
     // Honest mock: "found" means the fixture workflow actually lives under
     // the scanned root — scanning a folder with no agents finds nothing.
     const prefix = root.endsWith("/") ? root : `${root}/`;
-    return this.workflows.filter((w) => w.path === root || w.path.startsWith(prefix));
+    return this.workflows.filter(
+      (w) => w.path === root || w.path.startsWith(prefix),
+    );
   }
 
   async listHarnesses(): Promise<HarnessEntry[]> {
@@ -1029,8 +1442,13 @@ class MockApi implements HarnessApi {
     // effect, so Playwright reads this back to assert what a click actually
     // sent (e.g. that Visualize fires with no subject — it's one-click now).
     if (typeof window !== "undefined") {
-      const win = window as unknown as { __HARNESS_TEST__?: Record<string, unknown> };
-      win.__HARNESS_TEST__ = { ...(win.__HARNESS_TEST__ ?? {}), lastMacroRun: { id, req } };
+      const win = window as unknown as {
+        __HARNESS_TEST__?: Record<string, unknown>;
+      };
+      win.__HARNESS_TEST__ = {
+        ...(win.__HARNESS_TEST__ ?? {}),
+        lastMacroRun: { id, req },
+      };
     }
     // Demo nicety: the static build has no agent to render a canvas, so the
     // Visualize flow completes deterministically — a canvas.reload arrives
@@ -1038,7 +1456,10 @@ class MockApi implements HarnessApi {
     if (id === "visualize") {
       const { publishMockBusMessage } = await import("./events");
       setTimeout(() => {
-        publishMockBusMessage({ type: "canvas.reload", harnessSessionId: req.harnessSessionId });
+        publishMockBusMessage({
+          type: "canvas.reload",
+          harnessSessionId: req.harnessSessionId,
+        });
       }, 900);
     }
   }
@@ -1048,7 +1469,9 @@ class MockApi implements HarnessApi {
     return this.settings;
   }
 
-  async updateSettings(patch: Partial<HarnessSettings>): Promise<HarnessSettings> {
+  async updateSettings(
+    patch: Partial<HarnessSettings>,
+  ): Promise<HarnessSettings> {
     await delay();
     this.settings = { ...this.settings, ...patch };
     return this.settings;
@@ -1057,7 +1480,11 @@ class MockApi implements HarnessApi {
   async listDir(path?: string): Promise<FsListResponse> {
     await delay(120);
     if (mockErrorTargets().has("listDir")) {
-      throw new ApiError(500, "GET /api/fs → 500 (mock)", "Could not read that directory");
+      throw new ApiError(
+        500,
+        "GET /api/fs → 500 (mock)",
+        "Could not read that directory",
+      );
     }
     const requested = path && path.trim() ? path.trim() : MOCK_LAUNCH_DIR;
     // Walk up to the nearest ancestor the fixture tree actually has — lets the
@@ -1066,19 +1493,26 @@ class MockApi implements HarnessApi {
     let normalized = requested;
     while (!(normalized in MOCK_FS_TREE) && normalized !== "/") {
       const segments = normalized.split("/").filter(Boolean);
-      normalized = segments.length <= 1 ? "/" : "/" + segments.slice(0, -1).join("/");
+      normalized =
+        segments.length <= 1 ? "/" : "/" + segments.slice(0, -1).join("/");
     }
     if (!(normalized in MOCK_FS_TREE)) normalized = MOCK_LAUNCH_DIR;
 
     const names = MOCK_FS_TREE[normalized] ?? [];
     const segments = normalized.split("/").filter(Boolean);
     // Matches path.dirname("/") === "/" — root's own parent is itself, never null.
-    const parent = normalized === "/" ? "/" : segments.length <= 1 ? "/" : "/" + segments.slice(0, -1).join("/");
+    const parent =
+      normalized === "/"
+        ? "/"
+        : segments.length <= 1
+          ? "/"
+          : "/" + segments.slice(0, -1).join("/");
     return {
       path: normalized,
       parent,
       dirs: names.map((name) => {
-        const dirPath = normalized === "/" ? `/${name}` : `${normalized}/${name}`;
+        const dirPath =
+          normalized === "/" ? `/${name}` : `${normalized}/${name}`;
         return {
           name,
           path: dirPath,
@@ -1088,18 +1522,47 @@ class MockApi implements HarnessApi {
           // precisely the case "I have a project" exists to handle — and keying
           // off registry state would leave every folder unbadged under
           // `?mockState=fresh`, making that flow untestable.
-          hasAgentProject: MOCK_WORKFLOWS.some((workflow) => workflow.path === dirPath),
+          hasAgentProject: MOCK_WORKFLOWS.some(
+            (workflow) => workflow.path === dirPath,
+          ),
         };
       }),
     };
   }
 
-  async bindWorkflow(sessionId: string, workflowPath: string | null): Promise<HarnessSession> {
+  async bindWorkflow(
+    sessionId: string,
+    workflowPath: string | null,
+  ): Promise<HarnessSession> {
     await delay(150);
+    if (typeof window !== "undefined") {
+      const win = window as unknown as {
+        __HARNESS_TEST__?: Record<string, unknown>;
+        __MOCK_BIND_WORKFLOW_FAIL_ONCE__?: boolean;
+      };
+      const previous =
+        (win.__HARNESS_TEST__?.bindWorkflowCalls as unknown[] | undefined) ??
+        [];
+      const req = { sessionId, workflowPath };
+      win.__HARNESS_TEST__ = {
+        ...(win.__HARNESS_TEST__ ?? {}),
+        lastBindWorkflow: { req },
+        bindWorkflowCalls: [...previous, { req }],
+      };
+      if (win.__MOCK_BIND_WORKFLOW_FAIL_ONCE__) {
+        win.__MOCK_BIND_WORKFLOW_FAIL_ONCE__ = false;
+        throw new Error("mock: couldn't bind session");
+      }
+    }
     const existing = this.sessions.find((session) => session.id === sessionId);
     if (!existing) throw new Error(`mock: no session to bind for ${sessionId}`);
-    const bound: HarnessSession = { ...existing, boundWorkflowPath: workflowPath };
-    this.sessions = this.sessions.map((session) => (session.id === sessionId ? bound : session));
+    const bound: HarnessSession = {
+      ...existing,
+      boundWorkflowPath: workflowPath,
+    };
+    this.sessions = this.sessions.map((session) =>
+      session.id === sessionId ? bound : session,
+    );
     return bound;
   }
 
@@ -1108,10 +1571,20 @@ class MockApi implements HarnessApi {
     return { templates: MOCK_TEMPLATES, source: "live" };
   }
 
+  async getAccountPlan(): Promise<AccountPlanView> {
+    await delay(150);
+    return MOCK_ACCOUNT_PLAN;
+  }
+
   async getTemplate(id: string): Promise<TemplateDetailView> {
     await delay(150);
     const summary = MOCK_TEMPLATES.find((template) => template.id === id);
-    if (!summary) throw new ApiError(404, `mock: no template ${id}`, `Template not found: ${id}`);
+    if (!summary)
+      throw new ApiError(
+        404,
+        `mock: no template ${id}`,
+        `Template not found: ${id}`,
+      );
     // Real per-template graphs (MOCK_TEMPLATE_GRAPHS) with the registry's actual
     // step names, so mock mode previews what live mode previews. A template with
     // no graph fixture falls back to a single entry node rather than inventing a
@@ -1164,16 +1637,28 @@ class MockApi implements HarnessApi {
         return override;
       }
     }
+    // A run the user just STARTED (Run button → run() mints exec-mock-prod-*)
+    // advances step-by-step on a wall clock so the Steps view visibly moves.
+    // Every other id (the on-load demo receipt, Playwright's authored ids) keeps
+    // the terminal fixture below — several specs depend on that first poll being
+    // terminal so the poller stops.
+    if (executionId.startsWith("exec-mock-prod-")) {
+      let startedAt = this.progressiveRunStart.get(executionId);
+      if (startedAt === undefined) {
+        startedAt = Date.now();
+        this.progressiveRunStart.set(executionId, startedAt);
+      }
+      return progressiveLeasingRun(executionId, Date.now() - startedAt);
+    }
     return {
       executionId,
       status: "completed",
-      steps: [
-        { id: "intake", name: "intake", status: "passed" as const, latencyMs: 240 },
-        { id: "screen", name: "screen", status: "passed" as const, latencyMs: 610 },
-        { id: "credit-check", name: "credit-check", status: "passed" as const, latencyMs: 1900 },
-        { id: "approve", name: "approve", status: "passed" as const, latencyMs: 130 },
-        { id: "draft-lease", name: "draft-lease", status: "passed" as const, latencyMs: 800 },
-      ],
+      steps: LEASING_RUN_STEPS.map((step) => ({
+        id: step.id,
+        name: step.name,
+        status: "passed" as const,
+        latencyMs: step.latencyMs,
+      })),
     };
   }
 
@@ -1182,8 +1667,11 @@ class MockApi implements HarnessApi {
   // so the inspector visibly lights up step-by-step. Lets the mock/demo build
   // and Playwright exercise the run-local inspector with no server, mirroring
   // the real NDJSON stream's ordering (traces first, terminal line last).
-  async runLocal(args: RunLocalArgs, onLine: (line: RunLocalLine) => void): Promise<void> {
-    this.recordDirectAction("runLocal", { sourceDir: args.sourceDir });
+  async runLocal(
+    args: RunLocalArgs,
+    onLine: (line: RunLocalLine) => void,
+  ): Promise<void> {
+    this.recordDirectAction("runLocal", args);
     const traces: LocalStepTrace[] = [
       {
         step: "intake",
@@ -1212,10 +1700,44 @@ class MockApi implements HarnessApi {
     ];
     for (const trace of traces) {
       await delay(140);
-      onLine(trace);
+      onLine({
+        kind: "step",
+        phase: "started",
+        trace: {
+          step: trace.step,
+          attempt: trace.attempt,
+          input: trace.input,
+          status: "running",
+          startedAt: new Date().toISOString(),
+          logs: [],
+        },
+      });
+      await delay(140);
+      onLine({
+        kind: "step",
+        phase: "settled",
+        trace: {
+          ...trace,
+          startedAt: new Date(Date.now() - 140).toISOString(),
+          finishedAt: new Date().toISOString(),
+          sharedStateAfter: { lastStep: trace.step },
+          directive:
+            trace.step === "approve"
+              ? { kind: "terminate" }
+              : {
+                  kind: "continue",
+                  stepName: trace.step === "intake" ? "screen" : "approve",
+                  input: trace.output,
+                },
+        },
+      });
     }
     await delay(140);
-    onLine({ kind: "summary", outcome: "completed", output: { approved: true } });
+    onLine({
+      kind: "summary",
+      outcome: "completed",
+      output: { approved: true },
+    });
   }
 
   // The direct actions have no network in mock mode: they synthesize the same
@@ -1233,11 +1755,31 @@ class MockApi implements HarnessApi {
     // before the build, so mock mode exercises the same two-phase stream.
     const target = this.workflows.find((w) => w.path === workflowPath);
     if (target && target.definitionId == null) {
-      const linking: DeployStreamEvent = { phase: "linking", name: target.name };
+      const linking: DeployStreamEvent = {
+        phase: "linking",
+        name: target.name,
+      };
       onEvent?.(linking);
       await delay(200);
     }
-    const building: DeployStreamEvent = { phase: "building", definitionId: "mock-def" };
+    // A first link persists before its first build finishes. Model that exact
+    // boundary so failure tests cannot accidentally treat definitionId as a
+    // ready deployment.
+    this.workflows = this.workflows.map((w) =>
+      w.path === workflowPath
+        ? {
+            ...w,
+            definitionId: w.definitionId ?? 4242,
+            definitionSlug: w.definitionSlug ?? "mock-agent",
+            activeBuildRunId: "mock-build-1",
+            activeBuildRunStatus: "building",
+          }
+        : w,
+    );
+    const building: DeployStreamEvent = {
+      phase: "building",
+      definitionId: "mock-def",
+    };
     onEvent?.(building);
     await delay(400);
     // Test-only failure mode: `?mockError=deploy` makes the stream end with a
@@ -1245,11 +1787,14 @@ class MockApi implements HarnessApi {
     // affordance (lastDeployError persists, chip reads "Deploy failed",
     // prod-run disabled-reason reads "Last deploy failed — retry Deploy").
     if (mockErrorTargets().has("deploy")) {
+      this.workflows = this.workflows.map((w) =>
+        w.path === workflowPath ? { ...w, activeBuildRunStatus: "failed" } : w,
+      );
       const failed: DeployStreamEvent = {
         phase: "error",
         code: "BUILD_FAILED",
         message: "mock build error",
-        hint: "check your workflow definition",
+        hint: "check your agent definition",
       };
       onEvent?.(failed);
       return failed;
@@ -1261,18 +1806,23 @@ class MockApi implements HarnessApi {
       status: "succeeded",
     };
     onEvent?.(ready);
-    // Mirror the real server: a successful deploy links the workflow, so its
-    // definitionId flips. Reflect that in the fixture so the Draft→Deployed
-    // chip and the deploy-gated actions light up after a mock deploy.
+    // Mirror the definition-detail projection after a successful cloud build.
     this.workflows = this.workflows.map((w) =>
-      w.path === workflowPath && w.definitionId == null
-        ? { ...w, definitionId: 4242, definitionSlug: w.definitionSlug ?? "mock-agent" }
+      w.path === workflowPath
+        ? {
+            ...w,
+            activeBuildRunId: "mock-build-1",
+            activeBuildRunStatus: "ready",
+          }
         : w,
     );
     return ready;
   }
 
-  async run(req: { definitionId: string; input?: unknown }): Promise<RunResponse> {
+  async run(req: {
+    definitionId: string;
+    input?: unknown;
+  }): Promise<RunResponse> {
     this.recordDirectAction("run", req);
     await delay(200);
     // A fresh, non-"local" id so the run-state fixture returns the prod
@@ -1283,9 +1833,14 @@ class MockApi implements HarnessApi {
   /** Test-only escape hatch (mock mode only): record a direct-action call so
    *  Playwright can assert the button used the DIRECT route rather than the pty
    *  inject path. Same pattern as lastMacroRun/lastInjectInput. */
-  private recordDirectAction(action: "deploy" | "run" | "runLocal", req: unknown): void {
+  private recordDirectAction(
+    action: "deploy" | "run" | "runLocal",
+    req: unknown,
+  ): void {
     if (typeof window === "undefined") return;
-    const win = window as unknown as { __HARNESS_TEST__?: Record<string, unknown> };
+    const win = window as unknown as {
+      __HARNESS_TEST__?: Record<string, unknown>;
+    };
     const prev = (win.__HARNESS_TEST__?.directActions as unknown[]) ?? [];
     win.__HARNESS_TEST__ = {
       ...(win.__HARNESS_TEST__ ?? {}),
@@ -1303,10 +1858,20 @@ class MockApi implements HarnessApi {
 export function interceptMockTrack(): void {
   if (!isMockMode()) return;
   const originalFetch = window.fetch.bind(window);
-  window.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+  window.fetch = async (
+    input: RequestInfo | URL,
+    init?: RequestInit,
+  ): Promise<Response> => {
+    const url =
+      typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.href
+          : input.url;
     if (url === "/api/track" && init?.method === "POST") {
-      const win = window as unknown as { __HARNESS_TEST__?: Record<string, unknown> };
+      const win = window as unknown as {
+        __HARNESS_TEST__?: Record<string, unknown>;
+      };
       let body: unknown;
       try {
         body = JSON.parse(typeof init.body === "string" ? init.body : "{}");
@@ -1314,8 +1879,14 @@ export function interceptMockTrack(): void {
         body = {};
       }
       const prev = (win.__HARNESS_TEST__?.trackEvents as unknown[]) ?? [];
-      win.__HARNESS_TEST__ = { ...(win.__HARNESS_TEST__ ?? {}), trackEvents: [...prev, body] };
-      return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "Content-Type": "application/json" } });
+      win.__HARNESS_TEST__ = {
+        ...(win.__HARNESS_TEST__ ?? {}),
+        trackEvents: [...prev, body],
+      };
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
     }
     return originalFetch(input, init);
   };

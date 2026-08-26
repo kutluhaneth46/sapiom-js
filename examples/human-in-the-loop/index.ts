@@ -6,6 +6,7 @@ import {
   terminate,
   type AgentExecutionContext,
 } from "@sapiom/agent";
+import { EmailHttpError } from "@sapiom/tools";
 import { z } from "zod/v4";
 
 /**
@@ -33,7 +34,7 @@ import { z } from "zod/v4";
  * Two durable pauses (`pauseUntilSignal`) suspend the run at $0: the approval
  * gate, and each turn of the confirmation loop. `pauseUntilSignal` is a runtime
  * primitive, not a metered capability. The billed calls are the model reasoning
- * (`ctx.sapiom.models.run` — the live x402 path; `ctx.sapiom.llm` does NOT exist)
+ * (`ctx.sapiom.llm.run` — the live gateway path)
  * and the notifications (`ctx.sapiom.email`).
  *
  * Offline: `run_local` stubs the capabilities and auto-resumes the pauses. A
@@ -52,9 +53,6 @@ const APPROVER_PREVIEW = 5;
 const APPROVAL_SIGNAL = "approval.decision";
 /** The signal a candidate fires to accept or decline a provisional offer. */
 const CONFIRM_SIGNAL = "candidate.confirm";
-
-/** Username for the inbox we send notifications from (created once, then reused). */
-const SENDER_USERNAME = "approvals";
 
 // ─────────────────────────────────────────────────────────────── shapes ──
 /** String-only config bag (matches how templates receive their `config`). */
@@ -143,15 +141,32 @@ function must<T>(value: T | undefined, name: string): T {
   return value;
 }
 
-/** Reuse an existing inbox to send from, else provision one. */
+/**
+ * Reuse an existing inbox to send from, else provision one.
+ *
+ * We deliberately omit `username`. AgentMail addresses are globally unique, so a
+ * fixed local part can only ever be owned by ONE account across the whole
+ * platform — every other tenant's `create` 409s with "Email address is already
+ * taken", which fails the step. Omitting it lets AgentMail auto-generate a
+ * globally-unique address, so a fresh tenant's first run succeeds and two
+ * tenants never collide. `create` still isn't atomic against the `list`, so a
+ * 409 is treated as "someone already provisioned one" — re-list and reuse.
+ */
 async function resolveSenderInbox(ctx: Ctx): Promise<string> {
   const existing = await ctx.sapiom.email.inboxes.list({ limit: 1 });
   if (existing.inboxes.length > 0) return existing.inboxes[0].inboxId;
-  const inbox = await ctx.sapiom.email.inboxes.create({
-    username: SENDER_USERNAME,
-    displayName: "Approvals",
-  });
-  return inbox.inboxId;
+  try {
+    const inbox = await ctx.sapiom.email.inboxes.create({
+      displayName: "Approvals",
+    });
+    return inbox.inboxId;
+  } catch (err) {
+    if (err instanceof EmailHttpError && err.status === 409) {
+      const retry = await ctx.sapiom.email.inboxes.list({ limit: 1 });
+      if (retry.inboxes.length > 0) return retry.inboxes[0].inboxId;
+    }
+    throw err;
+  }
 }
 
 /**
@@ -188,12 +203,14 @@ async function parseRequest(ctx: Ctx, request: string): Promise<ParsedRequest> {
     "selecting one of several candidates. Identify what is being asked for and " +
     "the criteria that should drive the choice (weigh fit, not just cost). " +
     'Reply with ONLY minified JSON: {"summary":string,"criteria":string[]}.';
-  const res = await ctx.sapiom.models.run({
-    prompt: request,
-    system,
-    maxTokens: 300,
+  const res = await ctx.sapiom.llm.run({
+    request: {
+      system,
+      messages: [{ role: "user", content: request }],
+      max_tokens: 300,
+    },
   });
-  return coerceParsed(res.output, request);
+  return coerceParsed(ctx.sapiom.llm.textOf(res) ?? null, request);
 }
 
 /**
@@ -214,8 +231,14 @@ async function rankCandidates(
   const prompt =
     `CRITERIA:\n${parsed.criteria.map((c) => `- ${c}`).join("\n") || "- (none)"}\n\n` +
     `CANDIDATES:\n${JSON.stringify(candidates)}`;
-  const res = await ctx.sapiom.models.run({ prompt, system, maxTokens: 600 });
-  return applyRanking(res.output, candidates);
+  const res = await ctx.sapiom.llm.run({
+    request: {
+      system,
+      messages: [{ role: "user", content: prompt }],
+      max_tokens: 600,
+    },
+  });
+  return applyRanking(ctx.sapiom.llm.textOf(res) ?? null, candidates);
 }
 
 /**

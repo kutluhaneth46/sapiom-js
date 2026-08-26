@@ -39,7 +39,13 @@ import * as fs from "node:fs/promises";
 import { createRequire } from "node:module";
 import * as path from "node:path";
 
-import { resolveVersions, scaffold, writeConfig, type ResolvedVersions } from "@sapiom/agent-core";
+import {
+  installProjectDependencies,
+  resolveVersions,
+  scaffold,
+  writeConfig,
+  type ResolvedVersions,
+} from "@sapiom/agent-core";
 
 import { TEMPLATE_HTML, renderCanvasDocument } from "./canvas-template.js";
 
@@ -60,32 +66,7 @@ function agentCoreTemplatesDir(): string {
 
 function tryGit(cwd: string, args: string[]): boolean {
   try {
-    execFileSync("git", args, { cwd, stdio: "ignore" });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Best-effort `npm install` in the freshly-scaffolded project. The Canvas
- * step-graph extraction esbuild-bundles the project, so without its declared
- * deps (`@sapiom/agent`, `zod`, …) installed the very first render fails with
- * "Could not resolve …". Installing here means a freshly-seeded project opens
- * with a working Canvas instead of an error the user has to ask the agent to
- * fix. Non-fatal: if npm is missing or offline, seeding still succeeds and the
- * Canvas falls back to its existing "ask your agent to fix it" prompt.
- * `shell: true` lets Windows resolve the `npm.cmd` shim; cwd (which may contain
- * spaces) is passed via options, not the command line, so it stays safe.
- */
-function tryInstallDependencies(projectDir: string): boolean {
-  try {
-    execFileSync("npm", ["install", "--no-audit", "--no-fund", "--loglevel=error"], {
-      cwd: projectDir,
-      stdio: "ignore",
-      shell: process.platform === "win32",
-      timeout: 120_000,
-    });
+    execFileSync("git", args, { cwd, stdio: "ignore", windowsHide: true });
     return true;
   } catch {
     return false;
@@ -188,7 +169,7 @@ const ORDER_TRIAGE_CANVAS_BODY = `
   <header class="canvas-header">
     <div class="canvas-title-row">
       <h1 class="canvas-title">order-triage</h1>
-      <span class="canvas-badge">standalone workflow</span>
+      <span class="canvas-badge">standalone agent</span>
       <span class="canvas-badge">not deployed yet</span>
     </div>
     <p class="canvas-subtitle">Support-ticket triage: intake -&gt; classify -&gt; route, then auto-resolve or escalate to a human.</p>
@@ -248,7 +229,7 @@ const ORDER_TRIAGE_CANVAS_BODY = `
     <span class="canvas-legend-marker canvas-legend-marker--terminal-warn"></span>
     <span class="canvas-interconnection-title">escalate -&gt; external</span>
     <span class="canvas-interconnection-tag">handoff</span>
-    <p class="canvas-interconnection-desc">routes to a human out-of-band, not to another workflow</p>
+    <p class="canvas-interconnection-desc">routes to a human out-of-band, not to another agent</p>
   </div>
 </section>
 
@@ -258,9 +239,9 @@ const ORDER_TRIAGE_CANVAS_BODY = `
     <span class="canvas-legend-item"><span class="canvas-legend-marker canvas-legend-marker--step"></span>step</span>
     <span class="canvas-legend-item"><span class="canvas-legend-marker canvas-legend-marker--terminal-success"></span>terminal &middot; success</span>
     <span class="canvas-legend-item"><span class="canvas-legend-marker canvas-legend-marker--terminal-warn"></span>terminal &middot; escalation</span>
-    <span class="canvas-legend-item"><span class="canvas-legend-marker canvas-legend-marker--cross"></span>cross-workflow signal/handoff</span>
+    <span class="canvas-legend-item"><span class="canvas-legend-marker canvas-legend-marker--cross"></span>cross-agent signal/handoff</span>
   </div>
-  <p class="canvas-note">Static preview — ask your agent to regenerate this after you change the workflow.</p>
+  <p class="canvas-note">Static preview — ask your coding agent to regenerate this after you change the agent.</p>
 </footer>
 `.trim();
 
@@ -304,7 +285,9 @@ export interface SeedExampleProjectResult {
  * older/partial seed shouldn't leave the canvas pane empty), but a canvas
  * the user's agent has since regenerated is left alone.
  */
-export async function seedExampleProject(options: SeedExampleProjectOptions): Promise<SeedExampleProjectResult> {
+export async function seedExampleProject(
+  options: SeedExampleProjectOptions,
+): Promise<SeedExampleProjectResult> {
   const root = path.resolve(options.targetRoot);
   const projectDir = path.join(root, SAMPLE_PROJECT_NAME);
   const canvasDir = path.join(root, ".sapiom", "canvas");
@@ -322,13 +305,23 @@ export async function seedExampleProject(options: SeedExampleProjectOptions): Pr
       await fs.writeFile(canvasTemplateFile, TEMPLATE_HTML, "utf8");
     }
     if (overwrite || !existsSync(canvasFile)) {
-      await fs.writeFile(canvasFile, renderCanvasDocument(ORDER_TRIAGE_CANVAS_BODY), "utf8");
+      await fs.writeFile(
+        canvasFile,
+        renderCanvasDocument(ORDER_TRIAGE_CANVAS_BODY),
+        "utf8",
+      );
     }
   };
 
   if (alreadySeeded && !options.force) {
     await writeCanvasPair(false);
-    return { root, projectDir, created: false, gitInitialized: false, dependenciesInstalled: false };
+    return {
+      root,
+      projectDir,
+      created: false,
+      gitInitialized: false,
+      dependenciesInstalled: false,
+    };
   }
 
   // Wipe a stale copy before rescaffolding — scaffold() refuses a non-empty dir.
@@ -349,17 +342,29 @@ export async function seedExampleProject(options: SeedExampleProjectOptions): Pr
     versions,
   });
 
-  await fs.writeFile(path.join(projectDir, "index.ts"), ORDER_TRIAGE_INDEX_TS, "utf8");
+  await fs.writeFile(
+    path.join(projectDir, "index.ts"),
+    ORDER_TRIAGE_INDEX_TS,
+    "utf8",
+  );
   writeConfig(projectDir, { name: SAMPLE_PROJECT_NAME });
 
   // Install deps BEFORE the initial commit so the (gitignored) node_modules is
   // present for the Canvas's first bundle, while staying out of git history.
   const dependenciesInstalled =
-    (options.installDependencies ?? true) ? tryInstallDependencies(projectDir) : false;
+    (options.installDependencies ?? true)
+      ? await installProjectDependencies(projectDir)
+      : false;
 
   commitCustomizations(projectDir);
 
   await writeCanvasPair(true);
 
-  return { root, projectDir, created: true, gitInitialized: result.gitInitialized, dependenciesInstalled };
+  return {
+    root,
+    projectDir,
+    created: true,
+    gitInitialized: result.gitInitialized,
+    dependenciesInstalled,
+  };
 }

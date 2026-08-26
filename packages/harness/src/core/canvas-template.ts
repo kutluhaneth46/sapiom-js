@@ -20,10 +20,12 @@ import { CANVAS_DIR, CANVAS_INDEX } from "../shared/types.js";
 import { isLegacyDeterministicCanvas } from "./canvas-index-classify.js";
 import {
   applyRunStateToCanvas,
+  bootCanvasError,
   bootCanvasGraph,
   bootCanvasOverview,
   bootCanvasNodeClicks,
   bootCanvasRunState,
+  bootCanvasSelection,
   bootCanvasView,
   runStateNodeClass,
 } from "./canvas-run-state.js";
@@ -41,14 +43,19 @@ function themeStyleBlock(): string {
   // canvas look before per-theme passthrough landed for embedded iframes.
   return `
 :root {
-  --canvas-bg: #f3f4f6;
+  /* The whole graph column is the raised "lighter white" (--surface-raised in
+     the app) — the dotted board included, so it never reads darker than the
+     rail/terminal shell it's meant to sit in front of. */
+  --canvas-bg: #ffffff;
   --canvas-panel: #f5f5f5;
   --canvas-border: #e5e5e5;
   --canvas-border-strong: #d4d4d8;
   --canvas-text: #1a1a1a;
   --canvas-text-dim: #737373;
-  --canvas-accent: #05a9bc;
-  --canvas-success: #05a9bc;
+  /* Brand green (Studio light --brand), matching the dark theme's #6be195 — the
+     graph accent/success were an off-brand cyan (#05a9bc) in light only. */
+  --canvas-accent: #167e3a;
+  --canvas-success: #167e3a;
   --canvas-running: #2563eb;
   --canvas-passed: #16a34a;
   --canvas-escalation: #b45309;
@@ -104,8 +111,7 @@ body {
 #canvas-root { max-width: 1100px; padding: 24px 20px; display: flex; flex-direction: column; gap: 18px; }
 
 /* --- structural classes: keep these, and their names, untouched --- */
-.canvas-panel { background: transparent; border: 0; padding: 20px; }
-.canvas-header { display: flex; flex-direction: column; gap: 10px; margin-bottom: 14px; }
+.canvas-panel { background: transparent; border: 0; padding: 20px; }.canvas-header { display: flex; flex-direction: column; gap: 10px; margin-bottom: 14px; }
 .canvas-title-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .canvas-title { margin: 0; font-size: 20px; font-weight: 600; letter-spacing: -0.01em; }
 .canvas-badge {
@@ -132,7 +138,10 @@ body {
 .canvas-node { cursor: pointer; }
 .canvas-node:hover .canvas-node-rect { stroke-width: 2.5; }
 .canvas-node .canvas-node-rect { fill: var(--canvas-panel); stroke-width: 1.5; stroke: var(--canvas-border-strong); }
-.node--entry .canvas-node-rect { stroke: var(--canvas-accent); }
+/* Entry is a POSITION in the graph, not a state: it reads from the card's own
+   "entry" caption and from sitting at the top. It carries no accent, so the
+   only accented card on the board is the one the inspector is describing. */
+.node--entry .canvas-node-rect { stroke: var(--canvas-border-strong); }
 .node--pause .canvas-node-rect { stroke: var(--canvas-text-dim); stroke-dasharray: 5 4; }
 .node--terminal-success .canvas-node-rect { stroke: var(--canvas-success); }
 .node--terminal-warn .canvas-node-rect { stroke: var(--canvas-escalation); }
@@ -144,7 +153,7 @@ body {
 .canvas-group-band { fill: var(--canvas-accent); fill-opacity: 0.06; stroke: var(--canvas-border); stroke-dasharray: 3 5; }
 .canvas-group-label { fill: var(--canvas-text-dim); font-size: 9px; text-transform: uppercase; letter-spacing: 0.06em; }
 
-/* --- edge kinds: sequential (base) | branching (--success/--warn) | cross-workflow signal/handoff (--cross) --- */
+/* --- edge kinds: sequential (base) | branching (--success/--warn) | cross-agent signal/handoff (--cross) --- */
 .canvas-edge { fill: none; stroke-width: 1.8; stroke: var(--canvas-border-strong); }
 .canvas-edge--success { stroke: var(--canvas-success); }
 .canvas-edge--warn { stroke: var(--canvas-escalation); }
@@ -157,19 +166,26 @@ body {
 
 /* --- legend + interconnections --- */
 .canvas-legend { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; font-size: 11px; color: var(--canvas-text-dim); }
-/* In a diagram panel the legend is a footer under the SVG — separate it with a
-   hairline so it reads as a key, not part of the graph. Scoped to .canvas-panel
-   so the overview/seed legends keep their own layout. */
-.canvas-panel .canvas-legend { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--canvas-border); }
 .canvas-legend-item { display: flex; align-items: center; gap: 6px; }
 .canvas-legend-marker { width: 10px; height: 10px; border-radius: 50%; display: inline-block; flex: 0 0 auto; }
-.canvas-legend-marker--entry { background: var(--canvas-accent); }
+.canvas-legend-marker--entry { border: 1.5px solid var(--canvas-border-strong); background: transparent; }
 .canvas-legend-marker--step { border: 1.5px solid var(--canvas-border-strong); background: transparent; }
 .canvas-legend-marker--pause { border: 1.5px dashed var(--canvas-text-dim); background: transparent; }
 .canvas-legend-marker--terminal-success { background: var(--canvas-success); border-radius: 3px; }
 .canvas-legend-marker--terminal-warn { background: var(--canvas-escalation); border-radius: 3px; }
 .canvas-legend-marker--cross { border: 1.5px dashed var(--canvas-text-dim); border-radius: 2px; background: transparent; }
 .canvas-legend-marker--launched-workflow { border: 1.5px dashed var(--canvas-accent); border-radius: 3px; background: transparent; }
+/* The board is ONLY the graph. Title, badges, summary line, stats and the
+   node-kind key are app chrome: the SPA renders them in the overview panel
+   around this iframe (canvas-body.ts posts them), so floating a second copy
+   over the board would just crowd the diagram. Kept in the markup — hidden,
+   not deleted — so the classes stay a stable contract for hand-authored
+   documents and the run-state badge still has something to update. */
+.canvas-header,
+.canvas-legend {
+  position: absolute; width: 1px; height: 1px; overflow: hidden;
+  clip-path: inset(50%); white-space: nowrap; margin: 0; padding: 0;
+}
 .canvas-interconnections { display: flex; flex-direction: column; gap: 12px; }
 .canvas-panel-title { margin: 0; font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--canvas-text-dim); }
 .canvas-interconnection-row { display: grid; grid-template-columns: 12px 1fr auto; column-gap: 8px; row-gap: 2px; align-items: baseline; }
@@ -228,6 +244,27 @@ template { display: none; }
   opacity: 0.5;
 }
 
+/* --- selection ----------------------------------------------------------- */
+/* The card the bottom inspector is describing (canvas-run-state.ts's
+   bootCanvasSelection, driven by the parent). A ring plus a faint accent wash,
+   so the pick reads at a glance without repainting the node: run-state fill
+   still wins on the same rect, and a selected pending node comes back to full
+   opacity so the thing you just clicked is never the dimmest card on the
+   board. */
+.canvas-node.is-selected .canvas-node-rect {
+  stroke: var(--canvas-accent);
+  stroke-width: 3;
+}
+
+.canvas-node.is-selected:not(.is-running):not(.is-passed):not(.is-failed) .canvas-node-rect {
+  fill: var(--canvas-accent);
+  fill-opacity: 0.1;
+}
+
+.canvas-node.is-selected.is-pending {
+  opacity: 1;
+}
+
 /* Active-run header badge — accent background signals a live run. */
 .canvas-badge.canvas-badge--active {
   color: var(--canvas-bg);
@@ -261,7 +298,7 @@ const THEME_SCRIPT = `
 const PATTERNS_TEMPLATE = `
 <template id="canvas-patterns">
   <!-- copy the pattern you need; this whole block is never rendered -->
-  <span class="canvas-badge">standalone workflow</span>
+  <span class="canvas-badge">standalone agent</span>
   <div class="canvas-stat"><span class="canvas-stat-value">5</span><span class="canvas-stat-label">steps</span></div>
   <svg>
     <g class="canvas-node node--entry" filter="url(#canvas-glow)" transform="translate(392,40)">
@@ -293,7 +330,7 @@ const PATTERNS_TEMPLATE = `
     <!-- branching: a step with multiple successors -> curved, colored by the destination's outcome -->
     <path class="canvas-edge canvas-edge--success" d="M480,320 C480,365 288,365 288,410" marker-end="url(#canvas-arrow-success)" />
     <path class="canvas-edge canvas-edge--warn" d="M480,320 C480,365 688,365 688,410" marker-end="url(#canvas-arrow-warn)" />
-    <!-- cross-workflow signal/handoff: dashed, always neutral -->
+    <!-- cross-agent signal/handoff: dashed, always neutral -->
     <path class="canvas-edge canvas-edge--cross" d="M480,320 L480,410" marker-end="url(#canvas-arrow)" />
     <!-- edge label, positioned near the branch point, anchored toward its own destination -->
     <text class="canvas-edge-label" x="440" y="345" text-anchor="end">category == x</text>
@@ -309,7 +346,7 @@ const PATTERNS_TEMPLATE = `
   <span class="canvas-legend-item"><span class="canvas-legend-marker canvas-legend-marker--pause"></span>pause / waits for input</span>
   <span class="canvas-legend-item"><span class="canvas-legend-marker canvas-legend-marker--terminal-success"></span>terminal &middot; success</span>
   <span class="canvas-legend-item"><span class="canvas-legend-marker canvas-legend-marker--terminal-warn"></span>terminal &middot; escalation</span>
-  <span class="canvas-legend-item"><span class="canvas-legend-marker canvas-legend-marker--cross"></span>cross-workflow signal/handoff</span>
+  <span class="canvas-legend-item"><span class="canvas-legend-marker canvas-legend-marker--cross"></span>cross-agent signal/handoff</span>
 </template>
 `.trim();
 
@@ -361,7 +398,7 @@ const NAME_SHIM = "function __name(fn){return fn;}";
  *  embedded step graph so the Steps tab can project it — all via the same
  *  stringify pattern. `NAME_SHIM` MUST come first (see its doc — without it,
  *  esbuild/tsx output throws in the iframe). */
-const RUN_STATE_SCRIPT = `${NAME_SHIM}\n${runStateNodeClass.toString()}\n${applyRunStateToCanvas.toString()}\n${bootCanvasRunState.toString()}\nbootCanvasRunState();\n${bootCanvasNodeClicks.toString()}\nbootCanvasNodeClicks();\n${bootCanvasView.toString()}\nbootCanvasView();\n${bootCanvasGraph.toString()}\nbootCanvasGraph();\n${bootCanvasOverview.toString()}\nbootCanvasOverview();`;
+const RUN_STATE_SCRIPT = `${NAME_SHIM}\n${runStateNodeClass.toString()}\n${applyRunStateToCanvas.toString()}\n${bootCanvasRunState.toString()}\nbootCanvasRunState();\n${bootCanvasNodeClicks.toString()}\nbootCanvasNodeClicks();\n${bootCanvasSelection.toString()}\nbootCanvasSelection();\n${bootCanvasView.toString()}\nbootCanvasView();\n${bootCanvasGraph.toString()}\nbootCanvasGraph();\n${bootCanvasOverview.toString()}\nbootCanvasOverview();\n${bootCanvasError.toString()}\nbootCanvasError();`;
 
 /**
  * Wraps `bodyHtml` in the shared canvas document shell: doctype, the theme
@@ -376,7 +413,7 @@ export function renderCanvasDocument(bodyHtml: string): string {
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Sapiom workflow canvas</title>
+<title>Agent Studio canvas</title>
 <script>
 ${THEME_SCRIPT}
 </script>
@@ -397,30 +434,68 @@ ${bodyHtml}
 `;
 }
 
+/**
+ * A minimal, THEME-AWARE document for the canvas pane's non-graph states —
+ * the empty state and the "rendering…" placeholder the server serves for a
+ * session with nothing (yet) to draw. It reuses the SAME theme mechanism as
+ * `renderCanvasDocument` (the `?theme` reader + the ported token block), so
+ * these pages follow the app's light/dark theme instead of always painting a
+ * white panel inside a dark app. No graph, so it deliberately omits the
+ * run-state/pan-zoom script and SVG defs — just a centered title + subtitle on
+ * the themed canvas backdrop. `title`/`subtitle` are trusted, static server
+ * copy (never user input), so they're inlined without escaping.
+ */
+export function renderCanvasMessageDocument(title: string, subtitle: string): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Agent Studio canvas</title>
+<script>
+${THEME_SCRIPT}
+</script>
+<style>
+${themeStyleBlock()}
+.canvas-message { text-align: center; padding: 0 2rem; max-width: 520px; }
+.canvas-message h1 { margin: 0 0 0.5rem; font-size: 1.1rem; font-weight: 600; color: var(--canvas-text); }
+.canvas-message p { margin: 0; font-size: 13px; color: var(--canvas-text-dim); }
+</style>
+</head>
+<body>
+<div class="canvas-message">
+  <h1>${title}</h1>
+  <p>${subtitle}</p>
+</div>
+</body>
+</html>
+`;
+}
+
 const TEMPLATE_BODY = `
 <!--
   ═══════════════════════════════════════════════════════════════════════
-  SAPIOM CANVAS TEMPLATE — fill in the sections below to visualize a
-  workflow. Keep the <style> block in <head> and the structural classes
+  AGENT STUDIO CANVAS TEMPLATE — fill in the sections below to visualize an
+  agent. Keep the <style> block in <head> and the structural classes
   you see here untouched; only add markup using the patterns in the
   <template id="canvas-patterns"> block near the end of <body> (it is
   never rendered — read it, copy from it, don't edit it). Delete the
   empty-state note below and the patterns template once you're done
-  authoring. For a single bound workflow, one canvas-panel is enough; for
-  a workspace overview, add one canvas-panel per workflow plus an
+  authoring. For a single bound agent, one canvas-panel is enough; for
+  a workspace overview, add one canvas-panel per agent plus an
   Interconnections panel (see the pattern for its row shape).
   ═══════════════════════════════════════════════════════════════════════
 -->
 <section class="canvas-panel">
   <header class="canvas-header">
     <div class="canvas-title-row">
-      <h1 class="canvas-title">Untitled workflow</h1>
+      <h1 class="canvas-title">Untitled agent</h1>
     </div>
-    <p class="canvas-subtitle">One-line description of what this workflow does.</p>
+    <p class="canvas-subtitle">One-line description of what this agent does.</p>
     <div class="canvas-stats"></div>
   </header>
   <div class="canvas-diagram-panel">
-    <p class="canvas-empty-note">Nothing visualized yet — run Visualize on a workflow.</p>
+    <p class="canvas-empty-note">Nothing visualized yet — run Visualize on an agent.</p>
   </div>
 </section>
 

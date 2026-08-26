@@ -13,6 +13,7 @@ import {
   type AgentExecutionContext,
   type AgentDefinition,
   InMemoryContextStore,
+  StepInputValidationError,
 } from "@sapiom/agent";
 import {
   type StepCompletionPayload,
@@ -20,6 +21,7 @@ import {
   type StepDispatchRequest,
   type AgentRunnerCore,
   parseCorrelationId,
+  serializeStepCompletionError,
   STEP_COMPLETION_OUTCOME,
 } from "@sapiom/agent-runtime";
 import { createStubClient, type StubCallRecord } from "@sapiom/tools/stub";
@@ -35,11 +37,16 @@ export interface LogEntry {
 /** One step attempt's record in the local run trace. */
 export interface LocalStepTrace {
   step: string;
+  /** Zero-based attempt index, matching agent-runtime's execution state. */
   attempt: number;
   input: unknown;
-  status: "succeeded" | "threw";
+  status: "running" | "succeeded" | "threw";
+  startedAt?: string;
+  finishedAt?: string;
   output?: unknown;
   directive?: NextStepDirective;
+  /** Snapshot taken after the attempt settles; absent on the start event. */
+  sharedStateAfter?: Record<string, unknown>;
   error?: { name: string; message: string; stack?: string };
   logs: LogEntry[];
   /** Capability calls the step's stub client served, in call order. Each entry
@@ -49,6 +56,12 @@ export interface LocalStepTrace {
    *  empty array — honest absence. */
   calls?: StubCallRecord[];
 }
+
+export type LocalStepTracePhase = "started" | "settled";
+export type LocalStepTraceSink = (
+  phase: LocalStepTracePhase,
+  trace: LocalStepTrace,
+) => void;
 
 export class LocalStubDispatcher implements StepDispatcher {
   private core: AgentRunnerCore | null = null;
@@ -70,7 +83,16 @@ export class LocalStubDispatcher implements StepDispatcher {
   constructor(
     private readonly definition: AgentDefinition,
     private readonly stubs: StubFile,
+    private readonly traceSink?: LocalStepTraceSink,
   ) {}
+
+  private emit(phase: LocalStepTracePhase, trace: LocalStepTrace): void {
+    try {
+      this.traceSink?.(phase, trace);
+    } catch {
+      // Observability must never change author-code execution semantics.
+    }
+  }
 
   setCore(core: AgentRunnerCore): void {
     this.core = core;
@@ -101,8 +123,20 @@ export class LocalStubDispatcher implements StepDispatcher {
       );
 
     const logs: LogEntry[] = [];
+    const startedAt = new Date().toISOString();
+    this.emit("started", {
+      step: request.stepName,
+      attempt: request.attempt,
+      input: request.input,
+      status: "running",
+      startedAt,
+      logs: [],
+    });
     const sharedStore = new InMemoryContextStore<Record<string, unknown>>(
       request.shared,
+      {
+        stepName: request.stepName,
+      },
     );
     // The step's stub block is interpreted as capability overrides; unmatched
     // calls fall back to @sapiom/tools/stub's built-in defaults.
@@ -139,27 +173,53 @@ export class LocalStubDispatcher implements StepDispatcher {
       sapiom,
     } as unknown as AgentExecutionContext;
 
+    // Match the production step runner: the manifest's JSON Schema is a cheap
+    // pre-gate in AgentRunnerCore, while the definition's Zod schema is the
+    // authoritative parse immediately before author code runs. Besides
+    // validation, this applies defaults and object-key stripping.
+    // Without it, run_local could pass even though the same step saw a different
+    // value after deployment (the default starter's `.default("world")` was the
+    // simplest reproduction).
+    let stepInput = request.input;
     let directive: NextStepDirective;
     try {
-      directive = await step.run(request.input, ctx);
+      if (step.inputSchema) {
+        const parsedInput = step.inputSchema.safeParse(request.input);
+        if (!parsedInput.success) {
+          throw new StepInputValidationError(
+            request.stepName,
+            parsedInput.error.issues,
+          );
+        }
+        stepInput = parsedInput.data;
+      }
+      directive = await step.run(stepInput, ctx);
     } catch (err) {
       const e = err instanceof Error ? err : new Error(String(err));
       const traceEntry: LocalStepTrace = {
         step: request.stepName,
         attempt: request.attempt,
-        input: request.input,
+        // Validation failed before the step body ran, so retain the rejected
+        // wire payload. For author-code throws after a successful parse, record
+        // the value the step actually received.
+        input:
+          e instanceof StepInputValidationError ? request.input : stepInput,
         status: "threw",
+        startedAt,
+        finishedAt: new Date().toISOString(),
+        sharedStateAfter: sharedStore.snapshot(),
         error: { name: e.name, message: e.message, stack: e.stack },
         logs,
       };
       if (stepCalls.length > 0) traceEntry.calls = stepCalls;
       this.trace.push(traceEntry);
+      this.emit("settled", traceEntry);
       await this.core.completeDispatchedStep(
         {
           protocol: 1,
           correlationId: request.correlationId,
           outcome: STEP_COMPLETION_OUTCOME.THREW,
-          error: { name: e.name, message: e.message, stack: e.stack },
+          error: serializeStepCompletionError(e),
           shared: sharedStore.snapshot(),
         },
         parsed,
@@ -172,14 +232,18 @@ export class LocalStubDispatcher implements StepDispatcher {
     const traceEntry: LocalStepTrace = {
       step: request.stepName,
       attempt: request.attempt,
-      input: request.input,
+      input: stepInput,
       status: "succeeded",
+      startedAt,
+      finishedAt: new Date().toISOString(),
       output,
       directive,
+      sharedStateAfter: sharedStore.snapshot(),
       logs,
     };
     if (stepCalls.length > 0) traceEntry.calls = stepCalls;
     this.trace.push(traceEntry);
+    this.emit("settled", traceEntry);
     const payload: StepCompletionPayload = {
       protocol: 1,
       correlationId: request.correlationId,

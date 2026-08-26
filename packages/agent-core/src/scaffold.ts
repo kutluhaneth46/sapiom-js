@@ -1,8 +1,9 @@
 /**
  * scaffold — initialize a new agent project from a bundled template.
  *
- * Pure local operation: no network, no process.env. All inputs are passed
- * explicitly; the caller is responsible for output rendering.
+ * Local authoring operation: no Sapiom account or capability calls. Dependency
+ * versions are resolved from npm when reachable (with a bundled fallback), and
+ * the caller is responsible for output rendering.
  *
  * Template resolution: the `templates/` directory ships alongside `dist/` in
  * the published package. The resolution seam is deliberately isolated here so
@@ -13,6 +14,7 @@ import { execFileSync } from "node:child_process";
 import {
   cpSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   readdirSync,
   readFileSync,
@@ -23,7 +25,9 @@ import {
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { writeConfig } from "./config.js";
 import { AgentOperationError } from "./errors.js";
+import { installProjectDependencies } from "./install-deps.js";
 import { VERSION_FALLBACK } from "./version-fallback.generated.js";
 
 /**
@@ -192,9 +196,28 @@ function applyReplacements(
 function walk(dir: string, onFile: (file: string) => void): void {
   for (const entry of readdirSync(dir)) {
     const full = path.join(dir, entry);
+    // Agent Studio creates its private session/Canvas state before asking the
+    // coding agent to scaffold in this directory. It is not template content
+    // and must remain byte-for-byte untouched.
+    if (entry === ".sapiom" && lstatSync(full).isDirectory()) continue;
     if (statSync(full).isDirectory()) walk(full, onFile);
     else onFile(full);
   }
+}
+
+/**
+ * A Studio session owns `.sapiom/` and creates it before the coding agent can
+ * receive a scaffold prompt. Treat that one real directory as an empty target;
+ * every other pre-existing entry remains a hard stop so scaffolding cannot
+ * overwrite user work. Symlinks are deliberately rejected.
+ */
+function isScaffoldableTarget(targetDir: string): boolean {
+  if (!existsSync(targetDir)) return true;
+  const entries = readdirSync(targetDir);
+  if (entries.length === 0) return true;
+  if (entries.length !== 1 || entries[0] !== ".sapiom") return false;
+  const studioState = lstatSync(path.join(targetDir, ".sapiom"));
+  return studioState.isDirectory() && !studioState.isSymbolicLink();
 }
 
 function copyTemplate(
@@ -227,7 +250,7 @@ function copyTemplate(
 function initGitRepo(dir: string): boolean {
   const tryGit = (args: string[]): boolean => {
     try {
-      execFileSync("git", args, { cwd: dir, stdio: "ignore" });
+      execFileSync("git", args, { cwd: dir, stdio: "ignore", windowsHide: true });
       return true;
     } catch {
       return false;
@@ -272,6 +295,17 @@ export interface ScaffoldOptions {
    * the npm registry (may add ~5 s on slow connections).
    */
   versions?: ResolvedVersions;
+  /**
+   * Run a best-effort `npm install` in the new project so the Canvas can
+   * esbuild-bundle it on first render (its extraction resolves `@sapiom/agent`,
+   * `zod`, … from the project's own `node_modules`). Defaults to false so the
+   * CLI's `init` — which prints `npm install` as an explicit next step — and
+   * tests stay offline/fast. The Studio create path (the MCP scaffold tool)
+   * opts in with true so a newly-created agent opens with a working Canvas
+   * instead of a "Could not resolve …" render error. Non-fatal: a failed
+   * install (npm missing/offline) still returns a successful scaffold.
+   */
+  installDependencies?: boolean;
 }
 
 export interface ScaffoldResult {
@@ -280,20 +314,25 @@ export interface ScaffoldResult {
   projectName: string;
   /** Whether a git repo with an initial commit was created (false if `git` was unavailable). */
   gitInitialized: boolean;
+  /** Whether `npm install` ran and succeeded (always false when
+   *  `installDependencies` was not requested; false too when npm is
+   *  missing/offline — the Canvas then degrades to its "run npm install" hint). */
+  dependenciesInstalled: boolean;
 }
 
 /**
  * Initialize a new agent project from a bundled template.
  *
  * Throws `AgentOperationError` (code `DIR_NOT_EMPTY` | `UNKNOWN_TEMPLATE`) on
- * precondition failures; all other errors propagate as-is.
+ * precondition failures; all other errors propagate as-is. A target containing
+ * only Agent Studio's private `.sapiom/` directory is treated as empty.
  */
 export async function scaffold(opts: ScaffoldOptions): Promise<ScaffoldResult> {
   const { targetDir } = opts;
   const template = opts.template ?? DEFAULT_TEMPLATE;
   const projectName = opts.projectName ?? path.basename(targetDir);
 
-  if (existsSync(targetDir) && readdirSync(targetDir).length > 0) {
+  if (!isScaffoldableTarget(targetDir)) {
     throw new AgentOperationError({
       code: "DIR_NOT_EMPTY",
       message: `Target directory '${targetDir}' already exists and is not empty.`,
@@ -337,7 +376,26 @@ export async function scaffold(opts: ScaffoldOptions): Promise<ScaffoldResult> {
     JSON.stringify({ version: 1, steps: {} }, null, 2) + "\n",
   );
 
+  // The marker is intentionally valid but unlinked. Agent Studio discovers
+  // agent projects by this file; deploy/link fill in server identity later.
+  // It also records which starter produced the project — the provenance the
+  // Studio's lifecycle metrics read ("default" = bare/from-scratch scaffold).
+  writeConfig(targetDir, { starterId: template });
+
+  // Install deps BEFORE git init so the (gitignored) node_modules is present
+  // for the Canvas's first bundle while staying out of git history. Best-effort:
+  // a failed install (npm missing/offline) still yields a successful scaffold.
+  const dependenciesInstalled = opts.installDependencies
+    ? await installProjectDependencies(targetDir)
+    : false;
+
   const gitInitialized = initGitRepo(targetDir);
 
-  return { targetDir, template, projectName, gitInitialized };
+  return {
+    targetDir,
+    template,
+    projectName,
+    gitInitialized,
+    dependenciesInstalled,
+  };
 }

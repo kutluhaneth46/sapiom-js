@@ -1,5 +1,5 @@
 /**
- * Portable continue (SAP-2059): a session the agent can no longer reattach to
+ * Portable continue (SAP-2059): a session the coding agent can no longer reattach to
  * is still continuable, because the Studio seeds a FRESH session with its own
  * reconstruction of the old one.
  *
@@ -31,8 +31,14 @@ test.beforeEach(async ({ page }) => {
 });
 
 async function openPastRow(page: Page, testid: string): Promise<void> {
+  // Past-session rows moved out of the ⋯ menu into a sub-card that opens off
+  // the "Past sessions" row: ⋯ → Past sessions → the row.
   await page.getByTestId("history-trigger").click();
   await expect(page.getByTestId("history-menu")).toBeVisible();
+  // The flyout opens on hover onto its row (a click would toggle the
+  // hover-open straight back shut).
+  await page.getByTestId("past-sessions-trigger").hover();
+  await expect(page.getByTestId("past-sessions-card")).toBeVisible();
   await page.getByTestId(testid).click();
   await expect(page.getByTestId("dead-session-pane")).toBeVisible();
 }
@@ -52,21 +58,31 @@ test("a recorded, un-resumable session offers Continue and says what carries ove
   const reason = page.getByTestId("dead-session-resume-reason");
   await expect(reason).toContainText("no saved conversation for this session");
   await expect(reason).toContainText("seeded with the reconstruction below");
-  // Honest about what the new agent is actually getting.
+  // Honest about what the new coding agent is actually getting.
   await expect(reason).toContainText("a briefing about this session, not its context");
+  await expect(reason).toContainText("The new coding agent will need to check the repository");
+  await expect(reason).toContainText("the coding agent never writes a transcript");
 
   await page.screenshot({ path: "web/e2e/screenshots/portable-continue-pane.png", fullPage: true });
 });
 
 test("continuing it opens a NEW session rather than resuming the old one", async ({ page }) => {
   await openPastRow(page, REHYDRATABLE_ROW);
-  const tabs = page.getByTestId("session-tabs").locator(".session-tab");
-  const before = await tabs.count();
+  // While the pane is up, the exited pricing session is the one in context.
+  const context = page.getByTestId("session-context");
+  await expect(context).toHaveAttribute("data-session-id", "sess-pricing");
 
   await page.getByTestId("dead-session-continue").click();
 
-  await expect(tabs).toHaveCount(before + 1);
-  // The old session is not what came back — it stays exited.
+  // A FRESH session became active — the live workbench replaces the dead pane,
+  // and the active session is a new id, not the old one resumed in place.
+  await expect(page.getByTestId("agent-view")).toBeVisible();
+  await expect(context).not.toHaveAttribute("data-session-id", "sess-pricing");
+  // A real fresh id is present — `/.+/` proves the attribute EXISTS and is
+  // non-empty (a bare not-"" also passes when the attribute is absent).
+  await expect(context).toHaveAttribute("data-session-id", /.+/);
+  // The old session is not what came back — exited sessions never appear in
+  // the live tab strip.
   await expect(page.getByTestId("session-tab-sess-pricing")).toHaveCount(0);
   // And no failure toast: this path never attempts the resume that would 409.
   await expect(page.getByTestId("toast")).toHaveCount(0);
@@ -99,6 +115,11 @@ test("the rolling summary is off by default and reachable from settings", async 
   await expect(page.getByTestId("profile-menu")).toBeVisible();
   await page.getByTestId("settings-trigger").click();
   await expect(page.getByTestId("settings-popover")).toBeVisible();
+
+  const note = page.locator(".settings-note").filter({ hasText: "uses tokens" });
+  await expect(note).toContainText("a cheap one-shot coding-agent pass");
+  await expect(note).toContainText("the coding agent can no longer reattach");
+  await expect(note).not.toContainText("one-shot agent run");
 
   const toggle = page.getByTestId("rolling-summary-toggle");
   // Opt-in: it spends tokens on a background LLM call nobody asked for, and

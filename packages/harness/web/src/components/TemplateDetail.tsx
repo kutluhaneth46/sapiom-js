@@ -11,6 +11,7 @@ import {
 } from "../lib/templates";
 import { Icon } from "./Icon";
 import { Markdown } from "./Markdown";
+import { trackingAttrs } from "../lib/analytics/tracking-attrs";
 
 /**
  * The template's step structure, previewed with the canvas projections'
@@ -249,7 +250,11 @@ export function TemplateDetail({
   }, [template.kind, template.id, getTemplate]);
 
   return (
-    <div className="template-detail" data-testid="template-detail">
+    <div
+      className="template-detail"
+      data-testid="template-detail"
+      {...trackingAttrs({ surface: "template_detail", object: "template" })}
+    >
       <div className="template-detail-head">
         <h3 className="template-detail-name">{template.name}</h3>
         <div className="template-tags">
@@ -295,8 +300,8 @@ export function TemplateDetail({
       {/* What "Use template" really does — the two paths differ, say so. */}
       <p className="template-handoff" data-testid="template-handoff">
         {template.kind === "gallery"
-          ? "Using it forks the template into a repo you own, then clones it here. Needs a signed-in Sapiom account; the agent asks you to sign in if it is missing."
-          : "Scaffolds offline from the template bundled with the CLI. No account, no network."}
+          ? "Using it forks the template into a repo you own, then clones it here. Needs a signed-in Sapiom account; the coding agent asks you to sign in if it is missing."
+          : "Scaffolds from the template bundled with the CLI. No Sapiom account or capability spend; setup may access npm."}
       </p>
     </div>
   );

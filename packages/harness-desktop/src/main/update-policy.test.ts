@@ -191,6 +191,30 @@ describe("classifyUpdateError", () => {
     }
   });
 
+  it("still reads a 429 that GitHubProvider wrapped as a no-release message", () => {
+    // Verbatim shape from electron-updater: getLatestTagName wraps ANY failure
+    // of /releases/latest in its own "ensure a production release exists"
+    // sentence, so a throttled user was told "nothing published yet" — the
+    // message that invites another click, which deepens the rate limit.
+    const wrapped =
+      "Unable to find latest version on GitHub (https://github.com/sapiom/sapiom-js/releases.atom), " +
+      "please ensure a production release exists: HttpError: 429 Too Many Requests";
+    expect(classifyUpdateError(wrapped).kind).toBe("rate-limited");
+  });
+
+  it("names a GitHub 429 as rate-limiting, not jargon and not offline", () => {
+    // Seen live: a day of repeated installs/boot-checks from one home IP got
+    // the raw "429 Too Many Requests" into a toast. It must NOT classify as
+    // "offline" either — that kind gets an immediate retry (updater.ts),
+    // which is exactly what a throttled IP doesn't need.
+    const { kind, summary } = classifyUpdateError(
+      "HttpError: 429 Too Many Requests ... \"method: GET url: https://github.com/sapiom/sapiom-js/releases.atom\"",
+    );
+    expect(kind).toBe("rate-limited");
+    expect(summary).toContain("rate-limiting");
+    expect(summary).not.toContain("429");
+  });
+
   it("names an offline machine as such", () => {
     expect(classifyUpdateError("request to https://github.com failed, reason: getaddrinfo ENOTFOUND github.com").kind).toBe(
       "offline",

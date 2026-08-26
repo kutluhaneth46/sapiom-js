@@ -19,6 +19,68 @@ import type {
   PastSessionRecord,
   SpawnSpec,
 } from "../../shared/types.js";
+import { stripAnsi } from "../strip-ansi.js";
+
+/**
+ * Minimum `claude` version the harness supports.
+ *
+ * Below this, the binary predates behavior {@link ClaudeCodeAdapter.launch} /
+ * `resume` rely on for EVERY spawn — Auto permission mode at this floor, and
+ * `--plugin-dir` on older releases. A commander-style CLI aborts on an unknown
+ * option or value with a fast `exit 1`, BEFORE it ever runs its SessionStart
+ * hook, so the session dies with no `agentSessionId` and only an opaque exit
+ * code (the pty's stderr is discarded on exit). `doctor()` reports a
+ * below-floor claude as NOT ok so the desktop host installs a current one and
+ * the CLI surfaces an actionable upgrade remedy instead.
+ *
+ * Why 2.1.83:
+ * - Claude's permission-mode documentation identifies 2.1.83 as the first
+ *   version that supports Auto mode, which interactive Harness sessions use as
+ *   their initial mode.
+ * - The plugin system did not exist before the "Plugin System Released" entry
+ *   in `2.0.12`, so no `1.x` or `2.0.0`–`2.0.11` build can recognize
+ *   `--plugin-dir` — they reject it outright.
+ * - The changelog itemizes `--plugin-dir` only as modifications from `2.1.74`
+ *   onward, and the harness's own `--plugin-dir` skills usage is verified
+ *   against `2.1.x` (see core/inject/skills-plugin.ts). `2.1.x` is thus the
+ *   earliest range we can GUARANTEE both recognizes the flag and loads our
+ *   skills.
+ * This is the SINGLE source of truth — bump it whenever the adapter starts
+ * sending a flag, or relying on behavior, a newer `claude` introduced.
+ */
+export const MIN_CLAUDE_CODE_VERSION = "2.1.83";
+
+/**
+ * Extract a leading `major.minor.patch` from a `claude --version` line such as
+ * `"2.1.3 (Claude Code)"`. Returns null when no semver is present.
+ */
+export function parseClaudeVersion(
+  versionLine: string | null | undefined,
+): [number, number, number] | null {
+  const m = /(\d+)\.(\d+)\.(\d+)/.exec(versionLine ?? "");
+  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+}
+
+/**
+ * Whether a `claude --version` line is at least {@link MIN_CLAUDE_CODE_VERSION}.
+ *
+ * Deliberately surgical: the ONLY case treated as unsupported is a version we
+ * can parse AND that is below the floor. An absent or unparseable version
+ * returns `true` (supported) so a future change to claude's `--version` format
+ * can never mass-reject working installs — the floor exists to catch provably
+ * ancient binaries, not to gate on our own parser's limits.
+ */
+export function isClaudeVersionSupported(versionLine: string | null | undefined): boolean {
+  const parsed = parseClaudeVersion(versionLine);
+  if (!parsed) return true;
+  const floor = parseClaudeVersion(MIN_CLAUDE_CODE_VERSION)!;
+  for (let i = 0; i < 3; i++) {
+    if (parsed[i] > floor[i]) return true;
+    if (parsed[i] < floor[i]) return false;
+  }
+  return true;
+}
+
 /**
  * Maps a project cwd to the directory name Claude Code uses for its transcript
  * store under `~/.claude/projects/`. Claude Code applies this encoding before
@@ -300,6 +362,38 @@ function buildConfigArgs(opts: LaunchOpts): string[] {
   return args;
 }
 
+function buildInteractiveConfigArgs(opts: LaunchOpts): string[] {
+  const args = buildConfigArgs(opts);
+  // Auto remains the safe, classifier-backed default for eligible accounts.
+  // Claude Code silently downgrades when the account/model cannot enter Auto;
+  // the allow flag only adds Bypass to the Shift+Tab cycle so the user can
+  // explicitly opt in. It does not activate Bypass or suppress its warning.
+  args.push(
+    "--permission-mode",
+    "auto",
+    "--allow-dangerously-skip-permissions",
+  );
+  return args;
+}
+
+/**
+ * Claude Code's known blocking startup screens, matched against stripped-ANSI
+ * scrollback. Exported so the packaged smoke / e2e layers can pin the same
+ * patterns this adapter gates the ready-fallback on (see detectBlockingPrompt).
+ * Wording verified against Claude Code 2.1.x; a future rewording fails SAFE:
+ * an unmatched dialog only means the fallback flips `ready` and the injected
+ * prompt lands in a dialog the user is looking at anyway — the pre-fallback
+ * behaviour was the prompt silently vanishing after ten minutes.
+ */
+export const CLAUDE_BLOCKING_PROMPT_PATTERNS: readonly RegExp[] = [
+  // First-run / new-directory trust dialog.
+  /do\s+you\s+trust\s+the\s+files\s+in\s+this\s+(folder|directory)/i,
+  // First-run theme picker.
+  /choose\s+the\s+text\s+style/i,
+  // Signed-out login flow.
+  /select\s+login\s+method|sign\s+in\s+to\s+(use\s+)?claude/i,
+];
+
 export class ClaudeCodeAdapter implements HarnessAdapter {
   readonly id = "claude-code" as const;
   readonly eventSource = "hooks" as const;
@@ -307,6 +401,24 @@ export class ClaudeCodeAdapter implements HarnessAdapter {
    *  launch/resume path below, so a rehydration brief composed into that file
    *  needs no separate delivery. */
   readonly systemPromptDelivery = "launch-flag" as const;
+  /**
+   * See `HarnessAdapter.readyFallback`. The SessionStart hook stays the
+   * primary signal (isReadyEnough gives claude-code NO immediate scrollback
+   * shortcut); this only lets SessionManager's generously-timed fallback
+   * rescue a session whose hook chain is broken — on Windows the hook runs
+   * `node` through Claude's hook shell, and when that resolution fails the
+   * POST never fires, `ready` never flips, and the held first prompt was
+   * silently dropped.
+   */
+  readonly readyFallback = "hook-timeout" as const;
+  /**
+   * See `HarnessAdapter.assumesBracketedPaste`. Claude Code's Ink input layer
+   * enables mode 2004 in every interactive session — the macOS/Linux paste
+   * detection observing `ESC[?2004h` on real ptys is the in-repo evidence.
+   * Declared so Windows (where ConPTY hides that announcement) still paste-
+   * wraps multi-line prompts instead of submitting at the first newline.
+   */
+  readonly assumesBracketedPaste = true;
   private readonly binary: string;
   private readonly homeDir: string;
   private readonly fullScanMaxBytes: number;
@@ -317,10 +429,23 @@ export class ClaudeCodeAdapter implements HarnessAdapter {
     this.fullScanMaxBytes = options.fullScanMaxBytes ?? DEFAULT_FULL_SCAN_MAX_BYTES;
   }
 
+  /**
+   * See `HarnessAdapter.detectBlockingPrompt` and `readyFallback` above: this
+   * exists ONLY to gate the hook-timeout fallback (never type a stray Enter
+   * into an unanswered trust dialog) — it deliberately does NOT give
+   * claude-code Codex's immediate scrollback shortcut, because the hook is
+   * reliable wherever the hook chain itself works.
+   */
+  detectBlockingPrompt(scrollback: string): boolean {
+    const cleaned = stripAnsi(scrollback);
+    return CLAUDE_BLOCKING_PROMPT_PATTERNS.some((pattern) => pattern.test(cleaned));
+  }
+
   async doctor(): Promise<DoctorCheck[]> {
+    let versionLine: string;
     try {
-      const { stdout } = await execFileAsync(this.binary, ["--version"], { timeout: 5_000 });
-      return [{ name: "claude", ok: true, detail: stdout.trim() || "installed" }];
+      const { stdout } = await execFileAsync(this.binary, ["--version"], { timeout: 5_000, windowsHide: true });
+      versionLine = stdout.trim();
     } catch {
       return [
         {
@@ -330,10 +455,23 @@ export class ClaudeCodeAdapter implements HarnessAdapter {
         },
       ];
     }
+    // A too-old claude passes "is it on PATH" but rejects the flags we inject on
+    // every launch (see MIN_CLAUDE_CODE_VERSION), so it must report NOT ok — a
+    // green doctor for a binary that exit-1s every session is worse than none.
+    if (!isClaudeVersionSupported(versionLine)) {
+      return [
+        {
+          name: "claude",
+          ok: false,
+          detail: `\`${this.binary}\` is ${versionLine || "an unknown version"}, older than the required ${MIN_CLAUDE_CODE_VERSION}. Upgrade Claude Code: https://docs.claude.com/en/docs/claude-code/setup`,
+        },
+      ];
+    }
+    return [{ name: "claude", ok: true, detail: versionLine || "installed" }];
   }
 
   launch(opts: LaunchOpts): SpawnSpec {
-    const args = buildConfigArgs(opts);
+    const args = buildInteractiveConfigArgs(opts);
     if (opts.systemPromptFile) {
       args.push("--append-system-prompt", readPromptFile(opts.systemPromptFile));
     }
@@ -349,7 +487,7 @@ export class ClaudeCodeAdapter implements HarnessAdapter {
   }
 
   resume(agentSessionId: string, opts: LaunchOpts): SpawnSpec {
-    const args = ["--resume", agentSessionId, ...buildConfigArgs(opts)];
+    const args = ["--resume", agentSessionId, ...buildInteractiveConfigArgs(opts)];
     if (opts.systemPromptFile) {
       args.push("--append-system-prompt", readPromptFile(opts.systemPromptFile));
     }

@@ -1,5 +1,6 @@
 import {
   buildManifest,
+  MAX_SHARED_SNAPSHOT_BYTES,
   defineAgent,
   defineStep,
   fail,
@@ -8,9 +9,11 @@ import {
   terminate,
   agentManifestSchema,
   type AgentDefinition,
+  type AgentExecutionContext,
   type AgentManifest,
 } from "@sapiom/agent";
 import { CODING_RESULT_SIGNAL } from "@sapiom/tools";
+import { z } from "zod/v4";
 
 import { runLocal } from "./run-local.js";
 import type { StubFile } from "./stubs.js";
@@ -25,6 +28,160 @@ function manifestFor(def: AgentDefinition): AgentManifest {
 }
 
 describe("runLocal", () => {
+  it("streams start and settled evidence with timing, directive, and shared state", async () => {
+    const entry = defineStep({
+      name: "entry",
+      next: [],
+      terminal: true,
+      async run(input: { topic: string }, ctx) {
+        ctx.shared.set("topic", input.topic);
+        ctx.logger.info("prepared result");
+        return terminate({ accepted: true });
+      },
+    });
+    const def = defineAgent({
+      name: "live-evidence",
+      entry: "entry",
+      steps: { entry },
+    });
+    const events: Array<{ phase: string; trace: Record<string, unknown> }> = [];
+
+    const result = await runLocal({
+      definition: def,
+      manifest: manifestFor(def),
+      input: { topic: "leases" },
+      onStepTrace(phase, trace) {
+        // Snapshot at callback time: the settled event later mutates different
+        // data and must not make the start assertion pass accidentally.
+        events.push({
+          phase,
+          trace: JSON.parse(JSON.stringify(trace)) as Record<string, unknown>,
+        });
+      },
+    });
+
+    expect(result.outcome).toBe("completed");
+    expect(events).toHaveLength(2);
+    expect(events[0]).toMatchObject({
+      phase: "started",
+      trace: {
+        step: "entry",
+        attempt: 0,
+        input: { topic: "leases" },
+        status: "running",
+        logs: [],
+      },
+    });
+    expect(events[0]?.trace.startedAt).toEqual(expect.any(String));
+    expect(events[0]?.trace).not.toHaveProperty("finishedAt");
+    expect(events[1]).toMatchObject({
+      phase: "settled",
+      trace: {
+        step: "entry",
+        attempt: 0,
+        status: "succeeded",
+        output: { accepted: true },
+        directive: { kind: "terminate", output: { accepted: true } },
+        sharedStateAfter: { topic: "leases" },
+        logs: [{ level: "info", msg: "prepared result" }],
+      },
+    });
+    expect(events[1]?.trace.startedAt).toEqual(events[0]?.trace.startedAt);
+    expect(events[1]?.trace.finishedAt).toEqual(expect.any(String));
+  });
+
+  it("isolates observability sink errors from the local execution", async () => {
+    const entry = defineStep({
+      name: "entry",
+      next: [],
+      terminal: true,
+      async run() {
+        return terminate({ ok: true });
+      },
+    });
+    const def = defineAgent({
+      name: "sink-isolation",
+      entry: "entry",
+      steps: { entry },
+    });
+
+    await expect(
+      runLocal({
+        definition: def,
+        manifest: manifestFor(def),
+        onStepTrace() {
+          throw new Error("observer failed");
+        },
+      }),
+    ).resolves.toMatchObject({ outcome: "completed", output: { ok: true } });
+  });
+
+  it("applies Zod defaults before author code runs", async () => {
+    let capturedInput: unknown;
+    const entry = defineStep({
+      name: "entry",
+      next: [],
+      terminal: true,
+      inputSchema: z.object({
+        name: z.string().default("world"),
+      }),
+      async run(input) {
+        capturedInput = input;
+        return terminate({ greeting: `hello ${input.name}` });
+      },
+    });
+    const def = defineAgent({
+      name: "parsed-input",
+      entry: "entry",
+      steps: { entry },
+    });
+
+    const result = await runLocal({
+      definition: def,
+      manifest: manifestFor(def),
+    });
+
+    expect(result.outcome).toBe("completed");
+    expect(capturedInput).toEqual({ name: "world" });
+    expect(result.output).toEqual({ greeting: "hello world" });
+    expect(result.steps[0]?.input).toEqual({ name: "world" });
+  });
+
+  it("parses downstream step input with its declared Zod schema", async () => {
+    const start = defineStep({
+      name: "start",
+      next: ["finish"],
+      terminal: false,
+      async run() {
+        return goto("finish", { value: "  hello  ", extra: true });
+      },
+    });
+    const finish = defineStep({
+      name: "finish",
+      next: [],
+      terminal: true,
+      inputSchema: z.object({ value: z.string() }),
+      async run(input) {
+        return terminate(input);
+      },
+    });
+    const def = defineAgent({
+      name: "downstream-parse",
+      entry: "start",
+      steps: { start, finish },
+    });
+
+    const result = await runLocal({
+      definition: def,
+      manifest: manifestFor(def),
+      input: {},
+    });
+
+    expect(result.outcome).toBe("completed");
+    expect(result.output).toEqual({ value: "  hello  " });
+    expect(result.steps[1]?.input).toEqual({ value: "  hello  " });
+  });
+
   // The regression test: a handle-heavy workflow (the repo-helper shape) runs to
   // completion on built-in defaults — including `repo.pushFromSandbox(...)`, the
   // instance method that previously had no method body under stubs.
@@ -231,9 +388,12 @@ describe("runLocal", () => {
       next: [],
       pause: { signal: CODING_RESULT_SIGNAL, resumeStep: "finish" },
       async run(_input, ctx) {
-        return pauseUntilSignal(ctx.sapiom.models.coding.launch({ task: "t" }), {
-          resumeStep: "finish",
-        });
+        return pauseUntilSignal(
+          ctx.sapiom.models.coding.launch({ task: "t" }),
+          {
+            resumeStep: "finish",
+          },
+        );
       },
     });
     const finish = defineStep({
@@ -338,9 +498,12 @@ describe("runLocal", () => {
       next: [],
       pause: { signal: CODING_RESULT_SIGNAL, resumeStep: "done" },
       async run(_input, ctx) {
-        return pauseUntilSignal(ctx.sapiom.models.coding.launch({ task: "t" }), {
-          resumeStep: "done",
-        });
+        return pauseUntilSignal(
+          ctx.sapiom.models.coding.launch({ task: "t" }),
+          {
+            resumeStep: "done",
+          },
+        );
       },
     });
     const done = defineStep({
@@ -383,9 +546,12 @@ describe("runLocal", () => {
       next: [],
       pause: { signal: CODING_RESULT_SIGNAL, resumeStep: "review" },
       async run(_input, ctx) {
-        return pauseUntilSignal(ctx.sapiom.models.coding.launch({ task: "t" }), {
-          resumeStep: "review",
-        });
+        return pauseUntilSignal(
+          ctx.sapiom.models.coding.launch({ task: "t" }),
+          {
+            resumeStep: "review",
+          },
+        );
       },
     });
     const review = defineStep({
@@ -435,9 +601,12 @@ describe("runLocal", () => {
       next: [],
       pause: { signal: CODING_RESULT_SIGNAL, resumeStep: "finalize" },
       async run(_input, ctx) {
-        return pauseUntilSignal(ctx.sapiom.models.coding.launch({ task: "t" }), {
-          resumeStep: "finalize",
-        });
+        return pauseUntilSignal(
+          ctx.sapiom.models.coding.launch({ task: "t" }),
+          {
+            resumeStep: "finalize",
+          },
+        );
       },
     });
     const finalize = defineStep({
@@ -569,6 +738,113 @@ describe("runLocal", () => {
     expect(runs).toBe(2);
   });
 
+  it("terminalizes authoritative Zod input validation without consuming retries", async () => {
+    let runs = 0;
+    const validate = defineStep({
+      name: "validate",
+      next: [],
+      terminal: true,
+      // The manifest pre-gate deliberately relaxes additionalProperties while
+      // this authoritative Zod schema remains strict, exercising the remote-
+      // runner mismatch path rather than the engine pre-gate.
+      inputSchema: z.strictObject({ allowed: z.string().optional() }),
+      async run() {
+        runs += 1;
+        return terminate({ ok: true });
+      },
+    });
+    const def = defineAgent({
+      name: "strict-input",
+      entry: "validate",
+      steps: { validate },
+    });
+
+    const result = await runLocal({
+      definition: def,
+      manifest: manifestFor(def),
+      input: { unexpected: true },
+      maxAttemptsPerStep: 3,
+    });
+
+    expect(result.outcome).toBe("failed");
+    expect(result.steps).toHaveLength(1);
+    expect(result.steps[0]).toMatchObject({
+      step: "validate",
+      attempt: 0,
+      status: "threw",
+    });
+    expect(result.error).toMatchObject({
+      code: "STEP_INPUT_VALIDATION_FAILED",
+      retryable: false,
+      stepName: "validate",
+    });
+    expect(result.error).toBeInstanceOf(Error);
+    expect(runs).toBe(0);
+  });
+
+  it.each([
+    {
+      label: "an oversized candidate",
+      code: "CTX_SHARED_SIZE_LIMIT_EXCEEDED",
+      write(ctx: AgentExecutionContext) {
+        ctx.shared.set("candidate", "x".repeat(MAX_SHARED_SNAPSHOT_BYTES));
+      },
+    },
+    {
+      label: "an unserializable candidate",
+      code: "CTX_SHARED_SERIALIZATION_FAILED",
+      write(ctx: AgentExecutionContext) {
+        const circular: Record<string, unknown> = {};
+        circular.self = circular;
+        ctx.shared.set("candidate", circular);
+      },
+    },
+  ])(
+    "terminalizes $label at set time without retrying or committing it",
+    async ({ code, write }) => {
+      let runs = 0;
+      const collect = defineStep({
+        name: "collect",
+        next: [],
+        terminal: true,
+        async run(_input, ctx) {
+          runs += 1;
+          ctx.shared.set("accepted", "previous value");
+          write(ctx);
+          return terminate({ unreachable: true });
+        },
+      });
+      const def = defineAgent({
+        name: "shared-set-gate",
+        entry: "collect",
+        steps: { collect },
+      });
+
+      const result = await runLocal({
+        definition: def,
+        manifest: manifestFor(def),
+        maxAttemptsPerStep: 3,
+      });
+
+      expect(result.outcome).toBe("failed");
+      expect(result.steps).toHaveLength(1);
+      expect(result.steps[0]).toMatchObject({
+        step: "collect",
+        attempt: 0,
+        status: "threw",
+        sharedStateAfter: { accepted: "previous value" },
+      });
+      expect(result.error).toMatchObject({
+        code,
+        retryable: false,
+        stepName: "collect",
+        phase: "ctx_shared_set",
+      });
+      expect(result.error).toBeInstanceOf(Error);
+      expect(runs).toBe(1);
+    },
+  );
+
   // Prod parity: the server-side run defaults an absent input to {} (run.ts:63
   // `const { definitionId, input = {} } = opts`). Local must match — an absent
   // input must NOT reach the first step as undefined. A step that reads
@@ -584,7 +860,8 @@ describe("runLocal", () => {
         capturedInput = input;
         // mirrors the real failure mode: reading a property of what could be
         // undefined if the default is missing
-        const trimmed = (input as { topic?: string })?.topic?.trim() ?? "(none)";
+        const trimmed =
+          (input as { topic?: string })?.topic?.trim() ?? "(none)";
         return terminate({ trimmed });
       },
     });

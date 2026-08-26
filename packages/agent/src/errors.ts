@@ -1,3 +1,4 @@
+import { z } from 'zod/v4';
 // `zod/v4/core` subpath (present in zod 3.25.x AND zod 4.x): the issue type while
 // the `zod` peer can resolve to v3 or v4. See introspection.ts.
 import type { $ZodIssue } from 'zod/v4/core';
@@ -10,23 +11,75 @@ export class AgentError extends Error {
   }
 }
 
+/** Versioned wire contract for deterministic step-input validation failures. */
+export const STEP_INPUT_VALIDATION_ERROR_CONTRACT = Object.freeze({
+  version: 1,
+  errorCode: 'STEP_INPUT_VALIDATION_FAILED',
+  retryable: false,
+} as const);
+
+/** Stable cross-process representation; raw Zod issues deliberately stay local. */
+export const stepInputValidationErrorPayloadSchema = z.object({
+  name: z.literal('StepInputValidationError'),
+  message: z.string(),
+  code: z.literal(STEP_INPUT_VALIDATION_ERROR_CONTRACT.errorCode),
+  version: z.number().int().positive(),
+  stepName: z.string().min(1),
+  retryable: z.literal(false),
+  stack: z.string().optional(),
+});
+
+export type StepInputValidationErrorPayload = z.infer<typeof stepInputValidationErrorPayloadSchema>;
+
 /**
  * A step's input failed its declared `inputSchema`. Thrown both
  * synchronously by `createExecution` (entry input rejected before any
  * row is written) and at advance time by the runner (which fails the
  * execution terminally — bad input is deterministic, so retrying is
- * pure waste). Carries the raw Zod issues so callers (the admin tool)
- * can surface field-level detail.
+ * pure waste). Carries the raw Zod issues so in-process callers (the admin
+ * tool) can surface field-level detail. Use `toStepErrorPayload()` at the wire
+ * boundary; ordinary `JSON.stringify(error)` retains its legacy local shape.
  */
 export class StepInputValidationError extends AgentError {
   readonly stepName: string;
   readonly issues: readonly $ZodIssue[];
+
+  get code(): typeof STEP_INPUT_VALIDATION_ERROR_CONTRACT.errorCode {
+    return STEP_INPUT_VALIDATION_ERROR_CONTRACT.errorCode;
+  }
+
+  get version(): typeof STEP_INPUT_VALIDATION_ERROR_CONTRACT.version {
+    return STEP_INPUT_VALIDATION_ERROR_CONTRACT.version;
+  }
+
+  get retryable(): typeof STEP_INPUT_VALIDATION_ERROR_CONTRACT.retryable {
+    return STEP_INPUT_VALIDATION_ERROR_CONTRACT.retryable;
+  }
+
   constructor(stepName: string, issues: readonly $ZodIssue[]) {
     super(`Input for step '${stepName}' failed validation: ${formatIssues(issues)}`);
     this.name = 'StepInputValidationError';
     this.stepName = stepName;
     this.issues = issues;
   }
+
+  /** Build the bounded wire contract without changing global Error serialization. */
+  toStepErrorPayload(): StepInputValidationErrorPayload {
+    return {
+      name: 'StepInputValidationError',
+      message: this.message,
+      code: this.code,
+      version: this.version,
+      stepName: this.stepName,
+      retryable: this.retryable,
+      ...(this.stack === undefined ? {} : { stack: this.stack }),
+    };
+  }
+}
+
+/** Recognize the input-validation payload across bundles and processes. */
+export function isStepInputValidationErrorPayload(value: unknown): value is StepInputValidationErrorPayload {
+  return stepInputValidationErrorPayloadSchema.safeParse(value).success;
 }
 
 /** `path.to.field: message; other: message` — compact, human-readable. */

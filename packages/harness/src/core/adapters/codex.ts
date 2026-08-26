@@ -32,6 +32,7 @@ import type {
   PastSessionRecord,
   SpawnSpec,
 } from "../../shared/types.js";
+import { stripAnsi } from "../strip-ansi.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -44,41 +45,103 @@ const ROLLOUT_HEAD_BYTES = 65_536;
 const MAX_SCAN_DEPTH = 4; // ~/.codex/sessions/YYYY/MM/DD/*.jsonl
 
 /**
- * Matches Codex's directory-trust confirmation prompt ("Do you trust the
- * contents of this directory? ... 1. Yes, continue  2. No, quit"), after
- * `stripAnsi` — confirmed against a real capture: Codex's TUI positions
- * each *word* with its own cursor-addressing escape sequence instead of
- * emitting literal spaces between them (`trust\x1b[3;16Hthe\x1b[3;20H...`),
- * so even a stripped buffer runs the words together with no separator at
- * all; `\s*` between them tolerates that (and ordinary whitespace, in case
- * a future TUI revision renders differently). See `detectBlockingPrompt`
- * for why this exists at all (Codex's own structured readiness signal can't
- * be relied on standalone, unlike Claude Code's).
+ * Turn a rendered phrase into a pattern that also matches Codex's cursor-
+ * positioned output. Confirmed against real captures: the TUI can position
+ * each *word* separately instead of emitting literal spaces
+ * (`trust\x1b[3;16Hthe\x1b[3;20H...`), so `stripAnsi()` leaves adjacent words.
+ * `\s*` accepts both that representation and ordinary terminal text.
  */
-const TRUST_PROMPT_PATTERN = /trust\s*the\s*contents\s*of\s*this\s*directory/i;
+function tuiPhrase(phrase: string): RegExp {
+  const escapedWords = phrase
+    .trim()
+    .split(/\s+/)
+    .map((word) => word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  return new RegExp(escapedWords.join("\\s*"), "i");
+}
 
-/** Strips ANSI/CSI/OSC control sequences a pty stream is otherwise full of,
- *  so text pattern-matching (e.g. `TRUST_PROMPT_PATTERN`) sees the words a
- *  human would actually read rather than raw terminal-control bytes. Not
- *  exhaustive of every escape sequence a TUI could emit, but covers what
- *  Codex's TUI is confirmed (via real captures) to use: CSI (cursor moves,
- *  SGR color/style) and OSC (window title) sequences. */
-export function stripAnsi(text: string): string {
-  /* eslint-disable no-control-regex -- matching literal ESC (\x1b) / BEL
-   * (\x07) bytes is the entire point of an ANSI-sequence stripper; there's
-   * no non-control-character way to express "a real escape sequence". */
-  return text
-    // Lazy (`*?`), not greedy: a greedy `[^\x07]*` doesn't exclude `\x1b\\`
-    // (ST) from what it can consume, so it backtracks from the END of the
-    // whole string looking for the last reachable terminator instead of the
-    // next one — silently swallowing everything (including real prompt
-    // text) between an OSC sequence and some unrelated, much-later BEL/ST.
-    // Confirmed against a real capture: this exact bug made the trust-
-    // prompt regex below never match a full multi-KB scrollback buffer.
-    .replace(/\x1b\][\s\S]*?(?:\x07|\x1b\\)/g, "") // OSC ... BEL or ST
-    .replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "") // CSI sequences
-    .replace(/\x1b[()>=][A-Za-z0-9]?/g, ""); // charset/keypad-mode selection
-  /* eslint-enable no-control-regex */
+/**
+ * Recognizable signatures for Codex screens that need a human choice before
+ * the composer is safe for injected input. A signature may require multiple
+ * phrases so ordinary agent output mentioning one short label does not hold
+ * later programmatic input indefinitely.
+ *
+ * These strings are verified against codex-cli 0.147.0's onboarding, auth,
+ * model-migration, personality, and theme-picker sources. Detection remains
+ * deliberately best-effort: when Codex adds a new interactive startup screen,
+ * its stable rendered copy must be added here.
+ */
+const BLOCKING_PROMPT_SIGNATURES: readonly (readonly RegExp[])[] = [
+  [
+    tuiPhrase("trust the contents of this directory"),
+    tuiPhrase("Yes, continue"),
+    tuiPhrase("No, quit"),
+  ],
+  [
+    tuiPhrase("Sign in with ChatGPT to use Codex as part of your paid plan"),
+    tuiPhrase("connect an API key for usage-based billing"),
+  ],
+  [
+    tuiPhrase("Finish signing in via your browser"),
+    tuiPhrase("open the following link to authenticate"),
+  ],
+  [
+    tuiPhrase("Preparing device code login"),
+    tuiPhrase("Open this link in your browser and sign in"),
+  ],
+  [
+    tuiPhrase("Use your own OpenAI API key for usage-based billing"),
+    tuiPhrase("Paste or type your API key"),
+  ],
+  [
+    tuiPhrase("Before you start"),
+    tuiPhrase("Decide how much autonomy you want to grant Codex"),
+  ],
+  [
+    tuiPhrase("Codex just got an upgrade"),
+    tuiPhrase("Choose how you'd like Codex to proceed"),
+  ],
+  [
+    tuiPhrase("Select Personality"),
+    tuiPhrase("Choose a communication style for Codex"),
+  ],
+  [tuiPhrase("Select Syntax Theme"), tuiPhrase("Type to filter themes")],
+];
+
+/**
+ * Stable empty-composer copy across supported Codex CLI releases. This is not
+ * required for the ordinary already-trusted path; SessionManager uses it to
+ * prove that a previously detected onboarding screen has actually been
+ * replaced. Keep older copy here as well as newer copy: a real 0.143.0 startup
+ * renders "Use /skills to list available skills", while 0.147.0 renders "Ask
+ * Codex to do anything". Without both, accepting a trust prompt on 0.143.0
+ * leaves the safety latch closed even though the composer is visible.
+ */
+const READY_PROMPT_PATTERNS = [
+  tuiPhrase("Ask Codex to do anything"),
+  tuiPhrase("Use /skills to list available skills"),
+];
+
+/**
+ * Copy-independent composer proof. Codex's empty input row carries the `›`
+ * marker and its footer separates the mode from the cwd with `·`; onboarding
+ * selectors can use the same marker, but do not render that cwd footer. The
+ * blocker check in SessionManager still wins when a known modal and the
+ * underlying composer are present in the same diff-rendered frame.
+ */
+const COMPOSER_INPUT_MARKER = /›/u;
+const COMPOSER_CWD_FOOTER = /·\s*(?:~[\\/]|\/|[A-Za-z]:[\\/])/u;
+
+/**
+ * A modal can repaint only its moved selection row while leaving Codex's
+ * underlying footer visible. Full blocker detection deliberately requires a
+ * whole multi-phrase signature, but clearing an already-latched blocker is
+ * stricter: any one known modal fragment vetoes composer readiness until a
+ * clean frame arrives.
+ */
+function hasBlockingPromptFragment(rendered: string): boolean {
+  return BLOCKING_PROMPT_SIGNATURES.some((signature) =>
+    signature.some((pattern) => pattern.test(rendered)),
+  );
 }
 
 export interface CodexAdapterOptions {
@@ -223,7 +286,7 @@ export class CodexAdapter implements HarnessAdapter {
 
   async doctor(): Promise<DoctorCheck[]> {
     try {
-      const { stdout } = await execFileAsync(this.binary, ["--version"], { timeout: 5_000 });
+      const { stdout } = await execFileAsync(this.binary, ["--version"], { timeout: 5_000, windowsHide: true });
       return [{ name: "codex", ok: true, detail: stdout.trim() || "installed" }];
     } catch {
       return [
@@ -257,19 +320,32 @@ export class CodexAdapter implements HarnessAdapter {
   }
 
   /**
-   * See `HarnessAdapter.detectBlockingPrompt`. Codex needs this (Claude Code
-   * doesn't) because its rollout file — and therefore the SessionStart-
-   * equivalent event `SessionManager` otherwise waits on — isn't written
-   * until the *first* turn is actually submitted, confirmed empirically
-   * against a real `codex-cli 0.134.0`: an idle, fully-interactive session
-   * (trust prompt already accepted, composer visibly ready) produces zero
-   * files under `~/.codex/sessions` for as long as nothing is submitted.
-   * That real signal therefore can't arrive before the very first
-   * injection that needs it — a scrollback check is the only thing that
-   * can stand in for it up to that point.
+   * See `HarnessAdapter.readyFallback` and `detectBlockingPrompt`. Codex's
+   * rollout file — and therefore the SessionStart-equivalent event
+   * `SessionManager` otherwise waits on — isn't written until the first turn
+   * is submitted. Confirmed empirically against codex-cli 0.134.0: an idle,
+   * fully-interactive session produces no rollout for as long as nothing is
+   * submitted. SessionManager therefore publishes fallback readiness after a
+   * non-blocking frame settles (or reaches its bounded liveness ceiling),
+   * while retaining the same check at request time.
    */
+  readonly readyFallback = "immediate" as const;
+
   detectBlockingPrompt(scrollback: string): boolean {
-    return TRUST_PROMPT_PATTERN.test(stripAnsi(scrollback));
+    const rendered = stripAnsi(scrollback);
+    return BLOCKING_PROMPT_SIGNATURES.some((signature) =>
+      signature.every((pattern) => pattern.test(rendered)),
+    );
+  }
+
+  detectReadyPrompt(terminalOutput: string): boolean {
+    const rendered = stripAnsi(terminalOutput);
+    if (hasBlockingPromptFragment(rendered)) return false;
+    return (
+      READY_PROMPT_PATTERNS.some((pattern) => pattern.test(rendered)) ||
+      (COMPOSER_INPUT_MARKER.test(rendered) &&
+        COMPOSER_CWD_FOOTER.test(rendered))
+    );
   }
 
   /**

@@ -1,5 +1,320 @@
 # @sapiom/orchestration-core
 
+## 0.13.1
+
+### Patch Changes
+
+- Updated dependencies [065c9ca]
+  - @sapiom/tools@0.32.0
+  - @sapiom/agent@0.12.1
+
+## 0.13.0
+
+### Minor Changes
+
+- 555475d: Make `ctx.shared.set()` on the SDK's `InMemoryContextStore` an atomic
+  whole-snapshot quota gate. `runLocal` now constructs this store with step
+  context; hosts that have not adopted this store version may enforce the contract
+  only at execution boundaries during rollout. The store measures the complete
+  candidate as compact JSON UTF-8 before committing it, so oversized writes throw
+  `CTX_SHARED_SIZE_LIMIT_EXCEEDED` and retain the previous state.
+
+  Publish the bounded `CTX_SHARED_SERIALIZATION_FAILED` terminal error contract
+  for circular references, BigInt values, throwing `toJSON` methods, and other
+  `JSON.stringify` failures. Completion serializers and runners recognize the
+  new code through the closed platform-error registry and fail the step on its
+  current attempt without retrying. Ordinary JSON omission and coercion semantics
+  remain unchanged.
+
+  **Breaking:** `InMemoryContextStore.set()` can now throw synchronously for an
+  oversized or unserializable candidate. Existing local agents that wrote such
+  state now fail non-retryably on attempt 0. Migrate bulk state to durable storage
+  and keep only compact, JSON-compatible values or references in `ctx.shared`. If
+  a store is seeded with legacy invalid state, replace an offending key with a
+  value small enough to bring the complete candidate within the quota;
+  `TypedContextStore` has no `delete()` operation.
+
+### Patch Changes
+
+- 52efab3: `sapiom-agent-authoring` skill + scaffold `AGENTS.md`: system-design teaching for multi-stage builds. New "Composing Deployed Agents" section — one agent per PROJECT; a multi-stage system is several small projects composed via `ctx.sapiom.agents.run`, with a worked coordinator example — and the scaffold's "keep exactly one `defineAgent` export" rule now says so inline, so it reads as a per-project rule rather than a design instruction to inline every stage. Also drops the "pass `smart` if you must pin" no-op from the label rule (omitting `model` is the recommendation; `smart` already is the default).
+- Updated dependencies [555475d]
+  - @sapiom/agent@0.12.0
+  - @sapiom/agent-runtime@0.7.0
+
+## 0.12.2
+
+### Patch Changes
+
+- 9afeda9: Add a closed, versioned retry-classification contract for platform-owned step
+  errors. `CTX_SHARED_SIZE_LIMIT_EXCEEDED` and
+  `STEP_INPUT_VALIDATION_FAILED` now settle executions terminally without
+  consuming workflow retries; unknown, author, and capability errors keep the
+  legacy retry behavior.
+
+  `StepInputValidationError` now exposes a dedicated bounded wire payload with
+  stable `code`, `version`, `stepName`, and `retryable: false` fields while its
+  ordinary JSON representation continues carrying raw Zod issues for in-process
+  callers. Hosts receive a normalizing `parseNonRetryableStepErrorPayload`
+  registry plus `serializeStepCompletionError()` for completion reporters, and
+  may implement the additive atomic active-dispatch failure capability required
+  for terminal settlement. Older stores omit that capability and retain the
+  legacy retry path.
+
+- Updated dependencies [9afeda9]
+  - @sapiom/agent@0.11.0
+  - @sapiom/agent-runtime@0.6.0
+
+## 0.12.1
+
+### Patch Changes
+
+- Updated dependencies [d7d480a]
+  - @sapiom/tools@0.31.0
+  - @sapiom/agent@0.10.2
+
+## 0.12.0
+
+### Minor Changes
+
+- 00b8814: Adds `inspectStep(opts, client)` — fetches one step attempt's full-fidelity `input`/`output`/`error`/`logs` (`GET /executions/:id/steps/:stepId/io`), at a higher size cap than `inspect()`'s own `steps[]` bounds its aggregate read to. Reach for it when a step's fields on the execution projection look truncated.
+
+  - New exported `inspectStep`, `InspectStepOptions`, `StepIoDetail`, and `decodeStepIoDetail` (the tolerant decoder, mirroring `decodeExecutionProjection`'s degradation posture).
+  - `StepProjection` gains an optional `id` field (the step-attempt row id) — previously decoded from the wire but silently dropped; needed to call `inspectStep` from an `inspect()` read. `null` on a read from a server that doesn't report it — existing consumers are unaffected.
+
+### Patch Changes
+
+- 5a8eeea: `sapiom-agent-authoring` skill: teaches the LLM call-surface rule from step
+  code (`llm.run` one-shot vs `models.run` platform-driven loop vs `agents.run`
+  deployed-agent dispatch, with a worked example against the "reply with only
+  JSON" + string-parsing mistake) and settles the platform's naming
+  conventions (the overloaded "agent"/"run"/"task"/"session"/"dispatch" terms,
+  and "label" as the author-facing term for a `model:` value). Synced across
+  the canonical source, both scaffold templates, and the Claude Code plugin
+  copy. `@sapiom/tools`: corrected stale `agent.run`/`agent.coding` naming in
+  `models/index.ts`'s doc comments — the actual exported namespace is
+  `models`.
+- Updated dependencies [5a8eeea]
+- Updated dependencies [5a8eeea]
+  - @sapiom/tools@0.30.0
+  - @sapiom/agent@0.10.1
+
+## 0.11.4
+
+### Patch Changes
+
+- af764cd: Publish the authoritative 256 KiB `ctx.shared` whole-snapshot contract from
+  `@sapiom/agent`: `CTX_SHARED_QUOTA_CONTRACT`,
+  `MAX_SHARED_SNAPSHOT_BYTES`, `measureCtxSharedSnapshotBytes`,
+  `findCtxSharedSizeViolation`, `CtxSharedSizeLimitExceededError`,
+  `ctxSharedSizeLimitExceededPayloadSchema`, and
+  `isCtxSharedSizeLimitExceededPayload`, plus the
+  `CtxSharedSizeLimitPhase`, `CtxSharedSizeViolation`,
+  `CtxSharedSizeLimitExceededPayload`, and
+  `CtxSharedSizeLimitExceededErrorOptions` types.
+
+  `@sapiom/agent-runtime` now publicly exports `stepCompletionErrorSchema`,
+  preserves compatible structured quota payloads through protocol-1 parsing, and
+  re-exports the canonical compatibility limit.
+
+  Structured quota payloads include the reporting contract `version` and retain
+  unknown non-empty future phases during mixed-version rollouts; current error
+  construction remains limited to the three published enforcement phases.
+
+  This release defines measurement and error contracts; it does not make
+  `ctx.shared.set()` an atomic size gate or add local/final host-boundary
+  enforcement by itself. Host versions must adopt the contract. Authoring skills,
+  scaffolds, and MCP guidance now document compact ID/reference usage and that
+  enforcement can vary during rollout.
+
+- Updated dependencies [af764cd]
+  - @sapiom/agent@0.10.0
+  - @sapiom/agent-runtime@0.5.0
+
+## 0.11.3
+
+### Patch Changes
+
+- 04b7df5: Expose structured `CodingRunHttpError` details for failed coding requests and clarify repository-handle usage.
+
+  Add guidance for handling deterministic coding-repository failures.
+
+- Updated dependencies [04b7df5]
+  - @sapiom/tools@0.29.0
+  - @sapiom/agent@0.9.6
+
+## 0.11.2
+
+### Patch Changes
+
+- Updated dependencies [b768b18]
+- Updated dependencies [beb0f6f]
+  - @sapiom/tools@0.28.0
+  - @sapiom/agent@0.9.5
+
+## 0.11.1
+
+### Patch Changes
+
+- Updated dependencies [2b133e2]
+- Updated dependencies [beb3139]
+  - @sapiom/tools@0.27.0
+  - @sapiom/agent@0.9.4
+
+## 0.11.0
+
+### Minor Changes
+
+- b1d791b: Add an artifact-first Studio run workspace for local and cloud agents. Studio now
+  collects schema-driven input, streams chronological attempt evidence, renders
+  bounded outputs with Rendered and Raw views, and provides an isolated Focus mode
+  for inspecting input, output, state, directives, logs, and recorded capability
+  calls.
+
+  Local agent execution now emits start and settled trace events with timing,
+  directive, shared-state, log, and capability-call evidence. Desktop development
+  launches rebuild Harness first so Electron always opens the current Studio UI.
+
+## 0.10.7
+
+### Patch Changes
+
+- f21f6a6: Windows: sessions create and deliver their prompt, the canvas refreshes, and nothing pops a console window
+
+  The desktop app was unusable on Windows — every `POST /api/sessions` answered
+  `500 {"error":"internal error"}`, and when a session did start, its first
+  prompt never reached the agent. Root-caused on a real machine and fixed
+  end to end.
+
+  - **Sessions.** Claude Code's own native auto-updater had renamed the running
+    `claude.exe` to `claude.exe.old.<ts>` inside the app-managed npm prefix and
+    never written the replacement, so every spawn failed while `doctor` (which
+    shells `where`) still reported the agent present. Boot now verifies the
+    agent actually spawns, repairs the managed install when it doesn't, and sets
+    `DISABLE_AUTOUPDATER` for installs the app owns. The refusal itself names
+    the situation instead of "target could not be determined".
+  - **The first prompt.** It is held until the session reports ready, which only
+    happens when the generated `SessionStart` hook POSTs back — and Claude Code
+    runs hooks through Git Bash on Windows, which cannot resolve a `.cmd`, so
+    the desktop's `node.cmd`-only shims meant the hook never ran. The host now
+    ships npm's extensionless sh shim too, a 20s hook-timeout fallback rescues a
+    session whose hook chain is broken (gated on Claude's blocking-prompt
+    screens so it can never answer a trust dialog), `emit.cjs` gets budgets a
+    cold loopback survives (SessionStart only — the other hooks block the
+    agent), and multi-line prompts are paste-wrapped under ConPTY, which hides
+    the bracketed-paste announcement.
+  - **Console windows.** The `sapiom-dev` MCP server was launched via `npx`,
+    whose `cmd.exe` sat on screen as a persistent blank window; closing it
+    killed the server and every later tool call hung. The app now installs
+    `@sapiom/mcp` into its own prefix and launches it through the app binary
+    (GUI subsystem — no console can exist), and every `child_process` call
+    across the harness, agent-core, the MCP and the desktop passes
+    `windowsHide`.
+  - **Canvas.** `fs.watch` reports native separators, so the watcher's
+    POSIX-literal comparison never matched on Windows and `canvas.reload` was
+    never published — every canvas hot-reload was silently dead there (the
+    "Preparing your agent" placeholder outliving a finished install was the
+    visible symptom).
+  - **Diagnosis.** 500s now carry the real message (and errno) instead of
+    "internal error", the desktop tees its main-process log to
+    `<userData>/logs/main.log`, and spawn failures map to actionable 4xx.
+  - **Also:** Git is provisioned from git-for-windows' checksum-pinned MinGit
+    when a Windows machine has none (template clone and deploy shell out to a
+    real `git`); client-supplied `cwd` is normalized server-side and the SPA's
+    path helpers understand both separators; gateway requests time out instead
+    of hanging an MCP tool call for minutes; and the updater falls back to
+    HTTP/1.1, names a GitHub 429 for what it is, and bounds every path that can
+    reach GitHub.
+
+## 0.10.6
+
+### Patch Changes
+
+- 651c407: Anchor esbuild to the agent project in `check()`, local runs, and `bundleForDeploy()` (`absWorkingDir`). Given no working directory esbuild adopts the caller's cwd and enumerates that cwd's ancestor chain in addition to the project's — so for the Studio Canvas, whose caller is the harness package buried inside the app, a directory nowhere near the user's agent could fail the build: reported as `Cannot read directory "../../../../../../../..": result too large` followed by `Could not resolve <project>/index.ts` on a project that was readable, installed, and passed `check` from a terminal (where cwd _is_ the project). Diagnostics become legible as a side effect — paths print relative to the working directory, so a project error reads `index.ts` instead of `../../../../../Users/me/agents/x/index.ts`.
+
+  Also report the real cause when a bundle fails because the project directory itself can't be read. `describeBundleFailure` probed only for a missing `node_modules`, which an unreadable or vanished project directory also answers — so a failure whose esbuild error was `Cannot read directory "…": permission denied` told the user to run `npm install` in a directory nothing could list. It now names the directory and the reason (permission denied, no longer exists, not a directory) and keeps the raw esbuild detail.
+
+## 0.10.5
+
+### Patch Changes
+
+- 19b8bbb: Install a new agent's dependencies on scaffold, and turn the Canvas's "Could not resolve …" render error into an actionable "run npm install" hint
+
+  The Canvas step-graph extraction (`check` / `loadDefinition`) esbuild-bundles a project's `index.ts` resolving its imports — `@sapiom/agent`, `zod`, … — from the project's own `node_modules`. A newly-scaffolded (or freshly-cloned) agent whose deps were never installed therefore failed its very first, unprompted Canvas render with a raw esbuild wall (`Could not resolve "@sapiom/agent" … Could not resolve "zod"`), which the failure panel relayed verbatim.
+
+  Two fixes:
+
+  - `scaffold()` gains an opt-in `installDependencies` flag (returned as `dependenciesInstalled`), and the `sapiom_dev_agents_scaffold` MCP tool — the Studio's create path — now passes it, so a new agent opens with a working Canvas. Best-effort and non-fatal: a missing/offline npm still yields a successful scaffold. The `installProjectDependencies` helper (previously demo-only inside the harness's example seed) now lives in `@sapiom/agent-core` and is shared by both.
+  - `check` and `loadDefinition` now route bundle failures through `describeBundleFailure`, which detects the "no `node_modules` + unresolved import" case and returns `Dependencies are not installed. Run \`npm install\` in <dir>, then try again.` (preserving the raw esbuild detail). Every other bundle failure's message is unchanged.
+
+## 0.10.4
+
+### Patch Changes
+
+- 0bf040f: Fix `check` / `sapiom_dev_agents_check` always failing with `TYPECHECK_FAILED` on Windows
+
+  `runTypecheck` ran the project's compiler via the bare `node_modules/.bin/tsc` shim. On Windows that extensionless file is a POSIX sh script (npm ships the real launcher as `tsc.cmd`), which `execFileSync` cannot execute — it threw a spawn error with empty output, so the check reported `TYPECHECK_FAILED` with the generic "Run `tsc --noEmit` for details" hint even when the project's own `tsc --noEmit` passed cleanly. It now runs TypeScript's JS entry (`node_modules/typescript/bin/tsc`) under the current Node binary, which is platform-independent and avoids `.bin`/`.cmd`/PATHEXT/shell entirely.
+
+## 0.10.3
+
+### Patch Changes
+
+- 1000510: Describe deploy as a synthesized bundle of current local source, distinguish
+  account-free local validation from metered cloud builds and production runs,
+  and make execution inspection's cost-agnostic evidence boundary explicit.
+- 25fc26f: Make local agent runs parse step inputs through their Zod schemas like production, normalize relative check directories, stage and retry gallery clones across branch-propagation delays, and clarify that local validation stubs Sapiom capability traffic without sandboxing arbitrary author-code side effects.
+- 9addb66: Keep Agent Studio workspace discovery consistent across scanning, live updates, and the folder picker; preserve Studio state when cloning gallery templates; and clarify bundled starter network requirements.
+- Updated dependencies [1ac32ef]
+  - @sapiom/tools@0.26.1
+
+## 0.10.2
+
+### Patch Changes
+
+- 87636c1: Make bundled starters work from a fresh Agent Studio session by preserving Studio-owned state, writing the project discovery marker, and handing Claude the local scaffold MCP tool directly.
+- Updated dependencies [cc1ac0c]
+  - @sapiom/tools@0.26.0
+  - @sapiom/agent@0.9.3
+
+## 0.10.1
+
+### Patch Changes
+
+- Updated dependencies [27a1079]
+  - @sapiom/tools@0.25.0
+  - @sapiom/agent@0.9.2
+
+## 0.10.0
+
+### Minor Changes
+
+- be2b81b: Studio feedback: `sendFeedback` SDK function + the `sapiom_send_feedback` MCP tool (SAP-2286).
+
+  `@sapiom/agent-core` gains `sendFeedback({ message, context?, clientMeta? }, client)`, which POSTs
+  to `/v1/studio-feedback` and returns the stored record's id. Because that route sits at the API host
+  root rather than under `/v1/workflows`, `GatewayClient` gains one new public method,
+  `postAtHostRoot(path, body?)` — a separate method rather than a special-cased path prefix, so a call
+  site always declares which base its path is relative to. Every JSON request now funnels through a
+  single private `send()` (`openStream` keeps its own handshake path); as a side effect a `NETWORK`
+  error message now names the full URL instead of only the base.
+
+  `@sapiom/mcp` registers `sapiom_send_feedback`, which relays a user's feedback along with
+  client-side context it gathers itself (package version, platform, arch, node version, environment,
+  timestamp) so the model never has to read that off the machine. Internal: `ok`/`fail`/`gatewayClient`
+  moved from `tools/agents.ts` to a new `tools/shared.ts`, and `packageVersion()` from `analytics.ts`
+  to a new `version.ts`.
+
+### Patch Changes
+
+- 40d1c64: Use Agent and Agent run terminology in scaffolded and published authoring assets.
+
+## 0.9.13
+
+### Patch Changes
+
+- Updated dependencies [c8072cd]
+  - @sapiom/agent@0.9.0
+  - @sapiom/agent-runtime@0.4.3
+
 ## 0.9.12
 
 ### Patch Changes
