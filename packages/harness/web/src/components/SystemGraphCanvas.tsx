@@ -6,6 +6,10 @@ import type { HarnessApi } from "../lib/api";
 import { orderSystemGraphNodes } from "../lib/system-graph";
 import { EmptyState } from "./EmptyState";
 
+/**
+ * V0 mirrors the server's process-lifetime snapshot in the browser tab.
+ * SAP-2904 owns source-driven invalidation and user-visible freshness states.
+ */
 const requests = new Map<WorkspaceKey, Promise<SystemGraph>>();
 
 function loadSystemGraph(
