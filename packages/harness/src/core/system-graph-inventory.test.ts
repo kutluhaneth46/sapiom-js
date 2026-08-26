@@ -36,6 +36,7 @@ function provider(
     inspectManifestName?: (
       sourceRoot: string,
     ) => Promise<ManifestNameInspection>;
+    manifestInspectionBudgetMs?: number;
   } = {},
 ): HarnessRegistryInventoryProvider {
   return new HarnessRegistryInventoryProvider({
@@ -44,6 +45,9 @@ function provider(
       options.scopes ?? [{ workspaceKey: SCOPE.workspaceKey, cwd: SCOPE.root }],
     ...(options.inspectManifestName
       ? { inspectManifestName: options.inspectManifestName }
+      : {}),
+    ...(options.manifestInspectionBudgetMs !== undefined
+      ? { manifestInspectionBudgetMs: options.manifestInspectionBudgetMs }
       : {}),
   });
 }
@@ -165,6 +169,58 @@ describe("HarnessRegistryInventoryProvider", () => {
     ]);
     expect(inspectManifestName).toHaveBeenCalledTimes(6);
     expect(JSON.stringify(result.warnings)).not.toContain(WORKSPACE);
+  });
+
+  it("returns partial inventory when the enrichment budget expires", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const started: string[] = [];
+    const inspectManifestName = vi.fn(async (sourceRoot: string) => {
+      started.push(sourceRoot);
+      if (sourceRoot.endsWith("/fast")) {
+        return { status: "found" as const, name: "fast-manifest" };
+      }
+      await gate;
+      return { status: "absent" as const };
+    });
+
+    const result = await provider(
+      [
+        workflow("Fast", "fast", null),
+        workflow("Slow A", "slow-a", null),
+        workflow("Slow B", "slow-b", null),
+        workflow("Slow C", "slow-c", null),
+        workflow("Slow D", "slow-d", null),
+        workflow("Slow E", "slow-e", null),
+      ],
+      { inspectManifestName, manifestInspectionBudgetMs: 20 },
+    ).listAgents(SCOPE);
+
+    expect(result.agents.map((agent) => agent.agentKey)).toEqual([
+      "fast-manifest",
+      "local:slow-a",
+      "local:slow-b",
+      "local:slow-c",
+      "local:slow-d",
+      "local:slow-e",
+    ]);
+    expect(
+      result.warnings.map(({ code, agentKey }) => [code, agentKey]),
+    ).toEqual([
+      ["inventory-extraction-failed", "local:slow-a"],
+      ["inventory-extraction-failed", "local:slow-b"],
+      ["inventory-extraction-failed", "local:slow-c"],
+      ["inventory-extraction-failed", "local:slow-d"],
+      ["inventory-extraction-failed", "local:slow-e"],
+    ]);
+    expect(started).toHaveLength(5);
+
+    release();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(started).toHaveLength(5);
   });
 
   it("assigns each agent to its deepest known workspace", async () => {

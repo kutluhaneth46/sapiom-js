@@ -202,20 +202,28 @@ describe("StaticSystemGraphBuilder", () => {
       listAgents: vi.fn(async () => ({
         agents: [
           {
-            agentKey: "shared",
+            agentKey: "alpha",
             definitionId: null,
-            definitionSlug: "shared",
+            definitionSlug: "alpha",
             label: "/private/first",
-            resolutionAliases: ["shared"],
+            resolutionAliases: ["alpha"],
             sourceRoot: path.join(FIXTURE, "growth"),
           },
           {
-            agentKey: "shared",
+            agentKey: "alpha",
             definitionId: null,
-            definitionSlug: "shared",
+            definitionSlug: "alpha",
             label: "C:\\Users\\Demo\\second",
-            resolutionAliases: ["shared"],
+            resolutionAliases: ["alpha"],
             sourceRoot: path.join(FIXTURE, "research"),
+          },
+          {
+            agentKey: "local:growth",
+            definitionId: null,
+            definitionSlug: null,
+            label: "Caller",
+            resolutionAliases: ["local:growth"],
+            sourceRoot: path.join(FIXTURE, "caller"),
           },
           {
             agentKey: "/private/leaked-key",
@@ -235,23 +243,37 @@ describe("StaticSystemGraphBuilder", () => {
       vi.fn(async () => []),
     ).build(scope);
 
-    expect(graph.nodes).toHaveLength(3);
-    expect(new Set(graph.nodes.map((node) => node.id)).size).toBe(3);
-    expect(graph.nodes.map((node) => node.agentKey)).toEqual([
-      expect.stringMatching(/^local:[a-f0-9]{16}$/),
-      "local:growth",
-      "local:research",
-    ]);
-    expect(graph.nodes.map((node) => node.label)).toEqual([
-      expect.stringMatching(/^[a-f0-9]{16}$/),
-      "growth",
-      "research",
-    ]);
+    expect(graph.nodes).toHaveLength(4);
+    expect(new Set(graph.nodes.map((node) => node.id)).size).toBe(4);
+    const byKey = new Map(graph.nodes.map((node) => [node.agentKey, node]));
+    expect([...byKey.keys()]).toEqual(
+      expect.arrayContaining([
+        "local:caller",
+        "local:growth",
+        "local:research",
+      ]),
+    );
+    const hashedKey = [...byKey.keys()].find((key) =>
+      /^local:[a-f0-9]{16}$/.test(key),
+    );
+    expect(hashedKey).toBeDefined();
+    expect(byKey.get(hashedKey!)?.label).toBe(
+      hashedKey!.slice("local:".length),
+    );
+    expect(byKey.get("local:caller")?.label).toBe("Caller");
+    expect(byKey.get("local:growth")?.label).toBe("growth");
+    expect(byKey.get("local:research")?.label).toBe("research");
     expect(graph.warnings).toEqual([
       {
         code: "duplicate-agent-key",
-        agentKey: "shared",
-        message: "Multiple agents use shared; kept each with a local identity.",
+        agentKey: "alpha",
+        message: "Multiple agents use alpha; kept each with a local identity.",
+      },
+      {
+        code: "duplicate-agent-key",
+        agentKey: "local:growth",
+        message:
+          "Multiple agents use local:growth; kept each with a local identity.",
       },
     ]);
     expect(JSON.stringify(graph)).not.toContain("/private/");

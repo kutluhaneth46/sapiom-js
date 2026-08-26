@@ -57,30 +57,52 @@ export interface HarnessRegistryInventoryProviderOptions {
     | readonly WorkspaceScopeSummary[]
     | Promise<readonly WorkspaceScopeSummary[]>;
   inspectManifestName?: ManifestNameInspector;
+  /** Test seam; production keeps the default first-open latency budget. */
+  manifestInspectionBudgetMs?: number;
 }
 
 const MANIFEST_INSPECTION_CONCURRENCY = 4;
+// Individual extraction can wait 15 s; inventory must return well before that.
+const MANIFEST_INSPECTION_BUDGET_MS = 5_000;
 
-async function mapWithConcurrency<Input, Output>(
+async function mapWithDeadline<Input, Output>(
   values: readonly Input[],
   concurrency: number,
+  budgetMs: number,
   map: (value: Input) => Promise<Output>,
-): Promise<Output[]> {
-  const results = new Array<Output>(values.length);
+): Promise<Array<Output | undefined>> {
+  const results = new Array<Output | undefined>(values.length);
   let nextIndex = 0;
+  let deadlineReached = false;
   const worker = async (): Promise<void> => {
-    while (nextIndex < values.length) {
+    while (!deadlineReached && nextIndex < values.length) {
       const index = nextIndex;
       nextIndex += 1;
-      results[index] = await map(values[index]!);
+      try {
+        results[index] = await map(values[index]!);
+      } catch {
+        // The caller turns every unfinished/failed item into partial inventory.
+      }
     }
   };
-  await Promise.all(
+  const workers = Promise.all(
     Array.from({ length: Math.min(concurrency, values.length) }, async () =>
       worker(),
     ),
   );
-  return results;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<void>((resolve) => {
+    timer = setTimeout(() => {
+      deadlineReached = true;
+      resolve();
+    }, budgetMs);
+  });
+  await Promise.race([workers, deadline]);
+  if (!deadlineReached && timer) clearTimeout(timer);
+  // Already-started production inspections have their own 15 s timeout. Do
+  // not await them, and prevent workers from starting any more after the cap.
+  void workers;
+  return results.slice();
 }
 
 function isWindowsAbsolute(input: string): boolean {
@@ -217,7 +239,7 @@ function warningOrder(
  * V0 inventory adapter. WorkflowRegistry's scan/connect flows remain the only
  * writers; this provider receives snapshots and performs no discovery. The
  * injected manifest-name inspection may run cached extraction, so enrichment
- * is bounded to avoid unbounded child-process fan-out on a cold graph open.
+ * has both a concurrency cap and a wall-clock budget on a cold graph open.
  */
 export class HarnessRegistryInventoryProvider implements AgentInventoryProvider {
   constructor(
@@ -244,13 +266,22 @@ export class HarnessRegistryInventoryProvider implements AgentInventoryProvider 
         return owner?.workspaceKey === selectedScope.workspaceKey;
       });
 
-    const prepared = (
-      await mapWithConcurrency(
-        owned,
-        MANIFEST_INSPECTION_CONCURRENCY,
-        ({ workflow, sourceRoot }) =>
-          this.prepareAgent(selectedScope, workflow, sourceRoot),
-      )
+    const inspections = await mapWithDeadline(
+      owned,
+      MANIFEST_INSPECTION_CONCURRENCY,
+      this.options.manifestInspectionBudgetMs ?? MANIFEST_INSPECTION_BUDGET_MS,
+      ({ workflow, sourceRoot }) =>
+        this.prepareAgent(selectedScope, workflow, sourceRoot),
+    );
+    const prepared = Array.from(
+      { length: owned.length },
+      (_, index) =>
+        inspections[index] ??
+        this.prepareFallbackAgent(
+          selectedScope,
+          owned[index]!.workflow,
+          owned[index]!.sourceRoot,
+        ),
     ).sort(preparedOrder);
 
     const candidateCounts = new Map<AgentKey, number>();
@@ -402,6 +433,29 @@ export class HarnessRegistryInventoryProvider implements AgentInventoryProvider 
           (fallbackKey.slice("local:".length) || "Local agent"),
       ),
       resolutionAliases,
+      sourceRoot,
+    };
+  }
+
+  private prepareFallbackAgent(
+    scope: WorkspaceScope,
+    workflow: WorkflowInfo,
+    sourceRoot: string,
+  ): PreparedAgent {
+    const definitionSlug = normalizedAlias(workflow.definitionSlug);
+    const fallbackKey = workspaceRelativeLocalKey(scope.root, sourceRoot);
+    const candidateKey = definitionSlug ?? fallbackKey;
+    return {
+      candidateKey,
+      fallbackKey,
+      definitionId: workflow.definitionId,
+      definitionSlug,
+      extractionFailed: !definitionSlug,
+      label: safeLabel(
+        workflow.name,
+        definitionSlug ?? (fallbackKey.slice("local:".length) || "Local agent"),
+      ),
+      resolutionAliases: [candidateKey],
       sourceRoot,
     };
   }

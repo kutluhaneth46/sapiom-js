@@ -181,12 +181,22 @@ function normalizeInventory(
   }
 
   const used = new Set<AgentKey>();
+  const duplicateKeys = new Set(
+    [...counts.entries()]
+      .filter(([, count]) => count > 1)
+      .map(([candidateKey]) => candidateKey),
+  );
   const agents = prepared.map(({ agent, candidateKey, fallbackKey }) => {
     const duplicate = (counts.get(candidateKey) ?? 0) > 1;
     let agentKey = duplicate ? fallbackKey : candidateKey;
+    if (used.has(agentKey)) {
+      duplicateKeys.add(agentKey);
+      agentKey = fallbackKey;
+    }
     const base = agentKey;
     let suffix = 2;
     while (used.has(agentKey)) {
+      duplicateKeys.add(base);
       agentKey = `${base}~${suffix}`;
       suffix += 1;
     }
@@ -194,7 +204,10 @@ function normalizeInventory(
 
     const resolutionAliases = [
       ...new Set(
-        [...(duplicate ? [candidateKey] : []), ...agent.resolutionAliases]
+        [
+          ...(agentKey !== candidateKey ? [candidateKey] : []),
+          ...agent.resolutionAliases,
+        ]
           .map(safeAgentKey)
           .filter((alias): alias is AgentKey => alias !== null),
       ),
@@ -213,8 +226,7 @@ function normalizeInventory(
   );
 
   const warnings: GraphWarning[] = [];
-  for (const candidateKey of [...counts.keys()].sort()) {
-    if ((counts.get(candidateKey) ?? 0) < 2) continue;
+  for (const candidateKey of [...duplicateKeys].sort()) {
     warnings.push({
       code: "duplicate-agent-key",
       agentKey: candidateKey,
