@@ -93,6 +93,12 @@ import {
 import { ensureCanvasTemplate } from "../core/canvas-template.js";
 import { renderCanvasForSession } from "../core/canvas-render.js";
 import { invalidateExtractionCache } from "../core/canvas-cache.js";
+import {
+  LocalWorkspaceScopeCatalog,
+  StaticSystemGraphBuilder,
+  WorkflowRegistryInventoryReader,
+} from "../core/system-graph.js";
+import { SystemGraphStore } from "../core/system-graph-store.js";
 import { sweepNdjson } from "../core/collector/store-retention.js";
 import {
   createDefinitionSlugResolver,
@@ -102,6 +108,7 @@ import { resolveManifestName } from "../core/definition-name.js";
 import { createBootTokenMiddleware } from "./auth.js";
 import { createApiKeyProvider } from "../core/api-key-provider.js";
 import { createRestRouter } from "./rest.js";
+import { createSystemGraphRouter } from "./system-graph.js";
 import { createStaticRouter } from "./static.js";
 import { createTerminalWebSocketHandler } from "./terminal-ws.js";
 import { createEventsWebSocketHandler } from "./events-ws.js";
@@ -684,6 +691,15 @@ export const startServer = async (
   });
   await sessionManager.init();
 
+  const workspaceScopeCatalog = new LocalWorkspaceScopeCatalog(() =>
+    sessionManager.list().map((session) => session.cwd),
+  );
+  const systemGraphStore = new SystemGraphStore(
+    new StaticSystemGraphBuilder(
+      new WorkflowRegistryInventoryReader(() => workflowsCache),
+    ),
+  );
+
   const sessionSweepTimer = setInterval(
     () => sessionManager.sweepDeadSessions(),
     SESSION_LIVENESS_SWEEP_MS,
@@ -1085,6 +1101,7 @@ export const startServer = async (
           }
         : null,
       listWorkflows: () => workflowRegistry.list().then(enrichWorkflows),
+      listWorkspaceScopes: () => workspaceScopeCatalog.list(),
       listMacros: () => DEFAULT_MACROS,
       findWorkflow: (workflowPath) =>
         workflowsCache.find((w) => w.path === workflowPath) ?? null,
@@ -1127,6 +1144,13 @@ export const startServer = async (
         tenantId: identity?.tenantId ?? null,
       },
       settingsPath: statePaths.settings,
+    }),
+  );
+  app.use(
+    "/api",
+    createSystemGraphRouter({
+      scopeResolver: workspaceScopeCatalog,
+      store: systemGraphStore,
     }),
   );
   app.use(

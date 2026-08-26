@@ -728,10 +728,50 @@ test("one view only: there is no folders/groups toggle in the agent-primary rail
   await expect(page.getByTestId("workflow-onboarding-flow")).toBeVisible();
 });
 
+test("workspace graph: folder selection opens the cached direct-connection graph without touching the session", async ({ page }) => {
+  const folder = page.getByTestId("workspace-group-rfq-workflows");
+  await expect(page.getByTestId("session-context")).toHaveAttribute("data-session-id", "sess-boot");
+  await expect(page.locator(".harness-terminal")).toBeVisible();
+
+  // The label selects the workspace; it does not fold the children.
+  await folder.locator(".workspace-row-main").click();
+  await expect(folder).toHaveClass(/is-selected/);
+  await expect(page.getByTestId("workflow-rfq")).toBeVisible();
+  await expect(page.getByTestId("system-graph-canvas")).toBeVisible();
+  await expect(page.getByTestId("system-graph-node-research")).toContainText("Research");
+  await expect(page.getByTestId("system-graph-node-growth")).toContainText("Growth");
+  await expect(page.getByText("invokes · static · async")).toBeVisible();
+  await page.screenshot({ path: "web/e2e/screenshots/workspace-system-graph.png", fullPage: true });
+
+  // Center and active session are unchanged by a right-Canvas subject change.
+  await expect(page.getByTestId("session-context")).toHaveAttribute("data-session-id", "sess-boot");
+  await expect(page.locator(".harness-terminal")).toBeVisible();
+  await expect(page.getByTestId("right-tab-steps")).toBeDisabled();
+
+  // Agent navigation restores the existing per-agent board. Reopening the
+  // folder reuses the page cache, so mock mode records only one request.
+  await page.getByTestId("workflow-leasing").locator(".workflow-item-trigger").click();
+  await expect(page.locator(".canvas-iframe")).toBeVisible();
+  await folder.locator(".workspace-row-main").click();
+  await expect(page.getByTestId("system-graph-canvas")).toBeVisible();
+  expect(
+    await page.evaluate(() => {
+      const value = (window as unknown as { __HARNESS_TEST__?: Record<string, unknown> })
+        .__HARNESS_TEST__?.systemGraphRequests;
+      return Array.isArray(value) ? value.length : 0;
+    }),
+  ).toBe(1);
+
+  // Only the explicit chevron changes expansion; graph selection stays put.
+  await page.getByTestId("workspace-disclosure-rfq-workflows").click();
+  await expect(page.getByTestId("workflow-rfq")).toHaveCount(0);
+  await expect(page.getByTestId("system-graph-canvas")).toBeVisible();
+});
+
 test.describe("held arrangement", () => {
   test("workspace collapse, right tab, and right-pane collapse survive a reload", async ({ page }) => {
-    // Collapse the rfq workspace group (plain header toggles on click).
-    await page.getByTestId("workspace-group-rfq-workflows").locator(".workspace-row-main").click();
+    // Collapse is owned only by the dedicated chevron.
+    await page.getByTestId("workspace-disclosure-rfq-workflows").click();
     await expect(page.getByTestId("workflow-rfq")).toHaveCount(0);
 
     // Pick the Steps tab, then fold the right pane away.

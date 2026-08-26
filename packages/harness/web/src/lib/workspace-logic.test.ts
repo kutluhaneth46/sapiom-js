@@ -68,6 +68,15 @@ describe("buildWorkspaceTree (explorer: folders > agents)", () => {
     expect(tree.orphanAgents.map((a) => a.workflow.name)).toEqual(["orphan"]);
   });
 
+  it("joins each folder to its opaque workspace identity", () => {
+    const tree = buildWorkspaceTree(
+      [workflow({ path: "/home/dev/app/leasing" })],
+      [session({ cwd: "/home/dev/app" })],
+      [{ workspaceKey: "workspace-app", cwd: "/home/dev/app" }],
+    );
+    expect(tree.workspaces[0]?.workspaceKey).toBe("workspace-app");
+  });
+
   it("files every agent under its longest-prefix folder, sessions or not", () => {
     // Two live sessions bound to the same agent — neither surfaces as a rail
     // row; the folder simply carries the one agent.

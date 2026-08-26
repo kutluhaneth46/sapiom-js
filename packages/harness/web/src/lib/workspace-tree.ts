@@ -1,4 +1,5 @@
 import type { HarnessSession, WorkflowInfo } from "@shared/types";
+import type { WorkspaceScopeSummary } from "@shared/system-graph";
 
 /**
  * One agent (workflow) node in the rail. The rail is an EXPLORER of what
@@ -18,6 +19,7 @@ export interface AgentNode {
  * target so its sessions can open as tabs in the main panel.
  */
 export interface WorkspaceFolder {
+  workspaceKey: string | null;
   cwd: string;
   label: string;
   /** Agents owned by this folder, stable order (path). */
@@ -56,6 +58,7 @@ const isUnder = (childPath: string, cwd: string): boolean =>
 export function buildWorkspaceTree(
   workflows: WorkflowInfo[],
   sessions: HarnessSession[],
+  workspaceScopes: readonly WorkspaceScopeSummary[] = [],
 ): WorkspaceTree {
   const liveSessions = sessions.filter((session) => session.status !== "exited");
   const remaining = new Set(workflows);
@@ -99,7 +102,13 @@ export function buildWorkspaceTree(
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt) || a.id.localeCompare(b.id));
     // Nothing to show: no agents and no live session to keep the folder alive.
     if (agents.length === 0 && bareSessions.length === 0) continue;
-    workspaces.push({ cwd, label: basename(cwd), agents, bareSessions });
+    workspaces.push({
+      workspaceKey: workspaceScopes.find((scope) => scope.cwd === cwd)?.workspaceKey ?? null,
+      cwd,
+      label: basename(cwd),
+      agents,
+      bareSessions,
+    });
   }
 
   const orphanAgents: AgentNode[] = Array.from(remaining)

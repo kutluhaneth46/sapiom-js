@@ -14,12 +14,14 @@
  *     another tab is active so a running Visualize enrichment (and the
  *     graph-posting document) is never disturbed by a tab flip.
  *
- * The mapping invariant: rail focused agent == tab strip's agent == active
- * tab's bound agent == right panel's subject.
+ * The agent mapping invariant remains intact unless a workspace folder is
+ * selected. That one action changes only the right Canvas subject to the
+ * workspace graph; the focused agent, tab strip, binding, and center stay put.
  */
 import { useEffect, useRef, useState } from "react";
 import type { JSX } from "react";
 import type { HarnessKind, HarnessSession, MacroDef, SessionSummary, WorkflowInfo } from "@shared/types";
+import type { CanvasSubject } from "@shared/system-graph";
 
 import { CanvasPane } from "./components/CanvasPane";
 import { CodePanel } from "./components/CodePanel";
@@ -89,6 +91,9 @@ export const App = (): JSX.Element => {
   // selection and the main panel's tab-strip subject. The active tab's
   // session is harness.activeSessionId.
   const [focusedAgentPath, setFocusedAgentPath] = useState<string | null>(null);
+  // Workspace selection is a RIGHT-CANVAS subject only. The focused agent,
+  // active session, center terminal, and bindings stay exactly as they were.
+  const [selectedWorkspaceKey, setSelectedWorkspaceKey] = useState<string | null>(null);
   // Lifted so the telemetry chip in the session bar can open the settings
   // popover from outside SessionBar's own gear button.
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -161,6 +166,7 @@ export const App = (): JSX.Element => {
         const target = tabs[Number(e.key) - 1];
         if (target) {
           e.preventDefault();
+          setSelectedWorkspaceKey(null);
           setOverviewSelected(false);
           setReviewSummary(null);
           harness.setActiveSessionId(target.id);
@@ -333,6 +339,7 @@ export const App = (): JSX.Element => {
   // The ONE choke point for session creation: sets the focus to the new
   // session's folder (so the main panel shows it) and fires telemetry once.
   const createSessionAt = async (cwd: string, agentHarness: HarnessKind): Promise<HarnessSession> => {
+    setSelectedWorkspaceKey(null);
     setOverviewSelected(false);
     setReviewSummary(null);
     setFocusedAgentPath(cwd);
@@ -449,6 +456,7 @@ export const App = (): JSX.Element => {
   // Switch to a session (history-menu pick, palette hit): focus follows it so
   // the main panel shows its context (its bound agent, or its own folder).
   const openSession = (id: string): void => {
+    setSelectedWorkspaceKey(null);
     setOverviewSelected(false);
     setReviewSummary(null);
     closeMobileDrawer();
@@ -460,6 +468,7 @@ export const App = (): JSX.Element => {
   // Select a tab in the strip — same as openSession, but the tab always
   // belongs to the current focus, so focus never moves.
   const selectTab = (id: string): void => {
+    setSelectedWorkspaceKey(null);
     setOverviewSelected(false);
     setReviewSummary(null);
     harness.setActiveSessionId(id);
@@ -483,6 +492,7 @@ export const App = (): JSX.Element => {
 
   // One entry point for reviewing a past (transcript) session.
   const reviewPastSession = (summary: SessionSummary): void => {
+    setSelectedWorkspaceKey(null);
     setOverviewSelected(false);
     setReviewSummary(summary);
     closeMobileDrawer();
@@ -504,6 +514,7 @@ export const App = (): JSX.Element => {
   // its most-recent session (or none -> the "start a session" empty state).
   // Opening agent A never disturbs another agent's binding.
   const handleFocusAgent = (path: string): void => {
+    setSelectedWorkspaceKey(null);
     setOverviewSelected(false);
     setReviewSummary(null);
     setFocusedAgentPath(path);
@@ -523,6 +534,7 @@ export const App = (): JSX.Element => {
   // session in the workflow's own workspace, or STARTS one in the workflow's
   // folder. Resolves to the session the binding landed on.
   const handleBindWorkflow = async (path: string): Promise<string | null> => {
+    setSelectedWorkspaceKey(null);
     closeMobileDrawer();
     const live = state.sessions.filter((s) => s.status !== "exited");
     const ownsPath = (s: HarnessSession): boolean =>
@@ -554,6 +566,13 @@ export const App = (): JSX.Element => {
     await harness.bindWorkflow(targetId, path);
     setFocusedAgentPath(path);
     return targetId;
+  };
+
+  const handleSelectWorkspace = (workspaceKey: string): void => {
+    setSelectedWorkspaceKey(workspaceKey);
+    setRightTab("canvas");
+    setRightCollapsed(false);
+    closeMobileDrawer();
   };
 
   // Shared by the canvas Visualize CTA, the steps macros, and anything else
@@ -635,9 +654,12 @@ export const App = (): JSX.Element => {
           minWidth={RAIL_MIN}
           workflows={state.workflows}
           sessions={state.sessions}
+          workspaceScopes={state.workspaceScopes}
           activeSessionId={harness.activeSessionId}
-          focusedAgentPath={focusedAgentPath}
+          focusedAgentPath={selectedWorkspaceKey ? null : focusedAgentPath}
           onFocusAgent={handleFocusAgent}
+          selectedWorkspaceKey={selectedWorkspaceKey}
+          onSelectWorkspace={handleSelectWorkspace}
           onOpenPalette={() => setPaletteOpen(true)}
           onConnect={async (path) => {
             await harness.connectWorkflow(path);
@@ -908,6 +930,7 @@ export const App = (): JSX.Element => {
                 className={"right-pane-tab" + (rightTab === "steps" ? " is-active" : "")}
                 onClick={() => setRightTab("steps")}
                 data-testid="right-tab-steps"
+                disabled={selectedWorkspaceKey !== null}
               >
                 Steps
               </button>
@@ -920,6 +943,7 @@ export const App = (): JSX.Element => {
                   setCodePanelEverShown(true);
                 }}
                 data-testid="right-tab-code"
+                disabled={selectedWorkspaceKey !== null}
               >
                 Code
               </button>
@@ -927,7 +951,7 @@ export const App = (): JSX.Element => {
                 {/* Deployed pill → dashboard. The board has no subheader now, so
                     its deploy status lives here in the tab bar (Tidjane's design:
                     nothing sits between the tabs and the canvas). */}
-                {rightTab === "canvas" && rightPaneWorkflow?.definitionId != null && (
+                {selectedWorkspaceKey === null && rightTab === "canvas" && rightPaneWorkflow?.definitionId != null && (
                   <a
                     className="status-tag status-tag-action workflow-deployed-tag right-pane-deployed"
                     data-testid="workflow-dashboard-link"
@@ -942,7 +966,7 @@ export const App = (): JSX.Element => {
                   </a>
                 )}
                 {/* Canvas expand sits right beside the collapse-panel toggle. */}
-                {rightTab === "canvas" && (
+                {selectedWorkspaceKey === null && rightTab === "canvas" && (
                   <button
                     className="theme-toggle"
                     data-testid="canvas-expand"
@@ -970,6 +994,16 @@ export const App = (): JSX.Element => {
               data-testid="right-panel-canvas"
             >
               <CanvasPane
+                subject={
+                  selectedWorkspaceKey
+                    ? { kind: "workspace", workspaceKey: selectedWorkspaceKey }
+                    : ({
+                        kind: "agent",
+                        workflowPath: focusedAgentPath ?? rightPaneWorkflow?.path ?? "",
+                        sessionId: harness.activeSessionId,
+                      } satisfies CanvasSubject)
+                }
+                api={harness.api}
                 sessionId={harness.activeSessionId}
                 lastMessage={harness.lastMessage}
                 boundWorkflow={rightPaneWorkflow}

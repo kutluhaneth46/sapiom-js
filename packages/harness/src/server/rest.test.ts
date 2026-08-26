@@ -159,6 +159,19 @@ describe("createRestRouter", () => {
       expect(body.launchDir).toBe("/Users/demo/acme-app");
     });
 
+    it("surfaces opaque workspace identities when the server supplies them", async () => {
+      start({
+        listWorkspaceScopes: () => [
+          { workspaceKey: "workspace-app", cwd: "/Users/demo/acme-app" },
+        ],
+      });
+      const res = await fetch(`${baseUrl}/state`);
+      const body = (await res.json()) as { workspaceScopes: unknown[] };
+      expect(body.workspaceScopes).toEqual([
+        { workspaceKey: "workspace-app", cwd: "/Users/demo/acme-app" },
+      ]);
+    });
+
     it("omits availableHarnesses when the caller doesn't supply it", async () => {
       start();
       const res = await fetch(`${baseUrl}/state`);
@@ -1465,4 +1478,3 @@ describe("createRestRouter", () => {
     });
   });
 });
-

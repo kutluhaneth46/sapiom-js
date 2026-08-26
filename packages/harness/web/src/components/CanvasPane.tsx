@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { JSX } from "react";
 import type { BackgroundTask, BusMessage, MacroDef, RunView, WorkflowInfo } from "@shared/types";
+import type { CanvasSubject } from "@shared/system-graph";
 
-import { isMockMode } from "../lib/api";
+import { isMockMode, type HarnessApi } from "../lib/api";
 import { MOCK_CANVAS_OVERVIEWS, hasMockCanvasDoc } from "../lib/mock-data";
 import { getTheme, subscribeTheme } from "../lib/theme";
 import { type CanvasGraph, formatGraphCounts, parseCanvasGraph } from "../lib/canvas-graph";
@@ -12,6 +13,7 @@ import { CanvasChatPanel, CanvasStepDetail, CanvasStepsList, RunStepsList } from
 import { EmptyState } from "./EmptyState";
 import { Icon } from "./Icon";
 import { WorkflowActionsHeader } from "./WorkflowActionsHeader";
+import { SystemGraphCanvas } from "./SystemGraphCanvas";
 
 /** How many of a running task's trailing status lines the activity view shows. */
 const ACTIVITY_LINES_SHOWN = 8;
@@ -22,6 +24,8 @@ const ACTIVITY_LINES_SHOWN = 8;
 const FRAME_LOAD_TIMEOUT_MS = 4000;
 
 interface CanvasPaneProps {
+  subject: CanvasSubject;
+  api: HarnessApi;
   sessionId: string | null;
   lastMessage: BusMessage | null;
   boundWorkflow: WorkflowInfo | null;
@@ -71,6 +75,8 @@ interface CanvasPaneProps {
 }
 
 export function CanvasPane({
+  subject,
+  api,
   sessionId,
   lastMessage,
   boundWorkflow,
@@ -676,6 +682,14 @@ export function CanvasPane({
   // GitHub's 404 page rendered inside the pane.
   const sessionHasServableDoc = sessionId != null && (!isMockMode() || hasMockCanvasDoc(sessionId));
   const showsContent = hasGeneratedContent && sessionHasServableDoc;
+
+  if (subject.kind === "workspace") {
+    return (
+      <aside className="canvas-pane">
+        <SystemGraphCanvas key={subject.workspaceKey} workspaceKey={subject.workspaceKey} api={api} />
+      </aside>
+    );
+  }
 
   return (
     <aside className="canvas-pane">

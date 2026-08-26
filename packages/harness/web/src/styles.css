@@ -1348,6 +1348,10 @@ input {
   outline-offset: -2px;
 }
 
+.workspace-row-main:disabled {
+  cursor: default;
+}
+
 .workspace-row-static {
   cursor: default;
 }
@@ -1438,6 +1442,12 @@ input {
 
 .workspace-row-action:last-child {
   margin-right: 3px;
+}
+
+/* The disclosure is structural, not a hidden hover action: it is the only
+   control that folds the folder, so its target stays visible at rest. */
+.workspace-row-disclosure {
+  opacity: 1;
 }
 
 .workspace-row:hover .workspace-row-action,
@@ -3322,6 +3332,101 @@ input {
   flex-direction: column;
   background: var(--bg-1);
   min-width: 0;
+}
+
+/* V0 workspace system graph: the same opaque raised-node / dotted-flow
+   language as the design system's flow widgets, projected into the existing
+   right Canvas pane without introducing a second token vocabulary. */
+.system-graph-canvas {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background-color: var(--surface-base);
+  background-image: radial-gradient(var(--flow-grid-dot) 1px, transparent 1px);
+  background-size: 16px 16px;
+}
+
+.system-graph-heading {
+  flex: 0 0 auto;
+  height: var(--pane-header-h);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp3);
+  padding: 0 var(--pane-pad-x);
+  border-bottom: 1px solid var(--ui-line);
+  background: var(--surface-raised);
+  color: var(--text);
+  font-size: var(--type-label);
+  font-weight: 600;
+}
+
+.system-graph-heading span:last-child {
+  color: var(--text-faint);
+  font-size: var(--type-meta);
+  font-weight: 400;
+}
+
+.system-graph-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
+.system-graph-svg {
+  display: block;
+  width: 100%;
+  min-width: 320px;
+  min-height: 100%;
+}
+
+.system-graph-node rect {
+  fill: var(--surface-raised);
+  stroke: var(--ui-line-strong);
+}
+
+.system-graph-node circle {
+  fill: var(--text-dim);
+}
+
+.system-graph-node-label {
+  fill: var(--text);
+  font-family: var(--font);
+  font-size: var(--type-ui);
+  font-weight: 600;
+}
+
+.system-graph-node-meta,
+.system-graph-edge-label {
+  fill: var(--text-faint);
+  font-family: var(--font);
+  font-size: var(--type-micro);
+}
+
+.system-graph-edge {
+  fill: none;
+  stroke: var(--text-faint);
+  stroke-width: 1.5;
+  stroke-dasharray: 5 5;
+}
+
+.system-graph-arrow {
+  fill: var(--text-faint);
+}
+
+.system-graph-warning {
+  flex: 0 0 auto;
+  margin: 0;
+  padding: var(--sp2) var(--pane-pad-x);
+  border-top: 1px solid var(--ui-line);
+  background: var(--surface-raised);
+  color: var(--text-faint);
+  font-size: var(--type-meta);
+}
+
+.system-graph-state {
+  flex: 1;
 }
 
 .workflow-actions-header {
@@ -5960,6 +6065,14 @@ input {
 .right-pane-tab:hover {
   color: var(--text-dim);
   background: var(--bg-hover);
+}
+
+.right-pane-tab:disabled,
+.right-pane-tab:disabled:hover {
+  color: var(--text-faint);
+  background: transparent;
+  cursor: default;
+  opacity: 0.55;
 }
 
 .right-pane-tab.is-active {

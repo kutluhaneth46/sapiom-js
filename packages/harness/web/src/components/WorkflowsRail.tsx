@@ -35,6 +35,7 @@ interface WorkflowsRailProps {
   minWidth: number;
   workflows: WorkflowInfo[];
   sessions: HarnessSession[];
+  workspaceScopes: AppState["workspaceScopes"];
   /** The active session — highlights its own row in the history menu. */
   activeSessionId: string | null;
   /** The focused agent (or bare folder) path — the single filled selection. */
@@ -42,6 +43,9 @@ interface WorkflowsRailProps {
   /** Focuses an agent (or a bare-scaffold folder): swaps the main panel's
    *  session tab strip to that subject's sessions. */
   onFocusAgent: (path: string) => void;
+  /** The populated folder whose dependency graph owns the right Canvas. */
+  selectedWorkspaceKey: string | null;
+  onSelectWorkspace: (workspaceKey: string) => void;
   onOpenPalette: () => void;
   onConnect: (path: string) => Promise<void>;
   /** Collapses the rail — the session bar grows an expand affordance. */
@@ -100,35 +104,57 @@ const IS_MAC = typeof navigator !== "undefined" && navigator.platform.toUpperCas
 const SHORTCUT_HINT = IS_MAC ? "⌘K" : "Ctrl+K";
 
 /**
- * LEVEL 1 workspace folder header: a quiet, non-interactive-to-open label
- * that only groups the agents beneath it. The main button toggles collapse;
- * a trailing hover action (copy path) acts on the folder. It never focuses an
- * agent — that is the agent rows' job.
+ * LEVEL 1 workspace folder header. The label selects that workspace's system
+ * graph; the dedicated chevron is the only collapse/expand target.
  */
 function FolderHeader({
   label,
   cwd,
+  workspaceKey,
+  selected,
   collapsed,
+  onSelect,
   onToggleCollapsed,
   onCopyPath,
 }: {
   label: string;
   cwd: string;
+  workspaceKey: string | null;
+  selected: boolean;
   collapsed: boolean;
+  onSelect: (workspaceKey: string) => void;
   onToggleCollapsed: () => void;
   onCopyPath: (path: string) => void;
 }): JSX.Element {
   return (
-    <div className="workspace-row" data-testid={`workspace-group-${label}`}>
+    <div
+      className={
+        "workspace-row" +
+        (selected ? " is-selected" : "") +
+        (collapsed ? " is-collapsed" : "")
+      }
+      data-testid={`workspace-group-${label}`}
+    >
       <button
         className="workspace-row-main"
-        onClick={onToggleCollapsed}
+        onClick={() => {
+          if (workspaceKey) onSelect(workspaceKey);
+        }}
+        disabled={workspaceKey === null}
         title={cwd}
-        aria-expanded={!collapsed}
+        aria-pressed={selected}
       >
         <Icon name="Folder" size={13} />
         <span className="tree-row-label">{label}</span>
-        <span className={"workspace-caret" + (collapsed ? "" : " is-open")} aria-hidden="true">
+      </button>
+      <button
+        className="workspace-row-action workspace-row-disclosure"
+        aria-label={`${collapsed ? "Expand" : "Collapse"} ${label}`}
+        aria-expanded={!collapsed}
+        data-testid={`workspace-disclosure-${label}`}
+        onClick={onToggleCollapsed}
+      >
+        <span className={"disclosure-caret" + (collapsed ? "" : " is-open")} aria-hidden="true">
           <Icon name="ChevronDown" size={13} />
         </span>
       </button>
@@ -277,9 +303,12 @@ export function WorkflowsRail({
   minWidth,
   workflows,
   sessions,
+  workspaceScopes,
   activeSessionId,
   focusedAgentPath,
   onFocusAgent,
+  selectedWorkspaceKey,
+  onSelectWorkspace,
   onOpenPalette,
   onConnect,
   onCollapse,
@@ -395,7 +424,11 @@ export function WorkflowsRail({
   // because a registry session carries neither field.
   const historyByAgentId = new Map(history.map((summary) => [summary.agentSessionId, summary] as const));
 
-  const { workspaces, orphanAgents } = buildWorkspaceTree(workflows, sessions);
+  const { workspaces, orphanAgents } = buildWorkspaceTree(
+    workflows,
+    sessions,
+    workspaceScopes ?? [],
+  );
 
   const copyPath = (path: string): void => {
     void navigator.clipboard
@@ -660,7 +693,10 @@ export function WorkflowsRail({
                 <FolderHeader
                   label={workspace.label}
                   cwd={workspace.cwd}
+                  workspaceKey={workspace.workspaceKey}
+                  selected={workspace.workspaceKey === selectedWorkspaceKey}
                   collapsed={collapsed}
+                  onSelect={onSelectWorkspace}
                   onToggleCollapsed={() => toggleCollapsed(workspace.cwd)}
                   onCopyPath={copyPath}
                 />

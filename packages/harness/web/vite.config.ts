@@ -79,6 +79,7 @@ export default defineConfig({
       // (packages/harness/src/shared/types.ts) so the web and server always
       // build against one source of truth — no vendored copy to drift.
       "@shared/types": fileURLToPath(new URL("../src/shared/types.ts", import.meta.url)),
+      "@shared/system-graph": fileURLToPath(new URL("../src/shared/system-graph.ts", import.meta.url)),
       // The local-run mapper is a pure fn shared with the server (its canonical
       // home is src/core/render-local-run.ts, per the ticket). The SPA imports
       // the SAME implementation to map an offline stub run's NDJSON traces into

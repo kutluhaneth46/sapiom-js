@@ -17,6 +17,7 @@ export default defineConfig({
       // unit tests and server tests always build against the same source of
       // truth. Mirrors the alias in web/vite.config.ts.
       "@shared/types": fileURLToPath(new URL("src/shared/types.ts", import.meta.url)),
+      "@shared/system-graph": fileURLToPath(new URL("src/shared/system-graph.ts", import.meta.url)),
     },
   },
   test: {

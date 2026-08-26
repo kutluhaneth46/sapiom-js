@@ -1048,6 +1048,9 @@ export interface AppState {
   consentEnvReason?: string | null;
   sessions: HarnessSession[];
   workflows: WorkflowInfo[];
+  /** Opaque identities for the workspace folders currently known to Studio.
+   * Optional for compatibility with older servers and test fixtures. */
+  workspaceScopes?: import("./system-graph.js").WorkspaceScopeSummary[];
   macros: MacroDef[];
   /** The directory the CLI was launched against — the SPA prefills the
    *  new-session modal with this instead of recentDirs[0]. */

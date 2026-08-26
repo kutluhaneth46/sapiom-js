@@ -27,10 +27,12 @@ import type {
   RunView,
   WorkflowInfo,
 } from "@shared/types";
+import type { SystemGraph, WorkspaceKey, WorkspaceScopeSummary } from "@shared/system-graph";
 
 import type { LocalStepTrace, LocalRunOutcome } from "@sapiom/agent-core";
 
 import { MOCK_FS_TREE, MOCK_HARNESSES, MOCK_HISTORY, MOCK_LAUNCH_DIR, MOCK_MACROS, MOCK_SESSION_RECORDS, MOCK_SESSIONS, MOCK_SETTINGS, MOCK_TEMPLATE_GRAPHS, MOCK_TEMPLATES, MOCK_WORKFLOWS } from "./mock-data";
+import { parseSystemGraph } from "./system-graph";
 
 /**
  * Body for `POST /api/runs/local` — run the agent project at `sourceDir`
@@ -215,6 +217,7 @@ export interface HarnessApi {
    */
   authStatus(): Promise<AuthStatusResponse>;
   getState(): Promise<AppState>;
+  getSystemGraph(workspaceKey: WorkspaceKey): Promise<SystemGraph>;
   createSession(req: CreateSessionRequest): Promise<HarnessSession>;
   listSessions(): Promise<HarnessSession[]>;
   sessionHistory(cwd: string): Promise<SessionSummary[]>;
@@ -335,6 +338,16 @@ class RealApi implements HarnessApi {
 
   getState(): Promise<AppState> {
     return this.request<AppState>("/api/state");
+  }
+
+  async getSystemGraph(workspaceKey: WorkspaceKey): Promise<SystemGraph> {
+    const graph = parseSystemGraph(
+      await this.request<unknown>(`/api/workspaces/${encodeURIComponent(workspaceKey)}/system-graph`),
+    );
+    if (graph.scope.workspaceKey !== workspaceKey) {
+      throw new Error("Invalid system graph response");
+    }
+    return graph;
   }
 
   createSession(req: CreateSessionRequest): Promise<HarnessSession> {
@@ -704,6 +717,8 @@ class MockApi implements HarnessApi {
     new URLSearchParams(window.location.search).get("mockConsentSource") === "prompted";
   private sessions = this.fresh ? [] : MOCK_SESSIONS.map((session) => ({ ...session }));
   private workflows = this.fresh ? [] : MOCK_WORKFLOWS.map((workflow) => ({ ...workflow }));
+  private readonly workspaceKeyByCwd = new Map<string, WorkspaceKey>();
+  private nextWorkspaceKey = 1;
   private settings: HarnessSettings = this.fresh
     ? { ...MOCK_SETTINGS, recentDirs: [] }
     : {
@@ -711,6 +726,19 @@ class MockApi implements HarnessApi {
         recentDirs: [...MOCK_SETTINGS.recentDirs],
         ...(this.promptedConsent ? { telemetryOptIn: true } : {}),
       };
+
+  private workspaceScopes(): WorkspaceScopeSummary[] {
+    return [...new Set(this.sessions.map((session) => session.cwd))]
+      .sort((left, right) => left.localeCompare(right))
+      .map((cwd) => {
+        let workspaceKey = this.workspaceKeyByCwd.get(cwd);
+        if (!workspaceKey) {
+          workspaceKey = `mock-workspace-${this.nextWorkspaceKey++}`;
+          this.workspaceKeyByCwd.set(cwd, workspaceKey);
+        }
+        return { workspaceKey, cwd };
+      });
+  }
 
   async getState(): Promise<AppState> {
     await delay();
@@ -763,6 +791,7 @@ class MockApi implements HarnessApi {
       telemetryOptIn,
       sessions: this.sessions,
       workflows: this.workflows,
+      workspaceScopes: this.workspaceScopes(),
       macros: MOCK_MACROS,
       launchDir: MOCK_LAUNCH_DIR,
       // Mirrors the Electron host (`<launchDir>/projects`) rather than the CLI
@@ -772,6 +801,39 @@ class MockApi implements HarnessApi {
       consentSource: mockConsentSource,
       ...(mockEnvReason ? { consentEnvReason: mockEnvReason } : {}),
       ...(this.fresh ? { firstRun: true } : {}),
+    };
+  }
+
+  async getSystemGraph(workspaceKey: WorkspaceKey): Promise<SystemGraph> {
+    await delay();
+    if (!this.workspaceScopes().some((scope) => scope.workspaceKey === workspaceKey)) {
+      throw new ApiError(404, "GET system graph → 404", "Workspace not found");
+    }
+    if (typeof window !== "undefined") {
+      const win = window as unknown as { __HARNESS_TEST__?: Record<string, unknown> };
+      const previous = (win.__HARNESS_TEST__?.systemGraphRequests as string[]) ?? [];
+      win.__HARNESS_TEST__ = {
+        ...(win.__HARNESS_TEST__ ?? {}),
+        systemGraphRequests: [...previous, workspaceKey],
+      };
+    }
+    return {
+      kind: "system",
+      scope: { kind: "working-tree", workspaceKey },
+      nodes: [
+        { id: "agent:research", agentKey: "research", label: "Research" },
+        { id: "agent:growth", agentKey: "growth", label: "Growth" },
+      ],
+      edges: [
+        {
+          from: "agent:research",
+          to: "agent:growth",
+          kind: "invokes",
+          basis: "static",
+          mode: "async",
+        },
+      ],
+      warnings: [],
     };
   }
 
