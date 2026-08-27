@@ -29,6 +29,7 @@ import type {
   WorkflowInfo,
 } from "../shared/types.js";
 import { JSON_BODY_LIMIT_BYTES } from "../shared/types.js";
+import type { SystemGraphSnapshot } from "../shared/system-graph.js";
 import { unhandledRequestErrorHandler } from "./error-handler.js";
 import { resolveStatePaths } from "../core/paths.js";
 import {
@@ -778,9 +779,13 @@ export const startServer = async (
   );
   const activeSystemGraphScopes = new Map<string, WorkspaceScope>();
 
-  const refreshSystemGraphScopesForRoot = (changedRoot: string): void => {
+  const refreshSystemGraphScopesForRoot = (
+    changedRoot: string,
+    excludedWorkspaceKey?: string,
+  ): void => {
     const canonicalChangedRoot = canonicalGraphPath(changedRoot);
     for (const scope of activeSystemGraphScopes.values()) {
+      if (scope.workspaceKey === excludedWorkspaceKey) continue;
       if (!systemGraphStore.peek(scope.workspaceKey)) continue;
       const scopeRoot = canonicalGraphPath(scope.root);
       if (
@@ -1091,6 +1096,7 @@ export const startServer = async (
   // it with unrelated workflows some earlier scan already found elsewhere.
   const scanWorkflowsAndBroadcast = async (
     root: string,
+    options: { refreshGraphs?: () => Promise<void> } = {},
   ): Promise<WorkflowInfo[]> => {
     const before = workflowsCache;
     const found = await workflowRegistry.scan(root);
@@ -1104,9 +1110,32 @@ export const startServer = async (
     await Promise.all(
       sessionManager.list().map((session) => writeSessionContext(session)),
     );
-    await refreshSystemGraphScopesForRoot(root);
+    if (options.refreshGraphs) await options.refreshGraphs();
+    else await refreshSystemGraphScopesForRoot(root);
     bus.publish({ type: "workflows.changed" });
     return found;
+  };
+
+  const refreshSystemGraphInventory = async (
+    scope: WorkspaceScope,
+  ) => {
+    const canonicalScope = {
+      workspaceKey: scope.workspaceKey,
+      root: canonicalGraphPath(scope.root),
+    };
+    let refreshPromise: Promise<SystemGraphSnapshot> | null = null;
+    const refreshGraph = (): Promise<void> => {
+      refreshSystemGraphScopesForRoot(
+        canonicalScope.root,
+        canonicalScope.workspaceKey,
+      );
+      refreshPromise = systemGraphStore.refresh(canonicalScope);
+      return refreshPromise.then(() => undefined);
+    };
+    await scanWorkflowsAndBroadcast(canonicalScope.root, {
+      refreshGraphs: refreshGraph,
+    });
+    return await (refreshPromise ?? systemGraphStore.refresh(canonicalScope));
   };
 
   const workflowRootsForGraphScope = (scope: WorkspaceScope): string[] =>
@@ -1127,6 +1156,7 @@ export const startServer = async (
         workflowsCache.map((workflow) => workflow.path),
         sourcePaths,
       );
+      if (dirtyRoots.length === 0) return;
       for (const workflowRoot of dirtyRoots) {
         systemGraphRelationships.invalidateSource(workflowRoot);
       }
@@ -1134,11 +1164,9 @@ export const startServer = async (
     },
     onInventoryChange: async (scope) => {
       try {
-        await scanWorkflowsAndBroadcast(scope.root);
+        await refreshSystemGraphInventory(scope);
       } catch (err) {
-        if (systemGraphStore.peek(scope.workspaceKey)) {
-          systemGraphStore.reportRefreshFailure(scope);
-        }
+        systemGraphStore.reportRefreshFailure(scope);
         console.error("[harness] workspace graph inventory refresh failed");
         throw err;
       }
@@ -1408,6 +1436,14 @@ export const startServer = async (
       onScopeAccess: (scope) => {
         activeSystemGraphScopes.set(scope.workspaceKey, scope);
         systemGraphWatcher.start(scope);
+      },
+      onScopeRefresh: async (scope) => {
+        try {
+          return await refreshSystemGraphInventory(scope);
+        } catch {
+          console.error("[harness] workspace graph manual refresh failed");
+          return systemGraphStore.reportRefreshFailure(scope);
+        }
       },
     }),
   );

@@ -206,6 +206,22 @@ describe("SystemGraphStore", () => {
     expect(onChange).toHaveBeenCalledTimes(1);
   });
 
+  it("allows an explicit refresh after automatic recovery was exhausted", async () => {
+    const build = vi
+      .fn()
+      .mockResolvedValueOnce(buildResult("initial"))
+      .mockResolvedValueOnce(buildResult("recovered"));
+    const store = new SystemGraphStore({ build });
+    await store.get(scope);
+    store.reportRefreshFailure(scope);
+
+    await expect(store.refresh(scope)).resolves.toMatchObject({
+      state: "ready",
+      graph: graphFor("recovered"),
+    });
+    expect(build).toHaveBeenCalledTimes(2);
+  });
+
   it("returns an honest cold degraded snapshot when no graph can be built", async () => {
     const store = new SystemGraphStore({
       build: vi.fn().mockRejectedValue(new Error("unavailable")),

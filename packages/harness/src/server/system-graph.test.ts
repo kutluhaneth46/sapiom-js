@@ -121,6 +121,29 @@ describe("createSystemGraphRouter", () => {
     expect(builder.build).toHaveBeenCalledTimes(2);
   });
 
+  it("rebuilds the projection through the protected explicit refresh route", async () => {
+    const { baseUrl, builder } = start();
+    const route = `${baseUrl}/api/workspaces/${workspaceKey}/system-graph`;
+    const headers = { "X-Harness-Token": "test-token" };
+    await fetch(route, { headers });
+
+    expect((await fetch(`${route}/refresh`, { method: "POST" })).status).toBe(
+      401,
+    );
+    const refreshed = await fetch(`${route}/refresh`, {
+      method: "POST",
+      headers,
+    });
+
+    expect(refreshed.status).toBe(200);
+    expect((await refreshed.json()) as SystemGraphSnapshot).toMatchObject({
+      workspaceKey,
+      state: "ready",
+      graph,
+    });
+    expect(builder.build).toHaveBeenCalledTimes(2);
+  });
+
   it("rejects an unknown opaque workspace key without scanning", async () => {
     const { baseUrl, builder } = start();
     const response = await fetch(

@@ -71,6 +71,13 @@ export class SystemGraphStore {
     return entry.snapshot;
   }
 
+  /** Explicit user recovery: start a fresh projection and await its result. */
+  refresh(scope: WorkspaceScope): Promise<SystemGraphSnapshot> {
+    const entry = this.ensureEntry(scope);
+    entry.automaticRetryUsed = false;
+    return this.queueRefresh(entry) ?? Promise.resolve(entry.snapshot);
+  }
+
   peek(workspaceKey: WorkspaceKey): SystemGraphSnapshot | null {
     return this.entries.get(workspaceKey)?.snapshot ?? null;
   }

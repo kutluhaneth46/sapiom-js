@@ -63,6 +63,47 @@ describe("RealApi.getSystemGraph", () => {
       }),
     );
   });
+
+  it("sends explicit graph retries through the refresh route", async () => {
+    if (isMockMode()) return;
+    vi.stubGlobal("window", {
+      __HARNESS__: { token: "test-token" },
+      location: { search: "" },
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            workspaceKey: "workspace-test",
+            revision: 8,
+            state: "ready",
+            graph: {
+              kind: "system",
+              scope: {
+                kind: "working-tree",
+                workspaceKey: "workspace-test",
+              },
+              nodes: [],
+              edges: [],
+              warnings: [],
+            },
+          }),
+          { status: 200 },
+        ),
+      ),
+    );
+
+    await createApi().getSystemGraph("workspace-test", { refresh: true });
+
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/workspaces/workspace-test/system-graph/refresh",
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({ "X-Harness-Token": "test-token" }),
+      }),
+    );
+  });
 });
 
 describe("progressiveLeasingRun", () => {

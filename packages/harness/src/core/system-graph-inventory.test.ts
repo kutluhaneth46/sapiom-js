@@ -91,6 +91,13 @@ describe("HarnessRegistryInventoryProvider", () => {
           [path.join(linkedRoot, "agent", "nested-agent", "index.ts")],
         ),
       ).toEqual([canonicalNestedRoot]);
+      expect(
+        dirtyGraphSourceRoots(
+          linkedRoot,
+          [agentRoot, nestedRoot],
+          [path.join(linkedRoot, "unregistered", "index.ts")],
+        ),
+      ).toEqual([]);
     } finally {
       await fs.rm(tempRoot, { recursive: true, force: true });
     }

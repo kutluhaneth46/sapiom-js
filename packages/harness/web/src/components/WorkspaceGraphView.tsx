@@ -180,16 +180,14 @@ export function WorkspaceGraphView({
               <Icon name="TriangleAlert" size={13} />
               Graph may be out of date
             </span>
-            {error && (
-              <button
-                type="button"
-                className="status-tag status-tag-action"
-                onClick={retry}
-              >
-                <Icon name="RefreshCw" size={13} />
-                Retry
-              </button>
-            )}
+            <button
+              type="button"
+              className="status-tag status-tag-action"
+              onClick={retry}
+            >
+              <Icon name="RefreshCw" size={13} />
+              Retry
+            </button>
           </span>
         )}
         {lifecycle === "degraded" && graph && (

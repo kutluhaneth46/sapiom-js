@@ -1,7 +1,10 @@
 import type { SystemGraphSnapshot, WorkspaceKey } from "@shared/system-graph";
 
 export interface SystemGraphSource {
-  getSystemGraph(workspaceKey: WorkspaceKey): Promise<SystemGraphSnapshot>;
+  getSystemGraph(
+    workspaceKey: WorkspaceKey,
+    options?: { refresh?: boolean },
+  ): Promise<SystemGraphSnapshot>;
 }
 
 export interface SystemGraphLoader {
@@ -80,10 +83,15 @@ export function createSystemGraphLoader(): SystemGraphLoader {
       return promise;
     }
     if (shouldRetry) retryConsumed.add(workspaceKey);
+    const explicitRefresh = forcedReloads.has(workspaceKey);
 
     let request!: Promise<SystemGraphSnapshot>;
     request = Promise.resolve()
-      .then(() => source.getSystemGraph(workspaceKey))
+      .then(() =>
+        explicitRefresh
+          ? source.getSystemGraph(workspaceKey, { refresh: true })
+          : source.getSystemGraph(workspaceKey),
+      )
       .then((snapshot) => {
         if (snapshot.workspaceKey !== workspaceKey) {
           throw new Error("Invalid system graph response");
@@ -97,7 +105,8 @@ export function createSystemGraphLoader(): SystemGraphLoader {
         if (
           snapshot.revision < newestAnnouncement ||
           (lifetime.generation !== generation &&
-            forcedReloads.has(workspaceKey))
+            forcedReloads.has(workspaceKey) &&
+            !explicitRefresh)
         ) {
           if (requests.get(workspaceKey)?.promise === request) {
             requests.delete(workspaceKey);

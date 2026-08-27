@@ -224,6 +224,17 @@ describe("workspace graph freshness wiring", () => {
         },
         { timeout: 8_000, interval: 150 },
       );
+
+      const beforeManualRetry = await readGraph();
+      const manualRetryResponse = await fetch(`${graphUrl}/refresh`, {
+        method: "POST",
+        headers,
+      });
+      expect(manualRetryResponse.status).toBe(200);
+      const manualRetry =
+        (await manualRetryResponse.json()) as SystemGraphSnapshot;
+      expect(manualRetry).toMatchObject({ state: "ready" });
+      expect(manualRetry.revision).toBeGreaterThan(beforeManualRetry.revision);
     },
   );
 });

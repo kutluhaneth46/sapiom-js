@@ -270,7 +270,10 @@ export interface HarnessApi {
   authStatus(): Promise<AuthStatusResponse>;
   getState(): Promise<AppState>;
   /** Revisioned local dependency projection for one server-issued workspace key. */
-  getSystemGraph(workspaceKey: WorkspaceKey): Promise<SystemGraphSnapshot>;
+  getSystemGraph(
+    workspaceKey: WorkspaceKey,
+    options?: { refresh?: boolean },
+  ): Promise<SystemGraphSnapshot>;
   createSession(req: CreateSessionRequest): Promise<HarnessSession>;
   attachFile(id: string, req: AttachFileRequest): Promise<AttachFileResponse>;
   listSessions(): Promise<HarnessSession[]>;
@@ -421,9 +424,13 @@ class RealApi implements HarnessApi {
 
   async getSystemGraph(
     workspaceKey: WorkspaceKey,
+    options: { refresh?: boolean } = {},
   ): Promise<SystemGraphSnapshot> {
+    const route =
+      `/api/workspaces/${encodeURIComponent(workspaceKey)}/system-graph`;
     const response = await this.response(
-      `/api/workspaces/${encodeURIComponent(workspaceKey)}/system-graph`,
+      options.refresh ? `${route}/refresh` : route,
+      options.refresh ? { method: "POST" } : undefined,
     );
     const snapshot = parseSystemGraphSnapshot(
       (await response.json()) as unknown,
@@ -1060,6 +1067,7 @@ class MockApi implements HarnessApi {
 
   async getSystemGraph(
     workspaceKey: WorkspaceKey,
+    _options: { refresh?: boolean } = {},
   ): Promise<SystemGraphSnapshot> {
     await delay(180);
     if (!this.workspaceScopes().some((scope) => scope.workspaceKey === workspaceKey)) {

@@ -137,6 +137,33 @@ describe("createSystemGraphLoader", () => {
 
     expect(loader.peek(workspaceKey)).toBe(ready);
     expect(getSystemGraph).toHaveBeenCalledTimes(2);
+    expect(getSystemGraph).toHaveBeenNthCalledWith(1, workspaceKey);
+    expect(getSystemGraph).toHaveBeenNthCalledWith(2, workspaceKey, {
+      refresh: true,
+    });
+  });
+
+  it("accepts an explicit retry response after its lifecycle announcements", async () => {
+    const pending = deferred<SystemGraphSnapshot>();
+    const getSystemGraph = vi
+      .fn()
+      .mockResolvedValueOnce(snapshot(1, "degraded"))
+      .mockReturnValueOnce(pending.promise);
+    const loader = createSystemGraphLoader();
+    const source: SystemGraphSource = { getSystemGraph };
+    await loader.load(source, workspaceKey);
+
+    loader.invalidate(workspaceKey);
+    const retry = loader.load(source, workspaceKey);
+    await vi.waitFor(() => expect(getSystemGraph).toHaveBeenCalledTimes(2));
+    loader.invalidate(workspaceKey, 2);
+    pending.resolve(snapshot(2));
+
+    await expect(retry).resolves.toEqual(snapshot(2));
+    await expect(loader.load(source, workspaceKey)).resolves.toEqual(
+      snapshot(2),
+    );
+    expect(getSystemGraph).toHaveBeenCalledTimes(2);
   });
 
   it("never lets an older in-flight response overwrite a newer revision", async () => {

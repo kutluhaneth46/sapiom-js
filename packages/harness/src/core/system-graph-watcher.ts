@@ -58,13 +58,13 @@ function confinedSourcePath(root: string, relativePath: string): string | null {
  */
 export async function snapshotWorkflowSourceRootsAsync(
   sourceRoots: readonly string[],
-): Promise<string> {
+): Promise<ReadonlyMap<string, string>> {
   const roots = [
     ...new Set(sourceRoots.map((root) => path.resolve(root))),
   ].sort();
-  const parts = roots.map((root) => `root\0${root}`);
+  const snapshots = new Map<string, string>();
 
-  const walk = async (dir: string): Promise<void> => {
+  const walk = async (dir: string, parts: string[]): Promise<void> => {
     let entries: fs.Dirent[];
     try {
       entries = await fsp.readdir(dir, { withFileTypes: true });
@@ -77,7 +77,7 @@ export async function snapshotWorkflowSourceRootsAsync(
       const full = path.join(dir, entry.name);
       if (entry.isDirectory()) {
         if (isAgentProjectScanIgnoredDir(entry.name)) continue;
-        await walk(full);
+        await walk(full, parts);
         continue;
       }
       if (!entry.isFile() || !SOURCE_EXTENSIONS.has(path.extname(entry.name))) {
@@ -92,8 +92,42 @@ export async function snapshotWorkflowSourceRootsAsync(
     }
   };
 
-  for (const root of roots) await walk(root);
-  return parts.sort().join("|");
+  for (const root of roots) {
+    const parts = [`root\0${root}`];
+    await walk(root, parts);
+    snapshots.set(root, parts.sort().join("|"));
+  }
+  return snapshots;
+}
+
+function isNestedSourceRoot(parent: string, candidate: string): boolean {
+  const relative = path.relative(parent, candidate);
+  return (
+    relative !== "" &&
+    relative !== ".." &&
+    !relative.startsWith(`..${path.sep}`) &&
+    !path.isAbsolute(relative)
+  );
+}
+
+function changedSourceRoots(
+  previous: ReadonlyMap<string, string>,
+  current: ReadonlyMap<string, string>,
+): string[] {
+  const changed = [...new Set([...previous.keys(), ...current.keys()])].filter(
+    (root) => previous.get(root) !== current.get(root),
+  );
+  // Nested registered projects appear in their parent's recursive snapshot.
+  // Attribute the edit only to the deepest changed caller(s).
+  return changed
+    .filter(
+      (root) =>
+        !changed.some(
+          (candidate) =>
+            candidate !== root && isNestedSourceRoot(root, candidate),
+        ),
+    )
+    .sort();
 }
 
 export interface SystemGraphWatcherCallbacks {
@@ -107,6 +141,16 @@ export interface SystemGraphWatcherCallbacks {
   onInventoryChange: (scope: WorkspaceScope) => void | Promise<void>;
 }
 
+export interface SystemGraphWatchHandle {
+  close(): void;
+  on(event: "error", listener: (error: Error) => void): SystemGraphWatchHandle;
+}
+
+export type SystemGraphWatchFactory = (
+  root: string,
+  listener: (event: "rename" | "change", filename: string | null) => void,
+) => SystemGraphWatchHandle;
+
 export interface SystemGraphWatcherOptions {
   sourceDebounceMs?: number;
   inventoryDebounceMs?: number;
@@ -115,10 +159,12 @@ export interface SystemGraphWatcherOptions {
   pollIntervalMs?: number;
   /** Deterministic test seam for the supported polling fallback. */
   forcePolling?: boolean;
+  /** Deterministic test seam for native event routing and watcher errors. */
+  watchFactory?: SystemGraphWatchFactory;
 }
 
 class WorkspaceSystemGraphWatcher {
-  private watcher: fs.FSWatcher | null = null;
+  private watcher: SystemGraphWatchHandle | null = null;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private sourceTimer: ReturnType<typeof setTimeout> | null = null;
   private inventoryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -126,7 +172,7 @@ class WorkspaceSystemGraphWatcher {
   private closed = false;
   private sourcePaths = new Set<string>();
   private ambiguousSourceChange = false;
-  private lastSourceSnapshot: string | null = null;
+  private lastSourceSnapshots: ReadonlyMap<string, string> | null = null;
   private lastInventorySnapshot: string;
   private failedInventorySnapshot: string | null = null;
   private inventoryGeneration = 0;
@@ -280,27 +326,35 @@ class WorkspaceSystemGraphWatcher {
       return;
     }
     try {
-      this.watcher = fs.watch(
-        this.scope.root,
-        { recursive: true },
-        (_event, rawFilename) => {
-          if (rawFilename === null) {
-            this.scheduleSourceChange(null);
-            this.scheduleInventoryCheck();
-            return;
-          }
-          const relativePath = normalizeWatchPath(rawFilename);
-          if (ignoredRelativePath(relativePath)) return;
-          if (sourceRelativePath(relativePath)) {
-            this.scheduleSourceChange(
-              confinedSourcePath(this.scope.root, relativePath),
-            );
-          }
-          // Event kind is unreliable across editors/platforms. The marker
-          // fingerprint decides whether inventory really changed.
+      const listener = (
+        _event: "rename" | "change",
+        rawFilename: string | null,
+      ): void => {
+        if (rawFilename === null) {
+          this.scheduleSourceChange(null);
           this.scheduleInventoryCheck();
-        },
-      );
+          return;
+        }
+        const relativePath = normalizeWatchPath(rawFilename);
+        if (ignoredRelativePath(relativePath)) return;
+        if (sourceRelativePath(relativePath)) {
+          this.scheduleSourceChange(
+            confinedSourcePath(this.scope.root, relativePath),
+          );
+        }
+        // Event kind is unreliable across editors/platforms. The marker
+        // fingerprint decides whether inventory really changed.
+        this.scheduleInventoryCheck();
+      };
+      this.watcher = this.options.watchFactory
+        ? this.options.watchFactory(this.scope.root, listener)
+        : fs.watch(
+            this.scope.root,
+            { recursive: true },
+            (_event, rawFilename) => {
+              listener(_event, rawFilename);
+            },
+          );
       this.watcher.on("error", () => this.fallBackToPolling());
     } catch {
       this.fallBackToPolling();
@@ -325,15 +379,23 @@ class WorkspaceSystemGraphWatcher {
         snapshotWorkflowSourceRootsAsync(sourceRoots),
         snapshotWorkspaceWorkflowsAsync(this.scope.root),
       ])
-        .then(([sourceSnapshot, inventorySnapshot]) => {
+        .then(([sourceSnapshots, inventorySnapshot]) => {
           if (this.closed) return;
+          const changedRoots = this.lastSourceSnapshots
+            ? changedSourceRoots(this.lastSourceSnapshots, sourceSnapshots)
+            : [];
+          const ambiguousInitialChange =
+            this.lastSourceSnapshots === null && refreshAfterInitialSnapshot;
           const sourceChanged =
-            (this.lastSourceSnapshot !== null &&
-              sourceSnapshot !== this.lastSourceSnapshot) ||
-            (this.lastSourceSnapshot === null && refreshAfterInitialSnapshot);
-          this.lastSourceSnapshot = sourceSnapshot;
+            ambiguousInitialChange || changedRoots.length > 0;
+          this.lastSourceSnapshots = sourceSnapshots;
           refreshAfterInitialSnapshot = false;
-          if (sourceChanged) this.scheduleSourceChange(null);
+          if (ambiguousInitialChange) this.scheduleSourceChange(null);
+          else {
+            for (const sourceRoot of changedRoots) {
+              this.scheduleSourceChange(sourceRoot);
+            }
+          }
 
           if (inventorySnapshot !== this.lastInventorySnapshot) {
             this.dispatchInventoryChange(inventorySnapshot);

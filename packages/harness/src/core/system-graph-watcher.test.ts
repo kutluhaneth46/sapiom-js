@@ -4,7 +4,11 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { WorkspaceScope } from "./system-graph.js";
-import { SystemGraphWatcherManager } from "./system-graph-watcher.js";
+import {
+  SystemGraphWatcherManager,
+  type SystemGraphWatchFactory,
+  type SystemGraphWatchHandle,
+} from "./system-graph-watcher.js";
 
 const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
@@ -59,6 +63,7 @@ describe("SystemGraphWatcherManager", () => {
 
   it("refreshes source relationships without reporting inventory churn", async () => {
     const agentRoot = await scaffoldAgent("research");
+    await scaffoldAgent("growth");
     manager.start(scope);
     await sleep(100);
     onInventoryChange.mockClear();
@@ -74,7 +79,68 @@ describe("SystemGraphWatcherManager", () => {
 
     expect(onSourceChange).toHaveBeenCalled();
     expect(onSourceChange.mock.calls.at(-1)?.[0]).toEqual(scope);
+    expect(onSourceChange.mock.calls.at(-1)?.[1]).toEqual([agentRoot]);
     expect(onInventoryChange).not.toHaveBeenCalled();
+  });
+
+  it("routes native paths, ignores generated churn, and recovers via polling", async () => {
+    let watchListener!: Parameters<SystemGraphWatchFactory>[1];
+    let errorListener!: (error: Error) => void;
+    const close = vi.fn();
+    const watchFactory: SystemGraphWatchFactory = (_watchRoot, listener) => {
+      watchListener = listener;
+      const handle: SystemGraphWatchHandle = {
+        close,
+        on: (_event, onError) => {
+          errorListener = onError;
+          return handle;
+        },
+      };
+      return handle;
+    };
+    manager = new SystemGraphWatcherManager(
+      {
+        listSourceRoots: () => [...sourceRoots],
+        onSourceChange,
+        onInventoryChange,
+      },
+      {
+        watchFactory,
+        sourceDebounceMs: 10,
+        inventoryDebounceMs: 10,
+        pollIntervalMs: 25,
+      },
+    );
+    const agentRoot = await scaffoldAgent("research");
+    manager.start(scope);
+
+    watchListener("change", "research/index.ts");
+    await vi.waitFor(() => expect(onSourceChange).toHaveBeenCalled(), {
+      timeout: 2_000,
+      interval: 20,
+    });
+    expect(onSourceChange.mock.calls.at(-1)?.[1]).toEqual([
+      path.join(agentRoot, "index.ts"),
+    ]);
+
+    onSourceChange.mockClear();
+    watchListener("change", "node_modules/pkg/index.ts");
+    await sleep(50);
+    expect(onSourceChange).not.toHaveBeenCalled();
+
+    errorListener(new Error("recursive watch unavailable"));
+    expect(close).toHaveBeenCalledTimes(1);
+    await sleep(100);
+    onSourceChange.mockClear();
+    await fs.writeFile(
+      path.join(agentRoot, "index.ts"),
+      "export const recovered = true;\n",
+    );
+    await vi.waitFor(() => expect(onSourceChange).toHaveBeenCalled(), {
+      timeout: 2_000,
+      interval: 20,
+    });
+    expect(onSourceChange.mock.calls.at(-1)?.[1]).toEqual([agentRoot]);
   });
 
   it("reports agent inventory additions and removals", async () => {
