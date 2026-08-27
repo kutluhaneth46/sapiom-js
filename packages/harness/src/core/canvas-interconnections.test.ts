@@ -366,7 +366,7 @@ function categorize(input) {
     expect(caps).toEqual([{ capability: "rules.classify", fromStepId: null }]);
   });
 
-  it("excludes run and launch calls — they are relationships, not capability chips", async () => {
+  it("keeps the blocking run chip until the per-agent Canvas can render it as a relationship", async () => {
     const dir = await tmpProject({
       "index.ts": `
 const kickoff = defineStep({
@@ -381,6 +381,9 @@ const kickoff = defineStep({
 `,
     });
     const caps = await detectStepCapabilities(dir, new Set(["kickoff"]));
-    expect(caps).toEqual([{ capability: "web.search", fromStepId: "kickoff" }]);
+    expect(caps).toEqual([
+      { capability: "agents.run", fromStepId: "kickoff" },
+      { capability: "web.search", fromStepId: "kickoff" },
+    ]);
   });
 });

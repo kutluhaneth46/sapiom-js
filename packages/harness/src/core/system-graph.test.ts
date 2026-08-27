@@ -146,7 +146,7 @@ describe("StaticSystemGraphBuilder", () => {
     expect(JSON.stringify(graph)).not.toContain(FIXTURE);
   });
 
-  it("deduplicates by mode, retains dual-mode edges, skips self-links, and reports unresolved targets", async () => {
+  it("deduplicates by mode, retains dual-mode edges, and reports duplicate and unresolved targets", async () => {
     const inventory: AgentInventoryProvider = {
       listAgents: vi.fn(async () => ({
         agents: [
@@ -175,8 +175,14 @@ describe("StaticSystemGraphBuilder", () => {
       root.endsWith("research")
         ? {
             relationships: [
-              { target: "growth", mode: "blocking", evidence: EVIDENCE },
-              { target: "growth", mode: "blocking", evidence: EVIDENCE },
+              {
+                target: "growth",
+                mode: "blocking",
+                evidence: [
+                  ...EVIDENCE,
+                  { file: "second.ts", line: 2, column: 1 },
+                ],
+              },
               { target: "growth", mode: "async", evidence: EVIDENCE },
               { target: "research", mode: "async", evidence: EVIDENCE },
               { target: "missing", mode: "async", evidence: EVIDENCE },
@@ -207,8 +213,14 @@ describe("StaticSystemGraphBuilder", () => {
       },
     ]);
     expect(graph.warnings.map((warning) => warning.code)).toEqual([
+      "duplicate-edge",
       "unresolved-target",
     ]);
+    expect(graph.warnings[0]).toEqual({
+      code: "duplicate-edge",
+      agentKey: "research",
+      message: "Research invokes Growth more than once.",
+    });
     expect(JSON.stringify(graph)).not.toContain("/private/");
   });
 

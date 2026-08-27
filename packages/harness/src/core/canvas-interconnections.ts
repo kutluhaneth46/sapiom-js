@@ -6,7 +6,8 @@
  *    calls and the supported legacy `orchestrations.launch` form, extracted
  *    with a syntax-only TypeScript walk; and
  *  - Sapiom capabilities — `ctx.sapiom.<ns>.<method>(...)` call sites, rendered
- *    as capability chips on the step (the thing Sapiom bills for).
+ *    as capability chips on the step (usually the thing Sapiom bills for;
+ *    `agents.run` remains temporarily for per-agent Canvas compatibility).
  *
  * Each call is attributed to the step whose `defineStep({ ... })` block it
  * literally sits inside — a brace-balanced extent, not merely the nearest
@@ -46,9 +47,10 @@ const MAX_FILE_BYTES = 512 * 1024;
 const CAPABILITY_CALL_PATTERN =
   /(?<![\w$])sapiom\s*\.\s*([a-z][\w$]*(?:\s*\.\s*[a-z][\w$]*)+)\s*\(/gi;
 
-// Agent calls are relationships, not billable capability chips.
+// Async launches already render as launched-agent nodes on the per-agent
+// Canvas. Keep blocking `agents.run` in that Canvas's existing capability-chip
+// projection until it gains a blocking relationship node of its own.
 const NON_CAPABILITY_CALLS = new Set([
-  "agents.run",
   "agents.launch",
   "orchestrations.launch",
 ]);

@@ -2,7 +2,9 @@
  * Perf floor for the source scan that runs when Agent Studio refreshes an
  * agent Canvas. A workspace can contribute up to 200 bounded source files;
  * the representative tree below fills that limit while only a minority of
- * files contain direct agent APIs, which is the normal authored shape.
+ * files contain direct agent APIs. Every file still contains agent vocabulary
+ * so the benchmark exercises the parser path rather than mostly measuring the
+ * cheap prefilter.
  *
  * The threshold is intentionally generous for shared CI runners. Its purpose
  * is to catch an accidental loss of the cheap non-agent-file path or an
@@ -44,7 +46,7 @@ describe("workflow source scan perf (200-file workspace)", () => {
             : "";
         await fs.writeFile(
           path.join(directory, `source-${String(index).padStart(3, "0")}.ts`),
-          `export const records = [\n${RECORDS}\n] as const;\n${invocation}`,
+          `export const agentVocabulary = "agents";\nexport const records = [\n${RECORDS}\n] as const;\n${invocation}`,
         );
       }),
     );
@@ -72,7 +74,7 @@ describe("workflow source scan perf (200-file workspace)", () => {
     const p95 =
       sorted[Math.min(sorted.length - 1, Math.ceil(sorted.length * 0.95) - 1)]!;
     console.info(
-      `[perf] 200 workflow sources · 20 agent files · hot p95 ${p95.toFixed(1)}ms`,
+      `[perf] 200 parsed workflow sources · 20 direct-call files · hot p95 ${p95.toFixed(1)}ms`,
     );
     expect(p95).toBeLessThan(P95_BUDGET_MS);
   });

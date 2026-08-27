@@ -356,6 +356,13 @@ export class StaticSystemGraphBuilder implements SystemGraphBuilder {
         const from = `agent:${caller.agentKey}`;
         const to = `agent:${target.agentKey}`;
         const edgeKey = `${from}\0${to}\0${relationship.mode}`;
+        if (relationship.evidence.length > 1 || seenEdges.has(edgeKey)) {
+          warnings.push({
+            code: "duplicate-edge",
+            agentKey: caller.agentKey,
+            message: `${caller.label} invokes ${target.label} more than once.`,
+          });
+        }
         if (seenEdges.has(edgeKey)) continue;
         seenEdges.add(edgeKey);
         edges.push({
