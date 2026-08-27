@@ -87,7 +87,7 @@ export class SystemGraphStore {
     const visibleGraph = entry.lastGood ?? entry.snapshot.graph;
     return visibleGraph === null
       ? this.transition(entry, "degraded", null)
-      : this.transition(entry, "stale", visibleGraph, true);
+      : this.transition(entry, "stale", visibleGraph);
   }
 
   /** Retires projections for workspace scopes Studio no longer exposes. */

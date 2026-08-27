@@ -214,8 +214,7 @@ export function parseSystemGraphSnapshot(value: unknown): SystemGraphSnapshot {
   const graph = value.graph === null ? null : parseSystemGraph(value.graph);
   if (
     (state === "building" && graph !== null) ||
-    (state === "ready" || state === "stale") &&
-    graph === null
+    ((state === "ready" || state === "stale") && graph === null)
   ) {
     throw new Error("Invalid system graph response");
   }

@@ -221,8 +221,16 @@ export function WorkspaceGraphView({
             className="system-graph-state"
             testId="system-graph-error"
             icon="TriangleAlert"
-            title="Couldn't build this workspace graph"
-            body="Studio couldn't produce a usable local projection. Retry after the workspace is readable."
+            title={
+              error
+                ? "Couldn't load this workspace graph"
+                : "Couldn't build this workspace graph"
+            }
+            body={
+              error
+                ? "Studio couldn't load the latest local graph. Check that Studio is still running, then retry."
+                : "Studio couldn't produce a usable local projection. Retry after the workspace is readable."
+            }
             cta={
               <button type="button" className="btn-primary" onClick={retry}>
                 Retry

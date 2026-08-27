@@ -1,7 +1,12 @@
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
 import type { WorkflowInfo } from "../shared/types.js";
 import {
+  dirtyGraphSourceRoots,
+  graphSourceRootsWithinScope,
   HarnessRegistryInventoryProvider,
   type WorkspaceScope,
 } from "./system-graph-inventory.js";
@@ -53,6 +58,44 @@ function provider(
 }
 
 describe("HarnessRegistryInventoryProvider", () => {
+  it("matches canonical workflow roots beneath a symlinked workspace", async () => {
+    if (process.platform === "win32") return;
+    const tempRoot = await fs.mkdtemp(
+      path.join(os.tmpdir(), "system-graph-symlink-"),
+    );
+    try {
+      const workspaceRoot = path.join(tempRoot, "real-workspace");
+      const agentRoot = path.join(workspaceRoot, "agent");
+      const nestedRoot = path.join(agentRoot, "nested-agent");
+      const outsideRoot = path.join(tempRoot, "outside", "agent");
+      const linkedRoot = path.join(tempRoot, "linked-workspace");
+      await Promise.all([
+        fs.mkdir(nestedRoot, { recursive: true }),
+        fs.mkdir(outsideRoot, { recursive: true }),
+      ]);
+      await fs.symlink(workspaceRoot, linkedRoot, "dir");
+
+      const canonicalAgentRoot = await fs.realpath(agentRoot);
+      const canonicalNestedRoot = await fs.realpath(nestedRoot);
+      expect(
+        graphSourceRootsWithinScope(linkedRoot, [
+          agentRoot,
+          nestedRoot,
+          outsideRoot,
+        ]),
+      ).toEqual([canonicalAgentRoot, canonicalNestedRoot]);
+      expect(
+        dirtyGraphSourceRoots(
+          linkedRoot,
+          [agentRoot, nestedRoot, outsideRoot],
+          [path.join(linkedRoot, "agent", "nested-agent", "index.ts")],
+        ),
+      ).toEqual([canonicalNestedRoot]);
+    } finally {
+      await fs.rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
   it("returns every registry-known agent regardless of deployment, source, or relationships", async () => {
     const inspectManifestName = vi.fn(async (sourceRoot: string) => {
       if (sourceRoot.endsWith("/growth")) {

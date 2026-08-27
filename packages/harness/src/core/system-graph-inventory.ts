@@ -129,6 +129,23 @@ export function canonicalGraphPath(input: string): string {
   try {
     return realpathSync.native(resolved);
   } catch {
+    // Watchers can report a path after an atomic rename or deletion, so the
+    // leaf itself may no longer exist. Resolve the nearest existing ancestor
+    // and append the missing tail; otherwise a symlinked workspace would stop
+    // matching exactly when targeted invalidation matters most.
+    const missingSegments: string[] = [];
+    let ancestor = resolved;
+    let parent = api.dirname(ancestor);
+    while (parent !== ancestor) {
+      missingSegments.unshift(api.basename(ancestor));
+      ancestor = parent;
+      try {
+        return api.join(realpathSync.native(ancestor), ...missingSegments);
+      } catch {
+        // Keep walking toward an existing ancestor.
+      }
+      parent = api.dirname(ancestor);
+    }
     return resolved;
   }
 }
@@ -143,6 +160,56 @@ export function isWithinGraphPath(root: string, candidate: string): boolean {
       !relative.startsWith(`..${api.sep}`) &&
       !api.isAbsolute(relative))
   );
+}
+
+/** Canonical registered roots contained by a workspace, safe for symlinked scopes. */
+export function graphSourceRootsWithinScope(
+  scopeRoot: string,
+  sourceRoots: readonly string[],
+): string[] {
+  const canonicalScopeRoot = canonicalGraphPath(scopeRoot);
+  return [
+    ...new Set(
+      sourceRoots
+        .map(canonicalGraphPath)
+        .filter((sourceRoot) =>
+          isWithinGraphPath(canonicalScopeRoot, sourceRoot),
+        ),
+    ),
+  ].sort();
+}
+
+/**
+ * Attribute exact source edits to the deepest registered project roots.
+ * A null path list is the polling/ambiguous-event fallback and dirties every
+ * caller in the scope.
+ */
+export function dirtyGraphSourceRoots(
+  scopeRoot: string,
+  sourceRoots: readonly string[],
+  sourcePaths: readonly string[] | null,
+): string[] {
+  const roots = graphSourceRootsWithinScope(scopeRoot, sourceRoots);
+  if (sourcePaths === null) return roots;
+
+  const dirty = new Set<string>();
+  for (const sourcePath of sourcePaths) {
+    const canonicalSourcePath = canonicalGraphPath(sourcePath);
+    const matches = roots.filter((sourceRoot) =>
+      isWithinGraphPath(sourceRoot, canonicalSourcePath),
+    );
+    for (const match of matches) {
+      if (
+        !matches.some(
+          (candidate) =>
+            candidate !== match && isWithinGraphPath(match, candidate),
+        )
+      ) {
+        dirty.add(match);
+      }
+    }
+  }
+  return [...dirty].sort();
 }
 
 function graphPathIdentity(input: string): string {

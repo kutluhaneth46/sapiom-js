@@ -106,6 +106,8 @@ import {
 } from "../core/system-graph.js";
 import {
   canonicalGraphPath,
+  dirtyGraphSourceRoots,
+  graphSourceRootsWithinScope,
   isWithinGraphPath,
 } from "../core/system-graph-inventory.js";
 import { SystemGraphStore } from "../core/system-graph-store.js";
@@ -1107,39 +1109,28 @@ export const startServer = async (
     return found;
   };
 
+  const workflowRootsForGraphScope = (scope: WorkspaceScope): string[] =>
+    graphSourceRootsWithinScope(
+      scope.root,
+      workflowsCache.map((workflow) => workflow.path),
+    );
+
   const systemGraphWatcher = new SystemGraphWatcherManager({
+    listSourceRoots: workflowRootsForGraphScope,
     onSourceChange: (scope, sourcePaths) => {
-      const workflowRoots = workflowsCache
-        .map((workflow) => canonicalGraphPath(workflow.path))
-        .filter((workflowRoot) => isWithinGraphPath(scope.root, workflowRoot));
-      const dirtyRoots = new Set<string>();
-      if (sourcePaths === null) {
-        for (const workflowRoot of workflowRoots) dirtyRoots.add(workflowRoot);
-      } else {
-        for (const sourcePath of sourcePaths) {
-          const canonicalSourcePath = canonicalGraphPath(sourcePath);
-          const matches = workflowRoots.filter((workflowRoot) =>
-            isWithinGraphPath(workflowRoot, canonicalSourcePath),
-          );
-          // Manually connected projects can be nested. Attribute a changed
-          // file to the most-specific registered caller rather than charging
-          // every registered ancestor for the same extraction.
-          for (const match of matches) {
-            if (
-              !matches.some(
-                (candidate) =>
-                  candidate !== match && isWithinGraphPath(match, candidate),
-              )
-            ) {
-              dirtyRoots.add(match);
-            }
-          }
-        }
-      }
+      const canonicalScope = {
+        workspaceKey: scope.workspaceKey,
+        root: canonicalGraphPath(scope.root),
+      };
+      const dirtyRoots = dirtyGraphSourceRoots(
+        canonicalScope.root,
+        workflowsCache.map((workflow) => workflow.path),
+        sourcePaths,
+      );
       for (const workflowRoot of dirtyRoots) {
         systemGraphRelationships.invalidateSource(workflowRoot);
       }
-      systemGraphStore.requestRefresh(scope);
+      systemGraphStore.requestRefresh(canonicalScope);
     },
     onInventoryChange: async (scope) => {
       try {

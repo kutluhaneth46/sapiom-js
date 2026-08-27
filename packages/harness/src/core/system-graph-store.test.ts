@@ -189,6 +189,23 @@ describe("SystemGraphStore", () => {
     expect(store.peek(scope.workspaceKey)).toBe(stale);
   });
 
+  it("does not publish a new revision for repeated inventory failures", async () => {
+    const onChange = vi.fn();
+    const store = new SystemGraphStore(
+      { build: vi.fn().mockResolvedValue(buildResult("initial")) },
+      { onChange },
+    );
+    await store.get(scope);
+    onChange.mockClear();
+
+    const firstFailure = store.reportRefreshFailure(scope);
+    const repeatedFailure = store.reportRefreshFailure(scope);
+
+    expect(repeatedFailure).toBe(firstFailure);
+    expect(firstFailure.state).toBe("stale");
+    expect(onChange).toHaveBeenCalledTimes(1);
+  });
+
   it("returns an honest cold degraded snapshot when no graph can be built", async () => {
     const store = new SystemGraphStore({
       build: vi.fn().mockRejectedValue(new Error("unavailable")),

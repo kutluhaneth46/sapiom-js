@@ -1,12 +1,10 @@
 import * as fs from "node:fs";
+import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 
 import type { WorkspaceKey } from "../shared/system-graph.js";
 import { isAgentProjectScanIgnoredDir } from "./agent-project-discovery.js";
-import {
-  normalizeWatchPath,
-  snapshotWorkflowSources,
-} from "./canvas-watcher.js";
+import { normalizeWatchPath } from "./canvas-watcher.js";
 import type { WorkspaceScope } from "./system-graph.js";
 import {
   snapshotWorkspaceWorkflows,
@@ -15,9 +13,11 @@ import {
 
 const SOURCE_DEBOUNCE_MS = 150;
 const INVENTORY_DEBOUNCE_MS = 250;
-const INVENTORY_RETRY_MS = 500;
-const POLL_INTERVAL_MS = 500;
+const INVENTORY_RETRY_BASE_MS = 500;
+const MAX_INVENTORY_RETRIES = 3;
+const POLL_INTERVAL_MS = 2_000;
 const SOURCE_EXTENSIONS = new Set([".ts", ".tsx"]);
+const UNREADABLE_SOURCE_FINGERPRINT = "<unreadable>";
 
 function ignoredRelativePath(relativePath: string): boolean {
   return relativePath
@@ -46,7 +46,59 @@ function confinedSourcePath(root: string, relativePath: string): string | null {
   return absolute;
 }
 
+/**
+ * Async source fingerprint for the registered agent roots in one workspace.
+ *
+ * The graph watcher deliberately does not reuse Canvas's synchronous,
+ * 400-file project snapshot here: a workspace can contain many agent projects,
+ * and polling it on the server event loop would both stutter Studio and miss
+ * edits after that project-sized ceiling. Async directory reads yield between
+ * entries, while scoping the walk to registry roots keeps the unbounded file
+ * count honest without traversing unrelated workspace trees.
+ */
+export async function snapshotWorkflowSourceRootsAsync(
+  sourceRoots: readonly string[],
+): Promise<string> {
+  const roots = [
+    ...new Set(sourceRoots.map((root) => path.resolve(root))),
+  ].sort();
+  const parts = roots.map((root) => `root\0${root}`);
+
+  const walk = async (dir: string): Promise<void> => {
+    let entries: fs.Dirent[];
+    try {
+      entries = await fsp.readdir(dir, { withFileTypes: true });
+    } catch {
+      parts.push(`${dir}\0${UNREADABLE_SOURCE_FINGERPRINT}`);
+      return;
+    }
+
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (isAgentProjectScanIgnoredDir(entry.name)) continue;
+        await walk(full);
+        continue;
+      }
+      if (!entry.isFile() || !SOURCE_EXTENSIONS.has(path.extname(entry.name))) {
+        continue;
+      }
+      try {
+        const stat = await fsp.stat(full);
+        parts.push(`${full}:${stat.mtimeMs}:${stat.size}`);
+      } catch {
+        parts.push(`${full}:gone`);
+      }
+    }
+  };
+
+  for (const root of roots) await walk(root);
+  return parts.sort().join("|");
+}
+
 export interface SystemGraphWatcherCallbacks {
+  /** Current registry roots inside this scope; read lazily on every poll. */
+  listSourceRoots: (scope: WorkspaceScope) => readonly string[];
   onSourceChange: (
     scope: WorkspaceScope,
     /** Null when the platform can only report a workspace-level change. */
@@ -55,24 +107,37 @@ export interface SystemGraphWatcherCallbacks {
   onInventoryChange: (scope: WorkspaceScope) => void | Promise<void>;
 }
 
+export interface SystemGraphWatcherOptions {
+  sourceDebounceMs?: number;
+  inventoryDebounceMs?: number;
+  inventoryRetryBaseMs?: number;
+  maxInventoryRetries?: number;
+  pollIntervalMs?: number;
+  /** Deterministic test seam for the supported polling fallback. */
+  forcePolling?: boolean;
+}
+
 class WorkspaceSystemGraphWatcher {
   private watcher: fs.FSWatcher | null = null;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private sourceTimer: ReturnType<typeof setTimeout> | null = null;
   private inventoryTimer: ReturnType<typeof setTimeout> | null = null;
+  private inventoryRetryTimer: ReturnType<typeof setTimeout> | null = null;
   private closed = false;
   private sourcePaths = new Set<string>();
   private ambiguousSourceChange = false;
-  private lastSourceSnapshot: string;
+  private lastSourceSnapshot: string | null = null;
   private lastInventorySnapshot: string;
+  private failedInventorySnapshot: string | null = null;
+  private inventoryGeneration = 0;
   private pollInFlight = false;
   private callbackQueue: Promise<void> = Promise.resolve();
 
   constructor(
     readonly scope: WorkspaceScope,
     private readonly callbacks: SystemGraphWatcherCallbacks,
+    private readonly options: SystemGraphWatcherOptions,
   ) {
-    this.lastSourceSnapshot = snapshotWorkflowSources(scope.root);
     this.lastInventorySnapshot = snapshotWorkspaceWorkflows(scope.root);
     this.arm();
   }
@@ -110,37 +175,110 @@ class WorkspaceSystemGraphWatcher {
       this.sourcePaths.clear();
       this.ambiguousSourceChange = false;
       this.enqueue(() => this.callbacks.onSourceChange(this.scope, paths));
-    }, SOURCE_DEBOUNCE_MS);
+    }, this.options.sourceDebounceMs ?? SOURCE_DEBOUNCE_MS);
   }
 
-  private dispatchInventoryChange(snapshot: string): void {
-    const previousSnapshot = this.lastInventorySnapshot;
+  private dispatchInventoryChange(
+    snapshot: string,
+    retryNumber = 0,
+    retryGeneration?: number,
+  ): void {
+    const generation = retryGeneration ?? this.inventoryGeneration + 1;
+    if (
+      retryGeneration !== undefined &&
+      retryGeneration !== this.inventoryGeneration
+    ) {
+      return;
+    }
+    if (retryGeneration === undefined) {
+      this.inventoryGeneration = generation;
+      if (this.inventoryRetryTimer) clearTimeout(this.inventoryRetryTimer);
+      this.inventoryRetryTimer = null;
+    }
     this.lastInventorySnapshot = snapshot;
+    this.failedInventorySnapshot = null;
     this.enqueue(
-      () => this.callbacks.onInventoryChange(this.scope),
       () => {
-        if (this.closed || this.lastInventorySnapshot !== snapshot) return;
-        // A failed registry scan did not consume the structural change. Restore
-        // the old baseline and retry even when no second filesystem event lands.
-        this.lastInventorySnapshot = previousSnapshot;
-        this.scheduleInventoryCheck(INVENTORY_RETRY_MS);
+        if (generation !== this.inventoryGeneration) return;
+        return this.callbacks.onInventoryChange(this.scope);
+      },
+      () => {
+        if (
+          this.closed ||
+          generation !== this.inventoryGeneration ||
+          this.lastInventorySnapshot !== snapshot
+        ) {
+          return;
+        }
+        if (
+          retryNumber >=
+          (this.options.maxInventoryRetries ?? MAX_INVENTORY_RETRIES)
+        ) {
+          // Consume the observed fingerprint after bounded recovery. This
+          // leaves the server snapshot stale without turning polling into a
+          // permanent registry-scan/event-bus loop. A later real source or
+          // inventory change clears this sentinel and starts a fresh series.
+          this.failedInventorySnapshot = snapshot;
+          return;
+        }
+        this.scheduleInventoryRetry(snapshot, retryNumber + 1, generation);
       },
     );
   }
 
-  private scheduleInventoryCheck(delay = INVENTORY_DEBOUNCE_MS): void {
+  private scheduleInventoryRetry(
+    snapshot: string,
+    retryNumber: number,
+    generation: number,
+  ): void {
+    if (this.closed || generation !== this.inventoryGeneration) return;
+    if (this.inventoryRetryTimer) clearTimeout(this.inventoryRetryTimer);
+    const delay =
+      (this.options.inventoryRetryBaseMs ?? INVENTORY_RETRY_BASE_MS) *
+      2 ** (retryNumber - 1);
+    this.inventoryRetryTimer = setTimeout(() => {
+      this.inventoryRetryTimer = null;
+      if (this.closed || generation !== this.inventoryGeneration) return;
+      void snapshotWorkspaceWorkflowsAsync(this.scope.root)
+        .then((currentSnapshot) => {
+          if (this.closed || generation !== this.inventoryGeneration) return;
+          if (currentSnapshot !== snapshot) {
+            this.dispatchInventoryChange(currentSnapshot);
+            return;
+          }
+          this.dispatchInventoryChange(snapshot, retryNumber, generation);
+        })
+        .catch(() => {
+          if (this.closed || generation !== this.inventoryGeneration) return;
+          this.dispatchInventoryChange(snapshot, retryNumber, generation);
+        });
+    }, delay);
+  }
+
+  private scheduleInventoryCheck(
+    delay = this.options.inventoryDebounceMs ?? INVENTORY_DEBOUNCE_MS,
+  ): void {
     if (this.closed) return;
     if (this.inventoryTimer) clearTimeout(this.inventoryTimer);
     this.inventoryTimer = setTimeout(() => {
       this.inventoryTimer = null;
       const snapshot = snapshotWorkspaceWorkflows(this.scope.root);
-      if (snapshot === this.lastInventorySnapshot) return;
+      if (
+        snapshot === this.lastInventorySnapshot &&
+        snapshot !== this.failedInventorySnapshot
+      ) {
+        return;
+      }
       this.dispatchInventoryChange(snapshot);
     }, delay);
   }
 
   private arm(): void {
     if (this.closed) return;
+    if (this.options.forcePolling) {
+      this.fallBackToPolling();
+      return;
+    }
     try {
       this.watcher = fs.watch(
         this.scope.root,
@@ -171,24 +309,42 @@ class WorkspaceSystemGraphWatcher {
 
   private fallBackToPolling(): void {
     if (this.closed || this.pollTimer) return;
+    let refreshAfterInitialSnapshot = this.watcher !== null;
     this.watcher?.close();
     this.watcher = null;
-    this.lastSourceSnapshot = snapshotWorkflowSources(this.scope.root);
-    this.lastInventorySnapshot = snapshotWorkspaceWorkflows(this.scope.root);
-    this.pollTimer = setInterval(() => {
-      if (this.pollInFlight) return;
+    const poll = (): void => {
+      if (this.closed || this.pollInFlight) return;
       this.pollInFlight = true;
-      const sourceSnapshot = snapshotWorkflowSources(this.scope.root);
-      if (sourceSnapshot !== this.lastSourceSnapshot) {
-        this.lastSourceSnapshot = sourceSnapshot;
-        this.scheduleSourceChange(null);
+      let sourceRoots: readonly string[] = [];
+      try {
+        sourceRoots = this.callbacks.listSourceRoots(this.scope);
+      } catch {
+        // Registry reads are hints too. Inventory polling still proceeds.
       }
-      snapshotWorkspaceWorkflowsAsync(this.scope.root)
-        .then((inventorySnapshot) => {
-          if (this.closed || inventorySnapshot === this.lastInventorySnapshot) {
-            return;
+      void Promise.all([
+        snapshotWorkflowSourceRootsAsync(sourceRoots),
+        snapshotWorkspaceWorkflowsAsync(this.scope.root),
+      ])
+        .then(([sourceSnapshot, inventorySnapshot]) => {
+          if (this.closed) return;
+          const sourceChanged =
+            (this.lastSourceSnapshot !== null &&
+              sourceSnapshot !== this.lastSourceSnapshot) ||
+            (this.lastSourceSnapshot === null && refreshAfterInitialSnapshot);
+          this.lastSourceSnapshot = sourceSnapshot;
+          refreshAfterInitialSnapshot = false;
+          if (sourceChanged) this.scheduleSourceChange(null);
+
+          if (inventorySnapshot !== this.lastInventorySnapshot) {
+            this.dispatchInventoryChange(inventorySnapshot);
+          } else if (
+            sourceChanged &&
+            inventorySnapshot === this.failedInventorySnapshot
+          ) {
+            // Polling has no raw filesystem event. A source-fingerprint change
+            // is its proof that a real edit occurred after bounded give-up.
+            this.dispatchInventoryChange(inventorySnapshot);
           }
-          this.dispatchInventoryChange(inventorySnapshot);
         })
         .catch(() => {
           // The next poll retries an unreadable workspace.
@@ -196,13 +352,19 @@ class WorkspaceSystemGraphWatcher {
         .finally(() => {
           this.pollInFlight = false;
         });
-    }, POLL_INTERVAL_MS);
+    };
+    poll();
+    this.pollTimer = setInterval(
+      poll,
+      this.options.pollIntervalMs ?? POLL_INTERVAL_MS,
+    );
   }
 
   close(): void {
     this.closed = true;
     if (this.sourceTimer) clearTimeout(this.sourceTimer);
     if (this.inventoryTimer) clearTimeout(this.inventoryTimer);
+    if (this.inventoryRetryTimer) clearTimeout(this.inventoryRetryTimer);
     if (this.pollTimer) clearInterval(this.pollTimer);
     this.watcher?.close();
     this.watcher = null;
@@ -216,7 +378,10 @@ export class SystemGraphWatcherManager {
     WorkspaceSystemGraphWatcher
   >();
 
-  constructor(private readonly callbacks: SystemGraphWatcherCallbacks) {}
+  constructor(
+    private readonly callbacks: SystemGraphWatcherCallbacks,
+    private readonly options: SystemGraphWatcherOptions = {},
+  ) {}
 
   start(scope: WorkspaceScope): void {
     const existing = this.watchers.get(scope.workspaceKey);
@@ -224,7 +389,7 @@ export class SystemGraphWatcherManager {
     this.stop(scope.workspaceKey);
     this.watchers.set(
       scope.workspaceKey,
-      new WorkspaceSystemGraphWatcher(scope, this.callbacks),
+      new WorkspaceSystemGraphWatcher(scope, this.callbacks, this.options),
     );
   }
 

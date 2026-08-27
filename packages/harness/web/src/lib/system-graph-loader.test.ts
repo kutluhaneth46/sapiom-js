@@ -217,11 +217,9 @@ describe("createSystemGraphLoader", () => {
 
     const retiredRequest = loader.load(source, workspaceKey);
     loader.retain(new Set());
+    await expect(loader.load(source, workspaceKey)).resolves.toBe(ready);
     late.resolve(snapshot(1));
     await retiredRequest;
-    expect(loader.peek(workspaceKey)).toBeNull();
-
-    await expect(loader.load(source, workspaceKey)).resolves.toBe(ready);
     expect(loader.peek(workspaceKey)).toBe(ready);
     expect(getSystemGraph).toHaveBeenCalledTimes(2);
   });

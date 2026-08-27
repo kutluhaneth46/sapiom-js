@@ -14,6 +14,7 @@ let scope: WorkspaceScope;
 let manager: SystemGraphWatcherManager;
 let onSourceChange: ReturnType<typeof vi.fn>;
 let onInventoryChange: ReturnType<typeof vi.fn>;
+let sourceRoots: Set<string>;
 
 async function scaffoldAgent(name: string): Promise<string> {
   const agentRoot = path.join(root, name);
@@ -23,6 +24,7 @@ async function scaffoldAgent(name: string): Promise<string> {
     JSON.stringify({ name }),
   );
   await fs.writeFile(path.join(agentRoot, "index.ts"), "export {};\n");
+  sourceRoots.add(agentRoot);
   return agentRoot;
 }
 
@@ -32,10 +34,22 @@ describe("SystemGraphWatcherManager", () => {
     scope = { workspaceKey: "workspace-test", root };
     onSourceChange = vi.fn();
     onInventoryChange = vi.fn();
-    manager = new SystemGraphWatcherManager({
-      onSourceChange,
-      onInventoryChange,
-    });
+    sourceRoots = new Set();
+    manager = new SystemGraphWatcherManager(
+      {
+        listSourceRoots: () => [...sourceRoots],
+        onSourceChange,
+        onInventoryChange,
+      },
+      {
+        forcePolling: true,
+        sourceDebounceMs: 10,
+        inventoryDebounceMs: 10,
+        inventoryRetryBaseMs: 20,
+        maxInventoryRetries: 2,
+        pollIntervalMs: 25,
+      },
+    );
   });
 
   afterEach(async () => {
@@ -53,7 +67,10 @@ describe("SystemGraphWatcherManager", () => {
       path.join(agentRoot, "index.ts"),
       'ctx.sapiom.agents.run({ definition: "growth" });\n',
     );
-    await sleep(1_100);
+    await vi.waitFor(() => expect(onSourceChange).toHaveBeenCalled(), {
+      timeout: 2_000,
+      interval: 20,
+    });
 
     expect(onSourceChange).toHaveBeenCalled();
     expect(onSourceChange.mock.calls.at(-1)?.[0]).toEqual(scope);
@@ -64,13 +81,18 @@ describe("SystemGraphWatcherManager", () => {
     manager.start(scope);
     await sleep(100);
     const agentRoot = await scaffoldAgent("growth");
-    await sleep(1_100);
-    expect(onInventoryChange).toHaveBeenCalledWith(scope);
+    await vi.waitFor(
+      () => expect(onInventoryChange).toHaveBeenCalledWith(scope),
+      { timeout: 2_000, interval: 20 },
+    );
 
     onInventoryChange.mockClear();
+    sourceRoots.delete(agentRoot);
     await fs.rm(agentRoot, { recursive: true, force: true });
-    await sleep(1_100);
-    expect(onInventoryChange).toHaveBeenCalledWith(scope);
+    await vi.waitFor(
+      () => expect(onInventoryChange).toHaveBeenCalledWith(scope),
+      { timeout: 2_000, interval: 20 },
+    );
   });
 
   it("retries a failed inventory refresh without another filesystem edit", async () => {
@@ -81,8 +103,52 @@ describe("SystemGraphWatcherManager", () => {
     await scaffoldAgent("growth");
 
     await vi.waitFor(() => expect(onInventoryChange).toHaveBeenCalledTimes(2), {
-      timeout: 4_000,
-      interval: 100,
+      timeout: 2_000,
+      interval: 20,
+    });
+  });
+
+  it("bounds inventory retries until a later filesystem change", async () => {
+    onInventoryChange.mockRejectedValue(new Error("registry unavailable"));
+    manager.start(scope);
+    await scaffoldAgent("growth");
+
+    await vi.waitFor(() => expect(onInventoryChange).toHaveBeenCalledTimes(3), {
+      timeout: 2_000,
+      interval: 20,
+    });
+    await sleep(200);
+    expect(onInventoryChange).toHaveBeenCalledTimes(3);
+
+    await scaffoldAgent("reporting");
+    await vi.waitFor(
+      () => expect(onInventoryChange.mock.calls.length).toBeGreaterThan(3),
+      { timeout: 2_000, interval: 20 },
+    );
+  });
+
+  it("polls every registered source file past Canvas's project-sized cap", async () => {
+    const agentRoot = await scaffoldAgent("large");
+    await Promise.all(
+      Array.from({ length: 425 }, (_, index) =>
+        fs.writeFile(
+          path.join(agentRoot, `step-${index.toString().padStart(3, "0")}.ts`),
+          `export const step${index} = ${index};\n`,
+        ),
+      ),
+    );
+    manager.start(scope);
+    await sleep(200);
+    onSourceChange.mockClear();
+
+    await fs.writeFile(
+      path.join(agentRoot, "step-424.ts"),
+      "export const step424 = 424_424;\n",
+    );
+
+    await vi.waitFor(() => expect(onSourceChange).toHaveBeenCalled(), {
+      timeout: 2_000,
+      interval: 20,
     });
   });
 
@@ -96,7 +162,12 @@ describe("SystemGraphWatcherManager", () => {
       path.join(root, "node_modules", "pkg", "index.ts"),
       "export {};\n",
     );
-    await sleep(1_100);
+    await fs.mkdir(path.join(root, "unregistered"), { recursive: true });
+    await fs.writeFile(
+      path.join(root, "unregistered", "index.ts"),
+      "export const ignored = true;\n",
+    );
+    await sleep(300);
 
     expect(onSourceChange).not.toHaveBeenCalled();
     expect(onInventoryChange).not.toHaveBeenCalled();
