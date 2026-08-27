@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { resolveManifestName } from "./definition-name.js";
+import { inspectManifestName, resolveManifestName } from "./definition-name.js";
 
 /** A cached-extraction result shaped like canvas-cache's, with just the field
  *  under test populated. */
@@ -24,7 +24,9 @@ function extraction(manifestName: string) {
 describe("resolveManifestName", () => {
   it("returns the agent's declared manifest name", async () => {
     const extract = vi.fn().mockResolvedValue(extraction("order-triage"));
-    await expect(resolveManifestName("/proj/agent", extract)).resolves.toBe("order-triage");
+    await expect(resolveManifestName("/proj/agent", extract)).resolves.toBe(
+      "order-triage",
+    );
     expect(extract).toHaveBeenCalledWith("/proj/agent");
   });
 
@@ -36,16 +38,48 @@ describe("resolveManifestName", () => {
       cached: false,
       fingerprint: "0:0",
     });
-    await expect(resolveManifestName("/proj/agent", extract)).resolves.toBeNull();
+    await expect(
+      resolveManifestName("/proj/agent", extract),
+    ).resolves.toBeNull();
   });
 
   it("returns null when extraction throws", async () => {
     const extract = vi.fn().mockRejectedValue(new Error("boom"));
-    await expect(resolveManifestName("/proj/agent", extract)).resolves.toBeNull();
+    await expect(
+      resolveManifestName("/proj/agent", extract),
+    ).resolves.toBeNull();
   });
 
   it("returns null for a blank manifest name", async () => {
     const extract = vi.fn().mockResolvedValue(extraction("   "));
-    await expect(resolveManifestName("/proj/agent", extract)).resolves.toBeNull();
+    await expect(
+      resolveManifestName("/proj/agent", extract),
+    ).resolves.toBeNull();
+  });
+});
+
+describe("inspectManifestName", () => {
+  it("distinguishes an unnamed agent from a failed extraction", async () => {
+    const unnamed = vi.fn().mockResolvedValue(extraction("   "));
+    const failed = vi.fn().mockResolvedValue({
+      result: { ok: false as const, reason: "run npm install first" },
+      cached: false,
+      fingerprint: "0:0",
+    });
+
+    await expect(
+      inspectManifestName("/proj/unnamed", unnamed),
+    ).resolves.toEqual({ status: "absent" });
+    await expect(inspectManifestName("/proj/broken", failed)).resolves.toEqual({
+      status: "failed",
+    });
+  });
+
+  it("reports a thrown extraction as failed", async () => {
+    const extract = vi.fn().mockRejectedValue(new Error("boom"));
+
+    await expect(inspectManifestName("/proj/broken", extract)).resolves.toEqual(
+      { status: "failed" },
+    );
   });
 });

@@ -10,6 +10,7 @@ import type {
   SessionSummary,
   WorkflowInfo,
 } from "@shared/types";
+import type { WorkspaceKey } from "@shared/system-graph";
 
 import type { AuthStartResponse, FsListResponse } from "../lib/api";
 import type { ToastTone } from "../lib/toast";
@@ -24,7 +25,12 @@ import { PlanCard } from "./PlanCard";
 import { UpdateCard } from "./UpdateCard";
 import { SettingsPopover } from "./SettingsPopover";
 import { describeUpdateOutcome, getDesktopBridge } from "../lib/desktop";
-import { ProjectRow, ProjectTreeRows, dirKey, projectKey } from "./ProjectTreeRows";
+import {
+  ProjectRow,
+  ProjectTreeRows,
+  dirKey,
+  projectKey,
+} from "./ProjectTreeRows";
 import type { RailDrag } from "./ProjectTreeRows";
 import { RemoveProjectConfirm } from "./RemoveProjectConfirm";
 import { UNROOTED_KEY, UnrootedAgents } from "./UnrootedAgents";
@@ -43,7 +49,12 @@ import { WorkflowRow } from "./WorkflowRow";
 import { ApiError, createApi, isMockMode } from "../lib/api";
 import { planMove } from "../lib/agent-move";
 import { useAccountPlan } from "../lib/use-account-plan";
-import { HARNESS_LABELS, historyDirs, historyRowMeta, sessionRowState } from "../lib/history-meta";
+import {
+  HARNESS_LABELS,
+  historyDirs,
+  historyRowMeta,
+  sessionRowState,
+} from "../lib/history-meta";
 import { loadUiPrefs, saveUiPrefs } from "../lib/ui-prefs";
 import {
   agentPrefixes,
@@ -52,7 +63,10 @@ import {
   projectRoots,
   unrootedAgents,
 } from "../lib/project-tree";
-import { hiddenByClosedProject, planProjectRemoval } from "../lib/project-membership";
+import {
+  hiddenByClosedProject,
+  planProjectRemoval,
+} from "../lib/project-membership";
 import type { RailAxis, RailSort } from "../lib/project-tree";
 import { samePath } from "../lib/paths";
 import type { PendingWorkspace } from "../lib/use-harness-state";
@@ -82,6 +96,18 @@ interface WorkflowsRailProps {
   activeSessionId: string | null;
   /** The focused agent (or bare folder) path — the single filled selection. */
   focusedAgentPath: string | null;
+  /** Opaque server-issued identities that join project roots to the local
+   * system-graph endpoint without exposing paths in URLs. */
+  workspaceScopes: AppState["workspaceScopes"];
+  /** The project whose dependency graph currently owns the full main area. */
+  selectedWorkspaceKey: WorkspaceKey | null;
+  /** Selects an exact project graph without changing the active session or
+   * either preserved agent pane. */
+  onSelectWorkspace: (
+    workspaceKey: WorkspaceKey,
+    root: string,
+    label: string,
+  ) => void;
   /** Focuses an agent (or a bare-scaffold folder): swaps the main panel's
    *  session tab strip to that subject's sessions. */
   onFocusAgent: (path: string) => void;
@@ -135,7 +161,11 @@ interface WorkflowsRailProps {
   listHarnesses: () => Promise<HarnessEntry[]>;
   /** Session-plus-scaffold-prompt at a folder that doesn't exist yet. `idea`
    *  is the "start from an idea" door's text, passed verbatim to the agent. */
-  onScaffoldSession: (cwd: string, harness: HarnessKind, idea?: string) => Promise<void>;
+  onScaffoldSession: (
+    cwd: string,
+    harness: HarnessKind,
+    idea?: string,
+  ) => Promise<void>;
   /** Where NEW projects are created (resolveProjectRoot in App). */
   projectRoot: string | null;
   /** Persist a changed project root as the user's default. */
@@ -171,7 +201,9 @@ interface WorkflowsRailProps {
   onSetSettingsOpen: (open: boolean) => void;
 }
 
-const IS_MAC = typeof navigator !== "undefined" && navigator.platform.toUpperCase().includes("MAC");
+const IS_MAC =
+  typeof navigator !== "undefined" &&
+  navigator.platform.toUpperCase().includes("MAC");
 const SHORTCUT_HINT = IS_MAC ? "⌘K" : "Ctrl+K";
 
 /**
@@ -191,7 +223,10 @@ const preferredHarness = (): HarnessKind =>
   loadUiPrefs().preferredHarness === "codex" ? "codex" : "claude-code";
 
 const RAIL_AXES: readonly RailAxis[] = ["project", "group"];
-const AXIS_LABELS: Record<RailAxis, string> = { project: "Project", group: "Group" };
+const AXIS_LABELS: Record<RailAxis, string> = {
+  project: "Project",
+  group: "Group",
+};
 /** A stored value from a retired axis falls back to the default rather than
  *  rendering a section that no longer exists. */
 const resolveAxis = (stored: unknown): RailAxis =>
@@ -244,7 +279,12 @@ function PastSessionRow({
   isSelected: boolean;
   onOpen: () => void;
 }): JSX.Element {
-  const resumableAttr = resumeMode === "agent-resume" ? "true" : resumeMode === "rehydrate" ? "false" : "unknown";
+  const resumableAttr =
+    resumeMode === "agent-resume"
+      ? "true"
+      : resumeMode === "rehydrate"
+        ? "false"
+        : "unknown";
   return (
     <button
       data-testid={testid}
@@ -269,7 +309,7 @@ function PastSessionRow({
 
 /**
  * Full-height workspace rail: brand header, a jump/search field, the explorer
- * tree (workspace folder headers > agent rows), and the account row.
+ * tree (project roots > directory branches > agent rows), and the account row.
  * Sessions are not a rail concern — they live in the main panel's tab strip,
  * keyed to the focused agent.
  */
@@ -281,6 +321,9 @@ export function WorkflowsRail({
   pendingWorkspaces,
   activeSessionId,
   focusedAgentPath,
+  workspaceScopes,
+  selectedWorkspaceKey,
+  onSelectWorkspace,
   onFocusAgent,
   onOpenPalette,
   onConnect,
@@ -339,12 +382,16 @@ export function WorkflowsRail({
   // downloaded update is waiting. The push protocol re-sends current state on
   // every page load, so subscribing at mount is the whole handshake; a browser
   // (no bridge) or an older desktop build (no subscription) never sets this.
-  const [updateReady, setUpdateReady] = useState<{ version: string } | null>(null);
+  const [updateReady, setUpdateReady] = useState<{ version: string } | null>(
+    null,
+  );
   useEffect(() => {
     const bridge = getDesktopBridge();
     if (!bridge?.onUpdateState) return;
     return bridge.onUpdateState((state) => {
-      setUpdateReady(state.kind === "downloaded" ? { version: state.version } : null);
+      setUpdateReady(
+        state.kind === "downloaded" ? { version: state.version } : null,
+      );
     });
   }, []);
   // "Add existing agents" opens the detection-driven StartDialog (register a
@@ -372,7 +419,9 @@ export function WorkflowsRail({
   // `project` (where an agent lives) and `group` (what it is related to).
   // `deployment` is retired — it bucketed a fact every agent row already prints
   // as a glyph — and `workspace` is replaced by `project`.
-  const [axis, setAxis] = useState<RailAxis>(() => resolveAxis(loadUiPrefs().railAxis));
+  const [axis, setAxis] = useState<RailAxis>(() =>
+    resolveAxis(loadUiPrefs().railAxis),
+  );
   const [sort, setSort] = useState<RailSort>(() =>
     loadUiPrefs().railSort === "name" ? "name" : "recent",
   );
@@ -415,7 +464,9 @@ export function WorkflowsRail({
     saveUiPrefs({ collapsedKeys: Array.from(collapsedKeys) });
   }, [collapsedKeys]);
 
-  const exitedSessions = sessions.filter((session) => session.status === "exited");
+  const exitedSessions = sessions.filter(
+    (session) => session.status === "exited",
+  );
 
   const toggleHistory = (): void => {
     const next = !historyOpen;
@@ -432,16 +483,28 @@ export function WorkflowsRail({
   // entries merge, deduped, newest first.
   const registryIds = new Set(sessions.map((session) => session.id));
   const registryAgentIds = new Set(
-    sessions.map((session) => session.agentSessionId).filter((id): id is string => id != null),
+    sessions
+      .map((session) => session.agentSessionId)
+      .filter((id): id is string => id != null),
   );
   const pastSummaries = history.filter(
     (summary) =>
-      !(summary.harnessSessionId != null && registryIds.has(summary.harnessSessionId)) &&
-      !registryAgentIds.has(summary.agentSessionId),
+      !(
+        summary.harnessSessionId != null &&
+        registryIds.has(summary.harnessSessionId)
+      ) && !registryAgentIds.has(summary.agentSessionId),
   );
   const pastRows = [
-    ...exitedSessions.map((session) => ({ kind: "exited" as const, at: session.lastActiveAt, session })),
-    ...pastSummaries.map((summary) => ({ kind: "summary" as const, at: summary.lastActiveAt, summary })),
+    ...exitedSessions.map((session) => ({
+      kind: "exited" as const,
+      at: session.lastActiveAt,
+      session,
+    })),
+    ...pastSummaries.map((summary) => ({
+      kind: "summary" as const,
+      at: summary.lastActiveAt,
+      summary,
+    })),
   ].sort((a, b) => b.at.localeCompare(a.at));
 
   // Exited registry rows render from the session record (it carries live status
@@ -452,7 +515,9 @@ export function WorkflowsRail({
   // The whole summary is kept, not just `resumeMode`: the same lookup now feeds
   // the meta line's branch and turn count, which exited rows could never show
   // because a registry session carries neither field.
-  const historyByAgentId = new Map(history.map((summary) => [summary.agentSessionId, summary] as const));
+  const historyByAgentId = new Map(
+    history.map((summary) => [summary.agentSessionId, summary] as const),
+  );
 
   // The PROJECT axis: root folders the user opened > directories that actually
   // branch > agents. There is no migration — every recentDirs entry and every
@@ -468,7 +533,12 @@ export function WorkflowsRail({
   const shown = (path: string): boolean =>
     !hiddenByClosedProject(path, closedProjects, openRoots);
   const visibleWorkflows = workflows.filter((workflow) => shown(workflow.path));
-  const roots = projectRoots({ recentDirs, sessions, pendingCwds, sort }).filter(shown);
+  const roots = projectRoots({
+    recentDirs,
+    sessions,
+    pendingCwds,
+    sort,
+  }).filter(shown);
   const projects = buildProjectTree(visibleWorkflows, roots, sort);
   // Agents no open root contains. Rarer than the old "No workspace" bucket,
   // but dropping them would hide an agent that exists.
@@ -479,7 +549,10 @@ export function WorkflowsRail({
   const workflowPaths = workflows.map((workflow) => workflow.path);
   // The project whose remove confirm is open, and the row control focus
   // returns to when it closes.
-  const [removing, setRemoving] = useState<{ root: string; label: string } | null>(null);
+  const [removing, setRemoving] = useState<{
+    root: string;
+    label: string;
+  } | null>(null);
   // Set imperatively from the clicked row's own control, so Escape hands focus
   // back to the button the flow started from rather than to the document.
   const removeTriggerRef = useRef<HTMLButtonElement | null>(null);
@@ -522,7 +595,9 @@ export function WorkflowsRail({
             void api.moveAgent(plan.from, plan.to).catch((err: unknown) => {
               onToast(
                 (err instanceof ApiError ? err.reason : null) ??
-                  (err instanceof Error ? err.message : `Couldn't move ${plan.name}.`),
+                  (err instanceof Error
+                    ? err.message
+                    : `Couldn't move ${plan.name}.`),
               );
             });
           },
@@ -540,9 +615,10 @@ export function WorkflowsRail({
   // reducer, and reading it back from there would mean calling a setter inside a
   // state updater, which React is free to run twice. The label is what we chose
   // before the call.
-  const [freshGroupLabel, setFreshGroupLabel] = useState<{ root: string; label: string } | null>(
-    null,
-  );
+  const [freshGroupLabel, setFreshGroupLabel] = useState<{
+    root: string;
+    label: string;
+  } | null>(null);
 
   /** "New group", then "New group 2" — never a duplicate label, because two rows
    *  saying one thing cannot be told apart. */
@@ -567,7 +643,9 @@ export function WorkflowsRail({
     const rootAgents = railGroups.agentsIn(root);
     if (!rootAgents.some((workflow) => workflow.path === request.path)) return;
     setFreshGroupLabel(null);
-    railGroups.edit(root, rootAgents, (state) => applyGroupDrop(state, request));
+    railGroups.edit(root, rootAgents, (state) =>
+      applyGroupDrop(state, request),
+    );
   };
 
   // Live, UNBOUND sessions sitting exactly at a project root. Meaningful only
@@ -581,7 +659,10 @@ export function WorkflowsRail({
           session.boundWorkflowPath == null &&
           samePath(session.cwd, root),
       )
-      .sort((a, b) => b.createdAt.localeCompare(a.createdAt) || a.id.localeCompare(b.id))[0];
+      .sort(
+        (a, b) =>
+          b.createdAt.localeCompare(a.createdAt) || a.id.localeCompare(b.id),
+      )[0];
 
   // `projectIsEmpty` is the ONE emptiness answer, and it consults `rootAgent`:
   // a merged root-agent project has nothing in `dirs` or `agents`, so a naive
@@ -683,7 +764,9 @@ export function WorkflowsRail({
         {/* The header names what the list is FILED BY, so it changes with the
             axis. A header reading "Projects" over a list of relationship
             clusters would describe the wrong thing. */}
-        <span className="rail-header-label">{axis === "group" ? "Groups" : "Projects"}</span>
+        <span className="rail-header-label">
+          {axis === "group" ? "Groups" : "Projects"}
+        </span>
         <div className="rail-header-actions">
           {/* ADD sits to the LEFT OF THE ELLIPSIS, both in the trailing group.
               The label owns the leading edge: putting a control there made the
@@ -767,14 +850,19 @@ export function WorkflowsRail({
                     "how is this list filed?" is answerable without opening
                     anything — a radio row only says what is checked once you
                     are already inside the menu you had to guess to open. */}
-                <div className="menu-choice-group" onMouseEnter={() => setPastOpen(false)}>
+                <div
+                  className="menu-choice-group"
+                  onMouseEnter={() => setPastOpen(false)}
+                >
                   <label className="filing-field">
                     <span className="filing-field-label">Group by</span>
                     <select
                       className="filing-field-select"
                       data-testid="filing-group-by"
                       value={axis}
-                      onChange={(event) => pickAxis(resolveAxis(event.target.value))}
+                      onChange={(event) =>
+                        pickAxis(resolveAxis(event.target.value))
+                      }
                     >
                       {RAIL_AXES.map((option) => (
                         <option key={option} value={option}>
@@ -790,7 +878,9 @@ export function WorkflowsRail({
                       data-testid="filing-sort-by"
                       value={sort}
                       onChange={(event) =>
-                        pickSort(event.target.value === "name" ? "name" : "recent")
+                        pickSort(
+                          event.target.value === "name" ? "name" : "recent",
+                        )
                       }
                     >
                       {(["recent", "name"] as const).map((option) => (
@@ -809,7 +899,10 @@ export function WorkflowsRail({
                     Opens on hover (moving onto it) as well as click. */}
                 <button
                   type="button"
-                  className={"session-dropdown-item nested-trigger" + (pastOpen ? " is-open" : "")}
+                  className={
+                    "session-dropdown-item nested-trigger" +
+                    (pastOpen ? " is-open" : "")
+                  }
                   data-testid="past-sessions-trigger"
                   aria-haspopup="menu"
                   aria-expanded={pastOpen}
@@ -823,7 +916,10 @@ export function WorkflowsRail({
                     <span className="session-item-title">Past sessions</span>
                   </span>
                   {exitedSessions.length > 0 && (
-                    <span className="session-history-badge" data-testid="session-history-badge">
+                    <span
+                      className="session-history-badge"
+                      data-testid="session-history-badge"
+                    >
                       {exitedSessions.length}
                     </span>
                   )}
@@ -883,7 +979,10 @@ export function WorkflowsRail({
                               undefined,
                               {
                                 includeHarness: false,
-                                state: sessionRowState({ resumeMode, turnCount: summary?.turnCount }),
+                                state: sessionRowState({
+                                  resumeMode,
+                                  turnCount: summary?.turnCount,
+                                }),
                               },
                             )}
                             cwd={row.session.cwd}
@@ -916,9 +1015,13 @@ export function WorkflowsRail({
                         />
                       );
                     })}
-                    {historyLoading && <div className="session-dropdown-empty">Loading…</div>}
+                    {historyLoading && (
+                      <div className="session-dropdown-empty">Loading…</div>
+                    )}
                     {!historyLoading && pastRows.length === 0 && (
-                      <div className="session-dropdown-empty">No past sessions yet</div>
+                      <div className="session-dropdown-empty">
+                        No past sessions yet
+                      </div>
                     )}
                   </div>
                 </div>
@@ -939,7 +1042,16 @@ export function WorkflowsRail({
 
           {projects.map((project) => {
             const collapsed = collapsedKeys.has(projectKey(project.root));
-            const pending = pendingCwds.some((cwd) => samePath(cwd, project.root));
+            // The browser never invents graph identities from a path. Join this
+            // exact Project-axis root to the opaque key issued by the server.
+            // Segment-aware equality matters on Windows and avoids basename
+            // collisions between neighbouring projects.
+            const workspaceScope = (workspaceScopes ?? []).find((scope) =>
+              samePath(scope.cwd, project.root),
+            );
+            const pending = pendingCwds.some((cwd) =>
+              samePath(cwd, project.root),
+            );
             const empty = projectIsEmpty(project);
             const bare = empty ? bareSessionAt(project.root) : undefined;
             // Being created: the folder is known but its session/agent has not
@@ -959,12 +1071,15 @@ export function WorkflowsRail({
             // directory row, so merging an agent into it would put an agent row
             // where a scope header belongs — and the root agent is often the
             // head of the very group being shown.
-            const groupAgents = axis === "group" ? railGroups.agentsIn(project.root) : [];
+            const groupAgents =
+              axis === "group" ? railGroups.agentsIn(project.root) : [];
             const showGroups = axis === "group" && groupAgents.length > 1;
             const soloAgents = groupAgents.filter(
               (workflow) => workflow.path !== project.rootAgent?.workflow.path,
             );
-            const groupNodes = showGroups ? railGroups.groupsFor(project.root, groupAgents) : [];
+            const groupNodes = showGroups
+              ? railGroups.groupsFor(project.root, groupAgents)
+              : [];
             const groupState = railGroups.stateFor(project.root);
             return (
               <div
@@ -977,7 +1092,14 @@ export function WorkflowsRail({
                   root={project.root}
                   rootAgent={showGroups ? null : project.rootAgent}
                   collapsed={collapsed}
-                  onToggleCollapsed={() => toggleCollapsed(projectKey(project.root))}
+                  onToggleCollapsed={() =>
+                    toggleCollapsed(projectKey(project.root))
+                  }
+                  workspaceKey={workspaceScope?.workspaceKey ?? null}
+                  selected={
+                    workspaceScope?.workspaceKey === selectedWorkspaceKey
+                  }
+                  onSelectProject={onSelectWorkspace}
                   focusedAgentPath={focusedAgentPath}
                   onFocusAgent={onFocusAgent}
                   focusable={creating || bare != null}
@@ -989,11 +1111,13 @@ export function WorkflowsRail({
                   busy={creating}
                   drag={drag}
                   mainTestid={
-                    creating
-                      ? `workspace-pending-${project.label}`
-                      : bare
-                        ? `workspace-focus-${project.label}`
-                        : undefined
+                    workspaceScope
+                      ? undefined
+                      : creating
+                        ? `workspace-pending-${project.label}`
+                        : bare
+                          ? `workspace-focus-${project.label}`
+                          : undefined
                   }
                   tooltip={
                     creating
@@ -1005,7 +1129,10 @@ export function WorkflowsRail({
                   trailing={
                     <>
                       {creating ? (
-                        <span className="workspace-row-spinner" aria-hidden="true" />
+                        <span
+                          className="workspace-row-spinner"
+                          aria-hidden="true"
+                        />
                       ) : bare ? (
                         <button
                           type="button"
@@ -1033,7 +1160,10 @@ export function WorkflowsRail({
                         data-tooltip="Remove project"
                         onClick={(event) => {
                           removeTriggerRef.current = event.currentTarget;
-                          setRemoving({ root: project.root, label: project.label });
+                          setRemoving({
+                            root: project.root,
+                            label: project.label,
+                          });
                         }}
                       >
                         <Icon name="X" size={13} />
@@ -1055,7 +1185,10 @@ export function WorkflowsRail({
                 {!collapsed && empty && !creating && bare == null && (
                   <>
                   <div className="workspace-row is-nested workspace-row-empty">
-                    <span className="row-disclosure row-disclosure-static" aria-hidden="true" />
+                    <span
+                      className="row-disclosure row-disclosure-static"
+                      aria-hidden="true"
+                    />
                     {/* A ROW YOU CAN ACT ON. An empty project stating its
                         emptiness and offering nothing is a dead end — and the
                         whole reason to open a folder with no agent in it is to
@@ -1068,15 +1201,16 @@ export function WorkflowsRail({
                       data-testid={`project-empty-${project.label}`}
                       data-tooltip={`Start an agent in ${project.root}`}
                       onClick={() => {
-                        void onScaffoldSession(project.root, preferredHarness()).catch(
-                          (err: unknown) => {
-                            onToast(
-                              err instanceof Error
-                                ? err.message
-                                : `Couldn't start an agent in ${project.label}.`,
-                            );
-                          },
-                        );
+                        void onScaffoldSession(
+                          project.root,
+                          preferredHarness(),
+                        ).catch((err: unknown) => {
+                          onToast(
+                            err instanceof Error
+                              ? err.message
+                              : `Couldn't start an agent in ${project.label}.`,
+                          );
+                        });
                       }}
                     >
                       <Icon name="Sparkles" size={13} />
@@ -1144,7 +1278,9 @@ export function WorkflowsRail({
                     editable={railGroups.isReady(project.root)}
                     isDerived={!isMaterialized(groupState)}
                     freshLabel={
-                      freshGroupLabel?.root === project.root ? freshGroupLabel.label : null
+                      freshGroupLabel?.root === project.root
+                        ? freshGroupLabel.label
+                        : null
                     }
                     collapsedKeys={collapsedKeys}
                     onToggleCollapsed={toggleCollapsed}
@@ -1178,7 +1314,9 @@ export function WorkflowsRail({
                           }
                         : undefined
                     }
-                    resetCount={isMaterialized(groupState) ? groupState.groups.length : 0}
+                    resetCount={
+                      isMaterialized(groupState) ? groupState.groups.length : 0
+                    }
                   />
                 )}
                 {/* One agent (or none but a live session) has no relationship to
@@ -1188,7 +1326,9 @@ export function WorkflowsRail({
                   axis === "group" &&
                   !showGroups &&
                   soloAgents.map((workflow) => {
-                    const node = agentPrefixes(soloAgents, project.root).get(workflow.path);
+                    const node = agentPrefixes(soloAgents, project.root).get(
+                      workflow.path,
+                    );
                     return (
                       <WorkflowRow
                         key={workflow.path}
@@ -1220,7 +1360,11 @@ export function WorkflowsRail({
               agentPaths={workflowPaths}
               onOpenAsProject={(root) => {
                 void onOpenProject(root).catch((err: unknown) => {
-                  onToast(err instanceof Error ? err.message : "Couldn't open that folder.");
+                  onToast(
+                    err instanceof Error
+                      ? err.message
+                      : "Couldn't open that folder.",
+                  );
                 });
               }}
             />
@@ -1232,12 +1376,17 @@ export function WorkflowsRail({
         {/* Update card over plan card over account row — all in the SAME
             footer block. The update card exists only while the desktop app
             holds a downloaded update (see the onUpdateState subscription). */}
-        {updateReady && (() => {
-          const bridge = getDesktopBridge();
-          return bridge ? (
-            <UpdateCard desktop={bridge} version={updateReady.version} onToast={onToast} />
-          ) : null;
-        })()}
+        {updateReady &&
+          (() => {
+            const bridge = getDesktopBridge();
+            return bridge ? (
+              <UpdateCard
+                desktop={bridge}
+                version={updateReady.version}
+                onToast={onToast}
+              />
+            ) : null;
+          })()}
         {/* The plan summary: the server's /api/account/plan relay (MockApi's
             fixture in demo); a view with nothing to state renders nothing. */}
         <PlanCard plan={accountPlan} />
@@ -1278,7 +1427,9 @@ export function WorkflowsRail({
           onConnect={onConnect}
           onOpenProject={onOpenProject}
           onScan={onScanWorkflows}
-          triggerRef={startMode === "open" ? addProjectTriggerRef : connectTriggerRef}
+          triggerRef={
+            startMode === "open" ? addProjectTriggerRef : connectTriggerRef
+          }
         />
       )}
 
@@ -1301,7 +1452,6 @@ export function WorkflowsRail({
           triggerRef={removeTriggerRef}
         />
       )}
-
     </aside>
   );
 }
@@ -1361,10 +1511,15 @@ function ProfileRow({
   const [menuOpen, setMenuOpen] = useState(false);
   const [theme, setTheme] = useState(getTheme());
   useEffect(() => subscribeTheme(setTheme), []);
-  const [authProgress, setAuthProgress] = useState<ProfileAuthProgress>({ status: "idle" });
+  const [authProgress, setAuthProgress] = useState<ProfileAuthProgress>({
+    status: "idle",
+  });
   const triggerRef = useRef<HTMLButtonElement>(null);
   const closeMenu = useCallback(() => setMenuOpen(false), []);
-  const closeSettings = useCallback(() => onSetSettingsOpen(false), [onSetSettingsOpen]);
+  const closeSettings = useCallback(
+    () => onSetSettingsOpen(false),
+    [onSetSettingsOpen],
+  );
 
   const demo = isMockMode();
   const isPending = authProgress.status === "pending";
@@ -1422,7 +1577,9 @@ function ProfileRow({
       : authenticated
         ? "Sapiom account"
         : "connect to get started";
-  const initial = (demo ? "D" : (organizationName ?? "S")).charAt(0).toUpperCase();
+  const initial = (demo ? "D" : (organizationName ?? "S"))
+    .charAt(0)
+    .toUpperCase();
 
   const handleConnectFromMenu = async (): Promise<void> => {
     closeMenu();
@@ -1432,7 +1589,9 @@ function ProfileRow({
       // Server returns immediately — auth completes via auth.changed bus message.
     } catch (err) {
       const message =
-        err instanceof Error ? err.message : "Could not start sign-in. Try again.";
+        err instanceof Error
+          ? err.message
+          : "Could not start sign-in. Try again.";
       setAuthProgress({ status: "error", message });
     }
   };
@@ -1445,7 +1604,11 @@ function ProfileRow({
         data-testid="brand-identity"
         aria-haspopup="menu"
         aria-expanded={menuOpen}
-        title={demo ? "Static demo. No Sapiom account, server, or agent is connected." : "Account"}
+        title={
+          demo
+            ? "Static demo. No Sapiom account, server, or agent is connected."
+            : "Account"
+        }
         onClick={() => {
           // Opening the account menu collapses the settings card so the two
           // never stack — one section of the profile is open at a time.
@@ -1510,7 +1673,9 @@ function ProfileRow({
       >
         <button
           role="menuitem"
-          className={"profile-menu-item" + (overviewSelected ? " is-selected" : "")}
+          className={
+            "profile-menu-item" + (overviewSelected ? " is-selected" : "")
+          }
           data-testid="rail-overview"
           onClick={() => {
             onSelectOverview();
@@ -1619,7 +1784,10 @@ function ProfileRow({
           </button>
         )}
         {authProgress.status === "error" && (
-          <p className="profile-menu-auth-error" data-testid="profile-auth-error">
+          <p
+            className="profile-menu-auth-error"
+            data-testid="profile-auth-error"
+          >
             {authProgress.message}
           </p>
         )}

@@ -29,6 +29,7 @@ import type {
   WorkflowInfo,
 } from "../shared/types.js";
 import { JSON_BODY_LIMIT_BYTES } from "../shared/types.js";
+import type { SystemGraphSnapshot } from "../shared/system-graph.js";
 import { unhandledRequestErrorHandler } from "./error-handler.js";
 import { resolveStatePaths } from "../core/paths.js";
 import {
@@ -76,7 +77,10 @@ import { getOrCreateMachineId } from "../cli/machine-id.js";
 import { loadSettings, pruneDeadRecentDirs } from "../cli/settings.js";
 import type { HarnessIdentity } from "../cli/auth.js";
 import { generateClaudeSettings } from "../core/inject/claude-settings.js";
-import { generateMcpConfig, type McpDevServerCommand } from "../core/inject/mcp-config.js";
+import {
+  generateMcpConfig,
+  type McpDevServerCommand,
+} from "../core/inject/mcp-config.js";
 import { generateSystemPromptFile } from "../core/inject/system-prompt.js";
 import { generateSkillsPlugin } from "../core/inject/skills-plugin.js";
 import {
@@ -97,15 +101,35 @@ import {
 import { ensureCanvasTemplate } from "../core/canvas-template.js";
 import { renderCanvasForSession } from "../core/canvas-render.js";
 import { invalidateExtractionCache } from "../core/canvas-cache.js";
+import {
+  CachedAgentRelationshipProvider,
+  HarnessRegistryInventoryProvider,
+  LocalWorkspaceScopeCatalog,
+  SourceAgentRelationshipProvider,
+  StaticSystemGraphBuilder,
+  type WorkspaceScope,
+} from "../core/system-graph.js";
+import {
+  canonicalGraphPath,
+  dirtyGraphSourceRoots,
+  graphSourceRootsWithinScope,
+  isWithinGraphPath,
+} from "../core/system-graph-inventory.js";
+import { SystemGraphStore } from "../core/system-graph-store.js";
+import { SystemGraphWatcherManager } from "../core/system-graph-watcher.js";
 import { sweepNdjson } from "../core/collector/store-retention.js";
 import {
   createDefinitionSlugResolver,
   resolveAgentsBaseUrl,
 } from "../core/definition-slug-resolver.js";
-import { resolveManifestName } from "../core/definition-name.js";
+import {
+  inspectManifestName,
+  resolveManifestName,
+} from "../core/definition-name.js";
 import { createBootTokenMiddleware } from "./auth.js";
 import { createApiKeyProvider } from "../core/api-key-provider.js";
 import { createRestRouter } from "./rest.js";
+import { createSystemGraphRouter } from "./system-graph.js";
 import { createStaticRouter } from "./static.js";
 import { createTerminalWebSocketHandler } from "./terminal-ws.js";
 import { createEventsWebSocketHandler } from "./events-ws.js";
@@ -121,17 +145,18 @@ import { createCanvasRouter } from "./canvas.js";
 import { createCanvasRenderRouter } from "./canvas-render.js";
 import { createWorkflowGraphRouter } from "./workflow-graph.js";
 import { createStudioRailRouter } from "./studio-rail.js";
-import { createAgentMoveRouter, moveTargetDirs, remapSessions } from "./agent-move.js";
+import {
+  createAgentMoveRouter,
+  moveTargetDirs,
+  remapSessions,
+} from "./agent-move.js";
 import { createMacrosRouter } from "./macros.js";
 import { createFsRouter } from "./fs.js";
 import { createRunsRouter } from "./runs.js";
 import { createTemplatesRouter } from "./templates.js";
 import { createAccountRouter } from "./account.js";
 import { createActionsRouter } from "./actions.js";
-import {
-  createAuthRouter,
-  createMutableAuthState,
-} from "./auth-routes.js";
+import { createAuthRouter, createMutableAuthState } from "./auth-routes.js";
 // resolveAgentsBaseUrl is imported above from definition-slug-resolver.js
 // (an identical helper); the runs router reuses it for its agents base URL.
 
@@ -283,6 +308,7 @@ function packageRoot(): string {
  *   workspace-change the session cwd whose marker set the watcher saw change
  *   agent-linked     one agent's own directory, after `deploy` wrote its id
  *   agent-moved      the destination of a rail drag
+ *   graph-refresh    a project graph open or explicit graph refresh
  *   requested        POST /api/workflows/scan — the "Add all" button
  *
  * The sixth, POST /api/workflows/connect, registers exactly one path and is not
@@ -294,6 +320,7 @@ type WorkflowScanReason =
   | "workspace-change"
   | "agent-linked"
   | "agent-moved"
+  | "graph-refresh"
   | "requested";
 
 /**
@@ -401,7 +428,11 @@ function createDefaultBuildLaunchOpts(
     // (server-side auto-create, a legacy session resumed before this existed)
     // omits it and Claude keeps its default 256-color rendering, exactly as before.
     const claudeTheme =
-      req.theme === "light" ? "light-ansi" : req.theme === "dark" ? "dark-ansi" : undefined;
+      req.theme === "light"
+        ? "light-ansi"
+        : req.theme === "dark"
+          ? "dark-ansi"
+          : undefined;
 
     const [settings, mcpConfigFile, systemPromptFile, pluginDir] =
       await Promise.all([
@@ -430,7 +461,9 @@ function createDefaultBuildLaunchOpts(
       ...(pluginDir ? { pluginDir } : {}),
       // Set on BOTH channels: the post-ready path hasn't delivered yet, but a
       // brief exists and will, and this is the flag that tells it to.
-      ...(brief !== null && rehydrateFrom ? { rehydratedFrom: rehydrateFrom } : {}),
+      ...(brief !== null && rehydrateFrom
+        ? { rehydratedFrom: rehydrateFrom }
+        : {}),
     };
   };
 }
@@ -606,9 +639,13 @@ export const startServer = async (
   }, WORKFLOWS_CACHE_REFRESH_MS);
   workflowsCacheTimer.unref?.();
 
-  const boundWorkflowForSession = (session: HarnessSession): WorkflowInfo | null =>
+  const boundWorkflowForSession = (
+    session: HarnessSession,
+  ): WorkflowInfo | null =>
     session.boundWorkflowPath
-      ? (workflowsCache.find((workflow) => workflow.path === session.boundWorkflowPath) ?? null)
+      ? (workflowsCache.find(
+          (workflow) => workflow.path === session.boundWorkflowPath,
+        ) ?? null)
       : null;
 
   /**
@@ -622,19 +659,31 @@ export const startServer = async (
   const writeSessionContext = async (
     session: HarnessSession,
   ): Promise<void> => {
-    await writeHarnessContext(session, boundWorkflowForSession(session), workflowsCache);
+    await writeHarnessContext(
+      session,
+      boundWorkflowForSession(session),
+      workflowsCache,
+    );
   };
 
   const initializeSessionContext = async (
     session: HarnessSession,
   ): Promise<void> => {
-    await writeHarnessContextForLaunch(session, boundWorkflowForSession(session), workflowsCache);
+    await writeHarnessContextForLaunch(
+      session,
+      boundWorkflowForSession(session),
+      workflowsCache,
+    );
   };
 
   const prepareSessionContext = async (
     session: HarnessSession,
   ): Promise<void> => {
-    await prepareHarnessContextForResume(session, boundWorkflowForSession(session), workflowsCache);
+    await prepareHarnessContextForResume(
+      session,
+      boundWorkflowForSession(session),
+      workflowsCache,
+    );
   };
 
   // Declared before the launch-opts builder (rather than beside the ingest
@@ -675,7 +724,9 @@ export const startServer = async (
    * grows the store — enforcing the caps at the moment they can be exceeded
    * beats waiting for the next boot.
    */
-  const archiveSessionRecord = async (harnessSessionId: string): Promise<void> => {
+  const archiveSessionRecord = async (
+    harnessSessionId: string,
+  ): Promise<void> => {
     const record = await sessionRecordReader.readFromEvents(harnessSessionId);
     if (!record) return;
     if (!(await recordArchive.write(record))) return;
@@ -703,13 +754,18 @@ export const startServer = async (
    * doesn't apply to a single deliberate action). Null for a harness whose
    * transcript doesn't record a branch, and never throws.
    */
-  const priorGitBranch = async (record: SessionRecord): Promise<string | null> => {
+  const priorGitBranch = async (
+    record: SessionRecord,
+  ): Promise<string | null> => {
     if (!record.cwd || !record.agentSessionId) return null;
     const adapter = adapters[record.harness];
     if (!adapter) return null;
     try {
       const rows = await adapter.listPastSessions(record.cwd);
-      return rows.find((row) => row.agentSessionId === record.agentSessionId)?.gitBranch ?? null;
+      return (
+        rows.find((row) => row.agentSessionId === record.agentSessionId)
+          ?.gitBranch ?? null
+      );
     } catch {
       return null;
     }
@@ -724,10 +780,13 @@ export const startServer = async (
    * safe because nothing can create a session before the manager that creates
    * them exists.
    */
-  const resolveRehydrationBrief = (rehydrateFrom: string): Promise<string | null> =>
+  const resolveRehydrationBrief = (
+    rehydrateFrom: string,
+  ): Promise<string | null> =>
     buildRehydrationBrief(rehydrateFrom, {
       readRecord: (id) => sessionRecordReader.read(id),
-      readSummary: (harnessSessionId) => readRollingSummary(generatedRoot, harnessSessionId),
+      readSummary: (harnessSessionId) =>
+        readRollingSummary(generatedRoot, harnessSessionId),
       resolveContext: async (record) => {
         // The earliest merged session the registry still knows — the record's
         // own primary id first, so a conversation that spans a resume reports
@@ -743,7 +802,11 @@ export const startServer = async (
           title: prior?.title ?? null,
           gitBranch: await priorGitBranch(record),
           workflow: workflow
-            ? { name: workflow.name, path: workflow.path, definitionId: workflow.definitionId }
+            ? {
+                name: workflow.name,
+                path: workflow.path,
+                definitionId: workflow.definitionId,
+              }
             : null,
         };
       },
@@ -780,6 +843,56 @@ export const startServer = async (
   });
   await sessionManager.init();
 
+  const workspaceScopeCatalog = new LocalWorkspaceScopeCatalog(async () => [
+    ...(await loadSettings(statePaths.settings)).recentDirs,
+    ...sessionManager.list().map((session) => session.cwd),
+  ]);
+  const systemGraphRelationships = new CachedAgentRelationshipProvider(
+    new SourceAgentRelationshipProvider(),
+  );
+  const systemGraphStore = new SystemGraphStore(
+    new StaticSystemGraphBuilder(
+      new HarnessRegistryInventoryProvider({
+        listWorkflows: () => workflowsCache,
+        inspectManifestName,
+      }),
+      systemGraphRelationships,
+    ),
+    {
+      onChange: ({ workspaceKey, revision, state }) => {
+        bus.publish({
+          type: "system-graph.changed",
+          workspaceKey,
+          revision,
+          state,
+        });
+      },
+    },
+  );
+  const activeSystemGraphScopes = new Map<string, WorkspaceScope>();
+
+  const refreshSystemGraphScopesForRoot = (
+    changedRoot: string,
+    excludedWorkspaceKey?: string,
+  ): void => {
+    const canonicalChangedRoot = canonicalGraphPath(changedRoot);
+    for (const scope of activeSystemGraphScopes.values()) {
+      if (scope.workspaceKey === excludedWorkspaceKey) continue;
+      if (!systemGraphStore.peek(scope.workspaceKey)) continue;
+      const scopeRoot = canonicalGraphPath(scope.root);
+      if (
+        !isWithinGraphPath(scopeRoot, canonicalChangedRoot) &&
+        !isWithinGraphPath(canonicalChangedRoot, scopeRoot)
+      ) {
+        continue;
+      }
+      systemGraphStore.requestRefresh({
+        workspaceKey: scope.workspaceKey,
+        root: scopeRoot,
+      });
+    }
+  };
+
   const sessionSweepTimer = setInterval(
     () => sessionManager.sweepDeadSessions(),
     SESSION_LIVENESS_SWEEP_MS,
@@ -801,7 +914,11 @@ export const startServer = async (
     }
     const rehydratedFrom = session.rehydratedFrom;
     if (!session.ready || !rehydratedFrom) return;
-    if (systemPromptDeliveryFor(adapters[session.harness]) !== "post-ready-injection") return;
+    if (
+      systemPromptDeliveryFor(adapters[session.harness]) !==
+      "post-ready-injection"
+    )
+      return;
     if (briefsDelivered.has(session.id)) return;
     // Claimed before the await so a burst of status frames can't double-inject.
     briefsDelivered.add(session.id);
@@ -851,11 +968,15 @@ export const startServer = async (
   // last-N-turns, which is also the default for everyone with the setting off.
   const rollingSummarizer = createRollingSummarizer({
     generatedRoot,
-    enabled: async () => (await loadSettings(statePaths.settings)).rollingSummary === true,
-    readRecord: (harnessSessionId) => sessionRecordReader.read(harnessSessionId),
+    enabled: async () =>
+      (await loadSettings(statePaths.settings)).rollingSummary === true,
+    readRecord: (harnessSessionId) =>
+      sessionRecordReader.read(harnessSessionId),
     getSession: (harnessSessionId) => {
       const session = sessionManager.get(harnessSessionId);
-      return session ? { harness: session.harness, cwd: session.cwd } : undefined;
+      return session
+        ? { harness: session.harness, cwd: session.cwd }
+        : undefined;
     },
     runTask: (req) => taskManager.run(req),
   });
@@ -895,9 +1016,18 @@ export const startServer = async (
     await workflowRegistry.prune();
     const rescanBudget = new AgentProjectScanBudget();
     const rescanFound = await workflowRegistry.scan(session.cwd, rescanBudget);
-    logAgentScan("workspace-change", session.cwd, rescanFound.length, rescanBudget);
+    logAgentScan(
+      "workspace-change",
+      session.cwd,
+      rescanFound.length,
+      rescanBudget,
+    );
     const after = await workflowRegistry.list();
     workflowsCache = after;
+    const inventoryChanged = !workflowListsEqual(before, after);
+    if (inventoryChanged) {
+      await refreshSystemGraphScopesForRoot(session.cwd);
+    }
 
     // A removed project must not leave a live session permanently bound to a
     // path that the registry can no longer resolve. Clear only stale bindings;
@@ -941,7 +1071,7 @@ export const startServer = async (
       }
     }
 
-    if (workflowListsEqual(before, after)) return;
+    if (!inventoryChanged) return;
     await Promise.all(sessionManager.list().map((s) => writeSessionContext(s)));
     bus.publish({ type: "workflows.changed" });
   };
@@ -1082,20 +1212,96 @@ export const startServer = async (
   const scanWorkflowsAndBroadcast = async (
     root: string,
     reason: WorkflowScanReason,
+    options: { refreshGraphs?: () => Promise<void> } = {},
   ): Promise<WorkflowInfo[]> => {
+    const before = workflowsCache;
     const budget = new AgentProjectScanBudget();
     const found = await workflowRegistry.scan(root, budget);
     logAgentScan(reason, root, found.length, budget);
-    workflowsCache = await workflowRegistry.list();
+    const after = await workflowRegistry.list();
+    workflowsCache = after;
+    const changed = !workflowListsEqual(before, after);
     // Rewrite every open session's context file before broadcasting — a
     // listener reacting to workflows.changed (the SPA, or an agent that
     // happens to re-read the file right then) must never see the
     // notification before the file it describes is actually updated.
-    await Promise.all(
-      sessionManager.list().map((session) => writeSessionContext(session)),
-    );
-    bus.publish({ type: "workflows.changed" });
+    if (changed) {
+      await Promise.all(
+        sessionManager.list().map((session) => writeSessionContext(session)),
+      );
+    }
+    if (options.refreshGraphs) await options.refreshGraphs();
+    else if (changed) refreshSystemGraphScopesForRoot(root);
+    if (changed) bus.publish({ type: "workflows.changed" });
     return found;
+  };
+
+  const refreshSystemGraphInventory = async (scope: WorkspaceScope) => {
+    const canonicalScope = {
+      workspaceKey: scope.workspaceKey,
+      root: canonicalGraphPath(scope.root),
+    };
+    let refreshPromise: Promise<SystemGraphSnapshot> | null = null;
+    const refreshGraph = (): Promise<void> => {
+      refreshSystemGraphScopesForRoot(
+        canonicalScope.root,
+        canonicalScope.workspaceKey,
+      );
+      refreshPromise = systemGraphStore.refresh(canonicalScope);
+      return refreshPromise.then(() => undefined);
+    };
+    await scanWorkflowsAndBroadcast(canonicalScope.root, "graph-refresh", {
+      refreshGraphs: refreshGraph,
+    });
+    return await (refreshPromise ?? systemGraphStore.refresh(canonicalScope));
+  };
+
+  const workflowRootsForGraphScope = (scope: WorkspaceScope): string[] =>
+    graphSourceRootsWithinScope(
+      scope.root,
+      workflowsCache.map((workflow) => workflow.path),
+    );
+
+  const systemGraphWatcher = new SystemGraphWatcherManager({
+    listSourceRoots: workflowRootsForGraphScope,
+    onSourceChange: (scope, sourcePaths) => {
+      const canonicalScope = {
+        workspaceKey: scope.workspaceKey,
+        root: canonicalGraphPath(scope.root),
+      };
+      const dirtyRoots = dirtyGraphSourceRoots(
+        canonicalScope.root,
+        workflowsCache.map((workflow) => workflow.path),
+        sourcePaths,
+      );
+      if (dirtyRoots.length === 0) return;
+      for (const workflowRoot of dirtyRoots) {
+        systemGraphRelationships.invalidateSource(workflowRoot);
+      }
+      systemGraphStore.requestRefresh(canonicalScope);
+    },
+    onInventoryChange: async (scope) => {
+      try {
+        await refreshSystemGraphInventory(scope);
+      } catch (err) {
+        systemGraphStore.reportRefreshFailure(scope);
+        console.error("[harness] workspace graph inventory refresh failed");
+        throw err;
+      }
+    },
+  });
+
+  const listWorkspaceScopesAndRetain = async () => {
+    const scopes = await workspaceScopeCatalog.list();
+    const retained = new Set(scopes.map((scope) => scope.workspaceKey));
+    systemGraphWatcher.retain(retained);
+    systemGraphStore.retain(retained);
+    for (const workspaceKey of activeSystemGraphScopes.keys()) {
+      if (!retained.has(workspaceKey)) {
+        activeSystemGraphScopes.delete(workspaceKey);
+      }
+    }
+    return scopes;
   };
 
   /** Enrich only the bound workflow before a Canvas render. Canvas extraction
@@ -1171,12 +1377,13 @@ export const startServer = async (
     reactToRenderOutcome(session, outcome);
   };
 
-  const initialWorkflowScan = scanWorkflowsAndBroadcast(launchDir, "boot").catch(
-    (err: unknown) => {
-      console.error("[harness] initial agent scan failed:", err);
-      return [] as WorkflowInfo[];
-    },
-  );
+  const initialWorkflowScan = scanWorkflowsAndBroadcast(
+    launchDir,
+    "boot",
+  ).catch((err: unknown) => {
+    console.error("[harness] initial agent scan failed:", err);
+    return [] as WorkflowInfo[];
+  });
 
   // Boot-time retention sweep: keeps events.ndjson within the 50 MB / 30-day
   // caps even on long-lived installs. Runs through the store's exclusive queue
@@ -1295,6 +1502,7 @@ export const startServer = async (
           }
         : null,
       listWorkflows: () => workflowRegistry.list().then(enrichWorkflows),
+      listWorkspaceScopes: listWorkspaceScopesAndRetain,
       listMacros: () => DEFAULT_MACROS,
       findWorkflow: (workflowPath) =>
         workflowsCache.find((w) => w.path === workflowPath) ?? null,
@@ -1341,6 +1549,25 @@ export const startServer = async (
   );
   app.use(
     "/api",
+    createSystemGraphRouter({
+      scopeResolver: workspaceScopeCatalog,
+      store: systemGraphStore,
+      onScopeAccess: (scope) => {
+        activeSystemGraphScopes.set(scope.workspaceKey, scope);
+        return systemGraphWatcher.start(scope);
+      },
+      onScopeRefresh: async (scope) => {
+        try {
+          return await refreshSystemGraphInventory(scope);
+        } catch {
+          console.error("[harness] workspace graph manual refresh failed");
+          return systemGraphStore.reportRefreshFailure(scope);
+        }
+      },
+    }),
+  );
+  app.use(
+    "/api",
     createCanvasRenderRouter({
       getSession: (harnessSessionId) => sessionManager.get(harnessSessionId),
       listWorkflows: canvasWorkflowsForSession,
@@ -1359,11 +1586,16 @@ export const startServer = async (
   // as WorkflowRegistryLike so this wrapper needs no unsafe cast.
   const enrichedWorkflowRegistry: WorkflowRegistryLike = {
     list: () => workflowRegistry.list().then(enrichWorkflows),
-    scan: async (root: string) => {
-      const budget = new AgentProjectScanBudget();
-      const found = await workflowRegistry.scan(root, budget);
-      logAgentScan("requested", root, found.length, budget);
-      return found;
+    scan: (root: string) => scanWorkflowsAndBroadcast(root, "requested"),
+    connectPath: async (inputPath: string) => {
+      const workflow = await workflowRegistry.connectPath(inputPath);
+      workflowsCache = await workflowRegistry.list();
+      await Promise.all(
+        sessionManager.list().map((session) => writeSessionContext(session)),
+      );
+      await refreshSystemGraphScopesForRoot(workflow.path);
+      bus.publish({ type: "workflows.changed" });
+      return workflow;
     },
     scanWithBoundaries: async (root: string) => {
       const budget = new AgentProjectScanBudget();
@@ -1373,7 +1605,6 @@ export const startServer = async (
       // can explain an empty project instead of misdescribing one.
       return { found, repositoryBoundaries: budget.repositoryBoundaries };
     },
-    connectPath: (inputPath: string) => workflowRegistry.connectPath(inputPath),
   };
   app.use(
     createRunsRouter({
@@ -1488,7 +1719,15 @@ export const startServer = async (
       onMoved: async (from, to) => {
         remapSessions(sessionManager.list(), from, to);
         await workflowRegistry.prune();
-        await scanWorkflowsAndBroadcast(dirname(to), "agent-moved");
+        await scanWorkflowsAndBroadcast(dirname(to), "agent-moved", {
+          refreshGraphs: async () => {
+            // A cross-project move changes two containment inventories. Refresh
+            // every active parent/nested graph touching either side so neither
+            // keeps a ghost node or misses the arrival.
+            refreshSystemGraphScopesForRoot(dirname(from));
+            refreshSystemGraphScopesForRoot(dirname(to));
+          },
+        });
       },
     }),
   );
@@ -1510,7 +1749,8 @@ export const startServer = async (
       renderCanvas: async (harnessSessionId) => {
         const session = sessionManager.get(harnessSessionId);
         if (!session) return;
-        if (session.boundWorkflowPath) invalidateExtractionCache(session.boundWorkflowPath);
+        if (session.boundWorkflowPath)
+          invalidateExtractionCache(session.boundWorkflowPath);
         await renderCanvas(session);
       },
       injectInput: async (harnessSessionId, text, submit) => {
@@ -1608,7 +1848,8 @@ export const startServer = async (
       // store, so the archived record carries the whole conversation including
       // its `endedAt`. (The "exited" status handler archives too, for sessions
       // that never get here.)
-      if (event.type === "session.end") archiveSessionRecordDetached(event.harnessSessionId);
+      if (event.type === "session.end")
+        archiveSessionRecordDetached(event.harnessSessionId);
     },
     onError: (err) => console.error("[harness] ingest processing error:", err),
     seqCounter,
@@ -1806,6 +2047,10 @@ export const startServer = async (
       clearInterval(ndjsonRetentionTimer);
       canvasWatcher.stopAll();
       workspaceWatcher.stopAll();
+      systemGraphWatcher.stopAll();
+      activeSystemGraphScopes.clear();
+      systemGraphRelationships.clear();
+      systemGraphStore.clear();
       installWatcher.stopAll();
       for (const tailer of codexTailers.values()) tailer.stop();
       codexTailers.clear();

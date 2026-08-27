@@ -5,6 +5,7 @@ import type {
   JSX,
   ReactNode,
 } from "react";
+import type { WorkspaceKey } from "@shared/system-graph";
 
 import { Icon } from "./Icon";
 import { WorkflowRow } from "./WorkflowRow";
@@ -58,7 +59,8 @@ function dropHandlersFor(
     onDragLeave: (event) => {
       // A directory's own children fire dragleave too; only a pointer that has
       // actually left the row clears the highlight.
-      if (event.currentTarget.contains(event.relatedTarget as Node | null)) return;
+      if (event.currentTarget.contains(event.relatedTarget as Node | null))
+        return;
       if (drag.dropDir === targetDir) drag.setDropDir(null);
     },
     onDrop: (event) => {
@@ -298,9 +300,10 @@ export function ProjectTreeRows({
  * When the project root is ALSO an agent project (a `sapiom.json` sitting at
  * the folder you opened), the row and that agent are the same directory — so
  * this is ONE row, not a folder row with an identically-named child under it.
- * The disclosure owns collapse; the rest of the row focuses the agent and
- * carries the agent's selection, which is why the row also wears
- * `.workflow-item` and the agent's testid: it IS that agent's row.
+ * The disclosure owns collapse; the label opens the project graph once the
+ * server has issued its workspace key. Until then a pending root-agent row may
+ * still focus that agent. The row wears `.workflow-item` because it represents
+ * both the project root and that root agent without printing either twice.
  *
  * Printing both was the defining texture of a real install's rail — the folder
  * said `dashboard-keeper`, and the only thing inside it said `dashboard-keeper`
@@ -312,6 +315,9 @@ export function ProjectRow({
   rootAgent,
   collapsed,
   onToggleCollapsed,
+  workspaceKey,
+  selected,
+  onSelectProject,
   focusedAgentPath,
   onFocusAgent,
   trailing,
@@ -327,6 +333,16 @@ export function ProjectRow({
   rootAgent: AgentNode | null;
   collapsed: boolean;
   onToggleCollapsed: () => void;
+  /** Opaque server identity for this exact project root. Null only while a
+   * newly-opened root has not reached the scope catalog yet. */
+  workspaceKey: WorkspaceKey | null;
+  /** Whether this project's full-main dependency graph is selected. */
+  selected: boolean;
+  onSelectProject: (
+    workspaceKey: WorkspaceKey,
+    root: string,
+    label: string,
+  ) => void;
   focusedAgentPath: string | null;
   onFocusAgent: (path: string) => void;
   /** Row-end slot for state that belongs to the project itself (the
@@ -350,8 +366,9 @@ export function ProjectRow({
   drag?: RailDrag;
 }): JSX.Element {
   const agentPath = rootAgent?.workflow.path ?? null;
-  // A merged root-agent row IS that agent's row, so it takes the agent's
-  // selection styling; a plain project row takes the container's.
+  // Project selection takes precedence over the merged root-agent identity:
+  // the row names the project boundary, and its label opens that boundary's
+  // graph. The graph card remains the door into the root agent itself.
   const isFocused =
     (agentPath != null && agentPath === focusedAgentPath) ||
     (focusable && root === focusedAgentPath);
@@ -361,13 +378,22 @@ export function ProjectRow({
       className={
         "workspace-row" +
         (rootAgent ? " workflow-item" : "") +
-        (isFocused ? (rootAgent ? " is-focused" : " is-selected") : "") +
+        (selected ? " is-selected" : "") +
+        (!selected && isFocused
+          ? rootAgent
+            ? " is-focused"
+            : " is-selected"
+          : "") +
         (disclosable && collapsed ? " is-collapsed" : "") +
         (drag?.dropDir === root ? " is-drop-target" : "")
       }
-      data-testid={rootAgent ? `workflow-${rootAgent.workflow.name}` : `project-row-${label}`}
+      data-testid={
+        rootAgent
+          ? `workflow-${rootAgent.workflow.name}`
+          : `project-row-${label}`
+      }
       {...dropHandlersFor(root, drag)}
-      {...trackingAttrs({ object: rootAgent ? "agent" : "workspace" })}
+      {...trackingAttrs({ object: "workspace" })}
     >
       {disclosable ? (
         <RowDisclosure
@@ -379,7 +405,10 @@ export function ProjectRow({
           <ProjectMark root={root} />
         </RowDisclosure>
       ) : (
-        <span className="row-disclosure row-disclosure-static" aria-hidden="true">
+        <span
+          className="row-disclosure row-disclosure-static"
+          aria-hidden="true"
+        >
           <span className="row-disclosure-mark">
             <ProjectMark root={root} />
           </span>
@@ -387,19 +416,39 @@ export function ProjectRow({
       )}
       <button
         type="button"
-        className={"workspace-row-main" + (rootAgent ? " workflow-item-trigger" : "")}
-        data-testid={mainTestid}
+        className={
+          "workspace-row-main" + (rootAgent ? " workflow-item-trigger" : "")
+        }
+        data-testid={mainTestid ?? `project-select-${label}`}
         onClick={
-          focusTarget ? () => onFocusAgent(focusTarget) : disclosable ? onToggleCollapsed : undefined
+          workspaceKey
+            ? () => onSelectProject(workspaceKey, root, label)
+            : focusTarget
+              ? () => onFocusAgent(focusTarget)
+              : undefined
         }
         /* The ABSOLUTE path, matching every other row. The row shows what it
            is; the title answers where it lives. */
         title={root}
-        aria-expanded={focusTarget || !disclosable ? undefined : !collapsed}
-        aria-pressed={focusTarget && !busy ? isFocused : undefined}
+        aria-pressed={
+          workspaceKey ? selected : focusTarget && !busy ? isFocused : undefined
+        }
         aria-busy={busy ? true : undefined}
-        aria-label={focusTarget ? `Focus ${label}` : undefined}
-        data-tooltip={tooltip ?? (focusTarget ? "Focus this agent" : undefined)}
+        aria-label={
+          workspaceKey
+            ? `Open dependency graph for ${label}`
+            : focusTarget
+              ? `Focus ${label}`
+              : undefined
+        }
+        data-tooltip={
+          tooltip ??
+          (workspaceKey
+            ? "Open dependency graph"
+            : focusTarget
+              ? "Focus this agent"
+              : undefined)
+        }
       >
         <span className="tree-row-label">{label}</span>
         {/* NO deploy glyph here, even when this project's root IS an agent.

@@ -970,7 +970,6 @@ export function CanvasPane({
       ? routeFrameDocument != null
       : hasGeneratedContent && sessionHasServableDoc;
 
-
   // The observability header for the Steps surface: a deploy landing (if one is
   // in flight/just landed) and the run summary card (if a run has been
   // observed). Rendered at the top of every steps-surface path so Run/Test/Deploy

@@ -32,6 +32,7 @@ import type {
   UiTrackRequest,
   WorkflowInfo,
 } from "../shared/types.js";
+import type { WorkspaceScopeSummary } from "../shared/system-graph.js";
 import {
   HARNESS_UPLOADS_DIR,
   JSON_BODY_LIMIT_BYTES,
@@ -174,6 +175,10 @@ export interface RestRouterOptions {
   /** Sapiom identity from CLI auth; null when unauthenticated / --no-auth. */
   identity: { userId: string; tenantId: string; organizationName: string } | null;
   listWorkflows: () => Promise<WorkflowInfo[]>;
+  /** Workspace identities backing the folder projection and system-graph route. */
+  listWorkspaceScopes?: () =>
+    | WorkspaceScopeSummary[]
+    | Promise<WorkspaceScopeSummary[]>;
   listMacros: () => MacroDef[];
   /** Look up a registered workflow by its path; null when not found. Backs
    *  PATCH /sessions/:id/workflow's validation (a bind target must already
@@ -303,6 +308,9 @@ export function createRestRouter(options: RestRouterOptions): Router {
         productAnalyticsOptIn: settings.productAnalyticsOptIn !== false,
         sessions: sessionManager.list(),
         workflows: await listWorkflows(),
+        ...(options.listWorkspaceScopes
+          ? { workspaceScopes: await options.listWorkspaceScopes() }
+          : {}),
         macros: listMacros(),
         launchDir: options.launchDir,
         ...(options.defaultProjectRoot

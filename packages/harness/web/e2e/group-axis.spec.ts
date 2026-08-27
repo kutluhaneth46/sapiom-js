@@ -43,7 +43,9 @@ test.beforeEach(async ({ page }) => {
 
 /** The group rows of one project, in DOM order. */
 const groupLabels = (project: Locator): Promise<string[]> =>
-  project.locator('[data-testid^="group-row-"] .tree-row-label').allInnerTexts();
+  project
+    .locator('[data-testid^="group-row-"] .tree-row-label')
+    .allInnerTexts();
 
 /** The agent rows inside one group section, in DOM order. */
 const agentsIn = (project: Locator, group: string): Promise<string[]> =>
@@ -64,17 +66,30 @@ const agentsIn = (project: Locator, group: string): Promise<string[]> =>
 async function pathsOnScreen(page: Page): Promise<string[]> {
   const titles = await page
     .locator(".rail-list [title]")
-    .evaluateAll((nodes) => nodes.map((node) => node.getAttribute("title") ?? ""));
-  return [...new Set(titles.filter((title) => title.startsWith("/Users/demo")))].sort();
+    .evaluateAll((nodes) =>
+      nodes.map((node) => node.getAttribute("title") ?? ""),
+    );
+  return [
+    ...new Set(titles.filter((title) => title.startsWith("/Users/demo"))),
+  ].sort();
 }
 
 /** Every rail-state write the mock has served this page load. */
-const railStateWrites = (page: Page): Promise<Array<{ root: string; raw: string | null }>> =>
-  page.evaluate(
-    () =>
-      (window as unknown as { __HARNESS_TEST__?: { railStateWrites?: unknown } }).__HARNESS_TEST__
-        ?.railStateWrites as Array<{ root: string; raw: string | null }> | undefined,
-  ).then((writes) => writes ?? []);
+const railStateWrites = (
+  page: Page,
+): Promise<Array<{ root: string; raw: string | null }>> =>
+  page
+    .evaluate(
+      () =>
+        (
+          window as unknown as {
+            __HARNESS_TEST__?: { railStateWrites?: unknown };
+          }
+        ).__HARNESS_TEST__?.railStateWrites as
+          | Array<{ root: string; raw: string | null }>
+          | undefined,
+    )
+    .then((writes) => writes ?? []);
 
 /**
  * One HTML5 drag, driven through real `DragEvent`s over ONE `DataTransfer`.
@@ -98,7 +113,12 @@ async function dragAgent(
   await page.evaluate(
     ([from, to, alt]) => {
       const transfer = new DataTransfer();
-      const init = { dataTransfer: transfer, bubbles: true, cancelable: true, altKey: alt === true };
+      const init = {
+        dataTransfer: transfer,
+        bubbles: true,
+        cancelable: true,
+        altKey: alt === true,
+      };
       (from as Element).dispatchEvent(new DragEvent("dragstart", init));
       (to as Element).dispatchEvent(new DragEvent("dragover", init));
       (to as Element).dispatchEvent(new DragEvent("drop", init));
@@ -109,6 +129,28 @@ async function dragAgent(
 }
 
 test.describe("derivation", () => {
+  test("project selection opens its graph without folding the Group axis", async ({
+    page,
+  }) => {
+    const project = page.getByTestId(POLSIA);
+    await expect(project.getByTestId("group-agent-gateway")).toBeVisible();
+
+    await page.getByTestId("project-select-polsia").click();
+
+    await expect(page.getByTestId("workspace-graph-view")).toBeVisible();
+    await expect(page.getByTestId("system-graph-node-gateway")).toBeVisible();
+    await expect(project.getByTestId("group-agent-gateway")).toBeVisible();
+    await expect(page.getByTestId("project-row-polsia")).toHaveClass(
+      /is-selected/,
+    );
+
+    await page.getByTestId("system-graph-node-gateway").click();
+    await expect(page.getByTestId("workspace-graph-view")).toHaveCount(0);
+    await expect(
+      project.getByTestId("group-agent-gateway").locator(".workflow-item"),
+    ).toHaveClass(/is-focused/);
+  });
+
   test("launch-connected agents form one group named for its HEAD, with Ungrouped last", async ({
     page,
   }) => {
@@ -116,18 +158,32 @@ test.describe("derivation", () => {
     // `gateway` launches `queue` and `ads-worker`; nothing launches `gateway`,
     // so the component is named for it. Biggest component first — a derived
     // group has no author to have arranged it.
-    expect(await groupLabels(project)).toEqual(["gateway", "mailer", "Ungrouped"]);
-    expect(await agentsIn(project, "gateway")).toEqual(["gateway", "ads-worker", "queue"]);
+    expect(await groupLabels(project)).toEqual([
+      "gateway",
+      "mailer",
+      "Ungrouped",
+    ]);
+    expect(await agentsIn(project, "gateway")).toEqual([
+      "gateway",
+      "ads-worker",
+      "queue",
+    ]);
     expect(await agentsIn(project, "mailer")).toEqual(["mailer", "sender"]);
 
     // Ungrouped is NAMED and LAST. Most agents in a real repo launch nothing, so
     // hiding them would make the axis lie by omission.
     const rows = await groupLabels(project);
     expect(rows[rows.length - 1]).toBe("Ungrouped");
-    expect(await agentsIn(project, "Ungrouped")).toEqual(["ads", "outreach", "rollup"]);
+    expect(await agentsIn(project, "Ungrouped")).toEqual([
+      "ads",
+      "outreach",
+      "rollup",
+    ]);
   });
 
-  test("an edge to an agent this install LACKS forms no group", async ({ page }) => {
+  test("an edge to an agent this install LACKS forms no group", async ({
+    page,
+  }) => {
     const project = page.getByTestId(POLSIA);
     // `outreach` launches `ghost-agent`, which is not in the registry. That is
     // not a group of one plus a ghost; it is not an edge you can draw.
@@ -146,21 +202,31 @@ test.describe("derivation", () => {
     await expect(project.getByTestId("group-rename-gateway")).toHaveCount(1);
     await expect(project.getByTestId("group-delete-gateway")).toHaveCount(1);
     // Double-clicking Ungrouped's label opens no field either.
-    await project.getByTestId("group-row-Ungrouped").locator(".workspace-row-main").dblclick();
+    await project
+      .getByTestId("group-row-Ungrouped")
+      .locator(".workspace-row-main")
+      .dblclick();
     await expect(project.getByTestId("group-rename-input")).toHaveCount(0);
   });
 
-  test("groups cannot span projects: a second scope derives its own", async ({ page }) => {
+  test("groups cannot span projects: a second scope derives its own", async ({
+    page,
+  }) => {
     // `polsia/services/workers` holds `ads-worker` and `queue`, and the edges
     // that connect them both come from `gateway`, which lives in the OTHER
     // project. So this scope has no group at all — which is exactly what
     // project-scoped persistence implies.
     const workers = page.getByTestId(WORKERS);
     expect(await groupLabels(workers)).toEqual(["Ungrouped"]);
-    expect(await agentsIn(workers, "Ungrouped")).toEqual(["ads-worker", "queue"]);
+    expect(await agentsIn(workers, "Ungrouped")).toEqual([
+      "ads-worker",
+      "queue",
+    ]);
   });
 
-  test("a project with one agent shows no group row at all", async ({ page }) => {
+  test("a project with one agent shows no group row at all", async ({
+    page,
+  }) => {
     // A group is a RELATIONSHIP, and one agent has none. `dashboard-keeper` is a
     // root that IS an agent, so it keeps the Project axis's merged single row
     // rather than growing a header plus an identically-named child underneath a
@@ -174,13 +240,17 @@ test.describe("derivation", () => {
     expect(await groupLabels(solo)).toEqual([]);
   });
 
-  test("the left icon is the ONE disclosure control, and it folds the group", async ({ page }) => {
+  test("the left icon is the ONE disclosure control, and it folds the group", async ({
+    page,
+  }) => {
     const project = page.getByTestId(POLSIA);
     const row = project.getByTestId("group-row-gateway");
     // No second disclosure idiom: exactly one control, and it LEADS the row.
     expect(
       await row.evaluate((element) => {
-        const disclosures = element.querySelectorAll(":scope > .row-disclosure");
+        const disclosures = element.querySelectorAll(
+          ":scope > .row-disclosure",
+        );
         return {
           count: disclosures.length,
           leads: disclosures[0] === element.firstElementChild,
@@ -192,18 +262,30 @@ test.describe("derivation", () => {
     await project.getByTestId("group-disclosure-gateway").click();
     expect(await agentsIn(project, "gateway")).toEqual([]);
     await project.getByTestId("group-disclosure-gateway").click();
-    expect(await agentsIn(project, "gateway")).toEqual(["gateway", "ads-worker", "queue"]);
+    expect(await agentsIn(project, "gateway")).toEqual([
+      "gateway",
+      "ads-worker",
+      "queue",
+    ]);
   });
 });
 
 test.describe("persistence", () => {
-  test("LOADING THE PAGE TWICE leaves the derived groups intact", async ({ page }) => {
+  test("LOADING THE PAGE TWICE leaves the derived groups intact", async ({
+    page,
+  }) => {
     // THE regression. A mount effect serialized the un-materialized state as
     // `groups: []` — "the user deleted every group" — so the second load put
     // every agent in Ungrouped, forever. Two real loads, and nothing written.
     const project = page.getByTestId(POLSIA);
-    expect(await groupLabels(project)).toEqual(["gateway", "mailer", "Ungrouped"]);
-    expect(await railStateWrites(page), "a plain load writes nothing").toEqual([]);
+    expect(await groupLabels(project)).toEqual([
+      "gateway",
+      "mailer",
+      "Ungrouped",
+    ]);
+    expect(await railStateWrites(page), "a plain load writes nothing").toEqual(
+      [],
+    );
 
     await page.reload();
     await expect(page.getByTestId("group-create-polsia")).toBeVisible();
@@ -230,14 +312,18 @@ test.describe("persistence", () => {
     expect(await railStateWrites(page)).toEqual([]);
   });
 
-  test("a group edit survives reload and changes NOTHING on disk", async ({ page }) => {
+  test("a group edit survives reload and changes NOTHING on disk", async ({
+    page,
+  }) => {
     const project = page.getByTestId(POLSIA);
     const before = await pathsOnScreen(page);
 
     // Option-drag COPIES: a shared subagent belongs everywhere it is used.
     await dragAgent(
       page,
-      project.getByTestId("group-section-gateway").getByTestId("group-agent-queue"),
+      project
+        .getByTestId("group-section-gateway")
+        .getByTestId("group-agent-queue"),
       project.getByTestId("group-row-mailer"),
       { alt: true },
     );
@@ -246,7 +332,11 @@ test.describe("persistence", () => {
     await expect
       .poll(() => agentsIn(project, "mailer"))
       .toEqual(["mailer", "sender", "queue"]);
-    expect(await agentsIn(project, "gateway")).toEqual(["gateway", "ads-worker", "queue"]);
+    expect(await agentsIn(project, "gateway")).toEqual([
+      "gateway",
+      "ads-worker",
+      "queue",
+    ]);
 
     // Not one path moved: a group is a label over agents.
     expect(await pathsOnScreen(page)).toEqual(before);
@@ -254,18 +344,35 @@ test.describe("persistence", () => {
     await page.reload();
     await expect(page.getByTestId("group-create-polsia")).toBeVisible();
     const reloaded = page.getByTestId(POLSIA);
-    expect(await agentsIn(reloaded, "mailer")).toEqual(["mailer", "sender", "queue"]);
-    expect(await agentsIn(reloaded, "gateway")).toEqual(["gateway", "ads-worker", "queue"]);
+    expect(await agentsIn(reloaded, "mailer")).toEqual([
+      "mailer",
+      "sender",
+      "queue",
+    ]);
+    expect(await agentsIn(reloaded, "gateway")).toEqual([
+      "gateway",
+      "ads-worker",
+      "queue",
+    ]);
     expect(await pathsOnScreen(page)).toEqual(before);
 
     // The stored file names only paths that already existed, and only membership.
     const stored = await page.evaluate(
-      () => window.localStorage.getItem("sapiom-mock-studio-rail:/Users/demo/polsia") ?? "",
+      () =>
+        window.localStorage.getItem(
+          "sapiom-mock-studio-rail:/Users/demo/polsia",
+        ) ?? "",
     );
     const parsed = JSON.parse(stored);
     expect(parsed.version).toBe(1);
-    expect(Object.keys(parsed).sort()).toEqual(["groups", "renames", "version"]);
-    for (const member of parsed.groups.flatMap((group: { members: string[] }) => group.members)) {
+    expect(Object.keys(parsed).sort()).toEqual([
+      "groups",
+      "renames",
+      "version",
+    ]);
+    for (const member of parsed.groups.flatMap(
+      (group: { members: string[] }) => group.members,
+    )) {
       expect(before).toContain(member);
     }
   });
@@ -279,13 +386,17 @@ test.describe("persistence", () => {
 });
 
 test.describe("drag semantics", () => {
-  test("a plain drag MOVES: joins the target, leaves the source", async ({ page }) => {
+  test("a plain drag MOVES: joins the target, leaves the source", async ({
+    page,
+  }) => {
     const project = page.getByTestId(POLSIA);
     const before = await pathsOnScreen(page);
 
     await dragAgent(
       page,
-      project.getByTestId("group-section-mailer").getByTestId("group-agent-sender"),
+      project
+        .getByTestId("group-section-mailer")
+        .getByTestId("group-agent-sender"),
       project.getByTestId("group-row-gateway"),
     );
 
@@ -297,11 +408,15 @@ test.describe("drag semantics", () => {
     expect(await pathsOnScreen(page)).toEqual(before);
   });
 
-  test("Option-drag COPIES, so one agent sits in two groups", async ({ page }) => {
+  test("Option-drag COPIES, so one agent sits in two groups", async ({
+    page,
+  }) => {
     const project = page.getByTestId(POLSIA);
     await dragAgent(
       page,
-      project.getByTestId("group-section-gateway").getByTestId("group-agent-ads-worker"),
+      project
+        .getByTestId("group-section-gateway")
+        .getByTestId("group-agent-ads-worker"),
       project.getByTestId("group-row-mailer"),
       { alt: true },
     );
@@ -324,7 +439,11 @@ test.describe("drag semantics", () => {
       project.getByTestId("group-row-gateway"),
     );
     await expect(section.getByTestId("group-agent-queue")).toHaveCount(1);
-    expect(await agentsIn(project, "gateway")).toEqual(["gateway", "ads-worker", "queue"]);
+    expect(await agentsIn(project, "gateway")).toEqual([
+      "gateway",
+      "ads-worker",
+      "queue",
+    ]);
   });
 
   test("dropping on `Ungrouped` leaves EVERY group", async ({ page }) => {
@@ -333,7 +452,9 @@ test.describe("drag semantics", () => {
     // something to prove.
     await dragAgent(
       page,
-      project.getByTestId("group-section-gateway").getByTestId("group-agent-queue"),
+      project
+        .getByTestId("group-section-gateway")
+        .getByTestId("group-agent-queue"),
       project.getByTestId("group-row-mailer"),
       { alt: true },
     );
@@ -341,7 +462,9 @@ test.describe("drag semantics", () => {
 
     await dragAgent(
       page,
-      project.getByTestId("group-section-mailer").getByTestId("group-agent-queue"),
+      project
+        .getByTestId("group-section-mailer")
+        .getByTestId("group-agent-queue"),
       project.getByTestId("group-row-Ungrouped"),
     );
     await expect.poll(() => agentsIn(project, "Ungrouped")).toContain("queue");
@@ -363,7 +486,11 @@ test.describe("drag semantics", () => {
     const payload = await page.evaluate(
       ([from, to]) => {
         const transfer = new DataTransfer();
-        const init = { dataTransfer: transfer, bubbles: true, cancelable: true };
+        const init = {
+          dataTransfer: transfer,
+          bubbles: true,
+          cancelable: true,
+        };
         (from as Element).dispatchEvent(new DragEvent("dragstart", init));
         const carried = {
           agent: transfer.getData("application/x-sapiom-agent"),
@@ -379,10 +506,14 @@ test.describe("drag semantics", () => {
     );
     expect(payload.agent).toBe("/Users/demo/polsia/services/workers/queue");
     expect(payload.group).toBe("group:/Users/demo/polsia/services/gateway");
-    await expect(project.getByTestId("group-row-mailer")).toHaveClass(/is-drop-target/);
+    await expect(project.getByTestId("group-row-mailer")).toHaveClass(
+      /is-drop-target/,
+    );
   });
 
-  test("a drop from ANOTHER project is REFUSED: groups cannot span projects", async ({ page }) => {
+  test("a drop from ANOTHER project is REFUSED: groups cannot span projects", async ({
+    page,
+  }) => {
     // The arrangement lives in one project's `.sapiom/`, so a group holding a
     // neighbour's agent would be a group with nowhere to be stored.
     //
@@ -395,11 +526,15 @@ test.describe("drag semantics", () => {
     await workers.getByTestId("group-create-polsia/services/workers").click();
     await workers.getByTestId("group-rename-input").fill("workers only");
     await workers.getByTestId("group-rename-input").press("Enter");
-    await expect(workers.getByTestId("group-section-workers only")).toBeVisible();
+    await expect(
+      workers.getByTestId("group-section-workers only"),
+    ).toBeVisible();
 
     await dragAgent(
       page,
-      polsia.getByTestId("group-section-mailer").getByTestId("group-agent-sender"),
+      polsia
+        .getByTestId("group-section-mailer")
+        .getByTestId("group-agent-sender"),
       workers.getByTestId("group-row-workers only"),
     );
     // A NEGATIVE assertion passes when nothing happened at all, including when
@@ -408,23 +543,31 @@ test.describe("drag semantics", () => {
     // drop was going to do has certainly happened by then.
     await dragAgent(
       page,
-      workers.getByTestId("group-section-Ungrouped").getByTestId("group-agent-ads-worker"),
+      workers
+        .getByTestId("group-section-Ungrouped")
+        .getByTestId("group-agent-ads-worker"),
       workers.getByTestId("group-row-workers only"),
     );
-    await expect.poll(() => agentsIn(workers, "workers only")).toEqual(["ads-worker"]);
+    await expect
+      .poll(() => agentsIn(workers, "workers only"))
+      .toEqual(["ads-worker"]);
 
     // `sender` never joined, and it never left the group it was dragged from.
     expect(await agentsIn(workers, "workers only")).not.toContain("sender");
     expect(await agentsIn(polsia, "mailer")).toEqual(["mailer", "sender"]);
     // …and no write was ever aimed at `polsia`.
     expect(
-      (await railStateWrites(page)).filter((write) => write.root === "/Users/demo/polsia"),
+      (await railStateWrites(page)).filter(
+        (write) => write.root === "/Users/demo/polsia",
+      ),
     ).toEqual([]);
   });
 });
 
 test.describe("create and rename", () => {
-  test("creating a group opens straight into its NAME FIELD", async ({ page }) => {
+  test("creating a group opens straight into its NAME FIELD", async ({
+    page,
+  }) => {
     const project = page.getByTestId(POLSIA);
     await project.getByTestId("group-create-polsia").click();
 
@@ -466,14 +609,18 @@ test.describe("create and rename", () => {
     await expect(project.getByTestId("group-row-New group")).toHaveCount(0);
   });
 
-  test("Escape abandons a rename instead of committing it", async ({ page }) => {
+  test("Escape abandons a rename instead of committing it", async ({
+    page,
+  }) => {
     const project = page.getByTestId(POLSIA);
     await project.getByTestId("group-rename-gateway").click();
     const input = project.getByTestId("group-rename-input");
     await input.fill("something else");
     await input.press("Escape");
     await expect(project.getByTestId("group-row-gateway")).toBeVisible();
-    await expect(project.getByTestId("group-row-something else")).toHaveCount(0);
+    await expect(project.getByTestId("group-row-something else")).toHaveCount(
+      0,
+    );
   });
 
   test("a new group is a place to drag into, and deleting it keeps the agents", async ({
@@ -486,11 +633,15 @@ test.describe("create and rename", () => {
 
     const section = project.getByTestId("group-section-shared");
     // An empty group says what to do rather than looking like a render failure.
-    await expect(section.locator(".workspace-group-empty")).toHaveText("Drag agents here");
+    await expect(section.locator(".workspace-group-empty")).toHaveText(
+      "Drag agents here",
+    );
 
     await dragAgent(
       page,
-      project.getByTestId("group-section-gateway").getByTestId("group-agent-queue"),
+      project
+        .getByTestId("group-section-gateway")
+        .getByTestId("group-agent-queue"),
       project.getByTestId("group-row-shared"),
       { alt: true },
     );
@@ -505,7 +656,9 @@ test.describe("create and rename", () => {
 });
 
 test.describe("reset to detected", () => {
-  test("absent while derived, present once stored, and it restores detection", async ({ page }) => {
+  test("absent while derived, present once stored, and it restores detection", async ({
+    page,
+  }) => {
     const project = page.getByTestId(POLSIA);
     // A control that does nothing reads as a broken one, so on a purely derived
     // state it is not offered at all.
@@ -516,22 +669,36 @@ test.describe("reset to detected", () => {
     // everything would ask people to destroy their groups to find it.
     await dragAgent(
       page,
-      project.getByTestId("group-section-gateway").getByTestId("group-agent-queue"),
+      project
+        .getByTestId("group-section-gateway")
+        .getByTestId("group-agent-queue"),
       project.getByTestId("group-row-mailer"),
     );
     const reset = project.getByTestId("group-reset-polsia");
     await expect(reset).toBeVisible();
     // The cost is in the COPY, not paid for by hiding the control.
-    await expect(reset.locator(".rail-add-row-cost")).toHaveText("Discards 2 groups");
-    expect(await agentsIn(project, "mailer")).toEqual(["mailer", "sender", "queue"]);
+    await expect(reset.locator(".rail-add-row-cost")).toHaveText(
+      "Discards 2 groups",
+    );
+    expect(await agentsIn(project, "mailer")).toEqual([
+      "mailer",
+      "sender",
+      "queue",
+    ]);
 
     // Armed, then performed: it discards work, so it says so first.
     await reset.click();
     await expect(reset.locator(".tree-row-label")).toHaveText("Confirm reset");
     await reset.click();
 
-    await expect.poll(() => groupLabels(project)).toEqual(["gateway", "mailer", "Ungrouped"]);
-    expect(await agentsIn(project, "gateway")).toEqual(["gateway", "ads-worker", "queue"]);
+    await expect
+      .poll(() => groupLabels(project))
+      .toEqual(["gateway", "mailer", "Ungrouped"]);
+    expect(await agentsIn(project, "gateway")).toEqual([
+      "gateway",
+      "ads-worker",
+      "queue",
+    ]);
     expect(await agentsIn(project, "mailer")).toEqual(["mailer", "sender"]);
     // Back to derived, so the control withdraws again.
     await expect(project.getByTestId("group-reset-polsia")).toHaveCount(0);
@@ -543,7 +710,9 @@ test.describe("reset to detected", () => {
     const project = page.getByTestId(POLSIA);
     await dragAgent(
       page,
-      project.getByTestId("group-section-gateway").getByTestId("group-agent-queue"),
+      project
+        .getByTestId("group-section-gateway")
+        .getByTestId("group-agent-queue"),
       project.getByTestId("group-row-mailer"),
     );
     await expect(project.getByTestId("group-reset-polsia")).toBeVisible();
@@ -552,7 +721,9 @@ test.describe("reset to detected", () => {
     await reset.click();
     await expect(reset.locator(".tree-row-label")).toHaveText("Confirm reset");
     await reset.click();
-    await expect.poll(() => groupLabels(project)).toEqual(["gateway", "mailer", "Ungrouped"]);
+    await expect
+      .poll(() => groupLabels(project))
+      .toEqual(["gateway", "mailer", "Ungrouped"]);
 
     // The file is GONE, not rewritten as `groups: []` — which would mean "the
     // user deleted every group" and put the rail straight back where the reset
@@ -560,7 +731,9 @@ test.describe("reset to detected", () => {
     await expect
       .poll(() =>
         page.evaluate(() =>
-          window.localStorage.getItem("sapiom-mock-studio-rail:/Users/demo/polsia"),
+          window.localStorage.getItem(
+            "sapiom-mock-studio-rail:/Users/demo/polsia",
+          ),
         ),
       )
       .toBeNull();
@@ -568,7 +741,11 @@ test.describe("reset to detected", () => {
     await page.reload();
     await expect(page.getByTestId("group-create-polsia")).toBeVisible();
     const reloaded = page.getByTestId(POLSIA);
-    expect(await groupLabels(reloaded)).toEqual(["gateway", "mailer", "Ungrouped"]);
+    expect(await groupLabels(reloaded)).toEqual([
+      "gateway",
+      "mailer",
+      "Ungrouped",
+    ]);
     expect(await agentsIn(reloaded, "mailer")).toEqual(["mailer", "sender"]);
     await expect(reloaded.getByTestId("group-reset-polsia")).toHaveCount(0);
   });
@@ -578,7 +755,9 @@ test.describe("reset to detected", () => {
   }) => {
     const project = page.getByTestId(POLSIA);
     await project.getByTestId("group-delete-gateway").click();
-    await expect.poll(() => groupLabels(project)).toEqual(["mailer", "Ungrouped"]);
+    await expect
+      .poll(() => groupLabels(project))
+      .toEqual(["mailer", "Ungrouped"]);
     await project.getByTestId("group-delete-mailer").click();
     await expect.poll(() => groupLabels(project)).toEqual(["Ungrouped"]);
     // Materialized with nothing in it: every agent falls to Ungrouped and no
@@ -592,12 +771,17 @@ test.describe("reset to detected", () => {
     );
     await reset.click();
     await reset.click();
-    await expect.poll(() => groupLabels(project)).toEqual(["gateway", "mailer", "Ungrouped"]);
+    await expect
+      .poll(() => groupLabels(project))
+      .toEqual(["gateway", "mailer", "Ungrouped"]);
   });
 });
 
 test("the group rail renders", async ({ page }) => {
-  await page.screenshot({ path: "web/e2e/screenshots/group-axis.png", fullPage: true });
+  await page.screenshot({
+    path: "web/e2e/screenshots/group-axis.png",
+    fullPage: true,
+  });
 
   // The two list-end rows are below the fold on a 720px viewport, and they are
   // the affordances that read as missing when they are wrong — so they get their
@@ -605,7 +789,9 @@ test("the group rail renders", async ({ page }) => {
   const project = page.getByTestId(POLSIA);
   await dragAgent(
     page,
-    project.getByTestId("group-section-gateway").getByTestId("group-agent-queue"),
+    project
+      .getByTestId("group-section-gateway")
+      .getByTestId("group-agent-queue"),
     project.getByTestId("group-row-mailer"),
   );
   await expect(project.getByTestId("group-reset-polsia")).toBeVisible();

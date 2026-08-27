@@ -26,10 +26,14 @@ import { expect, test } from "@playwright/test";
    so it is already a row before the dialog opens. */
 const BLANK = "/Users/demo/blank-slate";
 
-const projectRows = (page: import("@playwright/test").Page): Promise<string[]> =>
+const projectRows = (
+  page: import("@playwright/test").Page,
+): Promise<string[]> =>
   page
     .locator('.rail-list [data-testid^="project-row-"]')
-    .evaluateAll((nodes) => nodes.map((node) => node.getAttribute("data-testid") ?? ""));
+    .evaluateAll((nodes) =>
+      nodes.map((node) => node.getAttribute("data-testid") ?? ""),
+    );
 
 test.beforeEach(async ({ page }) => {
   await page.goto("/");
@@ -43,7 +47,9 @@ test.describe("the header + opens a project", () => {
     await expect(page.getByTestId("project-row-blank-slate")).toHaveCount(0);
 
     await page.getByTestId("rail-add-project").click();
-    await expect(page.locator(".modal-start-title")).toHaveText("Add a project");
+    await expect(page.locator(".modal-start-title")).toHaveText(
+      "Add a project",
+    );
     await page.getByTestId("dir-picker-input").fill(BLANK);
 
     // Detection still RUNS and still says what it found — it just no longer
@@ -55,6 +61,10 @@ test.describe("the header + opens a project", () => {
     await page.getByTestId("open-project").click();
 
     await expect(page.getByTestId("project-row-blank-slate")).toBeVisible();
+    // The settings mutation refreshes the server-issued scope catalog in place:
+    // a just-opened empty project is graphable immediately, without a reload.
+    await page.getByTestId("project-select-blank-slate").click();
+    await expect(page.getByTestId("system-graph-empty")).toBeVisible();
     // The row is REMEMBERED, not just rendered: `recentDirs` is the harness's
     // one workspace list, and the whole rail re-derives from it when the axis
     // changes. (A cross-RELOAD assertion belongs against a real server — the
@@ -66,7 +76,9 @@ test.describe("the header + opens a project", () => {
     await expect(page.getByTestId("project-row-blank-slate")).toBeVisible();
   });
 
-  test("an empty project offers the one thing you opened it for", async ({ page }) => {
+  test("an empty project offers the one thing you opened it for", async ({
+    page,
+  }) => {
     await page.getByTestId("rail-add-project").click();
     await page.getByTestId("dir-picker-input").fill(BLANK);
     await page.getByTestId("open-project").click();
@@ -87,7 +99,9 @@ test.describe("the header + opens a project", () => {
     await expect(page.locator(".rail-empty")).toHaveCount(0);
   });
 
-  test("the empty row does NOT appear under a merged root-agent project", async ({ page }) => {
+  test("the empty row does NOT appear under a merged root-agent project", async ({
+    page,
+  }) => {
     // `rfq-agent` is a root that IS an agent — `projectIsEmpty` consults
     // `rootAgent` precisely so its row does not get "no agents" printed under
     // the agent it is showing.
@@ -95,12 +109,18 @@ test.describe("the header + opens a project", () => {
     await expect(page.getByTestId("project-empty-rfq-agent")).toHaveCount(0);
   });
 
-  test("opening a folder that IS an agent project registers the agent too", async ({ page }) => {
+  test("opening a folder that IS an agent project registers the agent too", async ({
+    page,
+  }) => {
     // One press, because "open this folder" and "show me what's in it" is not
     // a decision worth asking twice.
     await page.getByTestId("rail-add-project").click();
-    await page.getByTestId("dir-picker-input").fill("/Users/demo/acme-app/leasing");
-    await expect(page.getByTestId("aw-result")).toContainText("This is an agent project");
+    await page
+      .getByTestId("dir-picker-input")
+      .fill("/Users/demo/acme-app/leasing");
+    await expect(page.getByTestId("aw-result")).toContainText(
+      "This is an agent project",
+    );
     await page.getByTestId("open-project").click();
     // The root IS the agent, so this is ONE row wearing the agent's testid —
     // never a folder row with an identically-named child under it.
@@ -110,16 +130,22 @@ test.describe("the header + opens a project", () => {
 });
 
 test.describe("the two questions stay two controls", () => {
-  test("the nav row still asks the DETECTION question, with its own primary", async ({ page }) => {
+  test("the nav row still asks the DETECTION question, with its own primary", async ({
+    page,
+  }) => {
     await page.getByTestId("add-existing-agents").click();
-    await expect(page.locator(".modal-start-title")).toHaveText("Add existing agents");
+    await expect(page.locator(".modal-start-title")).toHaveText(
+      "Add existing agents",
+    );
     await page.getByTestId("dir-picker-input").fill("/Users/demo/rfq-agent");
     // Round 1's primary, unchanged.
     await expect(page.getByTestId("aw-add")).toBeVisible();
     await expect(page.getByTestId("open-project")).toHaveCount(0);
   });
 
-  test("a no-agent folder in the detection flow is no longer a dead end", async ({ page }) => {
+  test("a no-agent folder in the detection flow is no longer a dead end", async ({
+    page,
+  }) => {
     await page.getByTestId("add-existing-agents").click();
     await page.getByTestId("dir-picker-input").fill(BLANK);
     // The immediate-child probe has nothing to register, so its button is gone
@@ -137,7 +163,9 @@ test.describe("the two questions stay two controls", () => {
     await page.getByTestId("rail-add-project").click();
     await page.getByTestId("dir-picker-input").fill("/Users/demo/acme-app");
     await expect(page.getByTestId("open-project")).toBeEnabled();
-    await expect(page.getByTestId("aw-add-all")).toContainText("Add every agent under this folder");
+    await expect(page.getByTestId("aw-add-all")).toContainText(
+      "Add every agent under this folder",
+    );
   });
 });
 
@@ -175,7 +203,9 @@ test.describe("round trip: removed, then back", () => {
       await page.evaluate(
         () =>
           (
-            JSON.parse(localStorage.getItem("sapiom-harness-ui-prefs") ?? "{}") as {
+            JSON.parse(
+              localStorage.getItem("sapiom-harness-ui-prefs") ?? "{}",
+            ) as {
               closedProjects?: string[];
             }
           ).closedProjects ?? [],
@@ -192,7 +222,9 @@ test.describe("round trip: removed, then back", () => {
    * tombstone inside the folder being opened: you cannot open a folder as a
    * project and keep part of it removed.
    */
-  test("opening a folder ABOVE a removed project un-hides what is inside it", async ({ page }) => {
+  test("opening a folder ABOVE a removed project un-hides what is inside it", async ({
+    page,
+  }) => {
     await page.getByTestId("project-remove-acme-app").click({ force: true });
     await page.getByTestId("remove-project-confirm-btn").click();
     await expect(page.getByTestId("workflow-leasing")).toHaveCount(0);
@@ -209,7 +241,9 @@ test.describe("round trip: removed, then back", () => {
       await page.evaluate(
         () =>
           (
-            JSON.parse(localStorage.getItem("sapiom-harness-ui-prefs") ?? "{}") as {
+            JSON.parse(
+              localStorage.getItem("sapiom-harness-ui-prefs") ?? "{}",
+            ) as {
               closedProjects?: string[];
             }
           ).closedProjects ?? [],

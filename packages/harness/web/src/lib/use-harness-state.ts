@@ -49,6 +49,7 @@ import { loadUiPrefs, saveUiPrefs } from "./ui-prefs";
 import { mergeHistory } from "./history-meta";
 import { createToastMessage, type ToastMessage, type ToastTone } from "./toast";
 import { subscribeEvents } from "./events";
+import { systemGraphLoader } from "./system-graph-loader";
 import { track as trackProduct } from "./analytics/events";
 import {
   agentProvenance,
@@ -77,7 +78,6 @@ const BUSY_WINDOW_MS = 3_000;
  *  the server sanitizes and caps the real list (MAX_RECENT_DIRS in
  *  cli/settings.ts) and its response replaces this guess. */
 const RECENT_DIRS_UI_CAP = 8;
-
 
 /** Upper bound on {@link announcedRuns}. A Studio left open for days can
  *  accumulate executionIds without limit otherwise; the set only needs to
@@ -367,6 +367,13 @@ export interface HarnessStateHook {
 /** Central store for the SPA shell: fetches AppState + settings once, then keeps sessions/workflows fresh via the event bus. */
 export function useHarnessState(): HarnessStateHook {
   const [state, setState] = useState<AppState | null>(null);
+
+  useEffect(() => {
+    if (!state) return;
+    systemGraphLoader.retain(
+      new Set((state.workspaceScopes ?? []).map((scope) => scope.workspaceKey)),
+    );
+  }, [state?.workspaceScopes]);
   const [settings, setSettings] = useState<HarnessSettings | null>(null);
   /**
    * Mirror of `settings` for the one reader that cannot wait for a re-render:
@@ -512,9 +519,9 @@ export function useHarnessState(): HarnessStateHook {
   // POST resolves or the scaffolded `sapiom.json` is registered, so this bridges
   // the whole window during which the rail would otherwise show nothing to
   // return to. Presentational only — never enters `sessions`/`workflows`.
-  const [pendingWorkspaces, setPendingWorkspaces] = useState<PendingWorkspace[]>(
-    [],
-  );
+  const [pendingWorkspaces, setPendingWorkspaces] = useState<
+    PendingWorkspace[]
+  >([]);
   const addPendingWorkspace = useCallback((cwd: string): void => {
     setPendingWorkspaces((prev) =>
       prev.some((p) => p.cwd === cwd)
@@ -544,7 +551,8 @@ export function useHarnessState(): HarnessStateHook {
     if (pendingWorkspaces.length === 0) return;
     const sessions = state?.sessions ?? [];
     const workflows = state?.workflows ?? [];
-    const isUnder = (path: string, cwd: string): boolean => isWithinDir(cwd, path);
+    const isUnder = (path: string, cwd: string): boolean =>
+      isWithinDir(cwd, path);
     setPendingWorkspaces((prev) => {
       let changed = false;
       const next: PendingWorkspace[] = [];
@@ -676,7 +684,11 @@ export function useHarnessState(): HarnessStateHook {
           trackProduct("agent.run_succeeded", { ...runBase, duration_ms });
           return;
         }
-        trackProduct("agent.run_failed", { ...runBase, duration_ms, error_kind: emit.error_kind });
+        trackProduct("agent.run_failed", {
+          ...runBase,
+          duration_ms,
+          error_kind: emit.error_kind,
+        });
       };
 
       const alreadyAnnounced = announcedRuns.current.has(executionId);
@@ -1011,7 +1023,8 @@ export function useHarnessState(): HarnessStateHook {
         // Baseline the built-agents metric: everything present at load already
         // existed, so seed it into the seen-set and never count it as built.
         const seenAtLoad = (seenAgentPathsRef.current ??= new Set<string>());
-        for (const workflow of appState.workflows) seenAtLoad.add(workflow.path);
+        for (const workflow of appState.workflows)
+          seenAtLoad.add(workflow.path);
         setSettings(harnessSettings);
         setErrorKind(null);
         if (appState.tasks) setTasks(appState.tasks);
@@ -1113,6 +1126,10 @@ export function useHarnessState(): HarnessStateHook {
             });
           }
         });
+      } else if (message.type === "system-graph.changed") {
+        // Invalidate even while its workspace destination is closed. The next
+        // open must never resurrect a pre-edit process-lifetime promise.
+        systemGraphLoader.invalidate(message.workspaceKey, message.revision);
       } else if (message.type === "execution.started") {
         startRunPolling(
           message.harnessSessionId,
@@ -1229,6 +1246,17 @@ export function useHarnessState(): HarnessStateHook {
     }
   }, []);
 
+  /** Refresh only the server-issued project identities after a root mutation.
+   * Replacing the full AppState here could overwrite newer session/workflow bus
+   * updates with a slower HTTP snapshot; the scope catalog is the only field
+   * the mutation made stale. */
+  const refreshWorkspaceScopes = useCallback(async (): Promise<void> => {
+    const refreshed = await api.getState();
+    setState((prev) =>
+      prev ? { ...prev, workspaceScopes: refreshed.workspaceScopes } : prev,
+    );
+  }, []);
+
   /**
    * "I opened this folder" — the one place that records it.
    *
@@ -1273,11 +1301,12 @@ export function useHarnessState(): HarnessStateHook {
         setSettings((prev) =>
           prev ? { ...prev, recentDirs: updated.recentDirs } : prev,
         );
+        await refreshWorkspaceScopes();
       } catch {
         // Non-fatal: whatever the caller was really doing already succeeded.
       }
     },
-    [reopenProjects],
+    [refreshWorkspaceScopes, reopenProjects],
   );
 
   const createSession = useCallback(
@@ -1709,12 +1738,17 @@ export function useHarnessState(): HarnessStateHook {
       // in the toast: a removal that silently orphaned a live PTY would be a
       // worse answer than an honest partial one.
       const dead = new Set(
-        plan.endSessionIds.filter((id) => !outcome.failedSessionIds.includes(id)),
+        plan.endSessionIds.filter(
+          (id) => !outcome.failedSessionIds.includes(id),
+        ),
       );
       if (dead.size > 0) {
         setState((prev) =>
           prev
-            ? { ...prev, sessions: prev.sessions.filter((s) => !dead.has(s.id)) }
+            ? {
+                ...prev,
+                sessions: prev.sessions.filter((s) => !dead.has(s.id)),
+              }
             : prev,
         );
       }
@@ -1727,8 +1761,14 @@ export function useHarnessState(): HarnessStateHook {
           ),
         );
       }
+      try {
+        await refreshWorkspaceScopes();
+      } catch {
+        // The row is already gone. A later state reload or project open will
+        // reconcile the opaque scope catalog.
+      }
     },
-    [],
+    [refreshWorkspaceScopes],
   );
 
   const listHarnesses = useCallback(
@@ -1824,7 +1864,10 @@ export function useHarnessState(): HarnessStateHook {
           workflowsRef.current.find((w) => w.path === workflowPath),
         );
         const startedAt = performance.now();
-        trackProduct("agent.deploy_started", { workflow_slug: slug, ...provenance });
+        trackProduct("agent.deploy_started", {
+          workflow_slug: slug,
+          ...provenance,
+        });
         // Which non-terminal phase was last seen, so a terminal `error` can
         // say whether linking or building failed — both are the same wire
         // shape, told apart only by what preceded them.
@@ -1867,7 +1910,9 @@ export function useHarnessState(): HarnessStateHook {
             } else if (event.phase === "building") {
               lastNonTerminalPhase = "building";
               setDeployProgress(workflowPath, { phase: "building" });
-              setToast(createToastMessage("Deploying — building on Sapiom…", "info"));
+              setToast(
+                createToastMessage("Deploying — building on Sapiom…", "info"),
+              );
               // The link is already durable at this point. Pull its mutable
               // build projection so the chip can say Building, not Deployed.
               void refreshWorkflows();
@@ -2091,7 +2136,8 @@ export function useHarnessState(): HarnessStateHook {
     showToast,
     lastDeployErrorFor,
     deployStateByPath,
-    dismissDeployState: (workflowPath: string) => setDeployProgress(workflowPath, null),
+    dismissDeployState: (workflowPath: string) =>
+      setDeployProgress(workflowPath, null),
     pendingWorkspaces,
     addPendingWorkspace,
     removePendingWorkspace,

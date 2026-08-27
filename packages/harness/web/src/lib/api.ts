@@ -33,12 +33,19 @@ import type {
   WorkflowInputContractResponse,
   WorkflowInfo,
 } from "@shared/types";
+import {
+  type SystemGraph,
+  type SystemGraphSnapshot,
+  type WorkspaceKey,
+  type WorkspaceScopeSummary,
+} from "@shared/system-graph";
 
 import type { LocalStepTrace, LocalRunOutcome } from "@sapiom/agent-core";
 
 import { getTheme } from "./theme";
+import { parseSystemGraphSnapshot } from "./system-graph";
 import { refuseMove, remapUnder } from "./agent-move";
-import { samePath } from "./paths";
+import { basenameOf, isWithinDir, samePath } from "./paths";
 
 import type { CanvasGraph, CanvasGraphNode } from "./canvas-graph";
 import {
@@ -318,6 +325,11 @@ export interface HarnessApi {
    */
   authStatus(): Promise<AuthStatusResponse>;
   getState(): Promise<AppState>;
+  /** Revisioned local dependency projection for one server-issued workspace key. */
+  getSystemGraph(
+    workspaceKey: WorkspaceKey,
+    options?: { refresh?: boolean },
+  ): Promise<SystemGraphSnapshot>;
   createSession(req: CreateSessionRequest): Promise<HarnessSession>;
   attachFile(id: string, req: AttachFileRequest): Promise<AttachFileResponse>;
   listSessions(): Promise<HarnessSession[]>;
@@ -478,7 +490,7 @@ class RealApi implements HarnessApi {
     return this.request<AuthStatusResponse>("/api/auth/status");
   }
 
-  private async request<T>(path: string, init?: RequestInit): Promise<T> {
+  private async response(path: string, init?: RequestInit): Promise<Response> {
     const res = await fetch(path, {
       ...init,
       headers: {
@@ -508,12 +520,35 @@ class RealApi implements HarnessApi {
         reason,
       );
     }
+    return res;
+  }
+
+  private async request<T>(path: string, init?: RequestInit): Promise<T> {
+    const res = await this.response(path, init);
     if (res.status === 204) return undefined as T;
     return (await res.json()) as T;
   }
 
   getState(): Promise<AppState> {
     return this.request<AppState>("/api/state");
+  }
+
+  async getSystemGraph(
+    workspaceKey: WorkspaceKey,
+    options: { refresh?: boolean } = {},
+  ): Promise<SystemGraphSnapshot> {
+    const route = `/api/workspaces/${encodeURIComponent(workspaceKey)}/system-graph`;
+    const response = await this.response(
+      options.refresh ? `${route}/refresh` : route,
+      options.refresh ? { method: "POST" } : undefined,
+    );
+    const snapshot = parseSystemGraphSnapshot(
+      (await response.json()) as unknown,
+    );
+    if (snapshot.workspaceKey !== workspaceKey) {
+      throw new Error("Invalid system graph response");
+    }
+    return snapshot;
   }
 
   createSession(req: CreateSessionRequest): Promise<HarnessSession> {
@@ -972,10 +1007,18 @@ const LEASING_RUN_STEPS: { id: string; name: string; latencyMs: number }[] = [
 // passes; nothing carries cost. Used exclusively for `run()`-minted
 // `exec-mock-prod-*` ids, never the terminal default other ids rely on.
 export const PROGRESSIVE_STEP_MS = 900;
-export function progressiveLeasingRun(executionId: string, elapsedMs: number): RunView {
+export function progressiveLeasingRun(
+  executionId: string,
+  elapsedMs: number,
+): RunView {
   const steps: StepView[] = LEASING_RUN_STEPS.map((step, i) => {
     if (elapsedMs >= (i + 1) * PROGRESSIVE_STEP_MS) {
-      return { id: step.id, name: step.name, status: "passed", latencyMs: step.latencyMs };
+      return {
+        id: step.id,
+        name: step.name,
+        status: "passed",
+        latencyMs: step.latencyMs,
+      };
     }
     if (elapsedMs >= i * PROGRESSIVE_STEP_MS) {
       return { id: step.id, name: step.name, status: "running" };
@@ -1025,11 +1068,19 @@ const MOCK_RAIL_STATE_PREFIX = "sapiom-mock-studio-rail:";
  * only counted rows would pass while a mount effect quietly stored
  * `groups: []` — which is exactly how the regression shipped.
  */
-function recordRailStateWrite(entry: { root: string; raw: string | null }): void {
+function recordRailStateWrite(entry: {
+  root: string;
+  raw: string | null;
+}): void {
   if (typeof window === "undefined") return;
-  const win = window as unknown as { __HARNESS_TEST__?: Record<string, unknown> };
+  const win = window as unknown as {
+    __HARNESS_TEST__?: Record<string, unknown>;
+  };
   const previous =
-    (win.__HARNESS_TEST__?.railStateWrites as Array<{ root: string; raw: string | null }>) ?? [];
+    (win.__HARNESS_TEST__?.railStateWrites as Array<{
+      root: string;
+      raw: string | null;
+    }>) ?? [];
   win.__HARNESS_TEST__ = {
     ...(win.__HARNESS_TEST__ ?? {}),
     railStateWrites: [...previous, entry],
@@ -1065,8 +1116,12 @@ function replayMockMoves(p: string): string {
  *  never does. */
 function recordAgentMove(entry: { from: string; to: string }): void {
   if (typeof window === "undefined") return;
-  const win = window as unknown as { __HARNESS_TEST__?: Record<string, unknown> };
-  const previous = (win.__HARNESS_TEST__?.agentMoves as Array<{ from: string; to: string }>) ?? [];
+  const win = window as unknown as {
+    __HARNESS_TEST__?: Record<string, unknown>;
+  };
+  const previous =
+    (win.__HARNESS_TEST__?.agentMoves as Array<{ from: string; to: string }>) ??
+    [];
   win.__HARNESS_TEST__ = {
     ...(win.__HARNESS_TEST__ ?? {}),
     agentMoves: [...previous, entry],
@@ -1128,7 +1183,10 @@ function mockWorkflowGraph(name: string): CanvasGraph {
  * boards, and crucially they post NO graph: that is what keeps the pane from
  * revealing itself on setup scaffolding, so the mock must not post one either.
  */
-function mockWorkflowMessageDocument(title: string, subtitle: string | null): string {
+function mockWorkflowMessageDocument(
+  title: string,
+  subtitle: string | null,
+): string {
   const esc = (value: string): string =>
     value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
   return [
@@ -1151,7 +1209,11 @@ function mockWorkflowGraphDocument(name: string, graph: CanvasGraph): string {
   // HTML document by concatenation, and the next person to key it off a real
   // registry name (which is a directory basename) should not have to notice.
   const esc = (value: string): string =>
-    value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+    value
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
   const nodes = graph.nodes
     .map(
       (n) =>
@@ -1160,7 +1222,7 @@ function mockWorkflowGraphDocument(name: string, graph: CanvasGraph): string {
     )
     .join('<div class="edge" aria-hidden="true"></div>');
   return [
-    "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\" />",
+    '<!doctype html><html lang="en"><head><meta charset="utf-8" />',
     `<title>${esc(name)} — mock agent board</title>`,
     "<style>",
     ":root{--bg:#fff;--ink:#141417;--dim:#54545e;--line:rgba(17,17,20,.12);--node:#f2f2f3}",
@@ -1179,10 +1241,10 @@ function mockWorkflowGraphDocument(name: string, graph: CanvasGraph): string {
     "</script><script>",
     "(function(){",
     'var el=document.getElementById("sapiom-graph");',
-    "try{parent.postMessage({type:\"sapiom-canvas:graph\",graph:JSON.parse(el.textContent||\"{}\")},\"*\")}catch(e){}",
+    'try{parent.postMessage({type:"sapiom-canvas:graph",graph:JSON.parse(el.textContent||"{}")},"*")}catch(e){}',
     'var b=document.getElementById("board");',
-    "try{parent.postMessage({type:\"sapiom-canvas:size\",width:b.offsetWidth,height:b.offsetHeight,",
-    "insetTop:40,insetBottom:72,insetX:20},\"*\")}catch(e){}",
+    'try{parent.postMessage({type:"sapiom-canvas:size",width:b.offsetWidth,height:b.offsetHeight,',
+    'insetTop:40,insetBottom:72,insetX:20},"*")}catch(e){}',
     "})();",
     "</script></body></html>",
   ].join("");
@@ -1196,6 +1258,9 @@ class MockApi implements HarnessApi {
   // First-poll wall-clock per progressive prod run, so the timeline is measured
   // from when the run was first observed (not module load) — see getRunState.
   private progressiveRunStart = new Map<string, number>();
+  /** Stable for the lifetime of the mock process, mirroring server-issued
+   * opaque keys without putting filesystem paths into graph payloads. */
+  private workspaceKeys = new Map<string, WorkspaceKey>();
 
   async startAuth(): Promise<AuthStartResponse> {
     // Record the call for Playwright assertions (same pattern as runMacro/deploy).
@@ -1256,9 +1321,17 @@ class MockApi implements HarnessApi {
     typeof window !== "undefined" &&
     new URLSearchParams(window.location.search).get("mockConsentSource") ===
       "prompted";
-  private sessionsStore: HarnessSession[] = this.fresh
-    ? []
-    : MOCK_SESSIONS.map((session) => ({ ...session }));
+  // Playwright-only fixture shape: retain the persisted workspace/agent
+  // inventory while removing every session, so the folder graph's
+  // no-active-session contract is exercised without fabricating UI state.
+  private readonly noLiveSessions =
+    typeof window !== "undefined" &&
+    new URLSearchParams(window.location.search).get("mockNoLiveSessions") ===
+      "1";
+  private sessionsStore: HarnessSession[] =
+    this.fresh || this.noLiveSessions
+      ? []
+      : MOCK_SESSIONS.map((session) => ({ ...session }));
   private workflowsStore: WorkflowInfo[] = this.fresh
     ? []
     : [
@@ -1310,6 +1383,24 @@ class MockApi implements HarnessApi {
         recentDirs: [...MOCK_SETTINGS.recentDirs],
         ...(this.promptedConsent ? { telemetryOptIn: true } : {}),
       };
+
+  private workspaceKey(cwd: string): WorkspaceKey {
+    const existing = this.workspaceKeys.get(cwd);
+    if (existing) return existing;
+    const key = `workspace-mock-${this.workspaceKeys.size + 1}`;
+    this.workspaceKeys.set(cwd, key);
+    return key;
+  }
+
+  private workspaceScopes(): WorkspaceScopeSummary[] {
+    const roots = new Set([
+      ...this.settings.recentDirs,
+      ...this.sessions.map((session) => session.cwd),
+    ]);
+    return [...roots]
+      .sort((left, right) => left.localeCompare(right))
+      .map((cwd) => ({ cwd, workspaceKey: this.workspaceKey(cwd) }));
+  }
 
   async getState(): Promise<AppState> {
     await delay();
@@ -1382,6 +1473,7 @@ class MockApi implements HarnessApi {
           : true,
       sessions: this.sessions,
       workflows: this.workflows,
+      workspaceScopes: this.workspaceScopes(),
       macros: MOCK_MACROS,
       launchDir: MOCK_LAUNCH_DIR,
       // Mirrors the Electron host (`<launchDir>/projects`) rather than the CLI
@@ -1392,6 +1484,154 @@ class MockApi implements HarnessApi {
       ...(mockEnvReason ? { consentEnvReason: mockEnvReason } : {}),
       ...(this.fresh ? { firstRun: true } : {}),
     };
+  }
+
+  async getSystemGraph(
+    workspaceKey: WorkspaceKey,
+    _options: { refresh?: boolean } = {},
+  ): Promise<SystemGraphSnapshot> {
+    const graphDelay =
+      typeof window === "undefined"
+        ? 180
+        : ((window as unknown as { __MOCK_SYSTEM_GRAPH_DELAY_MS__?: number })
+            .__MOCK_SYSTEM_GRAPH_DELAY_MS__ ?? 180);
+    await delay(graphDelay);
+    const selectedScope = this.workspaceScopes().find(
+      (scope) => scope.workspaceKey === workspaceKey,
+    );
+    if (!selectedScope) {
+      throw new ApiError(404, "Workspace not found", "Workspace not found");
+    }
+    let state: SystemGraphSnapshot["state"] = "ready";
+    let revision = 1;
+    if (typeof window !== "undefined") {
+      const win = window as unknown as {
+        __HARNESS_TEST__?: Record<string, unknown>;
+        __MOCK_SYSTEM_GRAPH_FAIL_ONCE__?: boolean;
+        __MOCK_SYSTEM_GRAPH_DEGRADED_REMAINING__?: number;
+        __MOCK_SYSTEM_GRAPH_STATE__?: SystemGraphSnapshot["state"];
+        __MOCK_SYSTEM_GRAPH_REVISION__?: number;
+      };
+      const previous =
+        (win.__HARNESS_TEST__?.systemGraphRequests as
+          | WorkspaceKey[]
+          | undefined) ?? [];
+      win.__HARNESS_TEST__ = {
+        ...(win.__HARNESS_TEST__ ?? {}),
+        systemGraphRequests: [...previous, workspaceKey],
+      };
+      if (win.__MOCK_SYSTEM_GRAPH_FAIL_ONCE__) {
+        win.__MOCK_SYSTEM_GRAPH_FAIL_ONCE__ = false;
+        throw new ApiError(
+          500,
+          "System graph projection failed",
+          "System graph projection failed",
+        );
+      }
+      const degradedRemaining =
+        win.__MOCK_SYSTEM_GRAPH_DEGRADED_REMAINING__ ?? 0;
+      if (degradedRemaining > 0) {
+        state = "degraded";
+        win.__MOCK_SYSTEM_GRAPH_DEGRADED_REMAINING__ = degradedRemaining - 1;
+      }
+      state = win.__MOCK_SYSTEM_GRAPH_STATE__ ?? state;
+      revision = win.__MOCK_SYSTEM_GRAPH_REVISION__ ?? revision;
+    }
+    const fixtureGraph: SystemGraph = {
+      kind: "system",
+      scope: { kind: "working-tree", workspaceKey },
+      nodes: [
+        { id: "agent:growth", agentKey: "growth", label: "Growth" },
+        { id: "agent:leasing", agentKey: "leasing", label: "Leasing" },
+        {
+          id: "agent:reporting",
+          agentKey: "reporting",
+          label: "Reporting",
+        },
+        {
+          id: "agent:research",
+          agentKey: "research",
+          label: "Research",
+        },
+        {
+          id: "agent:standalone",
+          agentKey: "standalone",
+          label: "Standalone",
+        },
+      ],
+      edges: [
+        {
+          from: "agent:research",
+          to: "agent:growth",
+          kind: "invokes",
+          basis: "static",
+          mode: "blocking",
+        },
+        {
+          from: "agent:research",
+          to: "agent:growth",
+          kind: "invokes",
+          basis: "static",
+          mode: "async",
+        },
+        {
+          from: "agent:research",
+          to: "agent:leasing",
+          kind: "invokes",
+          basis: "static",
+          mode: "async",
+        },
+        {
+          from: "agent:growth",
+          to: "agent:research",
+          kind: "invokes",
+          basis: "static",
+          mode: "async",
+        },
+        {
+          from: "agent:reporting",
+          to: "agent:leasing",
+          kind: "invokes",
+          basis: "static",
+          mode: "blocking",
+        },
+      ],
+      warnings: [],
+    };
+    // Keep the original relationship-rich graph for acme-app's graph behavior
+    // specs. Every other mock project is an honest inventory projection of the
+    // agents beneath that exact root, which lets Project-axis tests prove parent
+    // and nested projects expose the same membership as the rail.
+    const graph = samePath(selectedScope.cwd, "/Users/demo/acme-app")
+      ? fixtureGraph
+      : {
+          kind: "system" as const,
+          scope: { kind: "working-tree" as const, workspaceKey },
+          nodes: this.workflows
+            .filter((workflow) => isWithinDir(selectedScope.cwd, workflow.path))
+            .map((workflow) => {
+              const normalizedRoot = selectedScope.cwd
+                .replace(/\\/g, "/")
+                .replace(/\/+$/, "");
+              const normalizedPath = workflow.path
+                .replace(/\\/g, "/")
+                .replace(/\/+$/, "");
+              const relative = samePath(selectedScope.cwd, workflow.path)
+                ? basenameOf(workflow.path)
+                : normalizedPath.slice(normalizedRoot.length + 1);
+              const agentKey =
+                workflow.definitionSlug?.trim() || `local:${relative}`;
+              return {
+                id: `agent:${agentKey}`,
+                agentKey,
+                label: workflow.name,
+              };
+            })
+            .sort((left, right) => left.agentKey.localeCompare(right.agentKey)),
+          edges: [],
+          warnings: [],
+        };
+    return { workspaceKey, revision, state, graph };
   }
 
   async createSession(req: CreateSessionRequest): Promise<HarnessSession> {
@@ -1532,7 +1772,9 @@ class MockApi implements HarnessApi {
 
   async sessionHistory(cwd: string): Promise<SessionSummary[]> {
     await delay();
-    const searchExtras = isSearchFixturesEnabled() ? (MOCK_SEARCH_HISTORY[cwd] ?? []) : [];
+    const searchExtras = isSearchFixturesEnabled()
+      ? (MOCK_SEARCH_HISTORY[cwd] ?? [])
+      : [];
     return [...(MOCK_HISTORY[cwd] ?? []), ...searchExtras];
   }
 
@@ -1656,19 +1898,22 @@ class MockApi implements HarnessApi {
     // 404 means "not a registered workflow" and NOTHING else — an agent whose
     // board is empty still answers 200. The mock keeps that distinction because
     // it is the one a consumer can get wrong invisibly.
-    if (!workflow) throw new ApiError(404, "agent not found", "Agent not found");
+    if (!workflow)
+      throw new ApiError(404, "agent not found", "Agent not found");
     // e2e seam: drive the non-`ok` statuses the pane must render as DISTINCT
     // honest states. `preparing` is not a failure (a fresh scaffold with no
     // deps installed) and `empty` is not an error (absent ⇒ empty), so a test
     // has to be able to reach each one.
     const override =
       typeof window !== "undefined"
-        ? (window as unknown as {
-            __MOCK_WORKFLOW_GRAPH__?: Record<
-              string,
-              { status: WorkflowGraphStatus; reason?: string | null }
-            >;
-          }).__MOCK_WORKFLOW_GRAPH__?.[workflowPath]
+        ? (
+            window as unknown as {
+              __MOCK_WORKFLOW_GRAPH__?: Record<
+                string,
+                { status: WorkflowGraphStatus; reason?: string | null }
+              >;
+            }
+          ).__MOCK_WORKFLOW_GRAPH__?.[workflowPath]
         : undefined;
     const status = override?.status ?? "ok";
     const base = {
@@ -1712,13 +1957,15 @@ class MockApi implements HarnessApi {
   ): Promise<WorkflowInputContractResponse> {
     await delay(120);
     const workflow = this.workflows.find((item) => item.path === workflowPath);
-    if (!workflow) throw new ApiError(404, "Agent not found", "Agent not found");
+    if (!workflow)
+      throw new ApiError(404, "Agent not found", "Agent not found");
     if (typeof window !== "undefined") {
       const testWindow = window as unknown as {
         __MOCK_INPUT_CONTRACT_MODE__?: "throw" | "unavailable";
         __MOCK_INPUT_CONTRACT__?: WorkflowInputContractResponse;
       };
-      if (testWindow.__MOCK_INPUT_CONTRACT__) return testWindow.__MOCK_INPUT_CONTRACT__;
+      if (testWindow.__MOCK_INPUT_CONTRACT__)
+        return testWindow.__MOCK_INPUT_CONTRACT__;
       const mode = testWindow.__MOCK_INPUT_CONTRACT_MODE__;
       if (mode === "throw") {
         throw new ApiError(
@@ -1791,7 +2038,12 @@ class MockApi implements HarnessApi {
       from,
       to,
     );
-    if (refusal) throw new ApiError(409, "POST /api/agents/move \u2192 409 (mock)", refusal);
+    if (refusal)
+      throw new ApiError(
+        409,
+        "POST /api/agents/move \u2192 409 (mock)",
+        refusal,
+      );
     if (samePath(from, to)) return;
     mockMoves.push({ from, to });
     void import("./events").then(({ publishMockBusMessage }) => {

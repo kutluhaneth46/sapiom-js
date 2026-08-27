@@ -6,6 +6,11 @@
  * integration boundary.
  */
 
+import type {
+  SystemGraphLifecycleState,
+  WorkspaceKey,
+} from "./system-graph.js";
+
 // ---------------------------------------------------------------------------
 // Constants & well-known paths
 // ---------------------------------------------------------------------------
@@ -530,6 +535,12 @@ export type BusMessage =
       target: "prod" | "local";
     }
   | { type: "workflows.changed" }
+  | {
+      type: "system-graph.changed";
+      workspaceKey: WorkspaceKey;
+      revision: number;
+      state: SystemGraphLifecycleState;
+    }
   /**
    * Full snapshot of one background task, re-broadcast on every change
    * (spawn, each new status line, completion/failure). Tasks are rare and
@@ -1150,6 +1161,9 @@ export interface AppState {
   consentEnvReason?: string | null;
   sessions: HarnessSession[];
   workflows: WorkflowInfo[];
+  /** Opaque identities for the workspace folders currently known to Studio.
+   * Optional for compatibility with older servers and test fixtures. */
+  workspaceScopes?: import("./system-graph.js").WorkspaceScopeSummary[];
   macros: MacroDef[];
   /** The directory the CLI was launched against — the SPA prefills the
    *  new-session modal with this instead of recentDirs[0]. */

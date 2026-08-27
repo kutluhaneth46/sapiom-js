@@ -32,7 +32,10 @@ import * as path from "node:path";
 import * as fs from "node:fs/promises";
 import { Router, type Router as ExpressRouter } from "express";
 
-import type { StudioRailFileResponse, StudioRailLaunchEdgesResponse } from "../shared/types.js";
+import type {
+  StudioRailFileResponse,
+  StudioRailLaunchEdgesResponse,
+} from "../shared/types.js";
 import { detectWorkflowLaunches } from "../core/canvas-interconnections.js";
 import { hasTraversalSegment, resolveWithinRoot } from "../core/path-safety.js";
 
@@ -58,9 +61,9 @@ export interface StudioRailDeps {
    */
   listKnownRoots: () => string[] | Promise<string[]>;
   /**
-   * The registered agents. Launch edges are computed from these and only these:
-   * an agent this install lacks is not a node, so an edge pointing at it is
-   * simply not an edge that can be drawn.
+   * The registered agents whose sources are scanned for launch calls. A call's
+   * target need not be registered: the client joins detected target slugs to
+   * its own project membership and ignores unmatched edges.
    */
   listWorkflows: () => Array<{ name: string; path: string }>;
 }
@@ -77,12 +80,17 @@ const canonical = (p: string): string => {
  * knows about — null otherwise, which every route answers as a 400 rather than
  * reaching for the disk.
  */
-function resolveKnownRoot(candidate: unknown, knownRoots: readonly string[]): string | null {
+function resolveKnownRoot(
+  candidate: unknown,
+  knownRoots: readonly string[],
+): string | null {
   if (typeof candidate !== "string" || candidate.trim() === "") return null;
   if (hasTraversalSegment(candidate)) return null;
   if (!path.isAbsolute(candidate)) return null;
   const wanted = canonical(candidate);
-  return knownRoots.some((root) => canonical(root) === wanted) ? path.resolve(candidate) : null;
+  return knownRoots.some((root) => canonical(root) === wanted)
+    ? path.resolve(candidate)
+    : null;
 }
 
 /** `<root>/.sapiom/studio-rail.json`, or null if that escapes `root`. */
@@ -111,9 +119,13 @@ export async function readStudioRailFile(root: string): Promise<string | null> {
 }
 
 /** Writes the blob verbatim, creating `.sapiom/` if it is not there yet. */
-export async function writeStudioRailFile(root: string, raw: string): Promise<void> {
+export async function writeStudioRailFile(
+  root: string,
+  raw: string,
+): Promise<void> {
   const file = studioRailPath(root);
-  if (file == null) throw new Error("studio-rail path escapes the project root");
+  if (file == null)
+    throw new Error("studio-rail path escapes the project root");
   await fs.mkdir(path.dirname(file), { recursive: true });
   await fs.writeFile(file, raw, "utf8");
 }
@@ -137,10 +149,10 @@ export async function removeStudioRailFile(root: string): Promise<void> {
 /**
  * Launch edges across every registered agent, as parent-name to child-slug.
  *
- * Uses the EXISTING grep (`core/canvas-interconnections.ts`) — the same
- * detector the canvas draws its dashed launched-workflow nodes from. A second
- * edge detector would be a second answer to "what does this launch", and the
- * axis and the system map are supposed to be reading one graph.
+ * Uses the shared syntax-only extractor (`core/canvas-interconnections.ts`) —
+ * the same detector the canvas and system graph use for agent relationships. A
+ * second edge detector would be a second answer to "what does this launch",
+ * and the Group axis and system graph are supposed to read one graph.
  *
  * `knownStepIds` is empty on purpose: that argument exists so a capability chip
  * can be attributed to the step it sits in, and a group does not care which
@@ -148,7 +160,7 @@ export async function removeStudioRailFile(root: string): Promise<void> {
  *
  * `child` is the `definition` slug as written at the call site. Matching it to
  * an agent is the client's job (a slug can name an agent by `definitionSlug` or
- * by folder name), and an unmatched slug is simply not an edge.
+ * by folder name); the client ignores an unmatched slug.
  */
 export async function detectLaunchEdges(
   workflows: ReadonlyArray<{ name: string; path: string }>,
@@ -201,7 +213,10 @@ export function createStudioRailRouter(deps: StudioRailDeps): ExpressRouter {
       return;
     }
     try {
-      res.json({ root, raw: await readStudioRailFile(root) } satisfies StudioRailFileResponse);
+      res.json({
+        root,
+        raw: await readStudioRailFile(root),
+      } satisfies StudioRailFileResponse);
     } catch (err) {
       next(err);
     }

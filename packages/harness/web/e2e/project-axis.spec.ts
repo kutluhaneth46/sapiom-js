@@ -59,7 +59,9 @@ test.describe("compaction", () => {
     // into the branch point rather than spending two rows to say nothing.
     const dir = page.getByTestId("dir-row-backend/src/agents");
     await expect(dir).toBeVisible();
-    await expect(dir.locator(".tree-row-label")).toHaveText("backend/src/agents");
+    await expect(dir.locator(".tree-row-label")).toHaveText(
+      "backend/src/agents",
+    );
     await expect(page.getByTestId("dir-row-backend")).toHaveCount(0);
     await expect(page.getByTestId("dir-row-backend/src")).toHaveCount(0);
 
@@ -67,7 +69,9 @@ test.describe("compaction", () => {
     expect(await rowOrder(group)).toEqual(["agent:ads", "agent:outreach"]);
   });
 
-  test("a lone agent's whole chain compacts onto its OWN row as a prefix", async ({ page }) => {
+  test("a lone agent's whole chain compacts onto its OWN row as a prefix", async ({
+    page,
+  }) => {
     // Three directories leading to one agent is three rows to reach one thing.
     await expect(page.getByTestId("dir-row-scripts")).toHaveCount(0);
     await expect(page.getByTestId("dir-row-scripts/tools")).toHaveCount(0);
@@ -78,8 +82,14 @@ test.describe("compaction", () => {
     // mail…` — the chain's own ellipsis plus a CSS one — and an unreadable
     // agent name; a shrink ratio cannot fix that, because flex shrinks in
     // proportion to basis and the long path has the larger basis.
-    await expect(page.getByTestId("workflow-prefix-/Users/demo/polsia/scripts/tools/rollup")).toHaveText("tools");
-    await expect(page.getByTestId("workflow-name-/Users/demo/polsia/scripts/tools/rollup")).toHaveText("rollup");
+    await expect(
+      page.getByTestId(
+        "workflow-prefix-/Users/demo/polsia/scripts/tools/rollup",
+      ),
+    ).toHaveText("tools");
+    await expect(
+      page.getByTestId("workflow-name-/Users/demo/polsia/scripts/tools/rollup"),
+    ).toHaveText("rollup");
   });
 
   test("a 3-segment 18-character label stays WHOLE; a 5-segment 35-character one elides", async ({
@@ -87,9 +97,9 @@ test.describe("compaction", () => {
   }) => {
     // Elision needs >2 segments AND >22 characters — both, so a short deep
     // chain keeps the only context the row had.
-    await expect(page.getByTestId("dir-row-backend/src/agents").locator(".tree-row-label")).toHaveText(
-      "backend/src/agents",
-    );
+    await expect(
+      page.getByTestId("dir-row-backend/src/agents").locator(".tree-row-label"),
+    ).toHaveText("backend/src/agents");
     await expect(
       page
         .getByTestId("dir-row-packages/harness/web/src/components")
@@ -97,7 +107,9 @@ test.describe("compaction", () => {
     ).toHaveText("packages/…/components");
   });
 
-  test("a mixed container holds an agent row AND a subdirectory", async ({ page }) => {
+  test("a mixed container holds an agent row AND a subdirectory", async ({
+    page,
+  }) => {
     const group = page.locator(".workspace-subgroup", {
       has: page.getByTestId("dir-row-services"),
     });
@@ -106,14 +118,21 @@ test.describe("compaction", () => {
 });
 
 test.describe("ordering", () => {
-  test("agents precede directories in EVERY container, at more than one depth", async ({ page }) => {
+  test("agents precede directories in EVERY container, at more than one depth", async ({
+    page,
+  }) => {
     // Deliberately unlike a file explorer: the rail explores AGENTS and
     // directories are scaffolding. Dirs-first buried the agent a project is
     // named for underneath the folder holding what it launches.
-    const kindsOf = (rows: string[]): string[] => rows.map((row) => row.split(":")[0]);
+    const kindsOf = (rows: string[]): string[] =>
+      rows.map((row) => row.split(":")[0]);
     const agentsFirst = (rows: string[]): boolean => {
       const kinds = kindsOf(rows);
-      return kinds.indexOf("agent") === -1 || kinds.lastIndexOf("agent") < (kinds.indexOf("dir") === -1 ? Infinity : kinds.indexOf("dir"));
+      return (
+        kinds.indexOf("agent") === -1 ||
+        kinds.lastIndexOf("agent") <
+          (kinds.indexOf("dir") === -1 ? Infinity : kinds.indexOf("dir"))
+      );
     };
 
     // Depth 0 — directly under the project row. `rollup` (an agent) comes
@@ -143,18 +162,32 @@ test.describe("the root-agent merge", () => {
   test("a root that IS an agent renders exactly ONE row", async ({ page }) => {
     // The project row and that agent are the same directory, so printing both
     // says one word twice. That stutter was 15 of one install's 40 rows.
-    const rows = page.getByTestId("workspace-group-dashboard-keeper").locator(".workspace-row");
+    const rows = page
+      .getByTestId("workspace-group-dashboard-keeper")
+      .locator(".workspace-row");
     await expect(rows).toHaveCount(1);
     const row = rows.first();
-    // …and the one row is the AGENT's row: it carries the agent's testid, its
-    // selection class, and its focus behaviour.
-    await expect(row).toHaveAttribute("data-testid", "workflow-dashboard-keeper");
+    // …and the one row keeps the agent identity while its project label opens
+    // the complete project graph.
+    await expect(row).toHaveAttribute(
+      "data-testid",
+      "workflow-dashboard-keeper",
+    );
     await expect(row).toHaveClass(/workflow-item/);
-    await row.locator(".workflow-item-trigger").click();
+    await page.getByTestId("project-select-dashboard-keeper").click();
+    await expect(row).toHaveClass(/is-selected/);
+    await expect(
+      page.getByTestId("system-graph-node-dashboard-keeper"),
+    ).toBeVisible();
+    // The graph node is the ordinary agent door and restores the preserved
+    // agent/session panes.
+    await page.getByTestId("system-graph-node-dashboard-keeper").click();
     await expect(row).toHaveClass(/is-focused/);
     // …and with nothing under it, it offers no disclosure at all: a chevron
     // that folds an empty subtree is an affordance for nothing.
-    await expect(page.getByTestId("project-disclosure-dashboard-keeper")).toHaveCount(0);
+    await expect(
+      page.getByTestId("project-disclosure-dashboard-keeper"),
+    ).toHaveCount(0);
     await expect(page.getByTestId("project-disclosure-polsia")).toHaveCount(1);
   });
 
@@ -162,14 +195,36 @@ test.describe("the root-agent merge", () => {
     // Deployment is a per-AGENT fact; on a project row it read as a property
     // of the project, appearing on one and not its neighbour for reasons
     // nothing on screen explained.
-    const row = page.getByTestId("workspace-group-dashboard-keeper").locator(".workspace-row");
+    const row = page
+      .getByTestId("workspace-group-dashboard-keeper")
+      .locator(".workspace-row");
     await expect(row.locator(".workflow-status")).toHaveCount(0);
     // The rail also offers no per-project `+`.
-    await expect(page.locator('.rail-list [data-testid^="workspace-new-session-"]')).toHaveCount(0);
+    await expect(
+      page.locator('.rail-list [data-testid^="workspace-new-session-"]'),
+    ).toHaveCount(0);
   });
 });
 
 test.describe("multi-root", () => {
+  test("parent and nested project graphs follow their visible containment", async ({
+    page,
+  }) => {
+    await page.getByTestId("project-select-polsia").click();
+    await expect(page.getByTestId("system-graph-node-gateway")).toBeVisible();
+    await expect(page.getByTestId("system-graph-node-queue")).toBeVisible();
+    await expect(
+      page.getByTestId("system-graph-node-ads-worker"),
+    ).toBeVisible();
+
+    await page.getByTestId(`project-select-${NESTED_LABEL}`).click();
+    await expect(page.getByTestId("system-graph-node-queue")).toBeVisible();
+    await expect(
+      page.getByTestId("system-graph-node-ads-worker"),
+    ).toBeVisible();
+    await expect(page.getByTestId("system-graph-node-gateway")).toHaveCount(0);
+  });
+
   test("an agent files under EVERY open root, and the nested project reads parent/child", async ({
     page,
   }) => {
@@ -185,7 +240,9 @@ test.describe("multi-root", () => {
     await expect(
       page
         .getByTestId(`workspace-group-${NESTED_LABEL}`)
-        .getByTestId("workflow-prefix-/Users/demo/polsia/services/workers/queue"),
+        .getByTestId(
+          "workflow-prefix-/Users/demo/polsia/services/workers/queue",
+        ),
     ).toHaveCount(0);
     // Under `polsia` it is reached through `services/workers`.
     await expect(page.getByTestId("dir-row-workers")).toBeVisible();
@@ -203,7 +260,9 @@ test.describe("multi-root", () => {
 
     // The project folded; the subdirectory inside `polsia` did not.
     await expect(
-      page.getByTestId(`workspace-group-${NESTED_LABEL}`).getByTestId("workflow-queue"),
+      page
+        .getByTestId(`workspace-group-${NESTED_LABEL}`)
+        .getByTestId("workflow-queue"),
     ).toHaveCount(0);
     await expect(page.getByTestId("dir-row-workers")).toBeVisible();
     await expect(page.getByTestId("workflow-queue")).toHaveCount(1);
@@ -213,7 +272,9 @@ test.describe("multi-root", () => {
     await page.getByTestId("dir-disclosure-workers").click();
     await expect(page.getByTestId("workflow-queue")).toHaveCount(1);
     await expect(
-      page.getByTestId(`workspace-group-${NESTED_LABEL}`).getByTestId("workflow-queue"),
+      page
+        .getByTestId(`workspace-group-${NESTED_LABEL}`)
+        .getByTestId("workflow-queue"),
     ).toHaveCount(1);
   });
 });
@@ -241,19 +302,24 @@ test.describe("row chrome", () => {
     await page.getByTestId("dir-disclosure-services").click();
     await page.locator(".rail-header-label").hover();
     await expect
-      .poll(() => opacityOf(chevron), { message: "a collapsed row keeps its chevron" })
+      .poll(() => opacityOf(chevron), {
+        message: "a collapsed row keeps its chevron",
+      })
       .toBe("1");
 
     // There is no trailing chevron column ANYWHERE in the tree — it reserved
     // width on every row to say something only needed at the moment of acting.
     await expect(page.locator(".rail-list .workspace-caret")).toHaveCount(0);
-    const misplaced = await page.locator(".rail-list .workspace-row").evaluateAll((rows) =>
-      rows.filter((row) => {
-        const disclosure = row.querySelector(":scope > .row-disclosure");
-        if (disclosure == null) return false; // the static stray-agents header
-        return disclosure !== row.firstElementChild;
-      }).length,
-    );
+    const misplaced = await page
+      .locator(".rail-list .workspace-row")
+      .evaluateAll(
+        (rows) =>
+          rows.filter((row) => {
+            const disclosure = row.querySelector(":scope > .row-disclosure");
+            if (disclosure == null) return false; // the static stray-agents header
+            return disclosure !== row.firstElementChild;
+          }).length,
+      );
     expect(misplaced, "every disclosure is the row's LEADING element").toBe(0);
   });
 
@@ -263,16 +329,18 @@ test.describe("row chrome", () => {
     await expect(page.locator(".rail-header-label")).toHaveText("Projects");
     await expect(page.locator(".rail-header [aria-expanded]")).toHaveCount(1); // the sliders popover
     await expect(page.locator(".rail-header .row-disclosure")).toHaveCount(0);
-    await expect(page.locator(".rail-header button[aria-expanded]")).toHaveAttribute(
-      "data-testid",
-      "history-trigger",
-    );
+    await expect(
+      page.locator(".rail-header button[aria-expanded]"),
+    ).toHaveAttribute("data-testid", "history-trigger");
   });
 
   test("the header's + sits LEFT OF the settings ellipsis, and adds a PROJECT", async ({
     page,
   }) => {
-    await expect(page.getByTestId("rail-add-project")).toHaveAttribute("aria-label", "Add a project");
+    await expect(page.getByTestId("rail-add-project")).toHaveAttribute(
+      "aria-label",
+      "Add a project",
+    );
 
     // ORDER, asserted from the live DOM rather than from CSS: the LABEL owns the
     // leading edge, then `+`, then settings last. A control at the leading edge
@@ -314,12 +382,21 @@ test.describe("row chrome", () => {
     // version of this spec asserted `lucide-more-horizontal` and was wrong,
     // because a deprecated alias does not name its own output.
     await expect(
-      page.getByTestId("history-trigger").locator("svg.lucide-ellipsis-vertical"),
+      page
+        .getByTestId("history-trigger")
+        .locator("svg.lucide-ellipsis-vertical"),
     ).toHaveCount(1);
-    await expect(page.getByTestId("history-trigger").locator("svg.lucide-sliders-horizontal")).toHaveCount(0);
+    await expect(
+      page
+        .getByTestId("history-trigger")
+        .locator("svg.lucide-sliders-horizontal"),
+    ).toHaveCount(0);
     // No HORIZONTAL ellipsis anywhere in the rail.
     await expect(page.locator(".rail-shell svg.lucide-ellipsis")).toHaveCount(0);
-    await expect(page.getByTestId("history-trigger")).toHaveAttribute("aria-label", "Rail settings");
+    await expect(page.getByTestId("history-trigger")).toHaveAttribute(
+      "aria-label",
+      "Rail settings",
+    );
     await page.getByTestId("history-trigger").click();
     // VISIBLE dropdowns, not a menu of radio rows: each states its current
     // value on the face of the control.
@@ -329,10 +406,9 @@ test.describe("row chrome", () => {
     await expect(page.getByTestId("filing-sort-by")).toHaveValue("recent");
     // The Deployment axis is retired; Group took its slot (SAP-2929).
     await expect(page.getByTestId("group-deployment")).toHaveCount(0);
-    await expect(page.getByTestId("filing-group-by").locator("option")).toHaveText([
-      "Project",
-      "Group",
-    ]);
+    await expect(
+      page.getByTestId("filing-group-by").locator("option"),
+    ).toHaveText(["Project", "Group"]);
   });
 
   test("Sort by actually reorders the projects, and the choice survives a reload", async ({
@@ -342,7 +418,9 @@ test.describe("row chrome", () => {
     // exact shape three prototype features shipped in.
     const labels = (): Promise<string[]> =>
       page
-        .locator(".rail-list > .workspace-group > .workspace-row .tree-row-label")
+        .locator(
+          ".rail-list > .workspace-group > .workspace-row .tree-row-label",
+        )
         .allInnerTexts();
 
     // "recent" is the recentDirs MRU order, which is not alphabetical.
@@ -392,14 +470,23 @@ test.describe("legibility", () => {
       .evaluateAll((names) =>
         names
           .filter((name) => name.scrollWidth > name.clientWidth)
-          .map((name) => `${name.textContent} (${name.scrollWidth} > ${name.clientWidth})`),
+          .map(
+            (name) =>
+              `${name.textContent} (${name.scrollWidth} > ${name.clientWidth})`,
+          ),
       );
-    expect(clipped, "agent names are never truncated by their prefix").toEqual([]);
+    expect(clipped, "agent names are never truncated by their prefix").toEqual(
+      [],
+    );
     // The assertion is only meaningful if there ARE prefixed rows on screen.
-    expect(await page.locator('.rail-list [class*="tree-row-prefix"]').count()).toBeGreaterThan(0);
+    expect(
+      await page.locator('.rail-list [class*="tree-row-prefix"]').count(),
+    ).toBeGreaterThan(0);
   });
 
-  test("the prefix, its slash and the name are ONE flex unit", async ({ page }) => {
+  test("the prefix, its slash and the name are ONE flex unit", async ({
+    page,
+  }) => {
     // As two children of the row, the row's gap opened a space INSIDE a path:
     // `scripts/tools/ rollup` read as two separate things.
     const parts = await page.getByTestId("workflow-rollup").evaluate((row) => {
@@ -410,11 +497,14 @@ test.describe("legibility", () => {
       return {
         allInsideOneUnit:
           unit != null &&
-          [prefix, sep, label].every((part) => part != null && unit.contains(part)),
+          [prefix, sep, label].every(
+            (part) => part != null && unit.contains(part),
+          ),
         // The `/` sits OUTSIDE the truncating span, so a clipped prefix keeps
         // its separator — inside it, `components/mailer` became
         // `componen…mailer`, one word where there were two things.
-        separatorOutsidePrefix: sep != null && prefix != null && !prefix.contains(sep),
+        separatorOutsidePrefix:
+          sep != null && prefix != null && !prefix.contains(sep),
         sepText: sep?.textContent ?? "",
       };
     });
@@ -425,9 +515,13 @@ test.describe("legibility", () => {
     // Rendered, the path reads as one location: no gap between the slash and
     // either side of it.
     const gaps = await page.getByTestId("workflow-rollup").evaluate((row) => {
-      const prefix = row.querySelector(".tree-row-prefix")!.getBoundingClientRect();
+      const prefix = row
+        .querySelector(".tree-row-prefix")!
+        .getBoundingClientRect();
       const sep = row.querySelector(".tree-row-sep")!.getBoundingClientRect();
-      const label = row.querySelector(".tree-row-label")!.getBoundingClientRect();
+      const label = row
+        .querySelector(".tree-row-label")!
+        .getBoundingClientRect();
       return [sep.left - prefix.right, label.left - sep.right];
     });
     for (const gap of gaps) expect(gap).toBeLessThan(3);
@@ -437,37 +531,52 @@ test.describe("legibility", () => {
     // The row shows what it is — a name, or a compacted and maybe elided
     // chain. The title answers where it lives, and only the absolute path
     // answers that.
-    await expect(page.getByTestId("project-row-polsia").locator(".workspace-row-main")).toHaveAttribute(
-      "title",
-      ROOT,
-    );
     await expect(
-      page.getByTestId("dir-row-backend/src/agents").locator(".workspace-row-main"),
+      page.getByTestId("project-row-polsia").locator(".workspace-row-main"),
+    ).toHaveAttribute("title", ROOT);
+    await expect(
+      page
+        .getByTestId("dir-row-backend/src/agents")
+        .locator(".workspace-row-main"),
     ).toHaveAttribute("title", `${ROOT}/backend/src/agents`);
     await expect(
-      page.getByTestId("dir-row-packages/harness/web/src/components").locator(".workspace-row-main"),
+      page
+        .getByTestId("dir-row-packages/harness/web/src/components")
+        .locator(".workspace-row-main"),
     ).toHaveAttribute("title", `${ROOT}/packages/harness/web/src/components`);
-    await expect(page.getByTestId("workflow-rollup").locator(".workflow-item-trigger")).toHaveAttribute(
-      "title",
-      `${ROOT}/scripts/tools/rollup`,
-    );
     await expect(
-      page.getByTestId("workspace-group-dashboard-keeper").locator(".workspace-row-main"),
+      page.getByTestId("workflow-rollup").locator(".workflow-item-trigger"),
+    ).toHaveAttribute("title", `${ROOT}/scripts/tools/rollup`);
+    await expect(
+      page
+        .getByTestId("workspace-group-dashboard-keeper")
+        .locator(".workspace-row-main"),
     ).toHaveAttribute("title", "/Users/demo/dashboard-keeper");
 
     // And no row in the tree is missing one, or carrying something that is not
     // a path — the old title repeated the label it was attached to.
     const bad = await page
-      .locator(".rail-list .workspace-row-main, .rail-list .workflow-item-trigger")
+      .locator(
+        ".rail-list .workspace-row-main, .rail-list .workflow-item-trigger",
+      )
       .evaluateAll((mains) =>
         mains
-          .filter((main) => !/^\/Users\/demo(\/|$)/.test(main.getAttribute("title") ?? ""))
-          .map((main) => `${main.textContent?.trim()} → ${main.getAttribute("title")}`),
+          .filter(
+            (main) =>
+              !/^\/Users\/demo(\/|$)/.test(main.getAttribute("title") ?? ""),
+          )
+          .map(
+            (main) =>
+              `${main.textContent?.trim()} → ${main.getAttribute("title")}`,
+          ),
       );
     expect(bad).toEqual([]);
   });
 });
 
 test("the deep rail renders", async ({ page }: { page: Page }) => {
-  await page.screenshot({ path: "web/e2e/screenshots/project-axis.png", fullPage: true });
+  await page.screenshot({
+    path: "web/e2e/screenshots/project-axis.png",
+    fullPage: true,
+  });
 });

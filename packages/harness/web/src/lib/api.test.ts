@@ -1,12 +1,110 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  createApi,
+  isMockMode,
   parseNdjsonLine,
   progressiveLeasingRun,
   PROGRESSIVE_STEP_MS,
   terminalDeployEvent,
   type DeployStreamEvent,
 } from "./api";
+
+describe("RealApi.getSystemGraph", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("parses the revisioned graph lifecycle envelope", async () => {
+    if (isMockMode()) return;
+    const graph = {
+      kind: "system",
+      scope: { kind: "working-tree", workspaceKey: "workspace-test" },
+      nodes: [],
+      edges: [],
+      warnings: [],
+    };
+    vi.stubGlobal("window", {
+      __HARNESS__: { token: "test-token" },
+      location: { search: "" },
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            workspaceKey: "workspace-test",
+            revision: 7,
+            state: "degraded",
+            graph,
+          }),
+          {
+            status: 200,
+            headers: {
+              "Content-Type": "application/json",
+            },
+          },
+        ),
+      ),
+    );
+
+    await expect(createApi().getSystemGraph("workspace-test")).resolves.toEqual(
+      {
+        workspaceKey: "workspace-test",
+        revision: 7,
+        state: "degraded",
+        graph,
+      },
+    );
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/workspaces/workspace-test/system-graph",
+      expect.objectContaining({
+        headers: expect.objectContaining({ "X-Harness-Token": "test-token" }),
+      }),
+    );
+  });
+
+  it("sends explicit graph retries through the refresh route", async () => {
+    if (isMockMode()) return;
+    vi.stubGlobal("window", {
+      __HARNESS__: { token: "test-token" },
+      location: { search: "" },
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            workspaceKey: "workspace-test",
+            revision: 8,
+            state: "ready",
+            graph: {
+              kind: "system",
+              scope: {
+                kind: "working-tree",
+                workspaceKey: "workspace-test",
+              },
+              nodes: [],
+              edges: [],
+              warnings: [],
+            },
+          }),
+          { status: 200 },
+        ),
+      ),
+    );
+
+    await createApi().getSystemGraph("workspace-test", { refresh: true });
+
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/workspaces/workspace-test/system-graph/refresh",
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({ "X-Harness-Token": "test-token" }),
+      }),
+    );
+  });
+});
 
 describe("progressiveLeasingRun", () => {
   const at = (elapsed: number) => progressiveLeasingRun("exec-mock-prod-1", elapsed);

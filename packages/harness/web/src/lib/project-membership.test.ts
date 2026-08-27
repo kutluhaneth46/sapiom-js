@@ -87,7 +87,6 @@ describe("agentNeedsOwnProject: THE CAUSE — an agent's own folder is not a pro
     expect(agentNeedsOwnProject(AGENT_IN_ACME, [`${ACME}/`])).toBe(false);
   });
 });
-
 describe("hiddenByClosedProject: a removal closes the whole subtree", () => {
   it("hides the closed root itself", () => {
     expect(hiddenByClosedProject(ACME, [ACME], [])).toBe(true);
@@ -329,4 +328,3 @@ describe("applyProjectRemoval", () => {
     }
   });
 });
-

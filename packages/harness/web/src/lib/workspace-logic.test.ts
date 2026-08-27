@@ -45,10 +45,14 @@ describe("fuzzyScore", () => {
   });
 });
 
-
 describe("macro gating", () => {
   const macros: MacroDef[] = [
-    { id: "visualize", label: "Visualize", icon: "Sparkles", action: { kind: "render-canvas" } },
+    {
+      id: "visualize",
+      label: "Visualize",
+      icon: "Sparkles",
+      action: { kind: "render-canvas" },
+    },
     {
       id: "deploy",
       label: "Deploy",
@@ -60,7 +64,10 @@ describe("macro gating", () => {
       id: "open_prod",
       label: "Open",
       icon: "ExternalLink",
-      action: { kind: "open-url", url: "https://app.sapiom.ai/agents/{{workflow.definitionId}}" },
+      action: {
+        kind: "open-url",
+        url: "https://app.sapiom.ai/agents/{{workflow.definitionId}}",
+      },
       requiresWorkflow: true,
     },
   ];
@@ -70,17 +77,23 @@ describe("macro gating", () => {
   });
 
   it("requires a session before anything runs", () => {
-    expect(macroDisabledReason(macros[0], null, null)).toBe("Start a session first");
+    expect(macroDisabledReason(macros[0], null, null)).toBe(
+      "Start a session first",
+    );
   });
 
   it("requires a selected workflow for requiresWorkflow macros", () => {
-    expect(macroDisabledReason(macros[1], null, "sess-1")).toBe("Select an agent first");
+    expect(macroDisabledReason(macros[1], null, "sess-1")).toBe(
+      "Select an agent first",
+    );
   });
 
   it("blocks definitionId-dependent macros until deployed", () => {
     const undeployed = workflow({ definitionId: null });
     const deployed = workflow({ definitionId: 42 });
-    expect(macroDisabledReason(macros[2], undeployed, "sess-1")).toBe("Not deployed yet");
+    expect(macroDisabledReason(macros[2], undeployed, "sess-1")).toBe(
+      "Not deployed yet",
+    );
     expect(macroDisabledReason(macros[2], deployed, "sess-1")).toBeNull();
   });
 });

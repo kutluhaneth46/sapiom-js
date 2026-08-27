@@ -14,16 +14,33 @@
  */
 import { extractWorkflowGraphCached } from "./canvas-cache.js";
 
+export type ManifestNameInspection =
+  | { status: "found"; name: string }
+  | { status: "absent" | "failed" };
+
+/**
+ * Inspect the declared manifest name while preserving the difference between
+ * a valid unnamed agent and an extraction failure. Inventory uses the richer
+ * result to avoid warning for the normal unnamed case.
+ */
+export async function inspectManifestName(
+  projectDir: string,
+  extract: typeof extractWorkflowGraphCached = extractWorkflowGraphCached,
+): Promise<ManifestNameInspection> {
+  try {
+    const { result } = await extract(projectDir);
+    if (!result.ok) return { status: "failed" };
+    const name = result.graph.manifestName.trim();
+    return name === "" ? { status: "absent" } : { status: "found", name };
+  } catch {
+    return { status: "failed" };
+  }
+}
+
 export async function resolveManifestName(
   projectDir: string,
   extract: typeof extractWorkflowGraphCached = extractWorkflowGraphCached,
 ): Promise<string | null> {
-  try {
-    const { result } = await extract(projectDir);
-    if (!result.ok) return null;
-    return result.graph.manifestName.trim() || null;
-  } catch {
-    // Extraction is best-effort here — a name is a nicety, a deploy is not.
-    return null;
-  }
+  const inspected = await inspectManifestName(projectDir, extract);
+  return inspected.status === "found" ? inspected.name : null;
 }
