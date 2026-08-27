@@ -8,6 +8,8 @@ import {
   LocalWorkspaceScopeCatalog,
   StaticSystemGraphBuilder,
   type AgentInventoryProvider,
+  type AgentRelationshipProvider,
+  type AgentRelationshipProviderResult,
   type WorkspaceScope,
 } from "./system-graph.js";
 
@@ -37,6 +39,23 @@ async function buildGraph(
 ) {
   return (await builder.build(scope)).graph;
 }
+
+function relationshipProvider(
+  listRelationships: (
+    sourceRoot: string,
+  ) => Promise<AgentRelationshipProviderResult>,
+): AgentRelationshipProvider {
+  return {
+    listRelationships: vi.fn((caller) => listRelationships(caller.sourceRoot)),
+  };
+}
+
+const EMPTY_RELATIONSHIPS: AgentRelationshipProviderResult = {
+  relationships: [],
+  warnings: [],
+};
+
+const EVIDENCE = [{ file: "index.ts", line: 1, column: 1 }];
 
 describe("LocalWorkspaceScopeCatalog", () => {
   it("gives a canonical root a stable opaque key and rejects unknown keys", async () => {
@@ -83,7 +102,7 @@ describe("StaticSystemGraphBuilder", () => {
     root: FIXTURE,
   };
 
-  it("projects the literal Research -> Growth launch into the public contract", async () => {
+  it("projects literal Research -> Growth blocking and async calls into the public contract", async () => {
     const inventory = new HarnessRegistryInventoryProvider({
       listWorkflows: () => [
         workflow("Research", "research", "research"),
@@ -112,6 +131,13 @@ describe("StaticSystemGraphBuilder", () => {
           to: "agent:growth",
           kind: "invokes",
           basis: "static",
+          mode: "blocking",
+        },
+        {
+          from: "agent:research",
+          to: "agent:growth",
+          kind: "invokes",
+          basis: "static",
           mode: "async",
         },
       ],
@@ -120,7 +146,7 @@ describe("StaticSystemGraphBuilder", () => {
     expect(JSON.stringify(graph)).not.toContain(FIXTURE);
   });
 
-  it("deduplicates edges, skips self-links, and reports unresolved targets deterministically", async () => {
+  it("deduplicates by mode, retains dual-mode edges, skips self-links, and reports unresolved targets", async () => {
     const inventory: AgentInventoryProvider = {
       listAgents: vi.fn(async () => ({
         agents: [
@@ -145,27 +171,90 @@ describe("StaticSystemGraphBuilder", () => {
         warnings: [],
       })),
     };
-    const detect = vi.fn(async (root: string) =>
+    const relationships = relationshipProvider(async (root) =>
       root.endsWith("research")
-        ? [
-            { slug: "growth", fromStepId: null },
-            { slug: "growth", fromStepId: null },
-            { slug: "research", fromStepId: null },
-            { slug: "missing", fromStepId: null },
-          ]
-        : [],
+        ? {
+            relationships: [
+              { target: "growth", mode: "blocking", evidence: EVIDENCE },
+              { target: "growth", mode: "blocking", evidence: EVIDENCE },
+              { target: "growth", mode: "async", evidence: EVIDENCE },
+              { target: "research", mode: "async", evidence: EVIDENCE },
+              { target: "missing", mode: "async", evidence: EVIDENCE },
+            ],
+            warnings: [],
+          }
+        : EMPTY_RELATIONSHIPS,
     );
 
     const graph = await buildGraph(
-      new StaticSystemGraphBuilder(inventory, detect),
+      new StaticSystemGraphBuilder(inventory, relationships),
       scope,
     );
-    expect(graph.edges).toHaveLength(1);
+    expect(graph.edges).toEqual([
+      {
+        from: "agent:research",
+        to: "agent:growth",
+        kind: "invokes",
+        basis: "static",
+        mode: "blocking",
+      },
+      {
+        from: "agent:research",
+        to: "agent:growth",
+        kind: "invokes",
+        basis: "static",
+        mode: "async",
+      },
+    ]);
     expect(graph.warnings.map((warning) => warning.code)).toEqual([
-      "duplicate-edge",
       "unresolved-target",
     ]);
     expect(JSON.stringify(graph)).not.toContain("/private/");
+  });
+
+  it("projects dynamic extraction warnings without degrading cacheability or leaking evidence", async () => {
+    const inventory: AgentInventoryProvider = {
+      listAgents: vi.fn(async () => ({
+        agents: [
+          {
+            agentKey: "research",
+            definitionId: 1,
+            definitionSlug: "research",
+            label: "Research",
+            resolutionAliases: ["research"],
+            sourceRoot: "/private/research",
+          },
+        ],
+        cacheable: true,
+        warnings: [],
+      })),
+    };
+    const relationships = relationshipProvider(async () => ({
+      relationships: [],
+      warnings: [
+        {
+          code: "dynamic-target",
+          mode: "blocking",
+          evidence: { file: "private/index.ts", line: 8, column: 5 },
+        },
+      ],
+    }));
+
+    const built = await new StaticSystemGraphBuilder(
+      inventory,
+      relationships,
+    ).build(scope);
+
+    expect(built.cacheable).toBe(true);
+    expect(built.graph.edges).toEqual([]);
+    expect(built.graph.warnings).toEqual([
+      {
+        code: "dynamic-target",
+        agentKey: "research",
+        message: "Research has a dynamic agent target that V0 cannot resolve.",
+      },
+    ]);
+    expect(JSON.stringify(built.graph)).not.toContain("private/index.ts");
   });
 
   it("keeps duplicate definition slugs as unique nodes and reports ambiguous launches", async () => {
@@ -179,12 +268,19 @@ describe("StaticSystemGraphBuilder", () => {
         { workspaceKey: scope.workspaceKey, cwd: scope.root },
       ],
     });
-    const detect = vi.fn(async (root: string) =>
-      root.endsWith("caller") ? [{ slug: "shared", fromStepId: null }] : [],
+    const relationships = relationshipProvider(async (root) =>
+      root.endsWith("caller")
+        ? {
+            relationships: [
+              { target: "shared", mode: "async", evidence: EVIDENCE },
+            ],
+            warnings: [],
+          }
+        : EMPTY_RELATIONSHIPS,
     );
 
     const graph = await buildGraph(
-      new StaticSystemGraphBuilder(inventory, detect),
+      new StaticSystemGraphBuilder(inventory, relationships),
       scope,
     );
 
@@ -255,7 +351,7 @@ describe("StaticSystemGraphBuilder", () => {
     const graph = await buildGraph(
       new StaticSystemGraphBuilder(
         inventory,
-        vi.fn(async () => []),
+        relationshipProvider(async () => EMPTY_RELATIONSHIPS),
       ),
       scope,
     );
@@ -317,7 +413,7 @@ describe("StaticSystemGraphBuilder", () => {
     const graph = await buildGraph(
       new StaticSystemGraphBuilder(
         inventory,
-        vi.fn(async () => {
+        relationshipProvider(async () => {
           throw new Error("boom at /private/research");
         }),
       ),
@@ -354,7 +450,7 @@ describe("StaticSystemGraphBuilder", () => {
     const graph = await buildGraph(
       new StaticSystemGraphBuilder(
         inventory,
-        vi.fn(async () => []),
+        relationshipProvider(async () => EMPTY_RELATIONSHIPS),
       ),
       scope,
     );
@@ -405,7 +501,7 @@ describe("StaticSystemGraphBuilder", () => {
     const graph = await buildGraph(
       new StaticSystemGraphBuilder(
         inventory,
-        vi.fn(async () => []),
+        relationshipProvider(async () => EMPTY_RELATIONSHIPS),
       ),
       scope,
     );
@@ -436,7 +532,7 @@ describe("StaticSystemGraphBuilder", () => {
 
     const built = await new StaticSystemGraphBuilder(
       inventory,
-      vi.fn(async () => []),
+      relationshipProvider(async () => EMPTY_RELATIONSHIPS),
     ).build(scope);
 
     expect(built.cacheable).toBe(false);

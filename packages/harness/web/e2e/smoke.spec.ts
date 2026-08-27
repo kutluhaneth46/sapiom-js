@@ -379,7 +379,7 @@ test.describe("three-zone IA (rail explorer, tab strip, right pane)", () => {
     );
     await expect(
       page.getByTestId("system-graph-edge-agent:research-agent:growth"),
-    ).toContainText("invokes · static · async");
+    ).toContainText("invokes · static · blocking + async");
     await expect(page.getByTestId("right-tab-canvas")).toHaveAttribute(
       "aria-selected",
       "true",

@@ -1,8 +1,13 @@
 import { describe, expect, it } from "vitest";
+import type { SystemGraph } from "@shared/system-graph";
 
-import { orderSystemGraphNodes, parseSystemGraph } from "./system-graph";
+import {
+  groupSystemGraphEdges,
+  orderSystemGraphNodes,
+  parseSystemGraph,
+} from "./system-graph";
 
-const valid = {
+const valid: SystemGraph = {
   kind: "system",
   scope: { kind: "working-tree", workspaceKey: "workspace-test" },
   nodes: [
@@ -24,6 +29,22 @@ const valid = {
 describe("parseSystemGraph", () => {
   it("accepts the system graph contract", () => {
     expect(parseSystemGraph(valid)).toEqual(valid);
+  });
+
+  it("accepts blocking edges and dynamic-target warnings", () => {
+    const graph = {
+      ...valid,
+      edges: [{ ...valid.edges[0], mode: "blocking" }],
+      warnings: [
+        {
+          code: "dynamic-target",
+          agentKey: "research",
+          message: "Research has a dynamic target.",
+        },
+      ],
+    };
+
+    expect(parseSystemGraph(graph)).toEqual(graph);
   });
 
   it("accepts typed duplicate and partial-inventory warnings", () => {
@@ -67,6 +88,33 @@ describe("parseSystemGraph", () => {
       }),
     ).toThrow("Invalid system graph response");
   });
+
+  it("rejects unsupported invocation modes", () => {
+    expect(() =>
+      parseSystemGraph({
+        ...valid,
+        edges: [{ ...valid.edges[0], mode: "unknown" }],
+      }),
+    ).toThrow("Invalid system graph response");
+  });
+});
+
+describe("groupSystemGraphEdges", () => {
+  it("groups mode-specific records into one stable visible connector", () => {
+    expect(
+      groupSystemGraphEdges([
+        { ...valid.edges[0], mode: "async" },
+        { ...valid.edges[0], mode: "blocking" },
+        { ...valid.edges[0], mode: "async" },
+      ]),
+    ).toEqual([
+      {
+        from: "agent:research",
+        to: "agent:growth",
+        modes: ["blocking", "async"],
+      },
+    ]);
+  });
 });
 
 describe("orderSystemGraphNodes", () => {
@@ -76,5 +124,20 @@ describe("orderSystemGraphNodes", () => {
         (node) => node.agentKey,
       ),
     ).toEqual(["research", "growth"]);
+  });
+
+  it("does not double-count a pair that has both invocation modes", () => {
+    const graph = parseSystemGraph({
+      ...valid,
+      edges: [
+        { ...valid.edges[0], mode: "blocking" },
+        { ...valid.edges[0], mode: "async" },
+      ],
+    });
+
+    expect(orderSystemGraphNodes(graph).map((node) => node.agentKey)).toEqual([
+      "research",
+      "growth",
+    ]);
   });
 });

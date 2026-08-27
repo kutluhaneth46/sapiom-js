@@ -22,17 +22,20 @@ export interface SystemGraphNode {
   label: string;
 }
 
+export type AgentInvocationMode = "blocking" | "async";
+
 export interface SystemGraphEdge {
   from: string;
   to: string;
   kind: "invokes";
   basis: "static";
-  mode: "async";
+  mode: AgentInvocationMode;
 }
 
 export interface GraphWarning {
   code:
     | "unresolved-target"
+    | "dynamic-target"
     | "duplicate-edge"
     | "projection-failed"
     | "duplicate-agent-key"

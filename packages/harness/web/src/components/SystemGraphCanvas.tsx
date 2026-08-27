@@ -3,7 +3,10 @@ import type { JSX } from "react";
 import type { SystemGraph, WorkspaceKey } from "@shared/system-graph";
 
 import type { HarnessApi } from "../lib/api";
-import { orderSystemGraphNodes } from "../lib/system-graph";
+import {
+  groupSystemGraphEdges,
+  orderSystemGraphNodes,
+} from "../lib/system-graph";
 import { createSystemGraphLoader } from "../lib/system-graph-loader";
 import { EmptyState } from "./EmptyState";
 
@@ -95,6 +98,7 @@ export function SystemGraphCanvas({
   const top = 44;
   const gap = 76;
   const orderedNodes = orderSystemGraphNodes(graph);
+  const visibleEdges = groupSystemGraphEdges(graph.edges);
   const positions = new Map(
     orderedNodes.map((node, index) => [
       node.id,
@@ -133,7 +137,7 @@ export function SystemGraphCanvas({
             </marker>
           </defs>
 
-          {graph.edges.map((edge) => {
+          {visibleEdges.map((edge) => {
             const from = positions.get(edge.from);
             const to = positions.get(edge.to);
             if (!from || !to) return null;
@@ -157,7 +161,7 @@ export function SystemGraphCanvas({
                   x={startX + 12}
                   y={middleY + 4}
                 >
-                  invokes · static · async
+                  {`invokes · static · ${edge.modes.join(" + ")}`}
                 </text>
               </g>
             );

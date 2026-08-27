@@ -41,7 +41,7 @@ function parseEdge(value: unknown): SystemGraphEdge | null {
     typeof value.to !== "string" ||
     value.kind !== "invokes" ||
     value.basis !== "static" ||
-    value.mode !== "async"
+    (value.mode !== "blocking" && value.mode !== "async")
   ) {
     return null;
   }
@@ -50,12 +50,13 @@ function parseEdge(value: unknown): SystemGraphEdge | null {
     to: value.to,
     kind: "invokes",
     basis: "static",
-    mode: "async",
+    mode: value.mode,
   };
 }
 
 const WARNING_CODES = new Set<GraphWarning["code"]>([
   "unresolved-target",
+  "dynamic-target",
   "duplicate-edge",
   "projection-failed",
   "duplicate-agent-key",
@@ -78,6 +79,50 @@ function parseWarning(value: unknown): GraphWarning | null {
     message: value.message,
     ...(typeof value.agentKey === "string" ? { agentKey: value.agentKey } : {}),
   };
+}
+
+export interface VisibleSystemGraphEdge {
+  from: string;
+  to: string;
+  modes: SystemGraphEdge["mode"][];
+}
+
+const MODE_ORDER: Record<SystemGraphEdge["mode"], number> = {
+  blocking: 0,
+  async: 1,
+};
+
+/** Public graph data retains one record per mode. The V0 Canvas draws one
+ * connector per endpoint pair so dual-mode relationships never overlap. */
+export function groupSystemGraphEdges(
+  edges: readonly SystemGraphEdge[],
+): VisibleSystemGraphEdge[] {
+  const grouped = new Map<
+    string,
+    { from: string; to: string; modes: Set<SystemGraphEdge["mode"]> }
+  >();
+  for (const edge of edges) {
+    const key = `${edge.from}\0${edge.to}`;
+    const group = grouped.get(key) ?? {
+      from: edge.from,
+      to: edge.to,
+      modes: new Set<SystemGraphEdge["mode"]>(),
+    };
+    group.modes.add(edge.mode);
+    grouped.set(key, group);
+  }
+  return [...grouped.values()]
+    .sort(
+      (left, right) =>
+        left.from.localeCompare(right.from) || left.to.localeCompare(right.to),
+    )
+    .map(({ from, to, modes }) => ({
+      from,
+      to,
+      modes: [...modes].sort(
+        (left, right) => MODE_ORDER[left] - MODE_ORDER[right],
+      ),
+    }));
 }
 
 /** Treat the HTTP payload as untrusted; malformed or path-bearing shapes fail closed. */
@@ -144,7 +189,11 @@ export function orderSystemGraphNodes(graph: SystemGraph): SystemGraphNode[] {
   const byId = new Map(graph.nodes.map((node) => [node.id, node]));
   const indegree = new Map(graph.nodes.map((node) => [node.id, 0]));
   const outgoing = new Map<string, string[]>();
+  const topologyPairs = new Set<string>();
   for (const edge of graph.edges) {
+    const pair = `${edge.from}\0${edge.to}`;
+    if (topologyPairs.has(pair)) continue;
+    topologyPairs.add(pair);
     indegree.set(edge.to, (indegree.get(edge.to) ?? 0) + 1);
     outgoing.set(edge.from, [...(outgoing.get(edge.from) ?? []), edge.to]);
   }

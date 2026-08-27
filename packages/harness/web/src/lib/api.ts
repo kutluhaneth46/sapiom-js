@@ -1119,6 +1119,13 @@ class MockApi implements HarnessApi {
           to: "agent:growth",
           kind: "invokes",
           basis: "static",
+          mode: "blocking",
+        },
+        {
+          from: "agent:research",
+          to: "agent:growth",
+          kind: "invokes",
+          basis: "static",
           mode: "async",
         },
       ],

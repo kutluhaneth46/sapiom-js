@@ -9,7 +9,6 @@ import type {
   WorkspaceKey,
   WorkspaceScopeSummary,
 } from "../shared/system-graph.js";
-import { detectWorkflowLaunches } from "./canvas-interconnections.js";
 import {
   canonicalGraphPath,
   isWithinGraphPath,
@@ -18,6 +17,11 @@ import {
   type WorkspaceScope,
   workspaceRelativeLocalKey,
 } from "./system-graph-inventory.js";
+import {
+  SourceAgentRelationshipProvider,
+  type AgentRelationshipProvider,
+  type AgentRelationshipProviderResult,
+} from "./system-graph-relationships.js";
 
 export { HarnessRegistryInventoryProvider } from "./system-graph-inventory.js";
 export type {
@@ -27,6 +31,13 @@ export type {
   AgentInventoryWarning,
   WorkspaceScope,
 } from "./system-graph-inventory.js";
+export { SourceAgentRelationshipProvider } from "./system-graph-relationships.js";
+export type {
+  AgentRelationshipCandidate,
+  AgentRelationshipProvider,
+  AgentRelationshipProviderResult,
+  AgentRelationshipWarning,
+} from "./system-graph-relationships.js";
 
 export interface WorkspaceScopeResolver {
   resolve(workspaceKey: WorkspaceKey): Promise<WorkspaceScope | null>;
@@ -45,8 +56,6 @@ export interface SystemGraphBuildResult {
   cacheable: boolean;
   graph: SystemGraph;
 }
-
-type LaunchDetector = typeof detectWorkflowLaunches;
 
 function workspaceKeyForRoot(root: string): WorkspaceKey {
   return `workspace-${createHash("sha256").update(root).digest("hex").slice(0, 16)}`;
@@ -245,7 +254,7 @@ function normalizeInventory(
 export class StaticSystemGraphBuilder implements SystemGraphBuilder {
   constructor(
     private readonly inventory: AgentInventoryProvider,
-    private readonly detectLaunches: LaunchDetector = detectWorkflowLaunches,
+    private readonly relationships: AgentRelationshipProvider = new SourceAgentRelationshipProvider(),
   ) {}
 
   async build(scope: WorkspaceScope): Promise<SystemGraphBuildResult> {
@@ -288,16 +297,23 @@ export class StaticSystemGraphBuilder implements SystemGraphBuilder {
         try {
           return {
             caller,
-            launches: await this.detectLaunches(caller.sourceRoot, new Set()),
+            result: await this.relationships.listRelationships(caller),
             failed: false as const,
           };
         } catch {
-          return { caller, launches: [], failed: true as const };
+          return {
+            caller,
+            result: {
+              relationships: [],
+              warnings: [],
+            } satisfies AgentRelationshipProviderResult,
+            failed: true as const,
+          };
         }
       }),
     );
 
-    for (const { caller, launches, failed } of scans) {
+    for (const { caller, result, failed } of scans) {
       if (failed) {
         warnings.push({
           code: "projection-failed",
@@ -307,11 +323,21 @@ export class StaticSystemGraphBuilder implements SystemGraphBuilder {
         continue;
       }
 
-      for (const launch of launches) {
-        const candidates = byTarget.get(launch.slug) ?? [];
+      for (const warning of result.warnings) {
+        if (warning.code === "dynamic-target") {
+          warnings.push({
+            code: "dynamic-target",
+            agentKey: caller.agentKey,
+            message: `${caller.label} has a dynamic agent target that V0 cannot resolve.`,
+          });
+        }
+      }
+
+      for (const relationship of result.relationships) {
+        const candidates = byTarget.get(relationship.target) ?? [];
         if (candidates.length !== 1) {
-          const target = /^[A-Za-z0-9@_.:-]+$/.test(launch.slug)
-            ? launch.slug
+          const target = /^[A-Za-z0-9@_.:-]+$/.test(relationship.target)
+            ? relationship.target
             : null;
           warnings.push({
             code: "unresolved-target",
@@ -329,29 +355,25 @@ export class StaticSystemGraphBuilder implements SystemGraphBuilder {
         if (target.agentKey === caller.agentKey) continue;
         const from = `agent:${caller.agentKey}`;
         const to = `agent:${target.agentKey}`;
-        const edgeKey = `${from}\0${to}`;
-        if (seenEdges.has(edgeKey)) {
-          warnings.push({
-            code: "duplicate-edge",
-            agentKey: caller.agentKey,
-            message: `${caller.label} invokes ${target.label} more than once.`,
-          });
-          continue;
-        }
+        const edgeKey = `${from}\0${to}\0${relationship.mode}`;
+        if (seenEdges.has(edgeKey)) continue;
         seenEdges.add(edgeKey);
         edges.push({
           from,
           to,
           kind: "invokes",
           basis: "static",
-          mode: "async",
+          mode: relationship.mode,
         });
       }
     }
 
+    const modeOrder = { blocking: 0, async: 1 } as const;
     edges.sort(
       (left, right) =>
-        left.from.localeCompare(right.from) || left.to.localeCompare(right.to),
+        left.from.localeCompare(right.from) ||
+        left.to.localeCompare(right.to) ||
+        modeOrder[left.mode] - modeOrder[right.mode],
     );
     const uniqueWarnings = [
       ...new Map(
