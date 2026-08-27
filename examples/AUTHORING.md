@@ -202,10 +202,42 @@ run, and secrets are read at step dispatch.
    template's `README.md` shows it.
 
    **Be aware of what it does not check.** Every capability is stubbed, so `database.get`
-   returns a `localhost` connection string and `repositories.get` returns a plausible
-   repository — _neither ever fails_. A `run_local` pass proves your control flow, **not** that
-   the resources your template names exist. Pauses are auto-resumed locally too, so a pause
+   returns a connection string and `repositories.get` returns a plausible repository —
+   _neither call ever fails_. A `run_local` pass proves your control flow, **not** that the
+   resources your template names exist. Pauses are auto-resumed locally too, so a pause
    nothing will ever fire still looks fine.
+
+   **The stub can only reach as far as `ctx.sapiom`.** A capability call succeeding is not the
+   same as what it hands back being usable. `database.get` returns a DSN whose host is in the
+   reserved `.invalid` TLD (RFC 6761), which does not resolve on a conforming resolver — so a
+   step that opens its own Postgres socket fails at name resolution, with the stub named in
+   the error. Treat that as a backstop, not a guard: a resolver that hijacks NXDOMAIN can
+   still hand back an address. The same goes for any I/O the stub never sees — raw HTTP to a
+   third party, a client holding its own connection.
+
+   **Gate that I/O on `ctx.isLocalTrace`.** It is `true` under `run_local` and absent on a
+   deployed run, so the branch reads as live in production with nothing set:
+
+   ```ts
+   // entry step — `input` here is the execution's entry input
+   const dryRun = input.dryRun ?? ctx.isLocalTrace ?? false;
+   ctx.shared.set("dryRun", dryRun);
+   if (!dryRun) {
+     // raw sockets, third-party HTTP — the things run_local cannot stub
+   }
+   ```
+
+   **Resolve it once, in the entry step, and carry it in `ctx.shared`.** Downstream, `input`
+   is the previous step's output, so `input.dryRun` is always `undefined` there — a step that
+   re-derives the gate would read live on a deployed run the caller asked to be dry:
+
+   ```ts
+   // any later step
+   const dryRun = ctx.shared.get("dryRun") ?? false;
+   ```
+
+   Keep the explicit input flag as the override; `?? ctx.isLocalTrace` only supplies the
+   default, so passing `{ "dryRun": false }` still forces the live path when you want it.
 
 3. **Then run it deployed, with no input at all.** `deploy` and `run` it with `{}`. It must
    reach a terminal state and produce something real (see [§1a](#1a-make-it-runnable-with-nothing)).
