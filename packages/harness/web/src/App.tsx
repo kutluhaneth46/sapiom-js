@@ -1602,6 +1602,7 @@ export const App = (): JSX.Element => {
               api={harness.api}
               workflows={state.workflows}
               workspaceScopes={workspaceScopes}
+              lastMessage={harness.lastMessage}
               onOpenAgent={handleFocusAgent}
               onExpandRail={
                 railCollapsed ? () => setRailCollapsed(false) : undefined

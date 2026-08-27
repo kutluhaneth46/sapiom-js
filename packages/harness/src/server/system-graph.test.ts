@@ -10,6 +10,7 @@ import type {
 import {
   SYSTEM_GRAPH_CACHE_HEADER,
   type SystemGraph,
+  type SystemGraphSnapshot,
 } from "../shared/system-graph.js";
 import { createBootTokenMiddleware } from "./auth.js";
 import { createSystemGraphRouter } from "./system-graph.js";
@@ -43,7 +44,7 @@ describe("createSystemGraphRouter", () => {
     server = undefined;
   });
 
-  function start(cacheable = true) {
+  function start(cacheable = true, onScopeAccess = vi.fn()) {
     const scopeResolver: WorkspaceScopeResolver = {
       resolve: vi.fn(async (key: string) =>
         key === workspaceKey
@@ -61,6 +62,7 @@ describe("createSystemGraphRouter", () => {
       createSystemGraphRouter({
         scopeResolver,
         store: new SystemGraphStore(builder),
+        onScopeAccess,
       }),
     );
     server = app.listen(0);
@@ -69,11 +71,12 @@ describe("createSystemGraphRouter", () => {
       baseUrl: `http://127.0.0.1:${address.port}`,
       scopeResolver,
       builder,
+      onScopeAccess,
     };
   }
 
   it("is boot-token protected and returns the cached public graph", async () => {
-    const { baseUrl, builder } = start();
+    const { baseUrl, builder, onScopeAccess } = start();
     const route = `${baseUrl}/api/workspaces/${workspaceKey}/system-graph`;
 
     expect((await fetch(route)).status).toBe(401);
@@ -86,9 +89,15 @@ describe("createSystemGraphRouter", () => {
 
     expect(first.status).toBe(200);
     expect(first.headers.get(SYSTEM_GRAPH_CACHE_HEADER)).toBe("complete");
-    expect(await first.json()).toEqual(graph);
+    expect((await first.json()) as SystemGraphSnapshot).toEqual({
+      workspaceKey,
+      revision: 1,
+      state: "ready",
+      graph,
+    });
     expect(second.status).toBe(200);
     expect(builder.build).toHaveBeenCalledTimes(1);
+    expect(onScopeAccess).toHaveBeenCalledTimes(2);
   });
 
   it("reports degradation and bounds re-enrichment to one later request", async () => {
@@ -104,7 +113,11 @@ describe("createSystemGraphRouter", () => {
     expect(first.headers.get(SYSTEM_GRAPH_CACHE_HEADER)).toBe("degraded");
     expect(second.headers.get(SYSTEM_GRAPH_CACHE_HEADER)).toBe("degraded");
     expect(third.headers.get(SYSTEM_GRAPH_CACHE_HEADER)).toBe("degraded");
-    expect(await third.json()).toEqual(graph);
+    expect((await third.json()) as SystemGraphSnapshot).toMatchObject({
+      workspaceKey,
+      state: "degraded",
+      graph,
+    });
     expect(builder.build).toHaveBeenCalledTimes(2);
   });
 

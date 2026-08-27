@@ -4096,6 +4096,22 @@ button.rail-footer-card:hover {
   white-space: nowrap;
 }
 
+.workspace-graph-lifecycle {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp1);
+  flex: 0 0 auto;
+  margin-left: auto;
+}
+
+.workspace-graph-lifecycle[data-state="degraded"] > .status-tag {
+  color: var(--text-warning);
+}
+
+.workspace-graph-lifecycle[data-state="stale"] > .status-tag {
+  color: var(--text-warning);
+}
+
 .workspace-graph-body,
 .system-graph-canvas,
 .system-graph-viewport {

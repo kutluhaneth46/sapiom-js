@@ -669,6 +669,124 @@ test.describe("three-zone IA (rail explorer, tab strip, right pane)", () => {
     await expect.poll(requestCount).toBe(2);
   });
 
+  test("workspace graph revisions invalidate closed views and preserve stale data", async ({
+    page,
+  }) => {
+    const requestCount = () =>
+      page.evaluate(
+        () =>
+          ((window as unknown as {
+            __HARNESS_TEST__?: { systemGraphRequests?: string[] };
+          }).__HARNESS_TEST__?.systemGraphRequests ?? []).length,
+      );
+    await page.getByTestId("workspace-select-acme-app").click();
+    await expect(page.getByTestId("system-graph-canvas")).toBeVisible();
+    await expect.poll(requestCount).toBe(1);
+
+    const workspaceKey = await page.evaluate(
+      () =>
+        (window as unknown as {
+          __HARNESS_TEST__?: { systemGraphRequests?: string[] };
+        }).__HARNESS_TEST__?.systemGraphRequests?.[0] ?? "",
+    );
+    await page
+      .getByTestId("workflow-leasing")
+      .locator(".workflow-item-trigger")
+      .click();
+
+    // The graph destination is closed, but the global event subscriber still
+    // invalidates its process-lifetime browser promise.
+    await page.evaluate((key) => {
+      const win = window as unknown as {
+        __MOCK_SYSTEM_GRAPH_REVISION__?: number;
+        __MOCK_SYSTEM_GRAPH_STATE__?: string;
+        __HARNESS_TEST__?: { publish?: (message: unknown) => void };
+      };
+      win.__MOCK_SYSTEM_GRAPH_REVISION__ = 3;
+      win.__MOCK_SYSTEM_GRAPH_STATE__ = "ready";
+      win.__HARNESS_TEST__?.publish?.({
+        type: "system-graph.changed",
+        workspaceKey: key,
+        revision: 2,
+        state: "stale",
+      });
+    }, workspaceKey);
+
+    await page.getByTestId("workspace-select-acme-app").click();
+    await expect(page.getByTestId("system-graph-canvas")).toBeVisible();
+    await expect(page.getByTestId("system-graph-refreshing")).toBeVisible();
+    await expect.poll(requestCount).toBe(2);
+    await expect(page.getByTestId("system-graph-refreshing")).toHaveCount(0);
+
+    // A hard refresh failure keeps last-known data visible and labels it stale.
+    await page.evaluate((key) => {
+      const win = window as unknown as {
+        __MOCK_SYSTEM_GRAPH_REVISION__?: number;
+        __MOCK_SYSTEM_GRAPH_STATE__?: string;
+        __HARNESS_TEST__?: { publish?: (message: unknown) => void };
+      };
+      win.__MOCK_SYSTEM_GRAPH_REVISION__ = 4;
+      win.__MOCK_SYSTEM_GRAPH_STATE__ = "stale";
+      win.__HARNESS_TEST__?.publish?.({
+        type: "system-graph.changed",
+        workspaceKey: key,
+        revision: 4,
+        state: "stale",
+      });
+    }, workspaceKey);
+    await expect(page.getByTestId("system-graph-stale")).toBeVisible();
+    await expect(page.getByTestId("system-graph-canvas")).toBeVisible();
+    await expect.poll(requestCount).toBe(3);
+
+    // A partial refresh keeps valid topology interactive and labels it degraded.
+    await page.evaluate((key) => {
+      const win = window as unknown as {
+        __MOCK_SYSTEM_GRAPH_REVISION__?: number;
+        __MOCK_SYSTEM_GRAPH_STATE__?: string;
+        __HARNESS_TEST__?: { publish?: (message: unknown) => void };
+      };
+      win.__MOCK_SYSTEM_GRAPH_REVISION__ = 5;
+      win.__MOCK_SYSTEM_GRAPH_STATE__ = "degraded";
+      win.__HARNESS_TEST__?.publish?.({
+        type: "system-graph.changed",
+        workspaceKey: key,
+        revision: 5,
+        state: "degraded",
+      });
+    }, workspaceKey);
+    await expect(page.getByTestId("system-graph-degraded")).toBeVisible();
+    await expect(page.getByTestId("system-graph-canvas")).toBeVisible();
+    await expect.poll(requestCount).toBe(4);
+
+    await page.evaluate(() => {
+      const win = window as unknown as {
+        __MOCK_SYSTEM_GRAPH_REVISION__?: number;
+        __MOCK_SYSTEM_GRAPH_STATE__?: string;
+      };
+      win.__MOCK_SYSTEM_GRAPH_REVISION__ = 6;
+      win.__MOCK_SYSTEM_GRAPH_STATE__ = "ready";
+    });
+    await page.getByRole("button", { name: "Retry" }).click();
+    await expect(page.getByTestId("system-graph-degraded")).toHaveCount(0);
+    await expect(page.getByTestId("system-graph-canvas")).toBeVisible();
+    await expect.poll(requestCount).toBe(5);
+
+    // An unrelated workspace announcement cannot invalidate this view.
+    await page.evaluate(() => {
+      const win = window as unknown as {
+        __HARNESS_TEST__?: { publish?: (message: unknown) => void };
+      };
+      win.__HARNESS_TEST__?.publish?.({
+        type: "system-graph.changed",
+        workspaceKey: "workspace-unrelated",
+        revision: 99,
+        state: "stale",
+      });
+    });
+    await page.waitForTimeout(250);
+    expect(await requestCount()).toBe(5);
+  });
+
   test("switching sessions makes the canvas follow the new session's content", async ({ page }) => {
     // Zone 3 keys off the active session. sess-boot ships a bundled doc (board);
     // the second leasing session ships none — so the canvas pane OPENS for the

@@ -54,3 +54,18 @@ export interface SystemGraph {
   edges: SystemGraphEdge[];
   warnings: GraphWarning[];
 }
+export type SystemGraphLifecycleState =
+  | "building"
+  | "ready"
+  | "stale"
+  | "degraded";
+
+/** Path-free lifecycle envelope for one workspace projection. */
+export interface SystemGraphSnapshot {
+  workspaceKey: WorkspaceKey;
+  /** Monotonic within one server process and workspace. */
+  revision: number;
+  state: SystemGraphLifecycleState;
+  /** Null only before a usable projection exists. */
+  graph: SystemGraph | null;
+}

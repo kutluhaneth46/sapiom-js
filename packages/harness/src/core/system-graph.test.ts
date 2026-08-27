@@ -422,16 +422,15 @@ describe("StaticSystemGraphBuilder", () => {
         warnings: [],
       })),
     };
-    const graph = await buildGraph(
-      new StaticSystemGraphBuilder(
-        inventory,
-        relationshipProvider(async () => {
-          throw new Error("boom at /private/research");
-        }),
-      ),
-      scope,
-    );
+    const built = await new StaticSystemGraphBuilder(
+      inventory,
+      relationshipProvider(async () => {
+        throw new Error("boom at /private/research");
+      }),
+    ).build(scope);
+    const graph = built.graph;
 
+    expect(built.cacheable).toBe(false);
     expect(graph.warnings).toEqual([
       {
         code: "projection-failed",
@@ -556,5 +555,53 @@ describe("StaticSystemGraphBuilder", () => {
       warnings: [],
     });
     expect(built.graph).not.toHaveProperty("cacheable");
+  });
+
+  it("retains caller caches across active workspaces and prunes retired ones", async () => {
+    const secondScope: WorkspaceScope = {
+      workspaceKey: "workspace-second",
+      root: "/private/second",
+    };
+    const inventory: AgentInventoryProvider = {
+      listAgents: vi.fn(async (activeScope) => {
+        const second = activeScope.workspaceKey === secondScope.workspaceKey;
+        const agentKey = second ? "second" : "first";
+        return {
+          agents: [
+            {
+              agentKey,
+              definitionId: null,
+              definitionSlug: agentKey,
+              label: agentKey,
+              resolutionAliases: [agentKey],
+              sourceRoot: activeScope.root,
+            },
+          ],
+          cacheable: true,
+          warnings: [],
+        };
+      }),
+    };
+    const retainCallers = vi.fn();
+    const relationships: AgentRelationshipProvider = {
+      listRelationships: vi.fn(async () => EMPTY_RELATIONSHIPS),
+      retainCallers,
+    };
+    const builder = new StaticSystemGraphBuilder(inventory, relationships);
+
+    await builder.build(scope);
+    await builder.build(secondScope);
+    expect(
+      retainCallers.mock.calls.at(-1)?.[0].map(
+        (caller: { agentKey: string }) => caller.agentKey,
+      ),
+    ).toEqual(["first", "second"]);
+
+    builder.retainWorkspaces(new Set([secondScope.workspaceKey]));
+    expect(
+      retainCallers.mock.calls.at(-1)?.[0].map(
+        (caller: { agentKey: string }) => caller.agentKey,
+      ),
+    ).toEqual(["second"]);
   });
 });

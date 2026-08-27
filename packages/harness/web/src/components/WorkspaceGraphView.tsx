@@ -2,26 +2,20 @@ import { useEffect, useMemo, useState } from "react";
 import type { JSX } from "react";
 import type {
   AgentKey,
-  SystemGraph,
+  SystemGraphLifecycleState,
+  SystemGraphSnapshot,
   WorkspaceKey,
   WorkspaceScopeSummary,
 } from "@shared/system-graph";
-import type { WorkflowInfo } from "@shared/types";
+import type { BusMessage, WorkflowInfo } from "@shared/types";
 
 import type { HarnessApi } from "../lib/api";
-import { createSystemGraphLoader } from "../lib/system-graph-loader";
+import { systemGraphLoader } from "../lib/system-graph-loader";
 import { mapSystemGraphNavigation } from "../lib/system-graph-navigation";
 import { trackingAttrs } from "../lib/analytics/tracking-attrs";
 import { EmptyState } from "./EmptyState";
 import { Icon } from "./Icon";
 import { SystemGraphCanvas } from "./SystemGraphCanvas";
-
-/**
- * V0 mirrors the server's process-lifetime snapshot in the browser tab, with
- * one later-open retry for a degraded projection. SAP-2904 owns source-driven
- * invalidation and user-visible freshness states.
- */
-const loadSystemGraph = createSystemGraphLoader();
 
 interface WorkspaceGraphViewProps {
   workspaceKey: WorkspaceKey;
@@ -29,6 +23,7 @@ interface WorkspaceGraphViewProps {
   api: HarnessApi;
   workflows: readonly WorkflowInfo[];
   workspaceScopes: readonly WorkspaceScopeSummary[];
+  lastMessage: BusMessage | null;
   onOpenAgent: (path: string) => void;
   onExpandRail?: () => void;
 }
@@ -39,29 +34,90 @@ export function WorkspaceGraphView({
   api,
   workflows,
   workspaceScopes,
+  lastMessage,
   onOpenAgent,
   onExpandRail,
 }: WorkspaceGraphViewProps): JSX.Element {
-  const [graph, setGraph] = useState<SystemGraph | null>(null);
+  const [snapshot, setSnapshot] = useState<SystemGraphSnapshot | null>(() =>
+    systemGraphLoader.peek(workspaceKey),
+  );
+  const [announcement, setAnnouncement] = useState<{
+    revision: number;
+    state: SystemGraphLifecycleState;
+  } | null>(null);
   const [error, setError] = useState(false);
-  const [attempt, setAttempt] = useState(0);
+  const [refreshSeq, setRefreshSeq] = useState(0);
 
   useEffect(() => {
     let active = true;
-    setGraph(null);
     setError(false);
-    void loadSystemGraph(api, workspaceKey).then(
+    void systemGraphLoader.load(api, workspaceKey).then(
       (next) => {
-        if (active) setGraph(next);
+        if (!active) return;
+        setSnapshot((current) =>
+          current && current.revision > next.revision ? current : next,
+        );
+        setAnnouncement((current) =>
+          current && current.revision > next.revision ? current : null,
+        );
       },
       () => {
-        if (active) setError(true);
+        if (!active) return;
+        setAnnouncement(null);
+        setError(true);
       },
     );
     return () => {
       active = false;
     };
-  }, [api, workspaceKey, attempt]);
+  }, [api, workspaceKey, refreshSeq]);
+
+  useEffect(() => {
+    if (
+      lastMessage?.type !== "system-graph.changed" ||
+      lastMessage.workspaceKey !== workspaceKey
+    ) {
+      return;
+    }
+    const knownRevision = Math.max(
+      snapshot?.revision ?? -1,
+      announcement?.revision ?? -1,
+    );
+    if (lastMessage.revision <= knownRevision) return;
+    // The global event subscriber already invalidates the shared cache while
+    // this destination is closed. Repeating it here keeps the view correct in
+    // isolation and is a no-op for an already-observed revision.
+    systemGraphLoader.invalidate(workspaceKey, lastMessage.revision);
+    setAnnouncement({
+      revision: lastMessage.revision,
+      state: lastMessage.state,
+    });
+    setError(false);
+    setRefreshSeq((value) => value + 1);
+  }, [announcement?.revision, lastMessage, snapshot?.revision, workspaceKey]);
+
+  const graph = snapshot?.graph ?? null;
+  const announcementIsNewer =
+    announcement !== null && announcement.revision > (snapshot?.revision ?? -1);
+  let lifecycle: SystemGraphLifecycleState = snapshot?.state ?? "building";
+  if (announcementIsNewer) {
+    lifecycle =
+      announcement.state === "degraded"
+        ? "degraded"
+        : graph
+          ? "stale"
+          : "building";
+  }
+  if (error) lifecycle = snapshot?.graph ? "stale" : "degraded";
+  const refreshing =
+    announcementIsNewer && announcement?.state !== "degraded" && !error;
+
+  const retry = (): void => {
+    systemGraphLoader.invalidate(workspaceKey);
+    setAnnouncement(null);
+    setError(false);
+    setRefreshSeq((value) => value + 1);
+  };
 
   const navigation = useMemo(
     () =>
@@ -102,22 +158,73 @@ export function WorkspaceGraphView({
         >
           {workspaceName}
         </span>
+        {refreshing && graph && (
+          <span
+            className="status-tag workspace-graph-lifecycle"
+            data-testid="system-graph-refreshing"
+            data-state="refreshing"
+            role="status"
+          >
+            <span className="canvas-task-spinner" aria-hidden="true" />
+            Refreshing graph
+          </span>
+        )}
+        {lifecycle === "stale" && graph && !refreshing && (
+          <span
+            className="workspace-graph-lifecycle"
+            data-testid="system-graph-stale"
+            data-state="stale"
+            role="status"
+          >
+            <span className="status-tag">
+              <Icon name="TriangleAlert" size={13} />
+              Graph may be out of date
+            </span>
+            {error && (
+              <button
+                type="button"
+                className="status-tag status-tag-action"
+                onClick={retry}
+              >
+                <Icon name="RefreshCw" size={13} />
+                Retry
+              </button>
+            )}
+          </span>
+        )}
+        {lifecycle === "degraded" && graph && (
+          <span
+            className="workspace-graph-lifecycle"
+            data-testid="system-graph-degraded"
+            data-state="degraded"
+            role="status"
+          >
+            <span className="status-tag">
+              <Icon name="TriangleAlert" size={13} />
+              Graph may be incomplete
+            </span>
+            <button
+              type="button"
+              className="status-tag status-tag-action"
+              onClick={retry}
+            >
+              <Icon name="RefreshCw" size={13} />
+              Retry
+            </button>
+          </span>
+        )}
       </header>
 
       <div className="workspace-graph-body">
-        {error ? (
+        {!graph && lifecycle === "degraded" ? (
           <EmptyState
             className="system-graph-state"
             testId="system-graph-error"
             icon="TriangleAlert"
-            title="Couldn't load this workspace graph"
-            body="The local projection failed. Retry the filesystem scan."
+            title="Couldn't build this workspace graph"
+            body="Studio couldn't produce a usable local projection. Retry after the workspace is readable."
             cta={
-              <button
-                type="button"
-                className="btn-primary"
-                onClick={() => setAttempt((value) => value + 1)}
-              >
+              <button type="button" className="btn-primary" onClick={retry}>
                 Retry
               </button>
             }
@@ -130,6 +237,19 @@ export function WorkspaceGraphView({
             <span className="canvas-task-spinner" aria-hidden="true" />
             <p className="canvas-empty-hint">Loading workspace graph…</p>
           </div>
+        ) : graph.nodes.length === 0 && lifecycle === "degraded" ? (
+          <EmptyState
+            className="system-graph-state"
+            testId="system-graph-incomplete"
+            icon="TriangleAlert"
+            title="Workspace graph is incomplete"
+            body="Studio couldn't inspect enough of this workspace to show a reliable graph."
+            cta={
+              <button type="button" className="btn-primary" onClick={retry}>
+                Retry
+              </button>
+            }
+          />
         ) : graph.nodes.length === 0 ? (
           <EmptyState
             className="system-graph-state"

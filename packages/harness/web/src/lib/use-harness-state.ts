@@ -39,6 +39,7 @@ import { isWithinDir } from "./paths";
 import { mergeHistory } from "./history-meta";
 import { createToastMessage, type ToastMessage, type ToastTone } from "./toast";
 import { subscribeEvents } from "./events";
+import { systemGraphLoader } from "./system-graph-loader";
 import { track as trackProduct } from "./analytics/events";
 import {
   agentProvenance,
@@ -320,6 +321,15 @@ export interface HarnessStateHook {
 /** Central store for the SPA shell: fetches AppState + settings once, then keeps sessions/workflows fresh via the event bus. */
 export function useHarnessState(): HarnessStateHook {
   const [state, setState] = useState<AppState | null>(null);
+
+  useEffect(() => {
+    if (!state) return;
+    systemGraphLoader.retain(
+      new Set(
+        (state.workspaceScopes ?? []).map((scope) => scope.workspaceKey),
+      ),
+    );
+  }, [state?.workspaceScopes]);
   const [settings, setSettings] = useState<HarnessSettings | null>(null);
   /**
    * Mirror of `settings` for the one reader that cannot wait for a re-render:
@@ -1041,6 +1051,10 @@ export function useHarnessState(): HarnessStateHook {
             });
           }
         });
+      } else if (message.type === "system-graph.changed") {
+        // Invalidate even while its workspace destination is closed. The next
+        // open must never resurrect a pre-edit process-lifetime promise.
+        systemGraphLoader.invalidate(message.workspaceKey, message.revision);
       } else if (message.type === "execution.started") {
         startRunPolling(
           message.harnessSessionId,

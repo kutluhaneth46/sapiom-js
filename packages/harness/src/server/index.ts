@@ -97,11 +97,19 @@ import { ensureCanvasTemplate } from "../core/canvas-template.js";
 import { renderCanvasForSession } from "../core/canvas-render.js";
 import { invalidateExtractionCache } from "../core/canvas-cache.js";
 import {
+  CachedAgentRelationshipProvider,
   HarnessRegistryInventoryProvider,
   LocalWorkspaceScopeCatalog,
+  SourceAgentRelationshipProvider,
   StaticSystemGraphBuilder,
+  type WorkspaceScope,
 } from "../core/system-graph.js";
+import {
+  canonicalGraphPath,
+  isWithinGraphPath,
+} from "../core/system-graph-inventory.js";
 import { SystemGraphStore } from "../core/system-graph-store.js";
+import { SystemGraphWatcherManager } from "../core/system-graph-watcher.js";
 import { sweepNdjson } from "../core/collector/store-retention.js";
 import {
   createDefinitionSlugResolver,
@@ -743,6 +751,9 @@ export const startServer = async (
     ...(await loadSettings(statePaths.settings)).recentDirs,
     ...sessionManager.list().map((session) => session.cwd),
   ]);
+  const systemGraphRelationships = new CachedAgentRelationshipProvider(
+    new SourceAgentRelationshipProvider(),
+  );
   const systemGraphStore = new SystemGraphStore(
     new StaticSystemGraphBuilder(
       new HarnessRegistryInventoryProvider({
@@ -750,8 +761,38 @@ export const startServer = async (
         listWorkspaceScopes: () => workspaceScopeCatalog.list(),
         inspectManifestName,
       }),
+      systemGraphRelationships,
     ),
+    {
+      onChange: ({ workspaceKey, revision, state }) => {
+        bus.publish({
+          type: "system-graph.changed",
+          workspaceKey,
+          revision,
+          state,
+        });
+      },
+    },
   );
+  const activeSystemGraphScopes = new Map<string, WorkspaceScope>();
+
+  const refreshSystemGraphScopesForRoot = (changedRoot: string): void => {
+    const canonicalChangedRoot = canonicalGraphPath(changedRoot);
+    for (const scope of activeSystemGraphScopes.values()) {
+      if (!systemGraphStore.peek(scope.workspaceKey)) continue;
+      const scopeRoot = canonicalGraphPath(scope.root);
+      if (
+        !isWithinGraphPath(scopeRoot, canonicalChangedRoot) &&
+        !isWithinGraphPath(canonicalChangedRoot, scopeRoot)
+      ) {
+        continue;
+      }
+      systemGraphStore.requestRefresh({
+        workspaceKey: scope.workspaceKey,
+        root: scopeRoot,
+      });
+    }
+  };
 
   const sessionSweepTimer = setInterval(
     () => sessionManager.sweepDeadSessions(),
@@ -869,6 +910,10 @@ export const startServer = async (
     await workflowRegistry.scan(session.cwd);
     const after = await workflowRegistry.list();
     workflowsCache = after;
+    const inventoryChanged = !workflowListsEqual(before, after);
+    if (inventoryChanged) {
+      await refreshSystemGraphScopesForRoot(session.cwd);
+    }
 
     // A removed project must not leave a live session permanently bound to a
     // path that the registry can no longer resolve. Clear only stale bindings;
@@ -912,7 +957,7 @@ export const startServer = async (
       }
     }
 
-    if (workflowListsEqual(before, after)) return;
+    if (!inventoryChanged) return;
     await Promise.all(sessionManager.list().map((s) => writeSessionContext(s)));
     bus.publish({ type: "workflows.changed" });
   };
@@ -1045,8 +1090,11 @@ export const startServer = async (
   const scanWorkflowsAndBroadcast = async (
     root: string,
   ): Promise<WorkflowInfo[]> => {
+    const before = workflowsCache;
     const found = await workflowRegistry.scan(root);
-    workflowsCache = await workflowRegistry.list();
+    const after = await workflowRegistry.list();
+    workflowsCache = after;
+    if (workflowListsEqual(before, after)) return found;
     // Rewrite every open session's context file before broadcasting — a
     // listener reacting to workflows.changed (the SPA, or an agent that
     // happens to re-read the file right then) must never see the
@@ -1054,8 +1102,69 @@ export const startServer = async (
     await Promise.all(
       sessionManager.list().map((session) => writeSessionContext(session)),
     );
+    await refreshSystemGraphScopesForRoot(root);
     bus.publish({ type: "workflows.changed" });
     return found;
+  };
+
+  const systemGraphWatcher = new SystemGraphWatcherManager({
+    onSourceChange: (scope, sourcePaths) => {
+      const workflowRoots = workflowsCache
+        .map((workflow) => canonicalGraphPath(workflow.path))
+        .filter((workflowRoot) => isWithinGraphPath(scope.root, workflowRoot));
+      const dirtyRoots = new Set<string>();
+      if (sourcePaths === null) {
+        for (const workflowRoot of workflowRoots) dirtyRoots.add(workflowRoot);
+      } else {
+        for (const sourcePath of sourcePaths) {
+          const canonicalSourcePath = canonicalGraphPath(sourcePath);
+          const matches = workflowRoots.filter((workflowRoot) =>
+            isWithinGraphPath(workflowRoot, canonicalSourcePath),
+          );
+          // Manually connected projects can be nested. Attribute a changed
+          // file to the most-specific registered caller rather than charging
+          // every registered ancestor for the same extraction.
+          for (const match of matches) {
+            if (
+              !matches.some(
+                (candidate) =>
+                  candidate !== match && isWithinGraphPath(match, candidate),
+              )
+            ) {
+              dirtyRoots.add(match);
+            }
+          }
+        }
+      }
+      for (const workflowRoot of dirtyRoots) {
+        systemGraphRelationships.invalidateSource(workflowRoot);
+      }
+      systemGraphStore.requestRefresh(scope);
+    },
+    onInventoryChange: async (scope) => {
+      try {
+        await scanWorkflowsAndBroadcast(scope.root);
+      } catch (err) {
+        if (systemGraphStore.peek(scope.workspaceKey)) {
+          systemGraphStore.reportRefreshFailure(scope);
+        }
+        console.error("[harness] workspace graph inventory refresh failed");
+        throw err;
+      }
+    },
+  });
+
+  const listWorkspaceScopesAndRetain = async () => {
+    const scopes = await workspaceScopeCatalog.list();
+    const retained = new Set(scopes.map((scope) => scope.workspaceKey));
+    systemGraphWatcher.retain(retained);
+    systemGraphStore.retain(retained);
+    for (const workspaceKey of activeSystemGraphScopes.keys()) {
+      if (!retained.has(workspaceKey)) {
+        activeSystemGraphScopes.delete(workspaceKey);
+      }
+    }
+    return scopes;
   };
 
   /** Enrich only the bound workflow before a Canvas render. Canvas extraction
@@ -1255,7 +1364,7 @@ export const startServer = async (
           }
         : null,
       listWorkflows: () => workflowRegistry.list().then(enrichWorkflows),
-      listWorkspaceScopes: () => workspaceScopeCatalog.list(),
+      listWorkspaceScopes: listWorkspaceScopesAndRetain,
       listMacros: () => DEFAULT_MACROS,
       findWorkflow: (workflowPath) =>
         workflowsCache.find((w) => w.path === workflowPath) ?? null,
@@ -1305,6 +1414,10 @@ export const startServer = async (
     createSystemGraphRouter({
       scopeResolver: workspaceScopeCatalog,
       store: systemGraphStore,
+      onScopeAccess: (scope) => {
+        activeSystemGraphScopes.set(scope.workspaceKey, scope);
+        systemGraphWatcher.start(scope);
+      },
     }),
   );
   app.use(
@@ -1327,8 +1440,17 @@ export const startServer = async (
   // as WorkflowRegistryLike so this wrapper needs no unsafe cast.
   const enrichedWorkflowRegistry: WorkflowRegistryLike = {
     list: () => workflowRegistry.list().then(enrichWorkflows),
-    scan: (root: string) => workflowRegistry.scan(root),
-    connectPath: (inputPath: string) => workflowRegistry.connectPath(inputPath),
+    scan: scanWorkflowsAndBroadcast,
+    connectPath: async (inputPath: string) => {
+      const workflow = await workflowRegistry.connectPath(inputPath);
+      workflowsCache = await workflowRegistry.list();
+      await Promise.all(
+        sessionManager.list().map((session) => writeSessionContext(session)),
+      );
+      await refreshSystemGraphScopesForRoot(workflow.path);
+      bus.publish({ type: "workflows.changed" });
+      return workflow;
+    },
   };
   app.use(
     createRunsRouter({
@@ -1696,6 +1818,10 @@ export const startServer = async (
       clearInterval(ndjsonRetentionTimer);
       canvasWatcher.stopAll();
       workspaceWatcher.stopAll();
+      systemGraphWatcher.stopAll();
+      activeSystemGraphScopes.clear();
+      systemGraphRelationships.clear();
+      systemGraphStore.clear();
       installWatcher.stopAll();
       for (const tailer of codexTailers.values()) tailer.stop();
       codexTailers.clear();

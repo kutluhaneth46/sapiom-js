@@ -1,7 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { SYSTEM_GRAPH_CACHE_HEADER } from "@shared/system-graph";
-
 import {
   createApi,
   isMockMode,
@@ -17,7 +15,7 @@ describe("RealApi.getSystemGraph", () => {
     vi.unstubAllGlobals();
   });
 
-  it("returns transport degradation metadata outside the graph JSON", async () => {
+  it("parses the revisioned graph lifecycle envelope", async () => {
     if (isMockMode()) return;
     const graph = {
       kind: "system",
@@ -33,18 +31,30 @@ describe("RealApi.getSystemGraph", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue(
-        new Response(JSON.stringify(graph), {
-          status: 200,
-          headers: {
-            "Content-Type": "application/json",
-            [SYSTEM_GRAPH_CACHE_HEADER]: "degraded",
+        new Response(
+          JSON.stringify({
+            workspaceKey: "workspace-test",
+            revision: 7,
+            state: "degraded",
+            graph,
+          }),
+          {
+            status: 200,
+            headers: {
+              "Content-Type": "application/json",
+            },
           },
-        }),
+        ),
       ),
     );
 
     await expect(createApi().getSystemGraph("workspace-test")).resolves.toEqual(
-      { graph, degraded: true },
+      {
+        workspaceKey: "workspace-test",
+        revision: 7,
+        state: "degraded",
+        graph,
+      },
     );
     expect(fetch).toHaveBeenCalledWith(
       "/api/workspaces/workspace-test/system-graph",

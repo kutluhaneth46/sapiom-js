@@ -1,6 +1,9 @@
 import { Router } from "express";
 
-import type { WorkspaceScopeResolver } from "../core/system-graph.js";
+import type {
+  WorkspaceScope,
+  WorkspaceScopeResolver,
+} from "../core/system-graph.js";
 import type { SystemGraphStore } from "../core/system-graph-store.js";
 import {
   SYSTEM_GRAPH_CACHE_HEADER,
@@ -10,6 +13,7 @@ import {
 export interface SystemGraphRouterOptions {
   scopeResolver: WorkspaceScopeResolver;
   store: SystemGraphStore;
+  onScopeAccess?: (scope: WorkspaceScope) => void | Promise<void>;
 }
 
 /** Mounted beneath the boot-token-protected `/api` boundary. */
@@ -29,11 +33,16 @@ export function createSystemGraphRouter(
           res.status(404).json({ error: "Workspace not found" });
           return;
         }
-        const result = await options.store.get(scope);
-        const cacheStatus: SystemGraphCacheStatus = result.degraded
-          ? "degraded"
-          : "complete";
-        res.set(SYSTEM_GRAPH_CACHE_HEADER, cacheStatus).json(result.graph);
+        try {
+          await options.onScopeAccess?.(scope);
+        } catch {
+          // Watcher setup is best-effort. A graph read must remain available
+          // even when automatic freshness cannot be armed.
+        }
+        const snapshot = await options.store.get(scope);
+        const cacheStatus: SystemGraphCacheStatus =
+          snapshot.state === "ready" ? "complete" : "degraded";
+        res.set(SYSTEM_GRAPH_CACHE_HEADER, cacheStatus).json(snapshot);
       } catch (err) {
         next(err);
       }

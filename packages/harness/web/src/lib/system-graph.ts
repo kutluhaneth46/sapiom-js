@@ -2,7 +2,9 @@ import type {
   GraphWarning,
   SystemGraph,
   SystemGraphEdge,
+  SystemGraphLifecycleState,
   SystemGraphNode,
+  SystemGraphSnapshot,
 } from "@shared/system-graph";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -184,5 +186,47 @@ export function parseSystemGraph(value: unknown): SystemGraph {
     nodes: typedNodes,
     edges: typedEdges,
     warnings: typedWarnings,
+  };
+}
+const LIFECYCLE_STATES = new Set<SystemGraphLifecycleState>([
+  "building",
+  "ready",
+  "stale",
+  "degraded",
+]);
+
+/** Treat the lifecycle envelope as untrusted and keep it path-free. */
+export function parseSystemGraphSnapshot(value: unknown): SystemGraphSnapshot {
+  if (
+    !isRecord(value) ||
+    !hasOnlyKeys(value, ["workspaceKey", "revision", "state", "graph"]) ||
+    typeof value.workspaceKey !== "string" ||
+    !Number.isSafeInteger(value.revision) ||
+    (value.revision as number) < 0 ||
+    typeof value.state !== "string" ||
+    !LIFECYCLE_STATES.has(value.state as SystemGraphLifecycleState) ||
+    (value.graph !== null && !isRecord(value.graph))
+  ) {
+    throw new Error("Invalid system graph response");
+  }
+
+  const state = value.state as SystemGraphLifecycleState;
+  const graph = value.graph === null ? null : parseSystemGraph(value.graph);
+  if (
+    (state === "building" && graph !== null) ||
+    (state === "ready" || state === "stale") &&
+    graph === null
+  ) {
+    throw new Error("Invalid system graph response");
+  }
+  if (graph && graph.scope.workspaceKey !== value.workspaceKey) {
+    throw new Error("Invalid system graph response");
+  }
+
+  return {
+    workspaceKey: value.workspaceKey,
+    revision: value.revision as number,
+    state,
+    graph,
   };
 }

@@ -18,6 +18,7 @@ import {
   workspaceRelativeLocalKey,
 } from "./system-graph-inventory.js";
 import {
+  CachedAgentRelationshipProvider,
   SourceAgentRelationshipProvider,
   type AgentRelationshipProvider,
   type AgentRelationshipProviderResult,
@@ -31,7 +32,10 @@ export type {
   AgentInventoryWarning,
   WorkspaceScope,
 } from "./system-graph-inventory.js";
-export { SourceAgentRelationshipProvider } from "./system-graph-relationships.js";
+export {
+  CachedAgentRelationshipProvider,
+  SourceAgentRelationshipProvider,
+} from "./system-graph-relationships.js";
 export type {
   AgentRelationshipCandidate,
   AgentRelationshipProvider,
@@ -49,6 +53,8 @@ export interface WorkspaceScopeCatalog extends WorkspaceScopeResolver {
 
 export interface SystemGraphBuilder {
   build(scope: WorkspaceScope): Promise<SystemGraphBuildResult>;
+  /** Optional lifecycle hook for builders with workspace-scoped caches. */
+  retainWorkspaces?(workspaceKeys: ReadonlySet<WorkspaceKey>): void;
 }
 
 export interface SystemGraphBuildResult {
@@ -252,15 +258,24 @@ function normalizeInventory(
 }
 
 export class StaticSystemGraphBuilder implements SystemGraphBuilder {
+  private readonly callersByWorkspace = new Map<
+    WorkspaceKey,
+    readonly AgentInventoryItem[]
+  >();
+
   constructor(
     private readonly inventory: AgentInventoryProvider,
-    private readonly relationships: AgentRelationshipProvider = new SourceAgentRelationshipProvider(),
+    private readonly relationships: AgentRelationshipProvider = new CachedAgentRelationshipProvider(
+      new SourceAgentRelationshipProvider(),
+    ),
   ) {}
 
   async build(scope: WorkspaceScope): Promise<SystemGraphBuildResult> {
     const inventory = await this.inventory.listAgents(scope);
     const normalized = normalizeInventory(scope, inventory.agents);
     const agents = normalized.agents;
+    this.callersByWorkspace.set(scope.workspaceKey, agents);
+    this.retainRelationshipCallers();
     const nodes = agents.map((agent) => ({
       id: `agent:${agent.agentKey}`,
       agentKey: agent.agentKey,
@@ -289,6 +304,7 @@ export class StaticSystemGraphBuilder implements SystemGraphBuilder {
       ...normalized.warnings,
     ];
     const seenEdges = new Set<string>();
+    let relationshipsComplete = true;
 
     // Source walks are independent. Run them together so first-open latency is
     // bounded by the slowest agent tree rather than the sum of every tree.
@@ -315,6 +331,7 @@ export class StaticSystemGraphBuilder implements SystemGraphBuilder {
 
     for (const { caller, result, failed } of scans) {
       if (failed) {
+        relationshipsComplete = false;
         warnings.push({
           code: "projection-failed",
           agentKey: caller.agentKey,
@@ -392,7 +409,7 @@ export class StaticSystemGraphBuilder implements SystemGraphBuilder {
     ].sort(warningOrder);
 
     return {
-      cacheable: inventory.cacheable,
+      cacheable: inventory.cacheable && relationshipsComplete,
       graph: {
         kind: "system",
         scope: { kind: "working-tree", workspaceKey: scope.workspaceKey },
@@ -401,5 +418,24 @@ export class StaticSystemGraphBuilder implements SystemGraphBuilder {
         warnings: uniqueWarnings,
       },
     };
+  }
+
+  retainWorkspaces(workspaceKeys: ReadonlySet<WorkspaceKey>): void {
+    for (const workspaceKey of this.callersByWorkspace.keys()) {
+      if (!workspaceKeys.has(workspaceKey)) {
+        this.callersByWorkspace.delete(workspaceKey);
+      }
+    }
+    this.retainRelationshipCallers();
+  }
+
+  private retainRelationshipCallers(): void {
+    try {
+      this.relationships.retainCallers?.(
+        [...this.callersByWorkspace.values()].flat(),
+      );
+    } catch {
+      // Cache pruning is an optimization and cannot make projection fail.
+    }
   }
 }

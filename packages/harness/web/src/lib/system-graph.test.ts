@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { SystemGraph } from "@shared/system-graph";
 
-import { groupSystemGraphEdges, parseSystemGraph } from "./system-graph";
+import {
+  groupSystemGraphEdges,
+  parseSystemGraph,
+  parseSystemGraphSnapshot,
+} from "./system-graph";
 
 const valid: SystemGraph = {
   kind: "system",
@@ -90,6 +94,78 @@ describe("parseSystemGraph", () => {
       parseSystemGraph({
         ...valid,
         edges: [{ ...valid.edges[0], mode: "unknown" }],
+      }),
+    ).toThrow("Invalid system graph response");
+  });
+});
+
+describe("parseSystemGraphSnapshot", () => {
+  it("accepts every honest lifecycle shape", () => {
+    expect(
+      parseSystemGraphSnapshot({
+        workspaceKey: "workspace-test",
+        revision: 1,
+        state: "building",
+        graph: null,
+      }),
+    ).toEqual({
+      workspaceKey: "workspace-test",
+      revision: 1,
+      state: "building",
+      graph: null,
+    });
+    for (const state of ["ready", "stale", "degraded"] as const) {
+      expect(
+        parseSystemGraphSnapshot({
+          workspaceKey: "workspace-test",
+          revision: 2,
+          state,
+          graph: valid,
+        }).state,
+      ).toBe(state);
+    }
+    expect(
+      parseSystemGraphSnapshot({
+        workspaceKey: "workspace-test",
+        revision: 3,
+        state: "degraded",
+        graph: null,
+      }).graph,
+    ).toBeNull();
+  });
+
+  it("rejects cross-workspace, path-bearing, and impossible snapshots", () => {
+    expect(() =>
+      parseSystemGraphSnapshot({
+        workspaceKey: "workspace-other",
+        revision: 1,
+        state: "ready",
+        graph: valid,
+      }),
+    ).toThrow("Invalid system graph response");
+    expect(() =>
+      parseSystemGraphSnapshot({
+        workspaceKey: "workspace-test",
+        revision: 1,
+        state: "stale",
+        graph: null,
+      }),
+    ).toThrow("Invalid system graph response");
+    expect(() =>
+      parseSystemGraphSnapshot({
+        workspaceKey: "workspace-test",
+        revision: 1,
+        state: "ready",
+        graph: valid,
+        root: "/private/workspace",
+      }),
+    ).toThrow("Invalid system graph response");
+    expect(() =>
+      parseSystemGraphSnapshot({
+        workspaceKey: "workspace-test",
+        revision: 1,
+        state: "building",
+        graph: valid,
       }),
     ).toThrow("Invalid system graph response");
   });
