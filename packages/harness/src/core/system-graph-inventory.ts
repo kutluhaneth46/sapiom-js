@@ -1,14 +1,17 @@
 import { realpathSync } from "node:fs";
 import * as path from "node:path";
 
-import type {
-  AgentKey,
-  GraphWarning,
-  WorkspaceKey,
-  WorkspaceScopeSummary,
+import {
+  workspaceRelativeLocalKey,
+  type AgentKey,
+  type GraphWarning,
+  type WorkspaceKey,
+  type WorkspaceScopeSummary,
 } from "../shared/system-graph.js";
 import type { WorkflowInfo } from "../shared/types.js";
 import type { ManifestNameInspection } from "./definition-name.js";
+
+export { workspaceRelativeLocalKey } from "../shared/system-graph.js";
 
 export interface WorkspaceScope {
   workspaceKey: WorkspaceKey;
@@ -154,19 +157,6 @@ function pathDepth(input: string): number {
   return input.split(/[\\/]/).filter(Boolean).length;
 }
 
-export function workspaceRelativeLocalKey(
-  scopeRoot: string,
-  sourceRoot: string,
-): AgentKey {
-  const api = pathApi(scopeRoot);
-  const relative = api.relative(scopeRoot, sourceRoot);
-  const local =
-    relative === ""
-      ? api.basename(sourceRoot) || "root"
-      : relative.split(api.sep).join("/");
-  return `local:${local}`;
-}
-
 function normalizedAlias(value: string | null): string | null {
   const alias = value?.trim() ?? "";
   if (
@@ -266,23 +256,34 @@ export class HarnessRegistryInventoryProvider implements AgentInventoryProvider 
       .filter(({ sourceRoot }) => {
         const owner = this.ownerOf(sourceRoot, knownScopes.scopes);
         return owner?.workspaceKey === selectedScope.workspaceKey;
+      })
+      .map(({ workflow, sourceRoot }) => {
+        const fallbackKey =
+          workspaceRelativeLocalKey(
+            knownScopes.navigationRoot,
+            workflow.path,
+          ) ?? workspaceRelativeLocalKey(selectedScope.root, sourceRoot);
+        if (!fallbackKey) {
+          throw new Error("Owned system graph path had no local identity");
+        }
+        return { workflow, sourceRoot, fallbackKey };
       });
 
     const inspections = await mapWithDeadline(
       owned,
       MANIFEST_INSPECTION_CONCURRENCY,
       this.options.manifestInspectionBudgetMs ?? MANIFEST_INSPECTION_BUDGET_MS,
-      ({ workflow, sourceRoot }) =>
-        this.prepareAgent(selectedScope, workflow, sourceRoot),
+      ({ workflow, sourceRoot, fallbackKey }) =>
+        this.prepareAgent(workflow, sourceRoot, fallbackKey),
     );
     const prepared = Array.from(
       { length: owned.length },
       (_, index) =>
         inspections[index] ??
         this.prepareFallbackAgent(
-          selectedScope,
           owned[index]!.workflow,
           owned[index]!.sourceRoot,
+          owned[index]!.fallbackKey,
         ),
     ).sort(preparedOrder);
 
@@ -354,11 +355,14 @@ export class HarnessRegistryInventoryProvider implements AgentInventoryProvider 
     };
   }
 
-  private async knownScopes(
-    scope: WorkspaceScope,
-  ): Promise<{ cacheable: boolean; scopes: KnownScope[] }> {
+  private async knownScopes(scope: WorkspaceScope): Promise<{
+    cacheable: boolean;
+    navigationRoot: string;
+    scopes: KnownScope[];
+  }> {
     let summaries: readonly WorkspaceScopeSummary[] = [];
     let cacheable = true;
+    let navigationRoot = scope.root;
     try {
       summaries = await this.options.listWorkspaceScopes();
     } catch {
@@ -370,6 +374,14 @@ export class HarnessRegistryInventoryProvider implements AgentInventoryProvider 
     const byRoot = new Map<string, KnownScope>();
     for (const summary of summaries) {
       const root = canonicalGraphPath(summary.cwd);
+      if (
+        summary.workspaceKey === scope.workspaceKey &&
+        graphPathIdentity(root) === graphPathIdentity(scope.root)
+      ) {
+        // Local keys describe the registry path the browser already knows,
+        // while canonical paths remain authoritative for ownership and scans.
+        navigationRoot = summary.cwd;
+      }
       byRoot.set(graphPathIdentity(root), {
         depth: pathDepth(root),
         workspaceKey: summary.workspaceKey,
@@ -382,7 +394,7 @@ export class HarnessRegistryInventoryProvider implements AgentInventoryProvider 
       ...scope,
       depth: pathDepth(scope.root),
     });
-    return { cacheable, scopes: [...byRoot.values()] };
+    return { cacheable, navigationRoot, scopes: [...byRoot.values()] };
   }
 
   private ownerOf(
@@ -402,9 +414,9 @@ export class HarnessRegistryInventoryProvider implements AgentInventoryProvider 
   }
 
   private async prepareAgent(
-    scope: WorkspaceScope,
     workflow: WorkflowInfo,
     sourceRoot: string,
+    fallbackKey: AgentKey,
   ): Promise<PreparedAgent> {
     const definitionSlug = normalizedAlias(workflow.definitionSlug);
     let manifestName: string | null = null;
@@ -422,7 +434,6 @@ export class HarnessRegistryInventoryProvider implements AgentInventoryProvider 
       }
     }
 
-    const fallbackKey = workspaceRelativeLocalKey(scope.root, sourceRoot);
     const candidateKey = definitionSlug ?? manifestName ?? fallbackKey;
     // Keep the pre-disambiguation candidate as an alias for every copy. When
     // duplicate local fallbacks exist, a caller targeting that candidate must
@@ -450,12 +461,11 @@ export class HarnessRegistryInventoryProvider implements AgentInventoryProvider 
   }
 
   private prepareFallbackAgent(
-    scope: WorkspaceScope,
     workflow: WorkflowInfo,
     sourceRoot: string,
+    fallbackKey: AgentKey,
   ): PreparedAgent {
     const definitionSlug = normalizedAlias(workflow.definitionSlug);
-    const fallbackKey = workspaceRelativeLocalKey(scope.root, sourceRoot);
     const candidateKey = definitionSlug ?? fallbackKey;
     return {
       candidateKey,
