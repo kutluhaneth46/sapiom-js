@@ -1,7 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 
 import type { SystemGraph } from "../shared/system-graph.js";
-import type { SystemGraphBuilder, WorkspaceScope } from "./system-graph.js";
+import type {
+  SystemGraphBuilder,
+  SystemGraphBuildResult,
+  WorkspaceScope,
+} from "./system-graph.js";
 import { SystemGraphStore } from "./system-graph-store.js";
 
 const scope: WorkspaceScope = {
@@ -16,10 +20,14 @@ const graph: SystemGraph = {
   warnings: [],
 };
 
+function buildResult(cacheable = true): SystemGraphBuildResult {
+  return { cacheable, graph };
+}
+
 describe("SystemGraphStore", () => {
   it("coalesces concurrent and sequential reads for an unchanged workspace", async () => {
-    let resolveBuild!: (value: SystemGraph) => void;
-    const pending = new Promise<SystemGraph>((resolve) => {
+    let resolveBuild!: (value: SystemGraphBuildResult) => void;
+    const pending = new Promise<SystemGraphBuildResult>((resolve) => {
       resolveBuild = resolve;
     });
     const builder: SystemGraphBuilder = { build: vi.fn(() => pending) };
@@ -28,7 +36,7 @@ describe("SystemGraphStore", () => {
     const first = store.get(scope);
     const concurrent = store.get(scope);
     expect(first).toBe(concurrent);
-    resolveBuild(graph);
+    resolveBuild(buildResult());
     await expect(first).resolves.toBe(graph);
     await expect(store.get(scope)).resolves.toBe(graph);
     expect(builder.build).toHaveBeenCalledTimes(1);
@@ -39,7 +47,7 @@ describe("SystemGraphStore", () => {
       build: vi
         .fn()
         .mockRejectedValueOnce(new Error("scan failed"))
-        .mockResolvedValueOnce(graph),
+        .mockResolvedValueOnce(buildResult()),
     };
     const store = new SystemGraphStore(builder);
 
@@ -49,11 +57,28 @@ describe("SystemGraphStore", () => {
   });
 
   it("supports explicit invalidation without coupling it to UI opens", async () => {
-    const builder: SystemGraphBuilder = { build: vi.fn(async () => graph) };
+    const builder: SystemGraphBuilder = {
+      build: vi.fn(async () => buildResult()),
+    };
     const store = new SystemGraphStore(builder);
     await store.get(scope);
     store.invalidate(scope.workspaceKey);
     await store.get(scope);
     expect(builder.build).toHaveBeenCalledTimes(2);
+  });
+
+  it("coalesces but does not retain a degraded graph", async () => {
+    const build = vi
+      .fn()
+      .mockResolvedValueOnce(buildResult(false))
+      .mockResolvedValueOnce(buildResult());
+    const store = new SystemGraphStore({ build });
+
+    const first = store.get(scope);
+    const concurrent = store.get(scope);
+    expect(first).toBe(concurrent);
+    await expect(first).resolves.toBe(graph);
+    await expect(store.get(scope)).resolves.toBe(graph);
+    expect(build).toHaveBeenCalledTimes(2);
   });
 });

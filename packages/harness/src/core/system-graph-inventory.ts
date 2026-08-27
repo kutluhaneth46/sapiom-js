@@ -37,6 +37,8 @@ export interface AgentInventoryWarning {
 
 export interface AgentInventoryResult {
   agents: AgentInventoryItem[];
+  /** False when a later graph open should retry degraded enrichment. */
+  cacheable: boolean;
   warnings: AgentInventoryWarning[];
 }
 
@@ -262,7 +264,7 @@ export class HarnessRegistryInventoryProvider implements AgentInventoryProvider 
         sourceRoot: canonicalGraphPath(workflow.path),
       }))
       .filter(({ sourceRoot }) => {
-        const owner = this.ownerOf(sourceRoot, knownScopes);
+        const owner = this.ownerOf(sourceRoot, knownScopes.scopes);
         return owner?.workspaceKey === selectedScope.workspaceKey;
       });
 
@@ -343,14 +345,24 @@ export class HarnessRegistryInventoryProvider implements AgentInventoryProvider 
       );
 
     warnings.sort(warningOrder);
-    return { agents, warnings };
+    return {
+      agents,
+      cacheable:
+        knownScopes.cacheable &&
+        prepared.every((agent) => !agent.extractionFailed),
+      warnings,
+    };
   }
 
-  private async knownScopes(scope: WorkspaceScope): Promise<KnownScope[]> {
+  private async knownScopes(
+    scope: WorkspaceScope,
+  ): Promise<{ cacheable: boolean; scopes: KnownScope[] }> {
     let summaries: readonly WorkspaceScopeSummary[] = [];
+    let cacheable = true;
     try {
       summaries = await this.options.listWorkspaceScopes();
     } catch {
+      cacheable = false;
       // The selected scope is sufficient for a usable partial inventory. A
       // later uncached graph request can recover once settings are readable.
     }
@@ -370,7 +382,7 @@ export class HarnessRegistryInventoryProvider implements AgentInventoryProvider 
       ...scope,
       depth: pathDepth(scope.root),
     });
-    return [...byRoot.values()];
+    return { cacheable, scopes: [...byRoot.values()] };
   }
 
   private ownerOf(

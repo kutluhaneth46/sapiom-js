@@ -37,7 +37,13 @@ export interface WorkspaceScopeCatalog extends WorkspaceScopeResolver {
 }
 
 export interface SystemGraphBuilder {
-  build(scope: WorkspaceScope): Promise<SystemGraph>;
+  build(scope: WorkspaceScope): Promise<SystemGraphBuildResult>;
+}
+
+export interface SystemGraphBuildResult {
+  /** Internal cache policy; only graph crosses the HTTP boundary. */
+  cacheable: boolean;
+  graph: SystemGraph;
 }
 
 type LaunchDetector = typeof detectWorkflowLaunches;
@@ -242,7 +248,7 @@ export class StaticSystemGraphBuilder implements SystemGraphBuilder {
     private readonly detectLaunches: LaunchDetector = detectWorkflowLaunches,
   ) {}
 
-  async build(scope: WorkspaceScope): Promise<SystemGraph> {
+  async build(scope: WorkspaceScope): Promise<SystemGraphBuildResult> {
     const inventory = await this.inventory.listAgents(scope);
     const normalized = normalizeInventory(scope, inventory.agents);
     const agents = normalized.agents;
@@ -357,11 +363,14 @@ export class StaticSystemGraphBuilder implements SystemGraphBuilder {
     ].sort(warningOrder);
 
     return {
-      kind: "system",
-      scope: { kind: "working-tree", workspaceKey: scope.workspaceKey },
-      nodes,
-      edges,
-      warnings: uniqueWarnings,
+      cacheable: inventory.cacheable,
+      graph: {
+        kind: "system",
+        scope: { kind: "working-tree", workspaceKey: scope.workspaceKey },
+        nodes,
+        edges,
+        warnings: uniqueWarnings,
+      },
     };
   }
 }

@@ -48,7 +48,9 @@ describe("createSystemGraphRouter", () => {
           : null,
       ),
     };
-    const builder: SystemGraphBuilder = { build: vi.fn(async () => graph) };
+    const builder: SystemGraphBuilder = {
+      build: vi.fn(async () => ({ cacheable: true, graph })),
+    };
     const app = express();
     app.use("/api", createBootTokenMiddleware("test-token"));
     app.use(

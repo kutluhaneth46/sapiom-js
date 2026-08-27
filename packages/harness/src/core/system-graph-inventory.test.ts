@@ -102,6 +102,7 @@ describe("HarnessRegistryInventoryProvider", () => {
           sourceRoot: `${WORKSPACE}/research`,
         },
       ],
+      cacheable: true,
       warnings: [],
     });
     expect(inspectManifestName).toHaveBeenCalledTimes(2);
@@ -168,6 +169,7 @@ describe("HarnessRegistryInventoryProvider", () => {
       },
     ]);
     expect(inspectManifestName).toHaveBeenCalledTimes(6);
+    expect(result.cacheable).toBe(false);
     expect(JSON.stringify(result.warnings)).not.toContain(WORKSPACE);
   });
 
@@ -216,6 +218,7 @@ describe("HarnessRegistryInventoryProvider", () => {
       ["inventory-extraction-failed", "local:slow-e"],
     ]);
     expect(started).toHaveLength(5);
+    expect(result.cacheable).toBe(false);
 
     release();
     await Promise.resolve();
@@ -360,6 +363,7 @@ describe("HarnessRegistryInventoryProvider", () => {
 
     await expect(inventory.listAgents(SCOPE)).resolves.toMatchObject({
       agents: [{ agentKey: "research" }],
+      cacheable: false,
       warnings: [],
     });
   });

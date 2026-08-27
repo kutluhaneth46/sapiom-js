@@ -31,6 +31,13 @@ function workflow(
   };
 }
 
+async function buildGraph(
+  builder: StaticSystemGraphBuilder,
+  scope: WorkspaceScope,
+) {
+  return (await builder.build(scope)).graph;
+}
+
 describe("LocalWorkspaceScopeCatalog", () => {
   it("gives a canonical root a stable opaque key and rejects unknown keys", async () => {
     const catalog = new LocalWorkspaceScopeCatalog(() => [
@@ -87,7 +94,10 @@ describe("StaticSystemGraphBuilder", () => {
       ],
     });
 
-    const graph = await new StaticSystemGraphBuilder(inventory).build(scope);
+    const graph = await buildGraph(
+      new StaticSystemGraphBuilder(inventory),
+      scope,
+    );
 
     expect(graph).toEqual({
       kind: "system",
@@ -131,6 +141,7 @@ describe("StaticSystemGraphBuilder", () => {
             sourceRoot: "/private/growth",
           },
         ],
+        cacheable: true,
         warnings: [],
       })),
     };
@@ -145,7 +156,8 @@ describe("StaticSystemGraphBuilder", () => {
         : [],
     );
 
-    const graph = await new StaticSystemGraphBuilder(inventory, detect).build(
+    const graph = await buildGraph(
+      new StaticSystemGraphBuilder(inventory, detect),
       scope,
     );
     expect(graph.edges).toHaveLength(1);
@@ -171,7 +183,8 @@ describe("StaticSystemGraphBuilder", () => {
       root.endsWith("caller") ? [{ slug: "shared", fromStepId: null }] : [],
     );
 
-    const graph = await new StaticSystemGraphBuilder(inventory, detect).build(
+    const graph = await buildGraph(
+      new StaticSystemGraphBuilder(inventory, detect),
       scope,
     );
 
@@ -234,14 +247,18 @@ describe("StaticSystemGraphBuilder", () => {
             sourceRoot: "/outside/private-agent",
           },
         ],
+        cacheable: true,
         warnings: [],
       })),
     };
 
-    const graph = await new StaticSystemGraphBuilder(
-      inventory,
-      vi.fn(async () => []),
-    ).build(scope);
+    const graph = await buildGraph(
+      new StaticSystemGraphBuilder(
+        inventory,
+        vi.fn(async () => []),
+      ),
+      scope,
+    );
 
     expect(graph.nodes).toHaveLength(4);
     expect(new Set(graph.nodes.map((node) => node.id)).size).toBe(4);
@@ -293,15 +310,19 @@ describe("StaticSystemGraphBuilder", () => {
             sourceRoot: "/private/research",
           },
         ],
+        cacheable: true,
         warnings: [],
       })),
     };
-    const graph = await new StaticSystemGraphBuilder(
-      inventory,
-      vi.fn(async () => {
-        throw new Error("boom at /private/research");
-      }),
-    ).build(scope);
+    const graph = await buildGraph(
+      new StaticSystemGraphBuilder(
+        inventory,
+        vi.fn(async () => {
+          throw new Error("boom at /private/research");
+        }),
+      ),
+      scope,
+    );
 
     expect(graph.warnings).toEqual([
       {
@@ -330,10 +351,13 @@ describe("StaticSystemGraphBuilder", () => {
       })),
     });
 
-    const graph = await new StaticSystemGraphBuilder(
-      inventory,
-      vi.fn(async () => []),
-    ).build(scope);
+    const graph = await buildGraph(
+      new StaticSystemGraphBuilder(
+        inventory,
+        vi.fn(async () => []),
+      ),
+      scope,
+    );
 
     expect(graph.nodes).toEqual([
       {
@@ -367,6 +391,7 @@ describe("StaticSystemGraphBuilder", () => {
             sourceRoot: "/private/reporting",
           },
         ],
+        cacheable: true,
         warnings: [
           {
             code: "inventory-extraction-failed" as const,
@@ -377,10 +402,13 @@ describe("StaticSystemGraphBuilder", () => {
       })),
     };
 
-    const graph = await new StaticSystemGraphBuilder(
-      inventory,
-      vi.fn(async () => []),
-    ).build(scope);
+    const graph = await buildGraph(
+      new StaticSystemGraphBuilder(
+        inventory,
+        vi.fn(async () => []),
+      ),
+      scope,
+    );
 
     expect(graph.nodes.map((node) => node.agentKey)).toEqual([
       "local:reporting",
@@ -395,5 +423,30 @@ describe("StaticSystemGraphBuilder", () => {
       },
     ]);
     expect(JSON.stringify(graph)).not.toContain("/private/");
+  });
+
+  it("keeps degraded cache policy outside the public graph contract", async () => {
+    const inventory: AgentInventoryProvider = {
+      listAgents: vi.fn(async () => ({
+        agents: [],
+        cacheable: false,
+        warnings: [],
+      })),
+    };
+
+    const built = await new StaticSystemGraphBuilder(
+      inventory,
+      vi.fn(async () => []),
+    ).build(scope);
+
+    expect(built.cacheable).toBe(false);
+    expect(built.graph).toEqual({
+      kind: "system",
+      scope: { kind: "working-tree", workspaceKey: scope.workspaceKey },
+      nodes: [],
+      edges: [],
+      warnings: [],
+    });
+    expect(built.graph).not.toHaveProperty("cacheable");
   });
 });
