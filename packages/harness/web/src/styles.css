@@ -4059,80 +4059,103 @@ button.rail-footer-card:hover {
   min-width: 0;
 }
 
-/* V0 workspace system graph: the same opaque raised-node / dotted-flow
-   language as the design system's flow widgets, projected into the existing
-   right Canvas pane without introducing a second token vocabulary. */
-.system-graph-canvas {
-  flex: 1;
-  min-height: 0;
+/* V0 workspace dependency graph -----------------------------------------
+   A folder is a full-main destination, while the agent workbench remains
+   mounted behind CSS. The field and cards use the design repository's flow
+   geometry and existing Studio tokens; V0 intentionally has no legend,
+   metrics, status treatments, inspector, or grouping chrome. */
+.workspace-graph-view {
+  grid-column: 1 / -1;
   display: flex;
   flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--surface-raised);
+}
+
+.workspace-graph-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--sp2);
+  flex: 0 0 auto;
+  height: var(--pane-header-h);
+  padding: 0 var(--pane-pad-x);
+  color: var(--text-dim);
+  border-bottom: 1px solid var(--ui-line);
+  background: var(--surface-raised);
+}
+
+.workspace-graph-title {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-size: var(--type-label);
+  font-weight: 590;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-graph-body,
+.system-graph-canvas,
+.system-graph-viewport {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.workspace-graph-body {
+  display: flex;
+  flex-direction: column;
+}
+
+.system-graph-canvas {
+  display: flex;
+  flex-direction: column;
+  background: var(--surface-base);
+}
+
+.system-graph-viewport {
+  touch-action: none;
+  cursor: grab;
   background-color: var(--surface-base);
   background-image: radial-gradient(var(--flow-grid-dot) 1px, transparent 1px);
+  background-position: 0 0;
   background-size: 16px 16px;
 }
 
-.system-graph-heading {
-  flex: 0 0 auto;
-  height: var(--pane-header-h);
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--sp3);
-  padding: 0 var(--pane-pad-x);
-  border-bottom: 1px solid var(--ui-line);
-  background: var(--surface-raised);
-  color: var(--text);
-  font-size: var(--type-label);
-  font-weight: 600;
+.system-graph-viewport.is-panning {
+  cursor: grabbing;
+  user-select: none;
 }
 
-.system-graph-heading span:last-child {
-  color: var(--text-faint);
-  font-size: var(--type-meta);
-  font-weight: 400;
+.system-graph-subject {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform-origin: center;
+  will-change: transform;
 }
 
-.system-graph-scroll {
-  flex: 1;
-  min-height: 0;
-  overflow: auto;
-}
-
-.system-graph-svg {
-  display: block;
-  width: 100%;
-  min-width: 320px;
-  min-height: 100%;
-}
-
-.system-graph-node rect {
-  fill: var(--surface-raised);
-  stroke: var(--ui-line-strong);
-}
-
-.system-graph-node circle {
-  fill: var(--text-dim);
-}
-
-.system-graph-node-label {
-  fill: var(--text);
-  font-family: var(--font);
-  font-size: var(--type-ui);
-  font-weight: 600;
-}
-
-.system-graph-node-meta,
-.system-graph-edge-label {
-  fill: var(--text-faint);
-  font-family: var(--font);
-  font-size: var(--type-micro);
+.system-graph-edges {
+  position: absolute;
+  inset: 0;
+  overflow: visible;
+  pointer-events: none;
 }
 
 .system-graph-edge {
   fill: none;
   stroke: var(--text-faint);
+  stroke-linecap: round;
+  stroke-linejoin: round;
   stroke-width: 1.5;
+  vector-effect: non-scaling-stroke;
+}
+
+.system-graph-edge.is-async {
   stroke-dasharray: 5 5;
 }
 
@@ -4140,18 +4163,132 @@ button.rail-footer-card:hover {
   fill: var(--text-faint);
 }
 
-.system-graph-warning {
-  flex: 0 0 auto;
-  margin: 0;
-  padding: var(--sp2) var(--pane-pad-x);
-  border-top: 1px solid var(--ui-line);
+.system-graph-edge-label {
+  fill: var(--text-faint);
+  stroke: var(--surface-base);
+  stroke-width: 4px;
+  paint-order: stroke fill;
+  font-family: var(--font-mono);
+  font-size: var(--type-meta);
+  pointer-events: none;
+}
+
+.system-graph-node {
+  position: absolute;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  gap: var(--sp1);
+  box-sizing: border-box;
+  padding: var(--sp2) var(--sp3);
+  overflow: hidden;
+  appearance: none;
+  color: var(--text);
   background: var(--surface-raised);
+  border: 1px dashed var(--ui-line-strong);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-xs);
+  font: inherit;
+  text-align: left;
+}
+
+button.system-graph-node.is-navigable {
+  cursor: pointer;
+  transition:
+    background-color var(--transition-fast),
+    border-color var(--transition-fast),
+    box-shadow var(--transition-fast);
+}
+
+button.system-graph-node.is-navigable:hover {
+  background: var(--surface-hover);
+  border-color: var(--text-faint);
+}
+
+button.system-graph-node.is-navigable:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  button.system-graph-node.is-navigable {
+    transition: none;
+  }
+}
+
+.system-graph-node-label,
+.system-graph-node-meta {
+  width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.system-graph-node-label {
+  font-size: var(--type-label);
+  font-weight: 590;
+}
+
+.system-graph-node-meta {
   color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: var(--type-meta);
+}
+
+.system-graph-subject[data-semantic-zoom="far"] .system-graph-node-meta,
+.system-graph-subject[data-semantic-zoom="far"] .system-graph-edge-label {
+  display: none;
+}
+
+.system-graph-controls {
+  position: absolute;
+  right: var(--sp3);
+  bottom: var(--sp3);
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: var(--sp1);
+  padding: var(--sp1);
+  border: 1px solid var(--ui-line-strong);
+  border-radius: var(--radius);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-xs);
+}
+
+.system-graph-controls .theme-toggle:disabled {
+  cursor: default;
+  opacity: 0.45;
+}
+
+.system-graph-controls .system-graph-zoom-reset {
+  width: auto;
+  min-width: calc(var(--control-h-xs) + var(--sp3));
+  padding: 0 var(--sp2);
+  font-family: var(--font-mono);
+  font-size: var(--type-meta);
+  font-variant-numeric: tabular-nums;
+}
+
+.system-graph-warning {
+  position: absolute;
+  top: var(--sp3);
+  right: var(--sp3);
+  z-index: 2;
+  margin: 0;
+  padding: var(--sp2) var(--sp3);
+  color: var(--text-faint);
+  border: 1px solid var(--ui-line);
+  border-radius: var(--radius);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-xs);
+  font-family: var(--font-mono);
   font-size: var(--type-meta);
 }
 
 .system-graph-state {
   flex: 1;
+  min-height: 0;
 }
 
 .workflow-actions-header {
@@ -8644,7 +8781,10 @@ button.rail-footer-card:hover {
    stretch cards to the full monitor. */
 .app.is-browsing > .center-pane,
 .app.is-browsing > .right-pane,
-.app.is-browsing > .pane-resize-handle {
+.app.is-browsing > .pane-resize-handle,
+.app.is-workspace-graph > .center-pane,
+.app.is-workspace-graph > .right-pane,
+.app.is-workspace-graph > .pane-resize-handle {
   display: none;
 }
 

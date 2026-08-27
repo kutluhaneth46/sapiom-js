@@ -1102,6 +1102,7 @@ class MockApi implements HarnessApi {
       scope: { kind: "working-tree", workspaceKey },
       nodes: [
         { id: "agent:growth", agentKey: "growth", label: "Growth" },
+        { id: "agent:leasing", agentKey: "leasing", label: "Leasing" },
         {
           id: "agent:reporting",
           agentKey: "reporting",
@@ -1111,6 +1112,11 @@ class MockApi implements HarnessApi {
           id: "agent:research",
           agentKey: "research",
           label: "Research",
+        },
+        {
+          id: "agent:standalone",
+          agentKey: "standalone",
+          label: "Standalone",
         },
       ],
       edges: [
@@ -1127,6 +1133,27 @@ class MockApi implements HarnessApi {
           kind: "invokes",
           basis: "static",
           mode: "async",
+        },
+        {
+          from: "agent:research",
+          to: "agent:leasing",
+          kind: "invokes",
+          basis: "static",
+          mode: "async",
+        },
+        {
+          from: "agent:growth",
+          to: "agent:research",
+          kind: "invokes",
+          basis: "static",
+          mode: "async",
+        },
+        {
+          from: "agent:reporting",
+          to: "agent:leasing",
+          kind: "invokes",
+          basis: "static",
+          mode: "blocking",
         },
       ],
       warnings: [],

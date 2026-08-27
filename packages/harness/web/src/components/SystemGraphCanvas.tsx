@@ -1,194 +1,425 @@
-import { useEffect, useState } from "react";
-import type { JSX } from "react";
-import type { SystemGraph, WorkspaceKey } from "@shared/system-graph";
-
-import type { HarnessApi } from "../lib/api";
 import {
-  groupSystemGraphEdges,
-  orderSystemGraphNodes,
-} from "../lib/system-graph";
-import { createSystemGraphLoader } from "../lib/system-graph-loader";
-import { EmptyState } from "./EmptyState";
+  useCallback,
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import type {
+  CSSProperties,
+  JSX,
+  PointerEvent as ReactPointerEvent,
+} from "react";
+import type { AgentKey, SystemGraph, WorkspaceKey } from "@shared/system-graph";
 
-/**
- * V0 mirrors the server's process-lifetime snapshot in the browser tab, with
- * one later-open retry for a degraded projection. SAP-2904 owns source-driven
- * invalidation and user-visible freshness states.
- */
-const loadSystemGraph = createSystemGraphLoader();
+import {
+  layoutSystemGraph,
+  systemGraphNodeById,
+} from "../lib/system-graph-layout";
+import {
+  SYSTEM_GRAPH_DEFAULT_MIN_ZOOM,
+  SYSTEM_GRAPH_MAX_ZOOM,
+  SYSTEM_GRAPH_ZOOM_STEP,
+  clampSystemGraphZoom,
+  createSystemGraphViewportStore,
+  fitSystemGraphView,
+  resetSystemGraphView,
+  wheelSystemGraphView,
+  type SystemGraphView,
+} from "../lib/system-graph-viewport";
+import { trackingAttrs } from "../lib/analytics/tracking-attrs";
+import { EmptyState } from "./EmptyState";
+import { Icon } from "./Icon";
+
+const viewportStore = createSystemGraphViewportStore();
+const PAN_THRESHOLD = 3;
 
 interface SystemGraphCanvasProps {
+  graph: SystemGraph;
   workspaceKey: WorkspaceKey;
-  api: HarnessApi;
+  navigableAgentKeys: ReadonlySet<AgentKey>;
+  onOpenAgent: (agentKey: AgentKey) => void;
+}
+
+interface DragState {
+  pointerId: number;
+  startClientX: number;
+  startClientY: number;
+  startView: SystemGraphView;
+  moved: boolean;
+}
+
+function edgeModeClass(modes: readonly string[]): string {
+  if (modes.length === 2) return "is-combined";
+  return modes[0] === "async" ? "is-async" : "is-blocking";
 }
 
 export function SystemGraphCanvas({
+  graph,
   workspaceKey,
-  api,
+  navigableAgentKeys,
+  onOpenAgent,
 }: SystemGraphCanvasProps): JSX.Element {
-  const [graph, setGraph] = useState<SystemGraph | null>(null);
-  const [error, setError] = useState(false);
-  const [attempt, setAttempt] = useState(0);
+  const computed = useMemo(() => {
+    try {
+      return { layout: layoutSystemGraph(graph), failed: false } as const;
+    } catch {
+      return { layout: null, failed: true } as const;
+    }
+  }, [graph]);
+  const layout = computed.layout;
+  const graphNodes = useMemo(() => systemGraphNodeById(graph), [graph]);
+  const saved = viewportStore.get(workspaceKey);
+  const [view, setView] = useState<SystemGraphView>(
+    saved?.view ?? resetSystemGraphView(),
+  );
+  const [minZoom, setMinZoom] = useState(SYSTEM_GRAPH_DEFAULT_MIN_ZOOM);
+  const [panning, setPanning] = useState(false);
+  const viewportRef = useRef<HTMLDivElement | null>(null);
+  const dragRef = useRef<DragState | null>(null);
+  const viewRef = useRef(view);
+  viewRef.current = view;
+  const markerId = `system-graph-arrow-${useId().replace(/:/g, "")}`;
+
+  const commitView = useCallback(
+    (
+      next: SystemGraphView | ((current: SystemGraphView) => SystemGraphView),
+    ): void => {
+      setView((current) => {
+        const resolved = typeof next === "function" ? next(current) : next;
+        viewportStore.set(workspaceKey, {
+          view: resolved,
+          autoFitted: true,
+        });
+        return resolved;
+      });
+    },
+    [workspaceKey],
+  );
+
+  const readFit = useCallback(() => {
+    const viewport = viewportRef.current;
+    if (!viewport || !layout) return null;
+    const rect = viewport.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return null;
+    const rootFontSize = Number.parseFloat(
+      getComputedStyle(document.documentElement).fontSize,
+    );
+    return fitSystemGraphView(
+      layout.bounds,
+      { width: rect.width, height: rect.height },
+      Number.isFinite(rootFontSize) ? rootFontSize : 16,
+    );
+  }, [layout]);
+
+  const fitView = useCallback((): void => {
+    const fit = readFit();
+    if (!fit) return;
+    setMinZoom(fit.minZoom);
+    commitView({ zoom: fit.zoom, x: fit.x, y: fit.y });
+  }, [commitView, readFit]);
+
+  useLayoutEffect(() => {
+    const viewport = viewportRef.current;
+    if (!viewport || !layout) return;
+    const syncFloor = (): void => {
+      const fit = readFit();
+      if (fit) setMinZoom(fit.minZoom);
+    };
+    const existing = viewportStore.get(workspaceKey);
+    const fit = readFit();
+    if (fit) {
+      setMinZoom(fit.minZoom);
+      if (existing?.autoFitted) {
+        setView(existing.view);
+      } else {
+        // The system-map reference never enlarges a small graph on arrival;
+        // explicit Fit may zoom up later. Containment wins when 100% crops.
+        const initial = { ...fit, zoom: Math.min(1, fit.zoom) };
+        const initialView = { zoom: initial.zoom, x: 0, y: 0 };
+        viewportStore.set(workspaceKey, {
+          view: initialView,
+          autoFitted: true,
+        });
+        setView(initialView);
+      }
+    }
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(syncFloor);
+    observer.observe(viewport);
+    return () => observer.disconnect();
+  }, [layout, readFit, workspaceKey]);
 
   useEffect(() => {
-    let active = true;
-    setGraph(null);
-    setError(false);
-    void loadSystemGraph(api, workspaceKey).then(
-      (next) => {
-        if (active) setGraph(next);
-      },
-      () => {
-        if (active) setError(true);
-      },
-    );
-    return () => {
-      active = false;
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+    const onWheel = (event: WheelEvent): void => {
+      const target = event.target;
+      if (
+        target instanceof Element &&
+        target.closest(".system-graph-controls")
+      ) {
+        return;
+      }
+      event.preventDefault();
+      const rect = viewport.getBoundingClientRect();
+      const pointer = {
+        x: event.clientX - (rect.left + rect.width / 2),
+        y: event.clientY - (rect.top + rect.height / 2),
+      };
+      commitView((current) =>
+        wheelSystemGraphView(current, event.deltaY, pointer, minZoom),
+      );
     };
-  }, [api, workspaceKey, attempt]);
+    viewport.addEventListener("wheel", onWheel, { passive: false });
+    return () => viewport.removeEventListener("wheel", onWheel);
+  }, [commitView, minZoom]);
 
-  if (error) {
+  const finishPan = (event: ReactPointerEvent<HTMLDivElement>): void => {
+    const drag = dragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    dragRef.current = null;
+    setPanning(false);
+  };
+
+  const handlePointerDown = (
+    event: ReactPointerEvent<HTMLDivElement>,
+  ): void => {
+    if (event.button !== 0) return;
+    const target = event.target;
+    if (target instanceof Element && target.closest("button, a")) return;
+    dragRef.current = {
+      pointerId: event.pointerId,
+      startClientX: event.clientX,
+      startClientY: event.clientY,
+      startView: viewRef.current,
+      moved: false,
+    };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+
+  const handlePointerMove = (
+    event: ReactPointerEvent<HTMLDivElement>,
+  ): void => {
+    const drag = dragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    const dx = event.clientX - drag.startClientX;
+    const dy = event.clientY - drag.startClientY;
+    if (!drag.moved && Math.hypot(dx, dy) < PAN_THRESHOLD) return;
+    drag.moved = true;
+    setPanning(true);
+    commitView({
+      ...drag.startView,
+      x: drag.startView.x + dx,
+      y: drag.startView.y + dy,
+    });
+  };
+
+  if (computed.failed || !layout) {
     return (
       <EmptyState
-        className="canvas-empty system-graph-state"
-        testId="system-graph-error"
+        className="system-graph-state"
+        testId="system-graph-layout-error"
         icon="TriangleAlert"
-        title="Couldn't load this workspace graph"
-        body="The local projection failed. Retry the filesystem scan."
-        cta={
-          <button
-            className="btn-primary"
-            onClick={() => setAttempt((value) => value + 1)}
-          >
-            Retry
-          </button>
-        }
+        title="Couldn't lay out this workspace graph"
+        body="The local graph was malformed, so Studio stopped before rendering unsafe geometry."
       />
     );
   }
-
-  if (!graph) {
-    return (
-      <div
-        className="canvas-loading system-graph-state"
-        data-testid="system-graph-loading"
-      >
-        <span className="canvas-task-spinner" aria-hidden="true" />
-        <p className="canvas-empty-hint">Loading workspace graph…</p>
-      </div>
-    );
-  }
-
-  if (graph.nodes.length === 0) {
-    return (
-      <EmptyState
-        className="canvas-empty system-graph-state"
-        testId="system-graph-empty"
-        icon="Frame"
-        title="No agents in this workspace"
-        body="Agent projects discovered inside this folder will appear here."
-      />
-    );
-  }
-
-  const width = 420;
-  const cardWidth = 240;
-  const cardHeight = 72;
-  const cardX = (width - cardWidth) / 2;
-  const top = 44;
-  const gap = 76;
-  const orderedNodes = orderSystemGraphNodes(graph);
-  const visibleEdges = groupSystemGraphEdges(graph.edges);
-  const positions = new Map(
-    orderedNodes.map((node, index) => [
-      node.id,
-      { x: cardX, y: top + index * (cardHeight + gap) },
-    ]),
-  );
-  const height = Math.max(
-    320,
-    top * 2 + graph.nodes.length * cardHeight + (graph.nodes.length - 1) * gap,
-  );
 
   return (
     <div className="system-graph-canvas" data-testid="system-graph-canvas">
-      <div className="system-graph-heading">
-        <span>Workspace dependencies</span>
-        <span>{graph.nodes.length} agents</span>
-      </div>
-      <div className="system-graph-scroll">
-        <svg
-          className="system-graph-svg"
-          viewBox={`0 0 ${width} ${height}`}
-          role="img"
+      <div
+        ref={viewportRef}
+        className={"system-graph-viewport" + (panning ? " is-panning" : "")}
+        data-testid="system-graph-viewport"
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={finishPan}
+        onPointerCancel={finishPan}
+        onDoubleClick={(event) => {
+          const target = event.target;
+          if (
+            !(target instanceof Element) ||
+            !target.closest(".system-graph-node, button, a")
+          ) {
+            fitView();
+          }
+        }}
+      >
+        <div
+          className="system-graph-subject"
+          data-testid="system-graph-subject"
+          data-semantic-zoom={view.zoom < 0.55 ? "far" : "near"}
+          style={
+            {
+              width: layout.bounds.width,
+              height: layout.bounds.height,
+              transform: `translate(-50%, -50%) translate(${view.x}px, ${view.y}px) scale(${view.zoom})`,
+            } satisfies CSSProperties
+          }
+          role="group"
           aria-label="Workspace dependency graph"
         >
-          <defs>
-            <marker
-              id="system-graph-arrow"
-              markerWidth="8"
-              markerHeight="8"
-              refX="7"
-              refY="4"
-              orient="auto"
-              markerUnits="strokeWidth"
-            >
-              <path d="M 0 0 L 8 4 L 0 8 z" className="system-graph-arrow" />
-            </marker>
-          </defs>
-
-          {visibleEdges.map((edge) => {
-            const from = positions.get(edge.from);
-            const to = positions.get(edge.to);
-            if (!from || !to) return null;
-            const startX = from.x + cardWidth / 2;
-            const startY = from.y + cardHeight;
-            const endX = to.x + cardWidth / 2;
-            const endY = to.y;
-            const middleY = (startY + endY) / 2;
-            return (
+          <svg
+            className="system-graph-edges"
+            width={layout.bounds.width}
+            height={layout.bounds.height}
+            viewBox={`0 0 ${layout.bounds.width} ${layout.bounds.height}`}
+            aria-hidden="true"
+          >
+            <defs>
+              <marker
+                id={markerId}
+                markerWidth="8"
+                markerHeight="8"
+                refX="7"
+                refY="4"
+                orient="auto"
+                markerUnits="strokeWidth"
+              >
+                <path d="M 0 0 L 8 4 L 0 8 z" className="system-graph-arrow" />
+              </marker>
+            </defs>
+            {layout.edges.map((edge) => (
               <g
-                key={`${edge.from}-${edge.to}`}
+                key={JSON.stringify([edge.from, edge.to])}
                 data-testid={`system-graph-edge-${edge.from}-${edge.to}`}
               >
                 <path
-                  className="system-graph-edge"
-                  d={`M ${startX} ${startY} C ${startX} ${middleY}, ${endX} ${middleY}, ${endX} ${endY - 8}`}
-                  markerEnd="url(#system-graph-arrow)"
+                  className={`system-graph-edge ${edgeModeClass(edge.modes)}`}
+                  d={edge.path}
+                  markerEnd={`url(#${markerId})`}
                 />
                 <text
                   className="system-graph-edge-label"
-                  x={startX + 12}
-                  y={middleY + 4}
+                  x={edge.labelX}
+                  y={edge.labelY}
+                  textAnchor="middle"
                 >
-                  {`invokes · static · ${edge.modes.join(" + ")}`}
+                  {edge.label}
                 </text>
               </g>
-            );
-          })}
+            ))}
+          </svg>
 
-          {orderedNodes.map((node) => {
-            const position = positions.get(node.id)!;
-            return (
-              <g
-                key={node.id}
-                className="system-graph-node"
-                data-testid={`system-graph-node-${node.agentKey}`}
-                transform={`translate(${position.x} ${position.y})`}
+          {layout.nodes.map((placed) => {
+            const graphNode = graphNodes.get(placed.id)!;
+            const navigable = navigableAgentKeys.has(graphNode.agentKey);
+            const style = {
+              left: placed.x,
+              top: placed.y,
+              width: placed.width,
+              height: placed.height,
+            } satisfies CSSProperties;
+            const contents = (
+              <>
+                <span className="system-graph-node-label">
+                  {graphNode.label}
+                </span>
+                <span className="system-graph-node-meta">agent</span>
+              </>
+            );
+            return navigable ? (
+              <button
+                key={placed.id}
+                type="button"
+                className="system-graph-node is-navigable"
+                data-testid={`system-graph-node-${graphNode.agentKey}`}
+                data-agent-key={graphNode.agentKey}
+                style={style}
+                title={graphNode.label}
+                aria-label={`Open ${graphNode.label}`}
+                onClick={() => onOpenAgent(graphNode.agentKey)}
+                {...trackingAttrs({ object: "agent" })}
               >
-                <rect width={cardWidth} height={cardHeight} rx="10" />
-                <circle cx="24" cy="25" r="5" />
-                <text className="system-graph-node-label" x="40" y="30">
-                  {node.label}
-                </text>
-                <text className="system-graph-node-meta" x="40" y="50">
-                  agent
-                </text>
-              </g>
+                {contents}
+              </button>
+            ) : (
+              <div
+                key={placed.id}
+                className="system-graph-node"
+                data-testid={`system-graph-node-${graphNode.agentKey}`}
+                data-agent-key={graphNode.agentKey}
+                style={style}
+                title={graphNode.label}
+                {...trackingAttrs({ object: "agent" })}
+              >
+                {contents}
+              </div>
             );
           })}
-        </svg>
+        </div>
+
+        <div
+          className="system-graph-controls"
+          data-testid="system-graph-controls"
+          role="group"
+          aria-label="Workspace graph view controls"
+        >
+          <button
+            type="button"
+            className="theme-toggle"
+            data-testid="system-graph-zoom-out"
+            aria-label="Zoom out"
+            disabled={view.zoom <= minZoom}
+            onClick={() =>
+              commitView((current) => ({
+                ...current,
+                zoom: clampSystemGraphZoom(
+                  current.zoom - SYSTEM_GRAPH_ZOOM_STEP,
+                  minZoom,
+                ),
+              }))
+            }
+          >
+            <Icon name="ZoomOut" size={14} />
+          </button>
+          <button
+            type="button"
+            className="theme-toggle system-graph-zoom-reset"
+            data-testid="system-graph-zoom-reset"
+            aria-label="Reset workspace graph view to 100%"
+            disabled={view.zoom === 1 && view.x === 0 && view.y === 0}
+            onClick={() => commitView(resetSystemGraphView())}
+          >
+            {Math.round(view.zoom * 100)}%
+          </button>
+          <button
+            type="button"
+            className="theme-toggle"
+            data-testid="system-graph-zoom-in"
+            aria-label="Zoom in"
+            disabled={view.zoom >= SYSTEM_GRAPH_MAX_ZOOM}
+            onClick={() =>
+              commitView((current) => ({
+                ...current,
+                zoom: clampSystemGraphZoom(
+                  current.zoom + SYSTEM_GRAPH_ZOOM_STEP,
+                  minZoom,
+                ),
+              }))
+            }
+          >
+            <Icon name="ZoomIn" size={14} />
+          </button>
+          <button
+            type="button"
+            className="theme-toggle"
+            data-testid="system-graph-fit"
+            aria-label="Fit workspace graph to view"
+            onClick={fitView}
+          >
+            <Icon name="Frame" size={14} />
+          </button>
+        </div>
       </div>
+
       {graph.warnings.length > 0 && (
         <p className="system-graph-warning" data-testid="system-graph-warning">
           {graph.warnings.length} static projection{" "}

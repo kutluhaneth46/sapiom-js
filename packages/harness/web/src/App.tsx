@@ -9,13 +9,13 @@
  *     session tabs inside the shared header, then the conversation/terminal.
  *     Session switching and same-folder session creation live in that strip.
  *  3. RIGHT PANEL — projections of the ACTIVE session's bound agent (Canvas |
- *     Steps | Code), or a folder-selected workspace dependency graph. The
- *     canvas stays mounted behind CSS when another tab is active so a running
- *     Visualize enrichment is never disturbed by a tab flip.
+ *     Steps | Code). The canvas stays mounted behind CSS when another tab is
+ *     active so a running Visualize enrichment is never disturbed by a tab
+ *     flip.
  *
- * The ordinary mapping invariant is: rail focused agent == tab strip's agent
- * == active tab's bound agent == right panel's subject. Selecting a workspace
- * temporarily changes only the last term; the center and session stay put.
+ * A workspace folder opens its dependency graph as a full main destination.
+ * The center and right agent panes stay mounted and inert behind that
+ * destination, so returning to an agent restores the exact prior view.
  */
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { JSX } from "react";
@@ -27,7 +27,7 @@ import type {
   WorkflowInfo,
   WorkflowInputContractResponse,
 } from "@shared/types";
-import type { CanvasSubject, WorkspaceKey } from "@shared/system-graph";
+import type { WorkspaceKey } from "@shared/system-graph";
 
 import { CanvasPane } from "./components/CanvasPane";
 import { CodePanel } from "./components/CodePanel";
@@ -47,6 +47,7 @@ import { TooltipLayer } from "./components/TooltipLayer";
 import { NewSessionComposer } from "./components/NewSessionComposer";
 import { OverviewModal } from "./components/OverviewModal";
 import { WorkflowsRail } from "./components/WorkflowsRail";
+import { WorkspaceGraphView } from "./components/WorkspaceGraphView";
 import { boundWorkflowPathOf } from "./lib/api";
 import { classifyConnectivity, useConnectivity } from "./lib/connectivity";
 import { historyDirs } from "./lib/history-meta";
@@ -182,8 +183,8 @@ export const App = (): JSX.Element => {
   // selection and the main panel's tab-strip subject. The active tab's
   // session is harness.activeSessionId.
   const [focusedAgentPath, setFocusedAgentPath] = useState<string | null>(null);
-  // Folder selection owns only the right Canvas. It deliberately does not
-  // mutate focusedAgentPath or activeSessionId, so the terminal never jumps.
+  // Folder selection opens a full-main graph destination. It deliberately
+  // does not mutate the focused agent, active session, or either agent pane.
   const [selectedWorkspaceKey, setSelectedWorkspaceKey] =
     useState<WorkspaceKey | null>(null);
   // "Open in Studio" deep links (sapiom://agent/<id>). The applier is a ref
@@ -754,9 +755,16 @@ export const App = (): JSX.Element => {
   const showComposer =
     !showReview && !showDead && (composing || (!showAgentEmpty && !showWorkbench));
   const showWorkspaceGraph = selectedWorkspaceKey != null;
-  // The composer still owns the center when there is no live session, but a
-  // folder graph remains independently viewable beside it.
   const rightPaneSuppressedByComposer = showComposer && !showWorkspaceGraph;
+  const workspaceScopes = state.workspaceScopes ?? [];
+  const selectedWorkspaceScope = selectedWorkspaceKey
+    ? (workspaceScopes.find(
+        (scope) => scope.workspaceKey === selectedWorkspaceKey,
+      ) ?? null)
+    : null;
+  const selectedWorkspaceName = selectedWorkspaceScope
+    ? basenameOf(selectedWorkspaceScope.cwd)
+    : "Workspace";
   // A live session to return to when the composer was opened over the workbench.
   const composerCanCancel =
     composing && activeSession != null && activeSession.status !== "exited";
@@ -782,14 +790,6 @@ export const App = (): JSX.Element => {
         harness.lastDeployErrorFor(rightPaneWorkflow.path),
       )
     : null;
-  const canvasSubject: CanvasSubject = showWorkspaceGraph
-    ? { kind: "workspace", workspaceKey: selectedWorkspaceKey }
-    : {
-        kind: "agent",
-        workflowPath: rightPaneWorkflow?.path ?? focusedAgentPath ?? "",
-        sessionId: harness.activeSessionId,
-      };
-
   // Run inspection for the active session.
   const selectedObservedRun = harness.activeSessionId
     ? (harness.runsBySession.get(harness.activeSessionId) ?? null)
@@ -820,13 +820,8 @@ export const App = (): JSX.Element => {
 
   const handleSelectWorkspace = (workspaceKey: WorkspaceKey): void => {
     setSelectedWorkspaceKey(workspaceKey);
-    setRightTab("canvas");
-    setCanvasExpanded(false);
-    setRightCollapsed(false);
-    // Templates is the one full-width destination that suppresses both panes;
-    // selecting a folder returns to the unchanged workbench/composer center so
-    // the requested graph can actually be seen.
     setTemplatesOpen(false);
+    setOverviewOpen(false);
     closeMobileDrawer();
   };
 
@@ -1538,10 +1533,14 @@ export const App = (): JSX.Element => {
             // stand in for the workbench — `.is-browsing` hides the panes for
             // either.
             (templatesOpen ? " is-browsing" : "") +
+            (showWorkspaceGraph ? " is-workspace-graph" : "") +
             // The workbench animates the canvas column open/closed (see
             // .app.canvas-animated). Off while browsing / composing / mobile,
             // where the single-column switch should be instant.
-            (!templatesOpen && !isMobile && !rightPaneSuppressedByComposer
+            (!templatesOpen &&
+              !showWorkspaceGraph &&
+              !isMobile &&
+              !rightPaneSuppressedByComposer
               ? " canvas-animated"
               : "") +
             // Present only DURING an open/close slide: it pins the pane content
@@ -1558,7 +1557,10 @@ export const App = (): JSX.Element => {
               // Browsing and the composer home take the whole width: a
               // two-column card grid inside half the shell is the letterbox this
               // view exists to escape, and the composer has no canvas yet.
-              templatesOpen || isMobile || rightPaneSuppressedByComposer
+              templatesOpen ||
+              showWorkspaceGraph ||
+              isMobile ||
+              rightPaneSuppressedByComposer
                 ? "minmax(0, 1fr)"
                 : // Two tracks always, so the canvas column can animate to 0 on
                   // collapse — the pane (and its left-edge shadow) slides shut,
@@ -1592,7 +1594,26 @@ export const App = (): JSX.Element => {
             />
           )}
 
-          <div className="center-pane">
+          {showWorkspaceGraph && selectedWorkspaceKey && (
+            <WorkspaceGraphView
+              key={selectedWorkspaceKey}
+              workspaceKey={selectedWorkspaceKey}
+              workspaceName={selectedWorkspaceName}
+              api={harness.api}
+              workflows={state.workflows}
+              workspaceScopes={workspaceScopes}
+              onOpenAgent={handleFocusAgent}
+              onExpandRail={
+                railCollapsed ? () => setRailCollapsed(false) : undefined
+              }
+            />
+          )}
+
+          <div
+            className="center-pane"
+            inert={showWorkspaceGraph ? true : undefined}
+            aria-hidden={showWorkspaceGraph || undefined}
+          >
             <SessionBar
               openedAgentName={noSessionAgentName}
               reviewTitle={reviewSummary ? reviewSummary.title : null}
@@ -1764,7 +1785,7 @@ export const App = (): JSX.Element => {
             />
           )}
 
-          {isMobile && !rightCollapsed && (
+          {isMobile && !showWorkspaceGraph && !rightCollapsed && (
             <div
               className="shell-scrim"
               data-testid="right-sheet-scrim"
@@ -1784,6 +1805,8 @@ export const App = (): JSX.Element => {
                 ? " is-collapsed"
                 : "")
             }
+            inert={showWorkspaceGraph ? true : undefined}
+            aria-hidden={showWorkspaceGraph || undefined}
           >
             <div className="right-pane-tabs" role="tablist" aria-label="Right pane">
               <button
@@ -1800,7 +1823,6 @@ export const App = (): JSX.Element => {
                 role="tab"
                 aria-selected={rightTab === "steps"}
                 className={"right-pane-tab" + (rightTab === "steps" ? " is-active" : "")}
-                disabled={showWorkspaceGraph}
                 onClick={() => setRightTab("steps")}
                 data-testid="right-tab-steps"
               >
@@ -1811,7 +1833,6 @@ export const App = (): JSX.Element => {
                 role="tab"
                 aria-selected={rightTab === "code"}
                 className={"right-pane-tab" + (rightTab === "code" ? " is-active" : "")}
-                disabled={showWorkspaceGraph}
                 onClick={() => {
                   setRightTab("code");
                   setCodePanelEverShown(true);
@@ -1824,8 +1845,7 @@ export const App = (): JSX.Element => {
               <div className="right-pane-corner">
                 {/* Cloud-status pill → dashboard. The board has no subheader,
                     so the link/build state lives here in the tab bar. */}
-                {!showWorkspaceGraph &&
-                  rightTab === "canvas" &&
+                {rightTab === "canvas" &&
                   rightPaneWorkflow?.definitionId != null && (
                     <a
                       className="status-tag status-tag-action workflow-deployed-tag right-pane-deployed"
@@ -1848,8 +1868,7 @@ export const App = (): JSX.Element => {
                     </a>
                   )}
                 {/* Canvas expand / Steps Focus sits beside the panel toggle. */}
-                {!showWorkspaceGraph &&
-                  (rightTab === "canvas" || rightTab === "steps") && (
+                {(rightTab === "canvas" || rightTab === "steps") && (
                   <button
                     className="theme-toggle"
                     data-testid="canvas-expand"
@@ -1878,8 +1897,6 @@ export const App = (): JSX.Element => {
               data-testid="right-panel-canvas"
             >
               <CanvasPane
-                subject={canvasSubject}
-                api={harness.api}
                 sessionId={harness.activeSessionId}
                 lastMessage={harness.lastMessage}
                 boundWorkflow={rightPaneWorkflow}
@@ -1887,8 +1904,9 @@ export const App = (): JSX.Element => {
                 overviewActive={showComposer}
                 sessionExited={showDead}
                 onCanvasState={(hasContent) => {
-                  // A workspace graph owns this surface independently. Late
-                  // probes from the still-mounted agent canvas must not fold it.
+                  // A full-main workspace graph leaves this agent probe mounted;
+                  // it must not mutate the hidden pane while that destination
+                  // is open.
                   if (showWorkspaceGraph) return;
                   // The pane follows the active session's board: open it whenever
                   // the session has one, close it when it doesn't. This fires on

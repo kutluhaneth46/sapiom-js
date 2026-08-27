@@ -1,9 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { JSX } from "react";
 import type { BackgroundTask, BusMessage, MacroDef, RunView, WorkflowInfo } from "@shared/types";
-import type { CanvasSubject } from "@shared/system-graph";
 
-import { isMockMode, type HarnessApi } from "../lib/api";
+import { isMockMode } from "../lib/api";
 import { MOCK_CANVAS_OVERVIEWS, hasMockCanvasDoc } from "../lib/mock-data";
 import { getTheme, subscribeTheme } from "../lib/theme";
 import { type CanvasGraph, formatGraphCounts, parseCanvasGraph } from "../lib/canvas-graph";
@@ -19,7 +18,6 @@ import { EmptyState } from "./EmptyState";
 import { Icon } from "./Icon";
 import { WorkflowActionsHeader } from "./WorkflowActionsHeader";
 import { RunWorkspace } from "./RunWorkspace";
-import { SystemGraphCanvas } from "./SystemGraphCanvas";
 import { track as trackProduct } from "../lib/analytics/events";
 import { trackingAttrs } from "../lib/analytics/tracking-attrs";
 
@@ -32,10 +30,6 @@ const ACTIVITY_LINES_SHOWN = 8;
 const FRAME_LOAD_TIMEOUT_MS = 4000;
 
 interface CanvasPaneProps {
-  /** Explicit owner of the Canvas surface. Workspace subjects use the local
-   * system-graph contract; agent subjects retain the session canvas below. */
-  subject: CanvasSubject;
-  api: HarnessApi;
   sessionId: string | null;
   lastMessage: BusMessage | null;
   boundWorkflow: WorkflowInfo | null;
@@ -128,8 +122,6 @@ function isLegendItem(value: unknown): value is CanvasLegendItem {
 }
 
 export function CanvasPane({
-  subject,
-  api,
   sessionId,
   lastMessage,
   boundWorkflow,
@@ -786,18 +778,6 @@ export function CanvasPane({
   // GitHub's 404 page rendered inside the pane.
   const sessionHasServableDoc = sessionId != null && (!isMockMode() || hasMockCanvasDoc(sessionId));
   const showsContent = hasGeneratedContent && sessionHasServableDoc;
-
-  // Keep every hook above unconditional so switching the right-pane subject
-  // never violates React's hook ordering. A workspace owns only this Canvas
-  // projection; the mounted session and center pane remain untouched.
-  if (subject.kind === "workspace") {
-    return (
-      <aside className="canvas-pane" {...trackingAttrs({ surface: "canvas" })}>
-        <SystemGraphCanvas workspaceKey={subject.workspaceKey} api={api} />
-      </aside>
-    );
-  }
-
 
   // The observability header for the Steps surface: a deploy landing (if one is
   // in flight/just landed) and the run summary card (if a run has been

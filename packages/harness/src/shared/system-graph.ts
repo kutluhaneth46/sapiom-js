@@ -54,7 +54,3 @@ export interface SystemGraph {
   edges: SystemGraphEdge[];
   warnings: GraphWarning[];
 }
-
-export type CanvasSubject =
-  | { kind: "workspace"; workspaceKey: WorkspaceKey }
-  | { kind: "agent"; workflowPath: string; sessionId: string | null };
