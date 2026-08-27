@@ -53,6 +53,12 @@ const NON_CAPABILITY_CALLS = new Set([
   "orchestrations.launch",
 ]);
 
+/** Most workflow files contain no cross-agent API at all. Avoid constructing a
+ * TypeScript tree for that hot path while keeping every supported spelling. */
+function mayContainAgentInvocation(content: string): boolean {
+  return content.includes("agents") || content.includes("orchestrations");
+}
+
 // A `name: "..."` property declaration — the step-name key `defineStep`
 // blocks always open with. The lookbehind rejects longer identifiers ending
 // in "name" (fromName, vendorName) without consuming the preceding char.
@@ -590,14 +596,16 @@ export async function scanWorkflowSources(
 
     const blocks = stepBlockRanges(content, knownStepIds);
 
-    const invocationScan = scanAgentInvocationsInFile(
-      root,
-      file,
-      content,
-      blocks,
-    );
-    invocations.push(...invocationScan.invocations);
-    invocationWarnings.push(...invocationScan.warnings);
+    if (mayContainAgentInvocation(content)) {
+      const invocationScan = scanAgentInvocationsInFile(
+        root,
+        file,
+        content,
+        blocks,
+      );
+      invocations.push(...invocationScan.invocations);
+      invocationWarnings.push(...invocationScan.warnings);
+    }
     for (const match of content.matchAll(CAPABILITY_CALL_PATTERN)) {
       const capability = match[1]!.replace(/\s+/g, "");
       if (NON_CAPABILITY_CALLS.has(capability)) continue;
