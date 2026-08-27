@@ -92,6 +92,9 @@ const MODE_ORDER: Record<SystemGraphEdge["mode"], number> = {
   async: 1,
 };
 
+const compareIds = (left: string, right: string): number =>
+  left === right ? 0 : left < right ? -1 : 1;
+
 /** Public graph data retains one record per mode. The V0 Canvas draws one
  * connector per endpoint pair so dual-mode relationships never overlap. */
 export function groupSystemGraphEdges(
@@ -114,7 +117,7 @@ export function groupSystemGraphEdges(
   return [...grouped.values()]
     .sort(
       (left, right) =>
-        left.from.localeCompare(right.from) || left.to.localeCompare(right.to),
+        compareIds(left.from, right.from) || compareIds(left.to, right.to),
     )
     .map(({ from, to, modes }) => ({
       from,
@@ -182,47 +185,4 @@ export function parseSystemGraph(value: unknown): SystemGraph {
     edges: typedEdges,
     warnings: typedWarnings,
   };
-}
-
-/** Stable Kahn order: direct callers render above the agents they invoke. */
-export function orderSystemGraphNodes(graph: SystemGraph): SystemGraphNode[] {
-  const byId = new Map(graph.nodes.map((node) => [node.id, node]));
-  const indegree = new Map(graph.nodes.map((node) => [node.id, 0]));
-  const outgoing = new Map<string, string[]>();
-  const topologyPairs = new Set<string>();
-  for (const edge of graph.edges) {
-    const pair = `${edge.from}\0${edge.to}`;
-    if (topologyPairs.has(pair)) continue;
-    topologyPairs.add(pair);
-    indegree.set(edge.to, (indegree.get(edge.to) ?? 0) + 1);
-    outgoing.set(edge.from, [...(outgoing.get(edge.from) ?? []), edge.to]);
-  }
-  const compareIds = (left: string, right: string): number =>
-    left.localeCompare(right);
-  const ready = graph.nodes
-    .filter((node) => indegree.get(node.id) === 0)
-    .map((node) => node.id)
-    .sort(compareIds);
-  const ordered: SystemGraphNode[] = [];
-  const visited = new Set<string>();
-
-  while (ready.length > 0) {
-    const id = ready.shift()!;
-    if (visited.has(id)) continue;
-    visited.add(id);
-    ordered.push(byId.get(id)!);
-    for (const target of [...(outgoing.get(id) ?? [])].sort(compareIds)) {
-      const next = (indegree.get(target) ?? 1) - 1;
-      indegree.set(target, next);
-      if (next === 0) {
-        ready.push(target);
-        ready.sort(compareIds);
-      }
-    }
-  }
-
-  // Cycles have no zero-indegree entry. Preserve the contract's stable order
-  // for those remaining nodes instead of dropping them from the view.
-  ordered.push(...graph.nodes.filter((node) => !visited.has(node.id)));
-  return ordered;
 }

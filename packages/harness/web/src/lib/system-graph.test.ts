@@ -1,11 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { SystemGraph } from "@shared/system-graph";
 
-import {
-  groupSystemGraphEdges,
-  orderSystemGraphNodes,
-  parseSystemGraph,
-} from "./system-graph";
+import { groupSystemGraphEdges, parseSystemGraph } from "./system-graph";
 
 const valid: SystemGraph = {
   kind: "system",
@@ -113,31 +109,6 @@ describe("groupSystemGraphEdges", () => {
         to: "agent:growth",
         modes: ["blocking", "async"],
       },
-    ]);
-  });
-});
-
-describe("orderSystemGraphNodes", () => {
-  it("places a direct caller above its target regardless of response order", () => {
-    expect(
-      orderSystemGraphNodes(parseSystemGraph(valid)).map(
-        (node) => node.agentKey,
-      ),
-    ).toEqual(["research", "growth"]);
-  });
-
-  it("does not double-count a pair that has both invocation modes", () => {
-    const graph = parseSystemGraph({
-      ...valid,
-      edges: [
-        { ...valid.edges[0], mode: "blocking" },
-        { ...valid.edges[0], mode: "async" },
-      ],
-    });
-
-    expect(orderSystemGraphNodes(graph).map((node) => node.agentKey)).toEqual([
-      "research",
-      "growth",
     ]);
   });
 });
