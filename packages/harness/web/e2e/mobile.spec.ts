@@ -87,3 +87,40 @@ test("right pane opens as a bottom sheet and dismisses from its own collapse con
   // Hidden, not unmounted — the keep-alive contract holds on mobile too.
   await expect(pane).toHaveCount(1);
 });
+
+test("a workspace graph is the main destination, never the right bottom sheet", async ({
+  page,
+}) => {
+  await page.getByTestId("rail-expand").click();
+  await page.getByTestId("workspace-select-acme-app").click();
+
+  const graph = page.getByTestId("workspace-graph-view");
+  await expect(graph).toBeVisible();
+  await expect(page.locator(".rail-workflows")).toHaveCount(0);
+  await expect(page.getByTestId("right-sheet-scrim")).toHaveCount(0);
+  await expect(page.locator(".right-pane")).toBeHidden();
+  await expect(page.locator(".right-pane")).toHaveCount(1);
+  await expect(page.locator(".center-pane")).toBeHidden();
+  await expect(page.locator(".center-pane")).toHaveCount(1);
+
+  const bounds = await graph.boundingBox();
+  expect(bounds?.x).toBe(0);
+  expect(bounds?.width).toBe(375);
+  expect((bounds?.y ?? 0) + (bounds?.height ?? 0)).toBe(812);
+
+  const controls = await page.getByTestId("system-graph-controls").boundingBox();
+  expect((controls?.x ?? -1) + (controls?.width ?? 0)).toBeLessThanOrEqual(375);
+  expect((controls?.y ?? -1) + (controls?.height ?? 0)).toBeLessThanOrEqual(812);
+  const overflow = await page.evaluate(() => {
+    const element = document.scrollingElement as HTMLElement;
+    return element.scrollWidth - element.clientWidth;
+  });
+  expect(overflow).toBe(0);
+  await page.screenshot({
+    path: "web/e2e/screenshots/mobile-workspace-graph.png",
+  });
+
+  await page.getByTestId("system-graph-node-leasing").click();
+  await expect(graph).toHaveCount(0);
+  await expect(page.locator(".center-pane")).toBeVisible();
+});

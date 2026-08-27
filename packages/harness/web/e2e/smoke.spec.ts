@@ -348,7 +348,7 @@ test.describe("three-zone IA (rail explorer, tab strip, right pane)", () => {
     });
   });
 
-  test("a folder label opens its cached workspace graph while the chevron only folds children", async ({
+  test("a folder label opens a full-main cached workspace graph while preserving the agent view", async ({
     page,
   }) => {
     const sessionContext = page.getByTestId("session-context");
@@ -359,14 +359,41 @@ test.describe("three-zone IA (rail explorer, tab strip, right pane)", () => {
     await expect(page.locator(".harness-terminal")).toBeVisible();
     await expect(page.getByTestId("workflow-leasing")).toBeVisible();
 
-    // The label owns graph selection; it does not fold the folder or navigate
-    // the active terminal/session.
+    // The right-pane arrangement is agent state, not workspace-graph state.
+    // Leave it on Steps and prove the folder destination does not rewrite it.
+    await page.getByTestId("right-tab-steps").click();
+    await expect(page.getByTestId("right-tab-steps")).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+
+    // The label owns graph selection; it does not fold the folder, navigate
+    // the session, or mount the graph in the right sidebar.
     await page.getByTestId("workspace-select-acme-app").click();
     await expect(page.getByTestId("workspace-group-acme-app")).toHaveClass(
       /is-selected/,
     );
     await expect(page.getByTestId("workflow-leasing")).toBeVisible();
+    await expect(page.getByTestId("workspace-graph-view")).toBeVisible();
     await expect(page.getByTestId("system-graph-canvas")).toBeVisible();
+    await expect(page.locator(".center-pane")).toBeHidden();
+    await expect(page.locator(".center-pane")).toHaveCount(1);
+    await expect(page.locator(".right-pane")).toBeHidden();
+    await expect(page.locator(".right-pane")).toHaveCount(1);
+    await expect(page.locator(".harness-terminal")).toBeHidden();
+    await expect(page.locator(".harness-terminal")).toHaveCount(1);
+    await expect(page.locator(".canvas-iframe")).toBeHidden();
+    await expect(page.locator(".canvas-iframe")).toHaveCount(1);
+
+    const destinationBounds = await page
+      .getByTestId("workspace-graph-view")
+      .boundingBox();
+    const appBounds = await page.locator(".app").boundingBox();
+    expect(destinationBounds).toEqual(appBounds);
+
+    await expect(page.getByTestId("system-graph-node-leasing")).toContainText(
+      "Leasing",
+    );
     await expect(page.getByTestId("system-graph-node-research")).toContainText(
       "Research",
     );
@@ -377,23 +404,61 @@ test.describe("three-zone IA (rail explorer, tab strip, right pane)", () => {
     await expect(page.getByTestId("system-graph-node-reporting")).toContainText(
       "Reporting",
     );
+    await expect(page.getByTestId("system-graph-node-standalone")).toContainText(
+      "Standalone",
+    );
     await expect(
       page.getByTestId("system-graph-edge-agent:research-agent:growth"),
-    ).toContainText("invokes · static · blocking + async");
-    await expect(page.getByTestId("right-tab-canvas")).toHaveAttribute(
-      "aria-selected",
-      "true",
+    ).toContainText("blocking + async");
+    await expect(
+      page
+        .getByTestId("system-graph-edge-agent:research-agent:growth")
+        .locator("path"),
+    ).toHaveClass(/is-combined/);
+    await expect(
+      page
+        .getByTestId("system-graph-edge-agent:research-agent:growth")
+        .locator("path"),
+    ).toHaveCSS("stroke-dasharray", "none");
+    await expect(
+      page
+        .getByTestId("system-graph-edge-agent:research-agent:leasing")
+        .locator("path"),
+    ).toHaveClass(/is-async/);
+    await expect(
+      page
+        .getByTestId("system-graph-edge-agent:reporting-agent:leasing")
+        .locator("path"),
+    ).toHaveClass(/is-blocking/);
+    await expect(page.getByTestId("system-graph-node-leasing")).toHaveAttribute(
+      "type",
+      "button",
     );
-    await expect(page.getByTestId("right-tab-steps")).toBeDisabled();
-    await expect(page.getByTestId("right-tab-code")).toBeDisabled();
+    await expect(page.locator(".system-graph-node-meta").first()).toHaveText(
+      "agent",
+    );
+    await expect(
+      page.getByTestId("system-graph-canvas").getByText(/failed|running|cost/i),
+    ).toHaveCount(0);
+    await expect(page.getByTestId("system-graph-legend")).toHaveCount(0);
     await expect(sessionContext).toHaveAttribute(
       "data-session-id",
       "sess-boot",
     );
-    await expect(page.locator(".harness-terminal")).toBeVisible();
+    await page.screenshot({
+      path: "web/e2e/screenshots/workspace-graph-full.png",
+      fullPage: true,
+    });
+    await toggleTheme(page);
+    await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+    await page.screenshot({
+      path: "web/e2e/screenshots/workspace-graph-full-dark.png",
+      fullPage: true,
+    });
+    await toggleTheme(page);
 
     // The dedicated disclosure is independent: folding keeps the selected
-    // graph and the terminal exactly where they are.
+    // graph and hidden agent surfaces exactly where they are.
     await page.getByTestId("workspace-disclosure-acme-app").click();
     await expect(page.getByTestId("workflow-leasing")).toHaveCount(0);
     await expect(page.getByTestId("system-graph-canvas")).toBeVisible();
@@ -418,19 +483,85 @@ test.describe("three-zone IA (rail explorer, tab strip, right pane)", () => {
       )
       .toBe(1);
 
-    // An agent row restores the ordinary per-agent/session Canvas contract.
-    await page
-      .getByTestId("workflow-leasing")
-      .locator(".workflow-item-trigger")
-      .click();
+    // A navigable graph card uses the ordinary agent-focus path and restores
+    // the exact terminal/session/right-tab arrangement that was underneath.
+    await page.getByTestId("system-graph-node-leasing").click();
     await expect(page.getByTestId("system-graph-canvas")).toHaveCount(0);
-    await expect(page.locator(".canvas-iframe")).toBeVisible();
+    await expect(page.locator(".harness-terminal")).toBeVisible();
     await expect(page.getByTestId("workflow-leasing")).toHaveClass(
       /is-focused/,
     );
     await expect(sessionContext).toHaveAttribute(
       "data-session-id",
       "sess-boot",
+    );
+    await expect(page.getByTestId("right-tab-steps")).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+  });
+
+  test("workspace graph view controls pan, zoom, reset, fit, and restore per workspace", async ({
+    page,
+  }) => {
+    await page.getByTestId("workspace-select-acme-app").click();
+    const subject = page.getByTestId("system-graph-subject");
+    const reset = page.getByTestId("system-graph-zoom-reset");
+    const initialTransform = await subject.evaluate(
+      (element) => (element as HTMLElement).style.transform,
+    );
+    const initialZoom = Number((await reset.innerText()).replace("%", ""));
+
+    await page.getByTestId("system-graph-zoom-in").click();
+    await expect
+      .poll(async () => Number((await reset.innerText()).replace("%", "")))
+      .toBeGreaterThan(initialZoom);
+
+    const viewport = page.getByTestId("system-graph-viewport");
+    const box = await viewport.boundingBox();
+    if (!box) throw new Error("Missing system graph viewport bounds");
+    await page.mouse.move(box.x + box.width / 3, box.y + box.height / 3);
+    const beforeWheel = Number((await reset.innerText()).replace("%", ""));
+    await page.mouse.wheel(0, -120);
+    await expect
+      .poll(async () => Number((await reset.innerText()).replace("%", "")))
+      .toBeGreaterThan(beforeWheel);
+
+    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(
+      box.x + box.width / 2 + 60,
+      box.y + box.height / 2 + 35,
+    );
+    await page.mouse.up();
+    await expect
+      .poll(() =>
+        subject.evaluate((element) => (element as HTMLElement).style.transform),
+      )
+      .not.toBe(initialTransform);
+
+    await reset.click();
+    await expect(reset).toHaveText("100%");
+    await page.getByTestId("system-graph-fit").click();
+    const fittedTransform = await subject.evaluate(
+      (element) => (element as HTMLElement).style.transform,
+    );
+    await page.getByTestId("system-graph-zoom-in").click();
+    await viewport.dblclick({ position: { x: 8, y: 8 } });
+    await expect
+      .poll(() =>
+        subject.evaluate((element) => (element as HTMLElement).style.transform),
+      )
+      .toBe(fittedTransform);
+
+    await page
+      .getByTestId("workflow-leasing")
+      .locator(".workflow-item-trigger")
+      .click();
+    await page.getByTestId("workspace-select-acme-app").click();
+    await expect(page.getByTestId("system-graph-subject")).toHaveAttribute(
+      "style",
+      new RegExp(fittedTransform.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
     );
   });
 
@@ -451,8 +582,11 @@ test.describe("three-zone IA (rail explorer, tab strip, right pane)", () => {
 
     await expect(page.getByTestId("system-graph-canvas")).toBeVisible();
     await expect(page.getByTestId("system-graph-node-research")).toBeVisible();
-    // Selecting the right-pane projection does not displace the center's
-    // no-session agent state.
+    // The graph is session-independent. The no-session agent view stays
+    // mounted underneath and returns unchanged when its card is selected.
+    await expect(page.getByTestId("open-agent-empty")).toBeHidden();
+    await expect(page.getByTestId("open-agent-empty")).toHaveCount(1);
+    await page.getByTestId("system-graph-node-leasing").click();
     await expect(page.getByTestId("open-agent-empty")).toContainText(
       "No running session for leasing",
     );
