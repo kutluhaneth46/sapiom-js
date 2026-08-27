@@ -33,9 +33,19 @@ import {
   type FsListResponse,
   type HarnessApi,
   type RunLocalLine,
+  type WorkflowScanOutcome,
 } from "./api";
 import { type ConnectivityErrorInput } from "./connectivity";
-import { isWithinDir } from "./paths";
+import { isWithinDir, samePath } from "./paths";
+import {
+  agentNeedsOwnProject,
+  applyProjectRemoval,
+  closedProjectsHolding,
+  planProjectRemoval,
+  reopenedClosedProjects,
+} from "./project-membership";
+import { rootContains } from "./session-scope";
+import { loadUiPrefs, saveUiPrefs } from "./ui-prefs";
 import { mergeHistory } from "./history-meta";
 import { createToastMessage, type ToastMessage, type ToastTone } from "./toast";
 import { subscribeEvents } from "./events";
@@ -177,7 +187,44 @@ export interface HarnessStateHook {
   connectWorkflow: (path: string) => Promise<WorkflowInfo>;
   /** Bulk discovery: POST /api/workflows/scan under a root, then
    *  refreshes the registry list so found agents join the rail at once. */
-  scanWorkflows: (root: string) => Promise<WorkflowInfo[]>;
+  scanWorkflows: (root: string) => Promise<WorkflowScanOutcome>;
+  /**
+   * Checkouts a scan of a given root stopped at rather than entering, keyed by
+   * the root that was scanned. Empty for a normal project. Non-empty means an
+   * empty-looking project is not necessarily empty.
+   */
+  unsearchedCheckouts: Record<string, string[]>;
+  /**
+   * Project roots the user removed from the rail — the rail hides their
+   * subtrees (`project-membership.ts` owns every rule about that). Persisted
+   * client-side because the server has no place for it, and because the thing
+   * it has to outlive is a SESSION RECORD: `recentDirs` forgets a removed
+   * project immediately, but the sessions that ran in it stay in the registry
+   * as exited, and their cwds are project roots too.
+   */
+  closedProjects: string[];
+  /**
+   * Removes a project: out of `recentDirs`, out of the rail, and the live
+   * sessions rooted in it are ended. NOTHING on disk is touched — the folder
+   * and everything in it stays exactly where it is, which is why the affordance
+   * is "remove" and the confirm says so.
+   *
+   * Removal is the release valve for accumulation: `recentDirs` is capped at 8
+   * but session cwds are not, so an install can carry far more projects than
+   * the cap suggests.
+   */
+  removeProject: (root: string) => Promise<void>;
+  /**
+   * OPENS A FOLDER AS A PROJECT — the other half of `removeProject`.
+   *
+   * Distinct from `connectWorkflow`, which registers an AGENT and only records
+   * the folder when nothing else already holds it. That gate is right for a
+   * build (it is what stopped one row per agent) and wrong for this: a project
+   * is a folder the user CHOSE, and whether it currently contains an agent is
+   * not the question. Round 1 had no such action at all, so the rail's `+`
+   * opened agent detection and an empty folder could not be added.
+   */
+  openProject: (root: string) => Promise<void>;
   /** Adapter registry (GET /api/harnesses) — drives the new-session picker
    *  (installed/experimental/external flags) and the MCP setup prompts. */
   listHarnesses: () => Promise<HarnessEntry[]>;
@@ -330,6 +377,31 @@ export function useHarnessState(): HarnessStateHook {
    */
   const settingsRef = useRef<HarnessSettings | null>(null);
   settingsRef.current = settings;
+  /**
+   * Removed projects, restored from the last session (SAP-2932).
+   *
+   * Written at the EDIT — inside `removeProject` and inside the reopen path —
+   * never from an effect watching the state. An effect would also fire on the
+   * restore-from-storage render, which is how a persisted list learns to
+   * rewrite itself with whatever the first render happened to hold.
+   */
+  // Per-root record of checkouts a scan declined to enter. Not persisted: it
+  // describes the last scan, and the next scan of that root re-derives it.
+  const [unsearchedCheckouts, setUnsearchedCheckouts] = useState<Record<string, string[]>>({});
+  const [closedProjects, setClosedProjects] = useState<string[]>(
+    () => loadUiPrefs().closedProjects ?? [],
+  );
+  const closedProjectsRef = useRef<string[]>(closedProjects);
+  closedProjectsRef.current = closedProjects;
+  /** Folders the app just opened, used, or created a session in are no longer
+   *  removed. `project-membership.ts` decides what counts as reopening one. */
+  const reopenProjects = useCallback((dirs: readonly string[]): void => {
+    const next = reopenedClosedProjects(closedProjectsRef.current, dirs);
+    if (next.length === closedProjectsRef.current.length) return;
+    closedProjectsRef.current = next;
+    setClosedProjects(next);
+    saveUiPrefs({ closedProjects: next });
+  }, []);
   /**
    * Mirror of `state.workflows` for deploy()'s provenance lookup. deploy is
    * memoised WITHOUT state in its deps on purpose — inFlightDeploys dedupes
@@ -1157,6 +1229,57 @@ export function useHarnessState(): HarnessStateHook {
     }
   }, []);
 
+  /**
+   * "I opened this folder" — the one place that records it.
+   *
+   * `recentDirs` is the harness's only workspace list, and therefore the
+   * rail's, so every act that MEANS opening a folder lands here: starting a
+   * session in it, and registering an agent that no open project contains.
+   * What must NOT land here is an agent's own directory when a project already
+   * holds it — see `connectWorkflow`.
+   *
+   * Optimistic, then reconciled: the server decides what actually qualifies (it
+   * must resolve to a real directory), so its sanitized list replaces the guess
+   * and stray free text never lingers in the UI.
+   *
+   * The list is built from the REF before any state is touched, because it is
+   * also the PATCH body and must exist synchronously. It used to be assigned
+   * inside the `setSettings` updater, which worked only by accident: React
+   * invokes a useState updater eagerly — synchronously, inside the dispatch —
+   * when that hook has no pending update, as a bail-out optimization. That is
+   * NOT a guarantee. With an update already queued on this hook (a session
+   * create landing near the boot settings fetch, say) the updater runs later
+   * instead and the PATCH ships the initializer, `[]` — and because the server
+   * MERGES a settings patch, that is a real erasure of the persisted list, not
+   * a no-op. Reintroducing the old form still passed the e2e, because the eager
+   * path covers the common case; the bug was the dependence on it.
+   */
+  const rememberProjectDir = useCallback(
+    async (dir: string): Promise<void> => {
+      reopenProjects([dir]);
+      const nextRecentDirs = [
+        dir,
+        ...(settingsRef.current?.recentDirs ?? []).filter(
+          (entry) => entry !== dir,
+        ),
+      ].slice(0, RECENT_DIRS_UI_CAP);
+      setSettings((prev) =>
+        prev ? { ...prev, recentDirs: nextRecentDirs } : prev,
+      );
+      try {
+        const updated = await api.updateSettings({
+          recentDirs: nextRecentDirs,
+        });
+        setSettings((prev) =>
+          prev ? { ...prev, recentDirs: updated.recentDirs } : prev,
+        );
+      } catch {
+        // Non-fatal: whatever the caller was really doing already succeeded.
+      }
+    },
+    [reopenProjects],
+  );
+
   const createSession = useCallback(
     async (req: CreateSessionRequest): Promise<HarnessSession> => {
       const session = await api.createSession(req);
@@ -1172,46 +1295,13 @@ export function useHarnessState(): HarnessStateHook {
       );
       selectSession(session.id);
 
-      // Built from the ref BEFORE touching state, because this value is also the
-      // PATCH body below and must exist synchronously.
-      //
-      // It used to be assigned INSIDE the setSettings updater on the line below.
-      // That worked only by accident: React invokes a useState updater eagerly —
-      // synchronously, inside the dispatch — when that hook has no pending update,
-      // as a bail-out optimization. It is NOT a guarantee. With an update already
-      // queued on this hook (a session create landing near the boot settings
-      // fetch, say) the updater runs later instead, and the PATCH ships the
-      // initializer: `[]`. The server MERGES a settings patch, so that is a real
-      // erasure of the persisted list, not a no-op.
-      //
-      // Verified: reintroducing the old form still passes the e2e below, because
-      // the eager path covers the common case. The bug is the dependence on it.
-      const nextRecentDirs = [
-        req.cwd,
-        ...(settingsRef.current?.recentDirs ?? []).filter(
-          (dir) => dir !== req.cwd,
-        ),
-      ].slice(0, RECENT_DIRS_UI_CAP);
-      setSettings((prev) =>
-        prev ? { ...prev, recentDirs: nextRecentDirs } : prev,
-      );
-      // The server is the source of truth for what actually qualifies as a
-      // recent dir (must resolve to a real, existing directory) — replace the
-      // optimistic guess with its sanitized response so invalid input (e.g.
-      // stray free text typed into the directory field) never lingers in the UI.
-      try {
-        const updated = await api.updateSettings({
-          recentDirs: nextRecentDirs,
-        });
-        setSettings((prev) =>
-          prev ? { ...prev, recentDirs: updated.recentDirs } : prev,
-        );
-      } catch {
-        // Non-fatal — session creation itself already succeeded.
-      }
+      // Starting a session in a folder is opening it: the folder joins the
+      // project list, and a project the user had removed comes back rather
+      // than hosting a session nothing shows.
+      await rememberProjectDir(req.cwd);
       return session;
     },
-    [selectSession],
+    [selectSession, rememberProjectDir],
   );
 
   const attachFile = useCallback(
@@ -1432,14 +1522,55 @@ export function useHarnessState(): HarnessStateHook {
       // Connecting an existing agent is an import, not a build — baseline it so
       // it is never counted as newly built.
       (seenAgentPathsRef.current ??= new Set<string>()).add(workflow.path);
+      /* WHERE THIS AGENT BELONGS IN THE PROJECT LIST (SAP-2932).
+         Three cases, and only the last one records anything.
+
+         The project holding it was REMOVED: reopen that folder. Filing the
+         agent into a hidden project would leave an agent that exists and
+         nothing shows, and giving it a root of its own would mint exactly the
+         row the gate below exists to stop. Registering an agent is an act of
+         interest in the folder that holds it. */
+      const hiding = closedProjectsHolding(
+        closedProjectsRef.current,
+        workflow.path,
+      );
+      if (hiding.length > 0) {
+        reopenProjects(hiding);
+      } else {
+        /* AN AGENT'S OWN DIRECTORY IS NOT A PROJECT. "Opening a folder IS
+           opening a workspace" is true of a folder you CHOSE and false of the
+           directory an agent happens to live in. Remembering it
+           unconditionally is what gave a real install both `acme-app` AND
+           `acme-app/sales-outreach` after a build — one row per agent, each
+           stuttering its own name, 24 of that install's 40 rows.
+
+           So the folder is remembered only when NO open project contains the
+           agent; then it is the honest answer, because the alternative is,
+           again, an agent that exists and nothing shows. The decision is
+           `agentNeedsOwnProject`, and its unit test is where the rule is
+           pinned — the containment CAUSE, as opposed to the rendered symptom
+           that `e2e/accumulation-guard.spec.ts` sweeps for.
+
+           `openRoots` is recentDirs AND the session cwds: recentDirs is capped
+           at 8 and session cwds are not, so a project can outlive its entry in
+           the list, and checking the list alone would mint a second row for an
+           agent the rail is already showing. */
+        const openRoots = [
+          ...(settingsRef.current?.recentDirs ?? []),
+          ...sessionsRef.current.map((session) => session.cwd),
+        ];
+        if (agentNeedsOwnProject(workflow.path, openRoots)) {
+          await rememberProjectDir(workflow.path);
+        }
+      }
       return workflow;
     },
-    [],
+    [rememberProjectDir, reopenProjects],
   );
 
   const scanWorkflows = useCallback(
-    async (root: string): Promise<WorkflowInfo[]> => {
-      const found = await api.scanWorkflows(root);
+    async (root: string): Promise<WorkflowScanOutcome> => {
+      const outcome = await api.scanWorkflows(root);
       // The scan registers server-side; re-list so every discovered agent
       // joins the rail in one shot instead of trickling in per connect.
       const workflows = await refreshWorkflows();
@@ -1447,9 +1578,157 @@ export function useHarnessState(): HarnessStateHook {
       // never inflates the built-agents count.
       const seen = (seenAgentPathsRef.current ??= new Set<string>());
       for (const workflow of workflows) seen.add(workflow.path);
-      return found;
+      // Remember what the walk declined to enter, per root. A project row that
+      // ends up empty needs this to tell "there is nothing here" apart from
+      // "I did not look in there" — the two look identical without it.
+      setUnsearchedCheckouts((prev) =>
+        outcome.repositoryBoundaries.length > 0
+          ? { ...prev, [root]: outcome.repositoryBoundaries }
+          : Object.keys(prev).includes(root)
+            ? Object.fromEntries(Object.entries(prev).filter(([key]) => key !== root))
+            : prev,
+      );
+      return outcome;
     },
     [refreshWorkflows],
+  );
+
+  /**
+   * REMOVE PROJECT (SAP-2932) — the release valve for accumulation.
+   *
+   * Out of `recentDirs`, out of the rail, and the live sessions rooted in it
+   * are ended. Nothing on disk is created, moved or deleted; every rule about
+   * what "rooted in it" means, and what the list looks like afterwards, lives
+   * in `project-membership.ts` so the confirm's count and the rows that
+   * disappear can never come from two different opinions.
+   *
+   * The tombstone is written FIRST and independently of the requests. It is
+   * the only part of a removal that outlives the page, and it has to outlive a
+   * session record specifically: `recentDirs` forgets the folder immediately,
+   * but the sessions that ran there stay in the registry as exited and their
+   * cwds are project roots too — so without it the project is back on the next
+   * reload, wearing a dead session's cwd.
+   */
+  /**
+   * "Open this folder as a project."
+   *
+   * Two things, in this order, and the first is why the second is safe.
+   *
+   * TOMBSTONES INSIDE THE OPENED FOLDER ARE DROPPED, not just the one that
+   * names it. `hiddenByClosedProject` deliberately refuses to let an EQUAL
+   * entry un-close a root (the next boot would re-record it and quietly undo
+   * every removal), and it rescues a path only via an open root STRICTLY
+   * INSIDE the closed one. Both rules are right, and together they leave a hole:
+   * remove `~/acme`, then open `~/` above it, and `~/acme`'s agents are inside
+   * a project the user has open and still rendered nowhere — an agent that
+   * exists and nothing shows, which is the failure this whole module is
+   * organised around. You cannot open a folder as a project and keep part of it
+   * removed; the rail would show a project silently missing its contents.
+   *
+   * Then the folder is remembered, which is what puts the row on screen.
+   */
+  const openProject = useCallback(
+    async (root: string): Promise<void> => {
+      const swallowed = closedProjectsRef.current.filter((closed) =>
+        rootContains(root, closed),
+      );
+      if (swallowed.length > 0) reopenProjects(swallowed);
+      await rememberProjectDir(root);
+      // AND SCAN IT. Remembering the root only draws the row; nothing in the
+      // harness scans a folder just because it became a project — the scan
+      // triggers are boot(launchDir), session-create, workspace-change,
+      // agent-linked, agent-moved and an explicit request (see
+      // docs/agent-discovery.md). So opening a folder whose agents were not
+      // already registered produced a project row with NOTHING UNDER IT, which
+      // reads as "adding a project did nothing" — the exact symptom reported
+      // against round 2. Mock mode hid it because its fixtures arrive
+      // pre-registered.
+      //
+      // Opening a folder IS the user asking for its agents, which is the
+      // explainability rule discovery is built on, and the scan is bounded by
+      // the node budget and stops at repository boundaries — so this cannot
+      // wander into sibling checkouts the way the old Add-all did.
+      //
+      // A scan failure must not un-open the project: the row is already correct
+      // and the folder is already remembered, so this degrades to "no agents
+      // found yet" rather than throwing out of the open.
+      try {
+        await scanWorkflows(root);
+      } catch (err) {
+        console.warn("[harness] scan after opening project failed", root, err);
+      }
+    },
+    [reopenProjects, rememberProjectDir, scanWorkflows],
+  );
+
+  const removeProject = useCallback(
+    async (root: string): Promise<void> => {
+      const plan = planProjectRemoval({
+        root,
+        recentDirs: settingsRef.current?.recentDirs ?? [],
+        sessions: sessionsRef.current,
+      });
+      const closed = [
+        ...closedProjectsRef.current.filter((entry) => !samePath(entry, root)),
+        root,
+      ];
+      closedProjectsRef.current = closed;
+      setClosedProjects(closed);
+      saveUiPrefs({ closedProjects: closed });
+
+      // Focus cannot stay on a session this removal is ending. Bumping the
+      // switch sequence first invalidates any resume already in flight, which
+      // would otherwise claim the pane back for a session that is about to die.
+      const ending = new Set(plan.endSessionIds);
+      if (ending.size > 0) {
+        switchSeqRef.current += 1;
+        setActiveSessionId((prev) =>
+          prev != null && ending.has(prev) ? null : prev,
+        );
+      }
+
+      const outcome = await applyProjectRemoval(plan, {
+        endSession: (id) => api.killSession(id),
+        saveRecentDirs: async (recentDirs) => {
+          const next = [...recentDirs];
+          setSettings((prev) => (prev ? { ...prev, recentDirs: next } : prev));
+          try {
+            const updated = await api.updateSettings({ recentDirs: next });
+            setSettings((prev) =>
+              prev ? { ...prev, recentDirs: updated.recentDirs } : prev,
+            );
+          } catch {
+            // Non-fatal for the rail — the row is already gone, and the
+            // tombstone keeps it gone across the reload that re-reads settings.
+          }
+        },
+      });
+
+      // The sessions that actually died leave the list, exactly as closing one
+      // by hand does. A session that refused to die stays visible and is named
+      // in the toast: a removal that silently orphaned a live PTY would be a
+      // worse answer than an honest partial one.
+      const dead = new Set(
+        plan.endSessionIds.filter((id) => !outcome.failedSessionIds.includes(id)),
+      );
+      if (dead.size > 0) {
+        setState((prev) =>
+          prev
+            ? { ...prev, sessions: prev.sessions.filter((s) => !dead.has(s.id)) }
+            : prev,
+        );
+      }
+      if (outcome.failedSessionIds.length > 0) {
+        setToast(
+          createToastMessage(
+            outcome.failedSessionIds.length === 1
+              ? "Project removed, but one session could not be ended."
+              : `Project removed, but ${outcome.failedSessionIds.length} sessions could not be ended.`,
+          ),
+        );
+      }
+    },
+    [],
   );
 
   const listHarnesses = useCallback(
@@ -1797,6 +2076,10 @@ export function useHarnessState(): HarnessStateHook {
     closeSession,
     connectWorkflow,
     scanWorkflows,
+    closedProjects,
+    unsearchedCheckouts,
+    removeProject,
+    openProject,
     listHarnesses,
     bindWorkflow,
     updateSettings,

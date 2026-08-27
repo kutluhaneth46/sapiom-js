@@ -299,24 +299,33 @@ test("inject macros are enabled once the boot session and a deployed workflow ar
 });
 
 test.describe("three-zone IA (rail explorer, tab strip, right pane)", () => {
-  test("rail is workspace > agent only, with no session rows", async ({ page }) => {
-    // Zone 1 is a pure explorer: workspace folder headers and agent rows, no
-    // sessions anywhere in the tree.
+  test("rail is project > agent only, with no session rows", async ({ page }) => {
+    // Zone 1 is a pure explorer: project rows and agent rows, no sessions
+    // anywhere in the tree.
     await expect(page.getByTestId("workspace-group-acme-app")).toBeVisible();
     await expect(page.getByTestId("workspace-group-rfq-agent")).toBeVisible();
-    // onboarding-flow is a known workspace (in recentDirs), so it files under
-    // its own folder header rather than an orphan bucket.
+    // onboarding-flow is a known project (in recentDirs), so it files under its
+    // own project row rather than an outside-your-projects bucket.
     await expect(page.getByTestId("workspace-group-onboarding-flow")).toBeVisible();
 
-    // Agents carry a deployed/draft cloud state; no session dot, no expander.
-    await expect(page.getByTestId("workflow-status-leasing")).toHaveAttribute("data-deployed", "true");
-    await expect(page.getByTestId("workflow-status-rfq")).toHaveAttribute("data-deployed", "false");
+    // An AGENT row carries a deployed/draft cloud state; no session dot, no
+    // expander.
+    await expect(page.getByTestId("workflow-status-/Users/demo/acme-app/leasing")).toHaveAttribute("data-deployed", "true");
     await expect(page.locator("[data-testid^='workflow-session-dot-']")).toHaveCount(0);
     await expect(page.locator("[data-testid^='workflow-expander-']")).toHaveCount(0);
     await expect(page.locator("[data-testid^='rail-session-']")).toHaveCount(0);
 
-    // A folder with live sessions but no agent (scratch) is the one focusable
-    // folder row — its sessions live in the tab strip, not the rail.
+    // `rfq-agent` is a project root that IS an agent, so it gets exactly ONE
+    // row — and a project row carries NO deploy glyph, however much of an agent
+    // it also is. Deployment is a per-agent fact; on a project row it read as a
+    // property of the project. (Retired with the Project axis, SAP-2928.)
+    const rfq = page.getByTestId("workflow-rfq");
+    await expect(rfq).toHaveCount(1);
+    await expect(rfq).toHaveClass(/workspace-row/);
+    await expect(page.getByTestId("workflow-status-/Users/demo/rfq-agent")).toHaveCount(0);
+
+    // A project with live sessions but no agent (scratch) is the one focusable
+    // project row — its sessions live in the tab strip, not the rail.
     await expect(page.getByTestId("workspace-focus-scratch")).toBeVisible();
 
     // Exactly one filled selection: the focused agent (leasing on load).
@@ -436,11 +445,17 @@ test.describe("three-zone IA (rail explorer, tab strip, right pane)", () => {
     await expect(start).toContainText("Start a session to map, run, and inspect this agent.");
     await expect(page.getByTestId("open-agent-start-session")).toBeVisible();
 
-    // The session bar names the same agent with an honest "no session" tag, and
-    // the right pane echoes the state instead of another agent's board.
+    // The session bar names the same agent with an honest "no session" tag. The
+    // right pane no longer echoes that absence: since SAP-2931 the board is the
+    // rail SELECTION, served for an unsessioned agent by the workflow-keyed
+    // route, so what draws here is rfq's own board — never the boot session's.
     await expect(page.getByTestId("session-context-title")).toHaveText("rfq");
     await expect(page.getByTestId("session-status-tag")).toContainText("no session");
-    await expect(page.getByTestId("canvas-empty-no-session")).toContainText("No running session for rfq");
+    await expect(page.getByTestId("canvas-empty-no-session")).toHaveCount(0);
+    await expect(page.locator(".canvas-iframe")).toHaveAttribute(
+      "srcdoc",
+      /rfq — mock agent board/,
+    );
 
     // Focusing rfq never touched the boot session's binding.
     await expect(
@@ -775,34 +790,38 @@ test.describe("dead sessions never trap the user", () => {
   });
 });
 
-test("the rail's ⋯ menu offers a Group by toggle (Workspace / Deployment)", async ({ page }) => {
-  // The old projection toggle and the custom-groups view are gone; grouping now
-  // lives in the ⋯ menu as an explicit Workspace / Deployment choice (docs/IA.md).
+test("the rail's filing panel offers Group by / Sort by as visible dropdowns", async ({ page }) => {
+  // The old projection toggle and the custom-groups view are gone; filing lives
+  // behind the settings ellipsis as two dropdowns that state their current value on
+  // the face of the control.
   await expect(page.getByTestId("rail-view-toggle")).toHaveCount(0);
   await expect(page.locator("[data-testid^='custom-group-']")).toHaveCount(0);
 
   await page.getByTestId("history-trigger").click();
   await expect(page.getByTestId("history-menu")).toBeVisible();
-  const workspace = page.getByTestId("group-workspace");
-  const deployment = page.getByTestId("group-deployment");
-  await expect(workspace).toBeVisible();
-  await expect(deployment).toBeVisible();
-  // Workspace is the default grouping.
-  await expect(workspace).toHaveAttribute("aria-checked", "true");
-  await expect(deployment).toHaveAttribute("aria-checked", "false");
+  await expect(page.getByTestId("filing-group-by")).toHaveValue("project");
+  await expect(page.getByTestId("filing-sort-by")).toHaveValue("recent");
+  // Deployment is RETIRED: it bucketed `definitionId != null`, a fact every
+  // agent row already prints as a cloud glyph, so it re-sorted the rail to tell
+  // you nothing new (SAP-2928).
+  await expect(page.getByTestId("group-deployment")).toHaveCount(0);
+  await expect(page.getByTestId("group-workspace")).toHaveCount(0);
   await page.keyboard.press("Escape");
 
-  // Agents still render as first-class rows; onboarding-flow files under its own
-  // workspace folder (it's in recentDirs), not an orphan bucket.
+  // Agents still render as first-class rows; onboarding-flow is a project root
+  // that IS an agent, so its one row carries the agent's identity.
   await expect(page.getByTestId("workspace-group-onboarding-flow")).toBeVisible();
   await expect(page.getByTestId("workflow-onboarding-flow")).toBeVisible();
 });
 
 test.describe("held arrangement", () => {
-  test("workspace collapse and the right tab survive a reload", async ({ page }) => {
-    // Collapse the rfq workspace group (plain header toggles on click).
-    await page.getByTestId("workspace-group-rfq-agent").locator(".workspace-row-main").click();
-    await expect(page.getByTestId("workflow-rfq")).toHaveCount(0);
+  test("project collapse and the right tab survive a reload", async ({ page }) => {
+    // Collapse the acme-app project (its main button toggles on click — a
+    // project row with no root agent of its own opens and closes).
+    // Not rfq-agent: that root IS an agent, so its row focuses rather than
+    // folds, and there is nothing underneath it to hide.
+    await page.getByTestId("workspace-group-acme-app").locator(".workspace-row-main").click();
+    await expect(page.getByTestId("workflow-leasing")).toHaveCount(0);
 
     // Pick the Steps tab.
     await page.getByTestId("right-tab-steps").click();
@@ -810,11 +829,11 @@ test.describe("held arrangement", () => {
     await page.reload();
     await expect(page.locator(".rail-workflows")).toBeVisible();
 
-    // Restored: the group stays folded and the pane still remembers the Steps
+    // Restored: the project stays folded and the pane still remembers the Steps
     // tab. The right pane's open/closed state is NOT a persisted arrangement —
     // it follows the active session's board (a populated session shows it), so
     // a fold does not survive a reload (the canvas auto-reveal contract).
-    await expect(page.getByTestId("workflow-rfq")).toHaveCount(0);
+    await expect(page.getByTestId("workflow-leasing")).toHaveCount(0);
     await expect(page.getByTestId("right-tab-steps")).toHaveAttribute("aria-selected", "true");
   });
 });
@@ -1900,12 +1919,28 @@ test("steps tab drills into a step's real transitions and slides back", async ({
 test("canvas repair sends the coding agent an Agent-terminology prompt", async ({ page }) => {
   const canvasBody = page.frameLocator(".canvas-iframe").locator("body");
   await expect(canvasBody).toBeVisible();
-  await canvasBody.evaluate(() => {
-    window.parent.postMessage(
-      { type: "sapiom-canvas:error", title: "leasing", reason: "TypeScript extraction failed" },
-      "*",
-    );
-  });
+  // POST UNTIL IT LANDS. The board is an srcdoc iframe the shell re-renders, so
+  // a single postMessage can be aimed at a document that is replaced before it
+  // is delivered — the message is simply lost and the assertion below then
+  // blames the error pane. Visible-then-evaluate is not a guarantee that the
+  // document surviving the evaluate is the one the shell is listening to.
+  // Re-posting is safe: the handler renders the same error state each time.
+  await expect
+    .poll(
+      async () => {
+        await canvasBody
+          .evaluate(() => {
+            window.parent.postMessage(
+              { type: "sapiom-canvas:error", title: "leasing", reason: "TypeScript extraction failed" },
+              "*",
+            );
+          })
+          .catch(() => {});
+        return page.getByTestId("canvas-render-error").isVisible().catch(() => false);
+      },
+      { timeout: 10_000, intervals: [100, 200, 300, 500] },
+    )
+    .toBe(true);
   await expect(page.getByTestId("canvas-render-error")).toBeVisible();
   await page.getByTestId("canvas-error-fix").click();
 

@@ -12,7 +12,7 @@ import {
   type Server as HttpServer,
 } from "node:http";
 import { readFileSync } from "node:fs";
-import { dirname, join, sep } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import express, { type Express } from "express";
 import { WebSocketServer } from "ws";
@@ -43,6 +43,7 @@ import {
   type WorkflowRegistryLike,
   createWorkflowsRouter,
 } from "../core/workflow-registry.js";
+import { AgentProjectScanBudget } from "../core/agent-project-discovery.js";
 import { DEFAULT_MACROS } from "../core/macros.js";
 import { createEventStore } from "../core/collector/store.js";
 import {
@@ -118,6 +119,9 @@ import {
 } from "./ingest.js";
 import { createCanvasRouter } from "./canvas.js";
 import { createCanvasRenderRouter } from "./canvas-render.js";
+import { createWorkflowGraphRouter } from "./workflow-graph.js";
+import { createStudioRailRouter } from "./studio-rail.js";
+import { createAgentMoveRouter, moveTargetDirs, remapSessions } from "./agent-move.js";
 import { createMacrosRouter } from "./macros.js";
 import { createFsRouter } from "./fs.js";
 import { createRunsRouter } from "./runs.js";
@@ -267,6 +271,50 @@ export interface HarnessServer {
 // root, so this resolves correctly either way.
 function packageRoot(): string {
   return join(dirname(fileURLToPath(import.meta.url)), "..", "..");
+}
+
+/**
+ * Why a registry scan is running. There are exactly six ways an agent can enter
+ * this install's registry and five of them are a scan, so naming them is what
+ * turns "the rail grew rows I did not ask for" into a line in the log:
+ *
+ *   boot             the directory the studio was launched in
+ *   session-create   the directory a new session was opened in
+ *   workspace-change the session cwd whose marker set the watcher saw change
+ *   agent-linked     one agent's own directory, after `deploy` wrote its id
+ *   agent-moved      the destination of a rail drag
+ *   requested        POST /api/workflows/scan — the "Add all" button
+ *
+ * The sixth, POST /api/workflows/connect, registers exactly one path and is not
+ * a walk at all.
+ */
+type WorkflowScanReason =
+  | "boot"
+  | "session-create"
+  | "workspace-change"
+  | "agent-linked"
+  | "agent-moved"
+  | "requested";
+
+/**
+ * One line per scan, on stderr with the rest of the harness's operational log.
+ * Deliberately unconditional rather than debug-gated: a scan happens a handful
+ * of times per session, and the one question this log answers ("what put that
+ * there?") is only ever asked after the fact.
+ */
+function logAgentScan(
+  reason: WorkflowScanReason,
+  root: string,
+  found: number,
+  budget: AgentProjectScanBudget,
+): void {
+  const truncated = budget.truncated
+    ? `, TRUNCATED at depth ${String(budget.truncatedAtDepth)} (envelope ${budget.envelopeDepth})`
+    : "";
+  console.error(
+    `[harness] agent scan (${reason}) ${root}: ${found} agent(s), ` +
+      `${budget.visited} dirs${truncated}`,
+  );
 }
 
 /** Whether two workflow lists are equivalent for the rail's purposes —
@@ -845,7 +893,9 @@ export const startServer = async (
     if (!session || session.status === "exited") return;
     const before = workflowsCache;
     await workflowRegistry.prune();
-    await workflowRegistry.scan(session.cwd);
+    const rescanBudget = new AgentProjectScanBudget();
+    const rescanFound = await workflowRegistry.scan(session.cwd, rescanBudget);
+    logAgentScan("workspace-change", session.cwd, rescanFound.length, rescanBudget);
     const after = await workflowRegistry.list();
     workflowsCache = after;
 
@@ -1021,10 +1071,21 @@ export const startServer = async (
   // merged registry) — callers use this to decide whether THIS scan turned
   // up something new worth an unprompted canvas render, without conflating
   // it with unrelated workflows some earlier scan already found elsewhere.
+  //
+  // Every call names WHY it is scanning. The registry is the thing the user
+  // asked "how am I finding my agents?" about, and until this line existed the
+  // only honest answer available after the fact was "something scanned
+  // something". One install ended up with 88 agents across twelve repositories
+  // nobody had opened, and reconstructing which root did it took a filesystem
+  // archaeology session. Now every scan says its root, its reason, what it
+  // found, what it cost, and what it declined to enter.
   const scanWorkflowsAndBroadcast = async (
     root: string,
+    reason: WorkflowScanReason,
   ): Promise<WorkflowInfo[]> => {
-    const found = await workflowRegistry.scan(root);
+    const budget = new AgentProjectScanBudget();
+    const found = await workflowRegistry.scan(root, budget);
+    logAgentScan(reason, root, found.length, budget);
     workflowsCache = await workflowRegistry.list();
     // Rewrite every open session's context file before broadcasting — a
     // listener reacting to workflows.changed (the SPA, or an agent that
@@ -1110,7 +1171,7 @@ export const startServer = async (
     reactToRenderOutcome(session, outcome);
   };
 
-  const initialWorkflowScan = scanWorkflowsAndBroadcast(launchDir).catch(
+  const initialWorkflowScan = scanWorkflowsAndBroadcast(launchDir, "boot").catch(
     (err: unknown) => {
       console.error("[harness] initial agent scan failed:", err);
       return [] as WorkflowInfo[];
@@ -1241,7 +1302,7 @@ export const startServer = async (
       renderCanvas,
       onTelemetryOptInChange: (optIn) => batcher.setTelemetryOptIn(optIn),
       onSessionCreated: (cwd, harnessSessionId) => {
-        scanWorkflowsAndBroadcast(cwd)
+        scanWorkflowsAndBroadcast(cwd, "session-create")
           .then((found) => {
             // Only auto-render when THIS session's own directory turned up a
             // workflow — an unrelated project scanned earlier elsewhere in
@@ -1298,7 +1359,20 @@ export const startServer = async (
   // as WorkflowRegistryLike so this wrapper needs no unsafe cast.
   const enrichedWorkflowRegistry: WorkflowRegistryLike = {
     list: () => workflowRegistry.list().then(enrichWorkflows),
-    scan: (root: string) => workflowRegistry.scan(root),
+    scan: async (root: string) => {
+      const budget = new AgentProjectScanBudget();
+      const found = await workflowRegistry.scan(root, budget);
+      logAgentScan("requested", root, found.length, budget);
+      return found;
+    },
+    scanWithBoundaries: async (root: string) => {
+      const budget = new AgentProjectScanBudget();
+      const found = await workflowRegistry.scan(root, budget);
+      logAgentScan("requested", root, found.length, budget);
+      // The boundaries the walk stopped at travel with the result so the rail
+      // can explain an empty project instead of misdescribing one.
+      return { found, repositoryBoundaries: budget.repositoryBoundaries };
+    },
     connectPath: (inputPath: string) => workflowRegistry.connectPath(inputPath),
   };
   app.use(
@@ -1349,7 +1423,72 @@ export const startServer = async (
       // which the watcher's directory-set diff cannot see — rescan that project
       // so the Draft→Deployed chip and the deploy-gated actions update.
       onLinked: async (workflow) => {
-        await scanWorkflowsAndBroadcast(workflow.path);
+        await scanWorkflowsAndBroadcast(workflow.path, "agent-linked");
+      },
+    }),
+  );
+  // IA-01: the session-free, workflow-keyed canvas route. Same derivation the
+  // session-bound render uses, keyed by the agent's absolute path instead of a
+  // session id — so a board can be read for an agent that has never hosted a
+  // session. Resolution goes through the same live cache actions.ts uses, so
+  // only registered agents are ever read from disk.
+  app.use(
+    createWorkflowGraphRouter({
+      resolveWorkflow: (agentPath) =>
+        workflowsCache.find((w) => resolve(w.path) === agentPath) ?? null,
+    }),
+  );
+  // SAP-2929: the Group axis's stored arrangement, one `.sapiom/studio-rail.json`
+  // per project root, plus the launch edges it seeds from. Writable roots are
+  // exactly the roots the rail can SHOW — recentDirs, the configured project
+  // root, and live session cwds — so the route cannot be aimed anywhere the
+  // studio has not already been pointed.
+  app.use(
+    createStudioRailRouter({
+      listKnownRoots: async () => {
+        const stored = await loadSettings(statePaths.settings);
+        return [
+          ...stored.recentDirs,
+          ...(stored.projectRoot ? [stored.projectRoot] : []),
+          ...sessionManager.list().map((session) => session.cwd),
+        ];
+      },
+      listWorkflows: () => workflowsCache,
+    }),
+  );
+  // SAP-2930: the Project axis's drag, performed on disk. Its own guards live
+  // in the module — a planner is not a permission system, so the route stats
+  // the destination itself. Only a REGISTERED agent may be moved, resolved
+  // through the same live cache the canvas and action routes use, and it may
+  // only be moved INTO a directory the rail can show: the roots studio-rail
+  // already treats as writable, plus the branching directories the Project
+  // axis draws between a root and an agent. Both sides of the move are
+  // therefore server-authored paths, not strings off the request.
+  app.use(
+    createAgentMoveRouter({
+      resolveAgent: (agentPath) =>
+        workflowsCache.find((w) => resolve(w.path) === agentPath) ?? null,
+      listMoveTargetDirs: async () => {
+        const stored = await loadSettings(statePaths.settings);
+        return moveTargetDirs(
+          [
+            ...stored.recentDirs,
+            ...(stored.projectRoot ? [stored.projectRoot] : []),
+            ...sessionManager.list().map((session) => session.cwd),
+          ],
+          workflowsCache.map((w) => w.path),
+        );
+      },
+      // Everything under the moved directory travelled with it, so every live
+      // session whose cwd sat inside follows — a session left pointing at a
+      // directory that no longer exists is the whole reason this remap exists.
+      // Then prune the path that is gone and rescan the destination, which
+      // broadcasts `workflows.changed`: the rail re-derives the tree from the
+      // NEW path rather than from a stale registry row.
+      onMoved: async (from, to) => {
+        remapSessions(sessionManager.list(), from, to);
+        await workflowRegistry.prune();
+        await scanWorkflowsAndBroadcast(dirname(to), "agent-moved");
       },
     }),
   );
