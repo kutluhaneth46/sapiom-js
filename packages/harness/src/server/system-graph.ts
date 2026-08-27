@@ -2,6 +2,10 @@ import { Router } from "express";
 
 import type { WorkspaceScopeResolver } from "../core/system-graph.js";
 import type { SystemGraphStore } from "../core/system-graph-store.js";
+import {
+  SYSTEM_GRAPH_CACHE_HEADER,
+  type SystemGraphCacheStatus,
+} from "../shared/system-graph.js";
 
 export interface SystemGraphRouterOptions {
   scopeResolver: WorkspaceScopeResolver;
@@ -25,7 +29,11 @@ export function createSystemGraphRouter(
           res.status(404).json({ error: "Workspace not found" });
           return;
         }
-        res.json(await options.store.get(scope));
+        const result = await options.store.get(scope);
+        const cacheStatus: SystemGraphCacheStatus = result.degraded
+          ? "degraded"
+          : "complete";
+        res.set(SYSTEM_GRAPH_CACHE_HEADER, cacheStatus).json(result.graph);
       } catch (err) {
         next(err);
       }

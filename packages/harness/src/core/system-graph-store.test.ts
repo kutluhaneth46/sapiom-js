@@ -6,7 +6,10 @@ import type {
   SystemGraphBuildResult,
   WorkspaceScope,
 } from "./system-graph.js";
-import { SystemGraphStore } from "./system-graph-store.js";
+import {
+  SystemGraphStore,
+  type StoredSystemGraph,
+} from "./system-graph-store.js";
 
 const scope: WorkspaceScope = {
   workspaceKey: "workspace-one",
@@ -24,6 +27,10 @@ function buildResult(cacheable = true): SystemGraphBuildResult {
   return { cacheable, graph };
 }
 
+function storedResult(degraded = false): StoredSystemGraph {
+  return { graph, degraded };
+}
+
 describe("SystemGraphStore", () => {
   it("coalesces concurrent and sequential reads for an unchanged workspace", async () => {
     let resolveBuild!: (value: SystemGraphBuildResult) => void;
@@ -37,8 +44,8 @@ describe("SystemGraphStore", () => {
     const concurrent = store.get(scope);
     expect(first).toBe(concurrent);
     resolveBuild(buildResult());
-    await expect(first).resolves.toBe(graph);
-    await expect(store.get(scope)).resolves.toBe(graph);
+    await expect(first).resolves.toEqual(storedResult());
+    await expect(store.get(scope)).resolves.toEqual(storedResult());
     expect(builder.build).toHaveBeenCalledTimes(1);
   });
 
@@ -52,7 +59,7 @@ describe("SystemGraphStore", () => {
     const store = new SystemGraphStore(builder);
 
     await expect(store.get(scope)).rejects.toThrow("scan failed");
-    await expect(store.get(scope)).resolves.toBe(graph);
+    await expect(store.get(scope)).resolves.toEqual(storedResult());
     expect(builder.build).toHaveBeenCalledTimes(2);
   });
 
@@ -67,7 +74,7 @@ describe("SystemGraphStore", () => {
     expect(builder.build).toHaveBeenCalledTimes(2);
   });
 
-  it("coalesces but does not retain a degraded graph", async () => {
+  it("coalesces a degraded graph and allows one later re-enrichment", async () => {
     const build = vi
       .fn()
       .mockResolvedValueOnce(buildResult(false))
@@ -77,8 +84,51 @@ describe("SystemGraphStore", () => {
     const first = store.get(scope);
     const concurrent = store.get(scope);
     expect(first).toBe(concurrent);
-    await expect(first).resolves.toBe(graph);
-    await expect(store.get(scope)).resolves.toBe(graph);
+    await expect(first).resolves.toEqual(storedResult(true));
+    await expect(store.get(scope)).resolves.toEqual(storedResult());
     expect(build).toHaveBeenCalledTimes(2);
+  });
+
+  it("retains the second degraded graph until explicit invalidation", async () => {
+    const build = vi.fn(async () => buildResult(false));
+    const store = new SystemGraphStore({ build });
+
+    await expect(store.get(scope)).resolves.toEqual(storedResult(true));
+    const second = store.get(scope);
+    await expect(second).resolves.toEqual(storedResult(true));
+    expect(store.get(scope)).toBe(second);
+    expect(build).toHaveBeenCalledTimes(2);
+
+    store.invalidate(scope.workspaceKey);
+    await expect(store.get(scope)).resolves.toEqual(storedResult(true));
+    expect(build).toHaveBeenCalledTimes(3);
+  });
+
+  it("does not let an invalidated in-flight build consume the retry", async () => {
+    let resolveFirst!: (value: SystemGraphBuildResult) => void;
+    let resolveSecond!: (value: SystemGraphBuildResult) => void;
+    const firstBuild = new Promise<SystemGraphBuildResult>((resolve) => {
+      resolveFirst = resolve;
+    });
+    const secondBuild = new Promise<SystemGraphBuildResult>((resolve) => {
+      resolveSecond = resolve;
+    });
+    const build = vi
+      .fn()
+      .mockReturnValueOnce(firstBuild)
+      .mockReturnValueOnce(secondBuild)
+      .mockResolvedValueOnce(buildResult());
+    const store = new SystemGraphStore({ build });
+
+    const stale = store.get(scope);
+    store.invalidate(scope.workspaceKey);
+    const current = store.get(scope);
+    resolveFirst(buildResult(false));
+    await stale;
+    resolveSecond(buildResult(false));
+    await current;
+
+    await expect(store.get(scope)).resolves.toEqual(storedResult());
+    expect(build).toHaveBeenCalledTimes(3);
   });
 });

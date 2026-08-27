@@ -6,6 +6,10 @@
 export type WorkspaceKey = string;
 export type AgentKey = string;
 
+/** Internal HTTP metadata; it is deliberately not part of SystemGraph JSON. */
+export const SYSTEM_GRAPH_CACHE_HEADER = "X-Sapiom-System-Graph-Cache";
+export type SystemGraphCacheStatus = "complete" | "degraded";
+
 export interface WorkspaceScopeSummary {
   workspaceKey: WorkspaceKey;
   /** Used only to join the existing workspace-folder projection in AppState. */

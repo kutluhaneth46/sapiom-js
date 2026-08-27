@@ -4,27 +4,15 @@ import type { SystemGraph, WorkspaceKey } from "@shared/system-graph";
 
 import type { HarnessApi } from "../lib/api";
 import { orderSystemGraphNodes } from "../lib/system-graph";
+import { createSystemGraphLoader } from "../lib/system-graph-loader";
 import { EmptyState } from "./EmptyState";
 
 /**
- * V0 mirrors the server's process-lifetime snapshot in the browser tab.
- * SAP-2904 owns source-driven invalidation and user-visible freshness states.
+ * V0 mirrors the server's process-lifetime snapshot in the browser tab, with
+ * one later-open retry for a degraded projection. SAP-2904 owns source-driven
+ * invalidation and user-visible freshness states.
  */
-const requests = new Map<WorkspaceKey, Promise<SystemGraph>>();
-
-function loadSystemGraph(
-  api: HarnessApi,
-  workspaceKey: WorkspaceKey,
-): Promise<SystemGraph> {
-  const existing = requests.get(workspaceKey);
-  if (existing) return existing;
-  const request = api.getSystemGraph(workspaceKey);
-  requests.set(workspaceKey, request);
-  void request.catch(() => {
-    if (requests.get(workspaceKey) === request) requests.delete(workspaceKey);
-  });
-  return request;
-}
+const loadSystemGraph = createSystemGraphLoader();
 
 interface SystemGraphCanvasProps {
   workspaceKey: WorkspaceKey;

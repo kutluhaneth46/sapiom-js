@@ -30,16 +30,19 @@ import type {
   WorkflowInputContractResponse,
   WorkflowInfo,
 } from "@shared/types";
-import type {
-  SystemGraph,
-  WorkspaceKey,
-  WorkspaceScopeSummary,
+import {
+  SYSTEM_GRAPH_CACHE_HEADER,
+  type SystemGraphCacheStatus,
+  type SystemGraph,
+  type WorkspaceKey,
+  type WorkspaceScopeSummary,
 } from "@shared/system-graph";
 
 import type { LocalStepTrace, LocalRunOutcome } from "@sapiom/agent-core";
 
 import { getTheme } from "./theme";
 import { parseSystemGraph } from "./system-graph";
+import type { SystemGraphLoadResult } from "./system-graph-loader";
 
 import {
   MOCK_ACCOUNT_PLAN,
@@ -269,7 +272,7 @@ export interface HarnessApi {
   authStatus(): Promise<AuthStatusResponse>;
   getState(): Promise<AppState>;
   /** Static local dependency projection for one server-issued workspace key. */
-  getSystemGraph(workspaceKey: WorkspaceKey): Promise<SystemGraph>;
+  getSystemGraph(workspaceKey: WorkspaceKey): Promise<SystemGraphLoadResult>;
   createSession(req: CreateSessionRequest): Promise<HarnessSession>;
   attachFile(id: string, req: AttachFileRequest): Promise<AttachFileResponse>;
   listSessions(): Promise<HarnessSession[]>;
@@ -375,7 +378,7 @@ class RealApi implements HarnessApi {
     return this.request<AuthStatusResponse>("/api/auth/status");
   }
 
-  private async request<T>(path: string, init?: RequestInit): Promise<T> {
+  private async response(path: string, init?: RequestInit): Promise<Response> {
     const res = await fetch(path, {
       ...init,
       headers: {
@@ -405,6 +408,11 @@ class RealApi implements HarnessApi {
         reason,
       );
     }
+    return res;
+  }
+
+  private async request<T>(path: string, init?: RequestInit): Promise<T> {
+    const res = await this.response(path, init);
     if (res.status === 204) return undefined as T;
     return (await res.json()) as T;
   }
@@ -413,16 +421,20 @@ class RealApi implements HarnessApi {
     return this.request<AppState>("/api/state");
   }
 
-  async getSystemGraph(workspaceKey: WorkspaceKey): Promise<SystemGraph> {
-    const graph = parseSystemGraph(
-      await this.request<unknown>(
-        `/api/workspaces/${encodeURIComponent(workspaceKey)}/system-graph`,
-      ),
+  async getSystemGraph(
+    workspaceKey: WorkspaceKey,
+  ): Promise<SystemGraphLoadResult> {
+    const response = await this.response(
+      `/api/workspaces/${encodeURIComponent(workspaceKey)}/system-graph`,
     );
+    const graph = parseSystemGraph((await response.json()) as unknown);
     if (graph.scope.workspaceKey !== workspaceKey) {
       throw new Error("Invalid system graph response");
     }
-    return graph;
+    const cacheStatus = response.headers.get(
+      SYSTEM_GRAPH_CACHE_HEADER,
+    ) as SystemGraphCacheStatus | null;
+    return { graph, degraded: cacheStatus === "degraded" };
   }
 
   createSession(req: CreateSessionRequest): Promise<HarnessSession> {
@@ -1049,15 +1061,19 @@ class MockApi implements HarnessApi {
     };
   }
 
-  async getSystemGraph(workspaceKey: WorkspaceKey): Promise<SystemGraph> {
+  async getSystemGraph(
+    workspaceKey: WorkspaceKey,
+  ): Promise<SystemGraphLoadResult> {
     await delay(180);
     if (!this.workspaceScopes().some((scope) => scope.workspaceKey === workspaceKey)) {
       throw new ApiError(404, "Workspace not found", "Workspace not found");
     }
+    let degraded = false;
     if (typeof window !== "undefined") {
       const win = window as unknown as {
         __HARNESS_TEST__?: Record<string, unknown>;
         __MOCK_SYSTEM_GRAPH_FAIL_ONCE__?: boolean;
+        __MOCK_SYSTEM_GRAPH_DEGRADED_REMAINING__?: number;
       };
       const previous =
         (win.__HARNESS_TEST__?.systemGraphRequests as WorkspaceKey[] | undefined) ??
@@ -1074,8 +1090,14 @@ class MockApi implements HarnessApi {
           "System graph projection failed",
         );
       }
+      const degradedRemaining =
+        win.__MOCK_SYSTEM_GRAPH_DEGRADED_REMAINING__ ?? 0;
+      degraded = degradedRemaining > 0;
+      if (degraded) {
+        win.__MOCK_SYSTEM_GRAPH_DEGRADED_REMAINING__ = degradedRemaining - 1;
+      }
     }
-    return {
+    const graph: SystemGraph = {
       kind: "system",
       scope: { kind: "working-tree", workspaceKey },
       nodes: [
@@ -1102,6 +1124,7 @@ class MockApi implements HarnessApi {
       ],
       warnings: [],
     };
+    return { graph, degraded };
   }
 
   async createSession(req: CreateSessionRequest): Promise<HarnessSession> {

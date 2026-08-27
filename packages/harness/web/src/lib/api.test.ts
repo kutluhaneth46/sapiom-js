@@ -1,12 +1,59 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import { SYSTEM_GRAPH_CACHE_HEADER } from "@shared/system-graph";
 
 import {
+  createApi,
+  isMockMode,
   parseNdjsonLine,
   progressiveLeasingRun,
   PROGRESSIVE_STEP_MS,
   terminalDeployEvent,
   type DeployStreamEvent,
 } from "./api";
+
+describe("RealApi.getSystemGraph", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("returns transport degradation metadata outside the graph JSON", async () => {
+    if (isMockMode()) return;
+    const graph = {
+      kind: "system",
+      scope: { kind: "working-tree", workspaceKey: "workspace-test" },
+      nodes: [],
+      edges: [],
+      warnings: [],
+    };
+    vi.stubGlobal("window", {
+      __HARNESS__: { token: "test-token" },
+      location: { search: "" },
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify(graph), {
+          status: 200,
+          headers: {
+            "Content-Type": "application/json",
+            [SYSTEM_GRAPH_CACHE_HEADER]: "degraded",
+          },
+        }),
+      ),
+    );
+
+    await expect(createApi().getSystemGraph("workspace-test")).resolves.toEqual(
+      { graph, degraded: true },
+    );
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/workspaces/workspace-test/system-graph",
+      expect.objectContaining({
+        headers: expect.objectContaining({ "X-Harness-Token": "test-token" }),
+      }),
+    );
+  });
+});
 
 describe("progressiveLeasingRun", () => {
   const at = (elapsed: number) => progressiveLeasingRun("exec-mock-prod-1", elapsed);

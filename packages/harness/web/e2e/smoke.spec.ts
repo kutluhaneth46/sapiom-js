@@ -499,6 +499,42 @@ test.describe("three-zone IA (rail explorer, tab strip, right pane)", () => {
       .toBe(2);
   });
 
+  test("a degraded workspace projection retries once on a later open", async ({ page }) => {
+    await page.evaluate(() => {
+      (window as unknown as {
+        __MOCK_SYSTEM_GRAPH_DEGRADED_REMAINING__?: number;
+      }).__MOCK_SYSTEM_GRAPH_DEGRADED_REMAINING__ = 2;
+    });
+
+    const openGraph = async () => {
+      await page.getByTestId("workspace-select-acme-app").click();
+      await expect(page.getByTestId("system-graph-canvas")).toBeVisible();
+    };
+    const openAgent = async () => {
+      await page
+        .getByTestId("workflow-leasing")
+        .locator(".workflow-item-trigger")
+        .click();
+      await expect(page.getByTestId("system-graph-canvas")).toHaveCount(0);
+    };
+    const requestCount = () =>
+      page.evaluate(
+        () =>
+          ((window as unknown as {
+            __HARNESS_TEST__?: { systemGraphRequests?: string[] };
+          }).__HARNESS_TEST__?.systemGraphRequests ?? []).length,
+      );
+
+    await openGraph();
+    await expect.poll(requestCount).toBe(1);
+    await openAgent();
+    await openGraph();
+    await expect.poll(requestCount).toBe(2);
+    await openAgent();
+    await openGraph();
+    await expect.poll(requestCount).toBe(2);
+  });
+
   test("switching sessions makes the canvas follow the new session's content", async ({ page }) => {
     // Zone 3 keys off the active session. sess-boot ships a bundled doc (board);
     // the second leasing session ships none — so the canvas pane OPENS for the

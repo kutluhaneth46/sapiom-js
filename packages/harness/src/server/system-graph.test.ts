@@ -7,7 +7,10 @@ import type {
   SystemGraphBuilder,
   WorkspaceScopeResolver,
 } from "../core/system-graph.js";
-import type { SystemGraph } from "../shared/system-graph.js";
+import {
+  SYSTEM_GRAPH_CACHE_HEADER,
+  type SystemGraph,
+} from "../shared/system-graph.js";
 import { createBootTokenMiddleware } from "./auth.js";
 import { createSystemGraphRouter } from "./system-graph.js";
 
@@ -40,7 +43,7 @@ describe("createSystemGraphRouter", () => {
     server = undefined;
   });
 
-  function start() {
+  function start(cacheable = true) {
     const scopeResolver: WorkspaceScopeResolver = {
       resolve: vi.fn(async (key: string) =>
         key === workspaceKey
@@ -49,7 +52,7 @@ describe("createSystemGraphRouter", () => {
       ),
     };
     const builder: SystemGraphBuilder = {
-      build: vi.fn(async () => ({ cacheable: true, graph })),
+      build: vi.fn(async () => ({ cacheable, graph })),
     };
     const app = express();
     app.use("/api", createBootTokenMiddleware("test-token"));
@@ -82,9 +85,27 @@ describe("createSystemGraphRouter", () => {
     });
 
     expect(first.status).toBe(200);
+    expect(first.headers.get(SYSTEM_GRAPH_CACHE_HEADER)).toBe("complete");
     expect(await first.json()).toEqual(graph);
     expect(second.status).toBe(200);
     expect(builder.build).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports degradation and bounds re-enrichment to one later request", async () => {
+    const { baseUrl, builder } = start(false);
+    const route = `${baseUrl}/api/workspaces/${workspaceKey}/system-graph`;
+    const request = () =>
+      fetch(route, { headers: { "X-Harness-Token": "test-token" } });
+
+    const first = await request();
+    const second = await request();
+    const third = await request();
+
+    expect(first.headers.get(SYSTEM_GRAPH_CACHE_HEADER)).toBe("degraded");
+    expect(second.headers.get(SYSTEM_GRAPH_CACHE_HEADER)).toBe("degraded");
+    expect(third.headers.get(SYSTEM_GRAPH_CACHE_HEADER)).toBe("degraded");
+    expect(await third.json()).toEqual(graph);
+    expect(builder.build).toHaveBeenCalledTimes(2);
   });
 
   it("rejects an unknown opaque workspace key without scanning", async () => {
