@@ -391,6 +391,42 @@ describe("HarnessRegistryInventoryProvider", () => {
     expect(maximum).toBe(4);
   });
 
+  it("surfaces settled identities within a bounded window while slower work continues", async () => {
+    let releaseSlow!: () => void;
+    const slow = new Promise<void>((resolve) => {
+      releaseSlow = resolve;
+    });
+    const inspectManifestName = vi.fn(async (sourceRoot: string) => {
+      if (sourceRoot.endsWith("/slow")) await slow;
+      return { status: "found" as const, name: path.basename(sourceRoot) };
+    });
+    const changed = vi.fn();
+    const inventory = provider(
+      [workflow("Fast", "fast", null), workflow("Slow", "slow", null)],
+      {
+        inspectManifestName,
+        onIdentityChange: changed,
+        identityChangeCoalesceMs: 1,
+      },
+    );
+
+    (await inventory.listAgents(SCOPE)).startEnrichment?.();
+    await vi.waitFor(() => expect(changed).toHaveBeenCalledTimes(1));
+    expect(changed).toHaveBeenNthCalledWith(1, [`${WORKSPACE}/fast`]);
+
+    const partial = await inventory.listAgents(SCOPE);
+    expect(
+      partial.inventory.agents.find((agent) => agent.path === "fast"),
+    ).toMatchObject({ agentKey: "fast", identityStatus: "canonical" });
+    expect(
+      partial.inventory.agents.find((agent) => agent.path === "slow"),
+    ).toMatchObject({ identityIssue: "identity-pending" });
+
+    releaseSlow();
+    await vi.waitFor(() => expect(changed).toHaveBeenCalledTimes(2));
+    expect(changed).toHaveBeenNthCalledWith(2, [`${WORKSPACE}/slow`]);
+  });
+
   it("drops a settled batch notification when its source is invalidated before the batch drains", async () => {
     let releaseSlow!: () => void;
     const slow = new Promise<void>((resolve) => {
@@ -403,7 +439,11 @@ describe("HarnessRegistryInventoryProvider", () => {
     const changed = vi.fn();
     const inventory = provider(
       [workflow("Fast", "fast", null), workflow("Slow", "slow", null)],
-      { inspectManifestName, onIdentityChange: changed },
+      {
+        inspectManifestName,
+        onIdentityChange: changed,
+        identityChangeCoalesceMs: 10_000,
+      },
     );
 
     (await inventory.listAgents(SCOPE)).startEnrichment?.();
