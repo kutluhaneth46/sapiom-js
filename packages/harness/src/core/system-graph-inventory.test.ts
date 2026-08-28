@@ -406,7 +406,6 @@ describe("HarnessRegistryInventoryProvider", () => {
       {
         inspectManifestName,
         onIdentityChange: changed,
-        identityChangeCoalesceMs: 1,
       },
     );
 
