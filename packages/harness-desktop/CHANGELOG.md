@@ -1,5 +1,12 @@
 # @sapiom/harness-desktop
 
+## 0.3.8-beta.1
+
+### Prerelease Changes
+
+- Package `@sapiom/harness@0.9.0` on the beta channel for validation of the
+  Project dependency graph and Project/Group rail integration.
+
 ## 0.3.7
 
 ### Patch Changes
