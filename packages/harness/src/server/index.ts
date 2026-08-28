@@ -854,8 +854,8 @@ export const startServer = async (
   const systemGraphInventory = new HarnessRegistryInventoryProvider({
     listWorkflows: () => workflowsCache,
     inspectManifestName,
-    onIdentityChange: (sourceRoot) => {
-      const canonicalSourceRoot = canonicalGraphPath(sourceRoot);
+    onIdentityChange: (sourceRoots) => {
+      const canonicalSourceRoots = sourceRoots.map(canonicalGraphPath);
       for (const scope of activeSystemGraphScopes.values()) {
         const canonicalScope = {
           workspaceKey: scope.workspaceKey,
@@ -863,7 +863,9 @@ export const startServer = async (
         };
         if (
           systemGraphStore.peek(canonicalScope.workspaceKey) &&
-          isWithinGraphPath(canonicalScope.root, canonicalSourceRoot)
+          canonicalSourceRoots.some((sourceRoot) =>
+            isWithinGraphPath(canonicalScope.root, sourceRoot),
+          )
         ) {
           systemGraphStore.requestRefresh(canonicalScope);
         }

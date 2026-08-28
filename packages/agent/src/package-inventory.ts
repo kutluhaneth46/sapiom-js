@@ -14,15 +14,30 @@ type JsonValue =
 
 export type PackageInventoryVersion =
   | {
+      /** Mutable checkout identity plus its normalized public-content revision. */
       readonly kind: "working-tree";
       readonly workspaceKey: string;
       readonly revision: `sha256:${string}`;
     }
   | {
+      /**
+       * Immutable uploaded-package identity. `bundleDigest` names the exact
+       * bundle whose inventory was derived; protocol 1 bundle inventories are
+       * complete snapshots and are rejected when marked degraded.
+       */
       readonly kind: "bundle";
       readonly bundleDigest: `sha256:${string}`;
     };
 
+/**
+ * Optional, producer-owned static-analysis evidence attached to one agent.
+ *
+ * `protocol` versions the producer's JSON-only `payload`; consumers must
+ * interpret only protocols they explicitly support and otherwise preserve or
+ * ignore the envelope. Protocol 1 intentionally does not prescribe a signal
+ * payload yet, so future extractors can add evidence without changing the
+ * package-inventory identity and location fields.
+ */
 export interface PackageInventoryStaticSignals {
   readonly protocol: number;
   readonly payload: JsonValue;
@@ -40,6 +55,7 @@ interface PackageInventoryAgentBase {
   readonly path: string;
   /** POSIX path relative to the agent directory. */
   readonly entrypoint: string;
+  /** Advisory versioned evidence; never required to identify the agent. */
   readonly staticSignals?: PackageInventoryStaticSignals;
 }
 

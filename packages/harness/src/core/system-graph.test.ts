@@ -866,7 +866,7 @@ describe("StaticSystemGraphBuilder", () => {
     );
     const initial = await builder.build(scope);
     initial.afterCommit?.();
-    await vi.waitFor(() => expect(changed).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(changed).toHaveBeenCalledTimes(1));
 
     const failed = await builder.build(scope);
 

@@ -183,7 +183,7 @@ describe("HarnessRegistryInventoryProvider", () => {
     );
     const initial = await inventory.listAgents(SCOPE);
     initial.startEnrichment?.();
-    await vi.waitFor(() => expect(changed).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(changed).toHaveBeenCalledTimes(1));
     const result = await inventory.listAgents(SCOPE);
 
     expect(result.inventory.agents).toEqual([
@@ -233,7 +233,7 @@ describe("HarnessRegistryInventoryProvider", () => {
     );
     const initial = await inventory.listAgents(SCOPE);
     initial.startEnrichment?.();
-    await vi.waitFor(() => expect(changed).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(changed).toHaveBeenCalledTimes(1));
     const result = await inventory.listAgents(SCOPE);
 
     expect(result.inventory.agents).toEqual([
@@ -384,8 +384,45 @@ describe("HarnessRegistryInventoryProvider", () => {
     );
     expect(maximum).toBe(4);
     release();
-    await vi.waitFor(() => expect(changed).toHaveBeenCalledTimes(7));
+    await vi.waitFor(() => expect(changed).toHaveBeenCalledTimes(1));
+    expect(changed).toHaveBeenCalledWith(
+      Array.from({ length: 7 }, (_, index) => `${WORKSPACE}/agent-${index}`),
+    );
     expect(maximum).toBe(4);
+  });
+
+  it("drops a settled batch notification when its source is invalidated before the batch drains", async () => {
+    let releaseSlow!: () => void;
+    const slow = new Promise<void>((resolve) => {
+      releaseSlow = resolve;
+    });
+    const inspectManifestName = vi.fn(async (sourceRoot: string) => {
+      if (sourceRoot.endsWith("/slow")) await slow;
+      return { status: "found" as const, name: path.basename(sourceRoot) };
+    });
+    const changed = vi.fn();
+    const inventory = provider(
+      [workflow("Fast", "fast", null), workflow("Slow", "slow", null)],
+      { inspectManifestName, onIdentityChange: changed },
+    );
+
+    (await inventory.listAgents(SCOPE)).startEnrichment?.();
+    await vi.waitFor(async () => {
+      const snapshot = await inventory.listAgents(SCOPE);
+      expect(
+        snapshot.inventory.agents.find((agent) => agent.path === "fast")
+          ?.agentKey,
+      ).toBe("fast");
+      expect(
+        snapshot.inventory.agents.find((agent) => agent.path === "slow")
+          ?.identityIssue,
+      ).toBe("identity-pending");
+    });
+    inventory.invalidateSource(`${WORKSPACE}/fast`);
+    releaseSlow();
+
+    await vi.waitFor(() => expect(changed).toHaveBeenCalledTimes(1));
+    expect(changed).toHaveBeenCalledWith([`${WORKSPACE}/slow`]);
   });
 
   it("deduplicates in-flight inspection and prevents an invalidated result from winning", async () => {

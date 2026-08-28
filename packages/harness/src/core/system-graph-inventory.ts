@@ -82,8 +82,12 @@ export interface HarnessRegistryInventoryProviderOptions {
     | readonly WorkflowInfo[]
     | Promise<readonly WorkflowInfo[]>;
   inspectManifestName?: ManifestNameInspector;
-  /** Called after a background identity result becomes available. */
-  onIdentityChange?: (sourceRoot: string) => void | Promise<void>;
+  /**
+   * Called once after a queued enrichment batch settles. A batch carries every
+   * changed source root so one cold workspace open needs at most one refresh
+   * per containing graph scope instead of one whole-graph build per agent.
+   */
+  onIdentityChange?: (sourceRoots: readonly string[]) => void | Promise<void>;
   /** Test seam. Production uses the same fingerprint as Canvas extraction. */
   fingerprintSource?: (sourceRoot: string) => Promise<string>;
 }
@@ -417,7 +421,9 @@ export class HarnessRegistryInventoryProvider implements AgentInventoryProvider 
   private readonly generations = new Map<string, number>();
   private readonly queuedTasks: IdentityTask[] = [];
   private readonly activeTasks = new Map<string, IdentityTask>();
+  private readonly pendingIdentityChanges = new Set<string>();
   private activeInspections = 0;
+  private identityChangeFlushInFlight = false;
   private epoch = 0;
   private nextGeneration = 1;
 
@@ -658,6 +664,7 @@ export class HarnessRegistryInventoryProvider implements AgentInventoryProvider 
     this.identityCache.delete(key);
     this.generations.set(key, this.nextGeneration++);
     this.dropQueuedTasks(key);
+    this.pendingIdentityChanges.delete(key);
   }
 
   /** Explicit Retry may retry failures even when no source fingerprint changed. */
@@ -680,6 +687,7 @@ export class HarnessRegistryInventoryProvider implements AgentInventoryProvider 
     this.identityCache.clear();
     this.generations.clear();
     this.queuedTasks.length = 0;
+    this.pendingIdentityChanges.clear();
   }
 
   /** Drops cache, queue, and generation state for retired source roots. */
@@ -695,6 +703,7 @@ export class HarnessRegistryInventoryProvider implements AgentInventoryProvider 
       this.identityCache.delete(sourceRoot);
       this.generations.delete(sourceRoot);
       this.dropQueuedTasks(sourceRoot);
+      this.pendingIdentityChanges.delete(sourceRoot);
     }
   }
 
@@ -730,7 +739,7 @@ export class HarnessRegistryInventoryProvider implements AgentInventoryProvider 
       const index = this.queuedTasks.findIndex(
         (task) => !this.activeTasks.has(task.sourceRoot),
       );
-      if (index === -1) return;
+      if (index === -1) break;
       const [task] = this.queuedTasks.splice(index, 1);
       if (!task || !this.isCurrentTask(task)) continue;
       this.activeTasks.set(task.sourceRoot, task);
@@ -743,6 +752,7 @@ export class HarnessRegistryInventoryProvider implements AgentInventoryProvider 
         this.drainInspectionQueue();
       });
     }
+    this.flushIdentityChangesIfIdle();
   }
 
   private async inspectSource(task: IdentityTask): Promise<void> {
@@ -766,11 +776,33 @@ export class HarnessRegistryInventoryProvider implements AgentInventoryProvider 
     }
     if (!this.isCurrentTask(task)) return;
     this.identityCache.set(task.sourceRoot, { fingerprint, inspection });
-    try {
-      await this.options.onIdentityChange?.(task.sourceRoot);
-    } catch {
-      // A refresh hint cannot make a settled identity result disappear.
+    this.pendingIdentityChanges.add(task.sourceRoot);
+  }
+
+  private flushIdentityChangesIfIdle(): void {
+    if (
+      this.activeInspections !== 0 ||
+      this.queuedTasks.length !== 0 ||
+      this.identityChangeFlushInFlight ||
+      this.pendingIdentityChanges.size === 0
+    ) {
+      return;
     }
+    const sourceRoots = [...this.pendingIdentityChanges].sort(compareText);
+    this.pendingIdentityChanges.clear();
+    const notify = this.options.onIdentityChange;
+    if (!notify) return;
+
+    this.identityChangeFlushInFlight = true;
+    void Promise.resolve()
+      .then(() => notify(sourceRoots))
+      .catch(() => {
+        // A refresh hint cannot make settled identity results disappear.
+      })
+      .finally(() => {
+        this.identityChangeFlushInFlight = false;
+        this.flushIdentityChangesIfIdle();
+      });
   }
 
   private dropQueuedTasks(sourceRoot: string): void {
