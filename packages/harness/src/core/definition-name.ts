@@ -12,11 +12,16 @@
  * a bundle error, the check process timing out) comes back as null and the
  * caller falls back to a weaker name source.
  */
-import { extractWorkflowGraphCached } from "./canvas-cache.js";
+import {
+  extractWorkflowGraphCached,
+  type CachedExtractionOptions,
+} from "./canvas-cache.js";
 
 export type ManifestNameInspection =
   | { status: "found"; name: string }
   | { status: "absent" | "failed" };
+
+export type ManifestNameInspectionOptions = CachedExtractionOptions;
 
 /**
  * Inspect the declared manifest name while preserving the difference between
@@ -26,9 +31,13 @@ export type ManifestNameInspection =
 export async function inspectManifestName(
   projectDir: string,
   extract: typeof extractWorkflowGraphCached = extractWorkflowGraphCached,
+  options: ManifestNameInspectionOptions = {},
 ): Promise<ManifestNameInspection> {
   try {
-    const { result } = await extract(projectDir);
+    const { result } =
+      options.authorizeBeforeLaunch || options.beforeLaunchAuthorization
+        ? await extract(projectDir, undefined, options)
+        : await extract(projectDir);
     if (!result.ok) {
       return {
         status: result.code === "NO_DEFINITION" ? "absent" : "failed",

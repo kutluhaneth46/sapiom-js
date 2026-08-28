@@ -34,11 +34,14 @@ GET  /api/workspaces/:workspaceKey/system-graph
 POST /api/workspaces/:workspaceKey/system-graph/refresh
 ```
 
-`GET` returns the current process-memory snapshot. A cold read waits for the
-initial projection, concurrent cold reads share that build, and later reads
-reuse it. `POST .../refresh` reruns registry prerequisites, requests a fresh
-projection, waits for that attempt, and is the explicit recovery action after
-an error. Both successful routes return `200` with a
+`GET` returns the current accepted process-memory snapshot. On a cold read,
+known inventory nodes and revision-matched navigation render immediately in a
+degraded projection; bounded relationship extraction and background discovery
+may publish a later revision. Concurrent reads share that work, and ordinary
+reads never await a filesystem baseline or discovery scan. `POST .../refresh`
+reruns registry prerequisites, requests a fresh projection, waits for that
+attempt, and is the explicit recovery action after an error. Both successful
+routes return `200` with a
 `SystemGraphSnapshot`:
 
 ```ts
@@ -119,13 +122,13 @@ Projection can remain useful while reporting warnings:
 | `inventory-extraction-failed` | One agent could not be enriched, so the remaining inventory was returned.                         |
 
 Registry-known agents enter a working-tree package inventory and render
-immediately; source inspection does not block the first graph. An unresolved
-agent uses a safe provisional marker or `local:` identity and makes that
-snapshot `degraded`. After the snapshot and its navigation sidecar commit,
-source-name inspection runs in the background. A valid current source
-definition name becomes canonical and publishes a newer graph revision, while
-the older marker remains only a compatibility alias. Inspection failure or an
-invalid name preserves the provisional node and any unambiguous direct edges.
+immediately. A syntax-proven source definition name is canonical without
+bundling or executing project code; a retained marker/cloud slug remains only a
+compatibility alias. Unknown or invalid identity uses a safe provisional marker
+or `local:` key and makes the snapshot degraded. Marker-authorized legacy name
+inspection and relationship extraction run in bounded background queues after
+the inventory projection commits. Settled identities/edges publish a later
+revision; failures preserve provisional nodes and unambiguous direct edges.
 
 ## Freshness event
 
@@ -144,10 +147,11 @@ The event is an invalidation hint. Clients compare its key and revision with
 the displayed snapshot and refetch when newer; the graph itself is not sent on
 the event bus.
 
-Opening a Project graph starts one session-independent recursive filesystem
-watcher for that Project. This is additional to session and Canvas watchers so
-the graph stays current even when no coding-agent session is open. Source and
-inventory events are debounced. Platforms without recursive watch support, or
-watchers that later error, fall back to asynchronous polling. Removing a
-Project retires its watcher and process-memory snapshot once Studio no longer
-exposes that scope.
+Opening a Project graph acquires a canonical-root watcher lease. Sessions and
+graphs for the same root share its bounded asynchronous fingerprint rather than
+multiplying recursive walks. Relevant raw events synchronously make old
+navigation inert; source/inventory reconciliation is debounced, coalesced, and
+generation-guarded. Platforms without recursive watch support, or watchers that
+later error, fall back to asynchronous polling over the same admitted candidate
+and dependency observations. Removing the final lease retires the watcher and
+degrades its accepted freshness proof before a later reopen can reuse it.
