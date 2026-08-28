@@ -16,6 +16,8 @@ import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import * as os from "node:os";
 
+import { assertHarnessVersion } from "./harness-version.mjs";
+
 const pkgDir = dirname(dirname(fileURLToPath(import.meta.url))); // packages/harness-desktop
 const repoRoot = dirname(dirname(pkgDir)); // sapiom-js
 const outputDir = join(pkgDir, "release");
@@ -98,6 +100,15 @@ rmSync(deployDir, { recursive: true, force: true });
 // --prod: drop devDeps (electron/electron-builder) — electronVersion is pinned
 // in electron-builder.yml so the version is known without the devDep present.
 run("pnpm", ["--filter", "@sapiom/harness-desktop", "deploy", "--prod", "--legacy", deployDir], repoRoot);
+
+// The expected Harness is either Desktop's explicit stable pin or the workspace
+// package version (see harness-version.mjs). Assert the MATERIALIZED dependency
+// before electron-builder sees it: changing dependency resolution must fail the
+// release instead of silently shipping a different application.
+assertHarnessVersion(
+  join(deployDir, "node_modules", "@sapiom", "harness", "package.json"),
+  "deployed desktop bundle",
+);
 
 // `pnpm deploy` honors .gitignore, which excludes dist/ + release/. Copy the
 // built app output, the builder config, and assets into the deploy dir.
