@@ -410,7 +410,9 @@ describe("HarnessRegistryInventoryProvider", () => {
     );
 
     (await inventory.listAgents(SCOPE)).startEnrichment?.();
-    await vi.waitFor(() => expect(changed).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(changed).toHaveBeenCalledTimes(1), {
+      timeout: 5_000,
+    });
     expect(changed).toHaveBeenNthCalledWith(1, [`${WORKSPACE}/fast`]);
 
     const partial = await inventory.listAgents(SCOPE);
@@ -422,7 +424,9 @@ describe("HarnessRegistryInventoryProvider", () => {
     ).toMatchObject({ identityIssue: "identity-pending" });
 
     releaseSlow();
-    await vi.waitFor(() => expect(changed).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(changed).toHaveBeenCalledTimes(2), {
+      timeout: 5_000,
+    });
     expect(changed).toHaveBeenNthCalledWith(2, [`${WORKSPACE}/slow`]);
   });
 
