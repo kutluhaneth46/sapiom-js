@@ -83,16 +83,18 @@ export interface HarnessRegistryInventoryProviderOptions {
     | Promise<readonly WorkflowInfo[]>;
   inspectManifestName?: ManifestNameInspector;
   /**
-   * Called once after a queued enrichment batch settles. A batch carries every
-   * changed source root so one cold workspace open needs at most one refresh
-   * per containing graph scope instead of one whole-graph build per agent.
+   * Called with coalesced identity changes. Settled roots are surfaced within
+   * a short bounded window, while a fully drained queue flushes immediately.
    */
   onIdentityChange?: (sourceRoots: readonly string[]) => void | Promise<void>;
   /** Test seam. Production uses the same fingerprint as Canvas extraction. */
   fingerprintSource?: (sourceRoot: string) => Promise<string>;
+  /** Test seam for the bounded identity-change coalescing window. */
+  identityChangeCoalesceMs?: number;
 }
 
 const MANIFEST_INSPECTION_CONCURRENCY = 4;
+const IDENTITY_CHANGE_COALESCE_MS = 250;
 const ENTRYPOINT = "index.ts";
 const ZERO_REVISION = `sha256:${"0".repeat(64)}` as const;
 function hasControlCharacter(value: string): boolean {
@@ -424,6 +426,7 @@ export class HarnessRegistryInventoryProvider implements AgentInventoryProvider 
   private readonly pendingIdentityChanges = new Set<string>();
   private activeInspections = 0;
   private identityChangeFlushInFlight = false;
+  private identityChangeTimer: ReturnType<typeof setTimeout> | null = null;
   private epoch = 0;
   private nextGeneration = 1;
 
@@ -665,6 +668,9 @@ export class HarnessRegistryInventoryProvider implements AgentInventoryProvider 
     this.generations.set(key, this.nextGeneration++);
     this.dropQueuedTasks(key);
     this.pendingIdentityChanges.delete(key);
+    if (this.pendingIdentityChanges.size === 0) {
+      this.clearIdentityChangeTimer();
+    }
   }
 
   /** Explicit Retry may retry failures even when no source fingerprint changed. */
@@ -688,6 +694,7 @@ export class HarnessRegistryInventoryProvider implements AgentInventoryProvider 
     this.generations.clear();
     this.queuedTasks.length = 0;
     this.pendingIdentityChanges.clear();
+    this.clearIdentityChangeTimer();
   }
 
   /** Drops cache, queue, and generation state for retired source roots. */
@@ -704,6 +711,9 @@ export class HarnessRegistryInventoryProvider implements AgentInventoryProvider 
       this.generations.delete(sourceRoot);
       this.dropQueuedTasks(sourceRoot);
       this.pendingIdentityChanges.delete(sourceRoot);
+    }
+    if (this.pendingIdentityChanges.size === 0) {
+      this.clearIdentityChangeTimer();
     }
   }
 
@@ -752,7 +762,7 @@ export class HarnessRegistryInventoryProvider implements AgentInventoryProvider 
         this.drainInspectionQueue();
       });
     }
-    this.flushIdentityChangesIfIdle();
+    this.scheduleIdentityChangeFlush();
   }
 
   private async inspectSource(task: IdentityTask): Promise<void> {
@@ -777,17 +787,33 @@ export class HarnessRegistryInventoryProvider implements AgentInventoryProvider 
     if (!this.isCurrentTask(task)) return;
     this.identityCache.set(task.sourceRoot, { fingerprint, inspection });
     this.pendingIdentityChanges.add(task.sourceRoot);
+    this.scheduleIdentityChangeFlush();
   }
 
-  private flushIdentityChangesIfIdle(): void {
+  private scheduleIdentityChangeFlush(): void {
+    if (this.pendingIdentityChanges.size === 0) return;
+    if (this.activeInspections === 0 && this.queuedTasks.length === 0) {
+      this.clearIdentityChangeTimer();
+      this.flushIdentityChanges();
+      return;
+    }
+    if (this.identityChangeFlushInFlight || this.identityChangeTimer !== null) {
+      return;
+    }
+    this.identityChangeTimer = setTimeout(() => {
+      this.identityChangeTimer = null;
+      this.flushIdentityChanges();
+    }, this.options.identityChangeCoalesceMs ?? IDENTITY_CHANGE_COALESCE_MS);
+  }
+
+  private flushIdentityChanges(): void {
     if (
-      this.activeInspections !== 0 ||
-      this.queuedTasks.length !== 0 ||
       this.identityChangeFlushInFlight ||
       this.pendingIdentityChanges.size === 0
     ) {
       return;
     }
+    this.clearIdentityChangeTimer();
     const sourceRoots = [...this.pendingIdentityChanges].sort(compareText);
     this.pendingIdentityChanges.clear();
     const notify = this.options.onIdentityChange;
@@ -801,8 +827,14 @@ export class HarnessRegistryInventoryProvider implements AgentInventoryProvider 
       })
       .finally(() => {
         this.identityChangeFlushInFlight = false;
-        this.flushIdentityChangesIfIdle();
+        this.scheduleIdentityChangeFlush();
       });
+  }
+
+  private clearIdentityChangeTimer(): void {
+    if (this.identityChangeTimer === null) return;
+    clearTimeout(this.identityChangeTimer);
+    this.identityChangeTimer = null;
   }
 
   private dropQueuedTasks(sourceRoot: string): void {
