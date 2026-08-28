@@ -1964,9 +1964,10 @@ export const App = (): JSX.Element => {
               workspaceKey={selectedWorkspaceKey}
               workspaceName={selectedWorkspaceName}
               api={harness.api}
-              workflows={state.workflows}
-              workspaceScopes={workspaceScopes}
-              lastMessage={harness.lastMessage}
+              latestAnnouncement={
+                harness.systemGraphAnnouncements.get(selectedWorkspaceKey) ??
+                null
+              }
               onOpenAgent={handleFocusAgent}
               onExpandRail={
                 railCollapsed ? () => setRailCollapsed(false) : undefined

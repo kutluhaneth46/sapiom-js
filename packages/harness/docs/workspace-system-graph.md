@@ -71,6 +71,34 @@ X-Sapiom-System-Graph-Cache: complete | degraded
 `degraded` all report `degraded`; the header is a health/cacheability signal,
 not an HTTP cache directive.
 
+## Resolving agent navigation
+
+Filesystem navigation is isolated from the public graph payload behind a
+separate boot-token-protected route:
+
+```http
+GET /api/workspaces/:workspaceKey/system-graph/navigation
+```
+
+It returns the resolver sidecar committed atomically with the graph snapshot:
+
+```ts
+interface SystemGraphNavigationResponse {
+  workspaceKey: string;
+  revision: number;
+  targets: Array<{ agentKey: string; workflowPath: string }>;
+}
+```
+
+The response has `Cache-Control: no-store`. Agent paths appear only in this
+protected sidecar; they never enter `SystemGraph` JSON, lifecycle events, or
+browser-derived identity logic. The browser accepts a sidecar only when both
+its `workspaceKey` and `revision` exactly match the displayed snapshot. A
+malformed or mismatched response, a newer invalidation, or a snapshot in a
+loading, error, `building`, or `stale` state leaves graph cards inert. If the
+resolver is newer, the browser reloads the graph through the normal lifecycle
+and retries the join within a bounded loop.
+
 ## Graph payload
 
 `SystemGraph` is path-free and has `kind: "system"`. Its scope repeats only the
@@ -89,6 +117,15 @@ Projection can remain useful while reporting warnings:
 | `projection-failed`           | A relationship projection failed and the remaining graph was preserved.                           |
 | `duplicate-agent-key`         | More than one contained agent proposed the same key; local fallback identities disambiguate them. |
 | `inventory-extraction-failed` | One agent could not be enriched, so the remaining inventory was returned.                         |
+
+Registry-known agents enter a working-tree package inventory and render
+immediately; source inspection does not block the first graph. An unresolved
+agent uses a safe provisional marker or `local:` identity and makes that
+snapshot `degraded`. After the snapshot and its navigation sidecar commit,
+source-name inspection runs in the background. A valid current source
+definition name becomes canonical and publishes a newer graph revision, while
+the older marker remains only a compatibility alias. Inspection failure or an
+invalid name preserves the provisional node and any unambiguous direct edges.
 
 ## Freshness event
 
