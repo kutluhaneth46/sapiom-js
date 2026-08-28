@@ -111,8 +111,24 @@ describe("workspace graph freshness wiring", () => {
         return JSON.parse(raw) as SystemGraphSnapshot;
       };
       const initial = await readGraph();
-      expect(initial).toMatchObject({ state: "ready" });
+      // These fixtures intentionally have no defineAgent export. The graph is
+      // useful immediately through their marker identities while background
+      // source inspection honestly leaves the inventory degraded.
+      expect(initial).toMatchObject({ state: "degraded" });
       expect(initial.graph?.edges).toEqual([]);
+      let absentSettled!: SystemGraphSnapshot;
+      await vi.waitFor(
+        async () => {
+          absentSettled = await readGraph();
+          expect(absentSettled.revision).toBeGreaterThan(initial.revision);
+          expect(
+            absentSettled.graph?.warnings.some(
+              (warning) => warning.code === "inventory-extraction-failed",
+            ),
+          ).toBe(false);
+        },
+        { timeout: 8_000, interval: 150 },
+      );
       graphEvents.length = 0;
 
       await fs.writeFile(
@@ -124,7 +140,7 @@ describe("workspace graph freshness wiring", () => {
         async () => {
           sourceRefresh = await readGraph();
           expect(sourceRefresh.revision).toBeGreaterThan(initial.revision);
-          expect(sourceRefresh.state).toBe("ready");
+          expect(sourceRefresh.state).toBe("degraded");
           expect(sourceRefresh.graph?.edges).toEqual([
             expect.objectContaining({
               from: "agent:research",
@@ -136,7 +152,9 @@ describe("workspace graph freshness wiring", () => {
         { timeout: 8_000, interval: 150 },
       );
       expect(graphEvents.some((event) => event.state === "stale")).toBe(true);
-      expect(graphEvents.some((event) => event.state === "ready")).toBe(true);
+      expect(graphEvents.some((event) => event.state === "degraded")).toBe(
+        true,
+      );
 
       await fs.writeFile(path.join(researchRoot, "index.ts"), "export {};\n");
       let sourceRemoved!: SystemGraphSnapshot;
@@ -233,7 +251,7 @@ describe("workspace graph freshness wiring", () => {
       expect(manualRetryResponse.status).toBe(200);
       const manualRetry =
         (await manualRetryResponse.json()) as SystemGraphSnapshot;
-      expect(manualRetry).toMatchObject({ state: "ready" });
+      expect(manualRetry).toMatchObject({ state: "degraded" });
       expect(manualRetry.revision).toBeGreaterThan(beforeManualRetry.revision);
     },
   );

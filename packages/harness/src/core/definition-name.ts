@@ -29,7 +29,11 @@ export async function inspectManifestName(
 ): Promise<ManifestNameInspection> {
   try {
     const { result } = await extract(projectDir);
-    if (!result.ok) return { status: "failed" };
+    if (!result.ok) {
+      return {
+        status: result.code === "NO_DEFINITION" ? "absent" : "failed",
+      };
+    }
     const name = result.graph.manifestName.trim();
     return name === "" ? { status: "absent" } : { status: "found", name };
   } catch {
