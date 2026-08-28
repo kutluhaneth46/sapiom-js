@@ -4,8 +4,8 @@
 
 ### Prerelease Changes
 
-- Package `@sapiom/harness@0.9.0` on the beta channel for validation of the
-  Project dependency graph and Project/Group rail integration.
+- Package the current workspace Harness on the beta channel for validation of
+  the Project dependency graph and Project/Group rail integration.
 
 ## 0.3.7
 
