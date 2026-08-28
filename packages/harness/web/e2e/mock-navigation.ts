@@ -12,7 +12,7 @@ export async function focusRfqAgentThroughProjectGraph(
     .getByTestId("workflow-rfq")
     .locator(".workflow-item-trigger")
     .click();
-  const node = page.getByTestId("system-graph-node-local:rfq-agent");
+  const node = page.getByTestId("system-graph-node-local:root");
   await expect(node).toBeVisible();
   await node.click();
 }

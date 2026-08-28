@@ -69,7 +69,7 @@ test("rail opens as a drawer and closes on opening a workflow or a scrim tap", a
     .click();
   await expect(rail).toHaveCount(0);
   await expect(page.getByTestId("workspace-graph-view")).toBeVisible();
-  await page.getByTestId("system-graph-node-local:rfq-agent").click();
+  await page.getByTestId("system-graph-node-local:root").click();
   await expect(page.getByTestId("open-agent-empty")).toContainText(
     "No running session for rfq",
   );
