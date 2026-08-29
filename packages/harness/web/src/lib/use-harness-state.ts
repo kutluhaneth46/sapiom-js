@@ -37,6 +37,7 @@ import {
 } from "./api";
 import { type ConnectivityErrorInput } from "./connectivity";
 import { isWithinDir, samePath } from "./paths";
+import { projectToOpen } from "./project-tree";
 import {
   agentNeedsOwnProject,
   applyProjectRemoval,
@@ -394,7 +395,9 @@ export function useHarnessState(): HarnessStateHook {
    */
   // Per-root record of checkouts a scan declined to enter. Not persisted: it
   // describes the last scan, and the next scan of that root re-derives it.
-  const [unsearchedCheckouts, setUnsearchedCheckouts] = useState<Record<string, string[]>>({});
+  const [unsearchedCheckouts, setUnsearchedCheckouts] = useState<
+    Record<string, string[]>
+  >({});
   const [closedProjects, setClosedProjects] = useState<string[]>(
     () => loadUiPrefs().closedProjects ?? [],
   );
@@ -522,6 +525,11 @@ export function useHarnessState(): HarnessStateHook {
   const [pendingWorkspaces, setPendingWorkspaces] = useState<
     PendingWorkspace[]
   >([]);
+  // Mirror, for the same reason `sessionsRef` exists: `openProject` is a
+  // callback that must read the CURRENT set without re-creating itself, and a
+  // folder mid-creation is one of the projects a promotion must not swallow.
+  const pendingWorkspacesRef = useRef<PendingWorkspace[]>([]);
+  pendingWorkspacesRef.current = pendingWorkspaces;
   const addPendingWorkspace = useCallback((cwd: string): void => {
     setPendingWorkspaces((prev) =>
       prev.some((p) => p.cwd === cwd)
@@ -1614,7 +1622,9 @@ export function useHarnessState(): HarnessStateHook {
         outcome.repositoryBoundaries.length > 0
           ? { ...prev, [root]: outcome.repositoryBoundaries }
           : Object.keys(prev).includes(root)
-            ? Object.fromEntries(Object.entries(prev).filter(([key]) => key !== root))
+            ? Object.fromEntries(
+                Object.entries(prev).filter(([key]) => key !== root),
+              )
             : prev,
       );
       return outcome;
@@ -1657,7 +1667,39 @@ export function useHarnessState(): HarnessStateHook {
    * Then the folder is remembered, which is what puts the row on screen.
    */
   const openProject = useCallback(
-    async (root: string): Promise<void> => {
+    async (requested: string): Promise<void> => {
+      /* YOU CANNOT OPEN A SINGLE AGENT AS A PROJECT, so opening an agent's own
+         folder opens the folder that HOLDS it.
+
+         `projectRoots` refuses to render an agent's own directory as a project
+         (see its header). Without this, pointing the picker at one and pressing
+         Open remembered a directory the rail then declined to draw: the picker
+         said "This is an agent project", the user pressed the button, and
+         nothing on screen changed. That is the same "adding a project did
+         nothing" symptom the scan below exists to fix, arriving by a different
+         door, and it also undercut the reason dropping those rows is safe. The
+         claim is that any folder is one Add-a-project away from coming back;
+         that has to be true of agent folders too, and the honest form of it is
+         that you get the project the agent lives in.
+
+         THE SAME QUESTION THE RAIL ASKS, not merely the same function. This hop
+         The eligible projects are the rail's own derivation, passed through
+         rather than rebuilt here: see `projectToOpen`. Sessions carry `status`,
+         because a live session in an agentless folder is a project and an
+         exited one is not. */
+      const root = projectToOpen(requested, {
+        agentPaths: workflowsRef.current.map((workflow) => workflow.path),
+        recentDirs: settingsRef.current?.recentDirs ?? [],
+        pendingCwds: pendingWorkspacesRef.current.map((pending) => pending.cwd),
+        sessions: sessionsRef.current.map((session) => ({
+          cwd: session.cwd,
+          createdAt: session.createdAt,
+          status: session.status,
+        })),
+        // Containment, not order: `projectRoots` sorts its output and nothing
+        // here reads the order.
+        sort: "recent",
+      });
       const swallowed = closedProjectsRef.current.filter((closed) =>
         rootContains(root, closed),
       );
