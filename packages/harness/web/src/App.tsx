@@ -1409,8 +1409,14 @@ export const App = (): JSX.Element => {
     // that fails to start is a session failure, reported as one — it must
     // never read as "the agent wasn't created", because it was.
     try {
+      // A LIVE one, or none. The bare-project door names the session that was
+      // sitting in that folder when the dialog opened, and a dialog can stay
+      // open longer than a pty lives — binding the new agent to an exited
+      // session would leave it with nothing to talk to.
       const existing = request.sessionId
-        ? (state.sessions.find((s) => s.id === request.sessionId) ?? null)
+        ? (state.sessions.find(
+            (s) => s.id === request.sessionId && s.status !== "exited",
+          ) ?? null)
         : null;
       const session =
         existing ??
