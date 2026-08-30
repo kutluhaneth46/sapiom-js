@@ -336,3 +336,60 @@ test("a read that failed is tried again when the map is reopened", async ({
 
   await expect.poll(() => mapContainers(page)).toEqual(["Custom", "Ungrouped"]);
 });
+
+test("opening the map cannot undo an edit the rail just made", async ({
+  page,
+}) => {
+  /* The arrangement is shared across surfaces but the request latch is per
+     surface, so opening the map issues its OWN read of the file — and that read
+     races any write still in flight from an edit a moment earlier. Served
+     first, it would replace the optimistic arrangement with the pre-edit file:
+     the rail visibly reverts, and the next edit then materializes from the
+     reverted state and persists it, losing the edit on disk as well as on
+     screen. A root this page has written to is never re-read.
+
+     The write is held open here so the race is deterministic rather than a
+     matter of who happens to win. */
+  await page.goto("/?mockFixtures=deep");
+  await expect(page.locator(".rail-workflows")).toBeVisible();
+  await openGroupAxis(page);
+
+  let releaseWrite = (): void => {};
+  const writeHeld = new Promise<void>((resolve) => {
+    releaseWrite = resolve;
+  });
+  await page.exposeFunction("__holdRailWrite", () => writeHeld);
+  await page.evaluate(() => {
+    const store = window.localStorage;
+    const original = store.setItem.bind(store);
+    store.setItem = (key: string, value: string) => {
+      if (key.startsWith("sapiom-mock-studio-rail:")) {
+        void (window as unknown as { __holdRailWrite: () => Promise<void> })
+          .__holdRailWrite()
+          .then(() => original(key, value));
+        return;
+      }
+      original(key, value);
+    };
+  });
+
+  // The edit: optimistic in memory, its write parked.
+  await page.getByTestId("group-rename-gateway").click();
+  await page.getByTestId("group-rename-input").fill("Ingest");
+  await page.keyboard.press("Enter");
+  await expect
+    .poll(() => railGroups(page))
+    .toEqual(["Ingest", "mailer", "Ungrouped"]);
+
+  // Opening the map is what issues the second read.
+  await page.getByTestId("project-select-polsia").click();
+  await expect(page.getByTestId("workspace-graph-view")).toBeVisible();
+  await expect
+    .poll(() => mapContainers(page))
+    .toEqual(["Ingest", "mailer", "Ungrouped"]);
+
+  releaseWrite();
+  // Still the edit, on both surfaces, after the write lands.
+  await expect.poll(() => railGroups(page)).toEqual(["Ingest", "mailer", "Ungrouped"]);
+  expect(await mapContainers(page)).toEqual(["Ingest", "mailer", "Ungrouped"]);
+});

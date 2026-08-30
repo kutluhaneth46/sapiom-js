@@ -4268,7 +4268,7 @@ button.rail-footer-card:hover {
    label. Growing it as the view shrinks keeps the systems named at
    exactly the altitude you zoom out to read them from, and the clamp stops
    there: at 70% and above the cards are legible on their own and the label is
-   1:1. transform-origin pins it to the corner it already sits in. */
+   1:1. */
 .system-graph-group-label {
   display: block;
   max-width: 100%;

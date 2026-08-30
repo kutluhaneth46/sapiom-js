@@ -489,6 +489,24 @@ describe("layoutSystemGraph with groups", () => {
     expect(boxOf(layout, "Ungrouped").nodeCount).toBe(40);
   });
 
+  it("does not file an unclaimed node into a group merely NAMED Ungrouped", () => {
+    /* The layout half of the same identity rule the mapper carries: the bucket
+       is `isUngrouped`, never the string. A user may name a real system
+       "Ungrouped", and matching on the label would drop the cards nothing
+       claimed inside it and move it to the end of the map. */
+    const layout = layoutSystemGraph(graph(["a", "b", "orphan"], []), [
+      { id: "g:named", label: "Ungrouped", nodeIds: ["a", "b"], isUngrouped: false },
+    ]);
+    expect(layout.groups.map((candidate) => candidate.nodeCount)).toEqual([2, 1]);
+    expect(layout.groups[0]!.id).toBe("g:named");
+    expect(byId(layout, "a").groupId).toBe("g:named");
+    expect(byId(layout, "b").groupId).toBe("g:named");
+    // The synthesized bucket is a SECOND box, after the user's group.
+    expect(layout.groups[1]!.label).toBe("Ungrouped");
+    expect(layout.groups[1]!.id).not.toBe("g:named");
+    expect(byId(layout, "orphan").groupId).toBe(layout.groups[1]!.id);
+  });
+
   it("still draws a node no group claimed", () => {
     // The caller hands over an exhaustive partition, so this is a backstop —
     // and it is deliberately not a throw. A card that silently disappears is

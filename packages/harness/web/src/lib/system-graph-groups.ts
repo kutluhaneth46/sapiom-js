@@ -12,7 +12,8 @@ import {
  *
  * The map used to draw every agent a project contains as one flat set, ignoring
  * the sub-structure the rail was showing six inches to its left: one root
- * holding nine systems and 76 agents came out as a single ~70-node column. The
+ * holding several systems and a few dozen agents came out as a single, endless
+ * column of unconnected nodes, thousands of pixels tall and one card wide. The
  * mechanism to fix that already existed — `lib/agent-groups.ts` derives groups
  * from launch edges, lets the user edit them, and persists the arrangement to a
  * committable `.sapiom/studio-rail.json`. The map simply never read it.

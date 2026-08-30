@@ -92,8 +92,14 @@ const snapshot = (): number => store.version;
 const canonicalRoot = (root: string): string =>
   root.replace(/\\/g, "/").replace(/(.)\/+$/, "$1");
 
-/** Writes in flight, per canonical root. See `commit` below. */
+/** Writes in flight, per canonical root. See `commit` below. Its KEYS double as
+ *  "this page has edited that root", which is what stops a later mount's read
+ *  from overwriting an edit — see the load effect. */
 const writeChain = new Map<string, Promise<void>>();
+
+/** Whether the install-wide launch-edge grep has been asked for. Module scope
+ *  on purpose; see the effect that reads it. */
+let edgesRequested = false;
 
 export interface RailGroups {
   /** The rows to render for one project root: the stored groups if the user has
@@ -177,11 +183,11 @@ export function useRailGroups(
 ): RailGroups {
   const version = useSyncExternalStore(subscribe, snapshot, snapshot);
 
-  /** Roots and edges this INSTANCE has already asked for. Refs, not state, so
-   *  they update synchronously and a re-render mid-flight cannot start a second
-   *  read; per instance, so a remount re-reads. */
+  /** Roots this INSTANCE has already asked for. A ref, not state, so it updates
+   *  synchronously and a re-render mid-flight cannot start a second read; per
+   *  instance, so a remount re-reads the file. (The launch edges are latched at
+   *  module scope instead — see `edgesRequested`.) */
   const requested = useRef(new Set<string>());
-  const edgesRequested = useRef(false);
 
   // The registry changes as agents are scanned, and the load effect below must
   // not re-run for that — it would re-read every project's file. It reads the
@@ -192,9 +198,15 @@ export function useRailGroups(
   // Launch edges are a property of the INSTALL, not of a root, so one read
   // serves every project. Fetched only once the axis is in use: it greps every
   // registered agent's sources, and the Project axis has no use for the answer.
+  //
+  // Latched at MODULE scope, unlike the per-root reads below — and the
+  // difference is the cost. That grep walks every registered agent's sources,
+  // the answer is install-wide, and the map unmounts on every drill-in, so a
+  // per-instance latch would scan the whole tree again each time someone
+  // clicked an agent and came back. There is nothing per-root to re-read here.
   useEffect(() => {
-    if (!enabled || edgesRequested.current) return;
-    edgesRequested.current = true;
+    if (!enabled || edgesRequested) return;
+    edgesRequested = true;
     void api
       .listLaunchEdges()
       .then((next) => {
@@ -207,6 +219,9 @@ export function useRailGroups(
         // as an empty ARRAY rather than left null so the axis becomes editable —
         // hand-grouping is the whole point when detection finds nothing.
         store.edges = [];
+        // Released, so a later mount tries once more: this one is a request
+        // that failed, not an install with nothing in it.
+        edgesRequested = false;
         notify();
       });
   }, [enabled]);
@@ -216,6 +231,17 @@ export function useRailGroups(
     if (!enabled) return;
     for (const root of rootsKey.split(ROOTS_SEP).filter(Boolean)) {
       if (requested.current.has(root)) continue;
+      /* NEVER re-read a root this page has already WRITTEN to.
+
+         The arrangement is shared across surfaces but the request latch is per
+         surface, so opening the map issues its own GET — and that GET races any
+         PUT still in flight. Served first, its result would replace the
+         optimistic state with the pre-edit file: the rail visibly reverts, and
+         the next edit then materializes from the reverted state and persists
+         it, losing the drag on disk as well as on screen. Once this page has
+         written a root, the in-memory arrangement IS the newer answer and a
+         read can only tell us something older. */
+      if (writeChain.has(root)) continue;
       requested.current.add(root);
       void api
         .getRailState(root)
