@@ -10824,3 +10824,109 @@ button.system-graph-node.is-navigable:focus-visible {
   flex: 0 0 auto;
   opacity: 0.7;
 }
+
+/* ── Create-agent dialog (SAP-2981) ─────────────────────────────────────────
+   The create form. Wider than a confirm because it holds four blocks, and
+   built from `.modal-*` so it shares the confirm dialogs' anatomy rather than
+   inventing a second dialog shape. */
+.modal-create-agent {
+  width: 460px;
+}
+
+/* The destination, stated. The label is the sentence; the path sits under it
+   in meta because it is the fact that disambiguates a shared or widened label,
+   not the thing being read first. */
+.create-agent-target {
+  display: grid;
+  gap: 2px;
+  padding-top: var(--sp3);
+  padding-bottom: 0;
+  color: var(--text-dim);
+}
+
+.create-agent-path {
+  overflow: hidden;
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: var(--type-meta);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.create-agent-label {
+  color: var(--text-dim);
+  font-size: var(--type-label);
+  font-weight: 510;
+}
+
+.create-agent-optional {
+  color: var(--text-faint);
+  font-weight: 400;
+}
+
+.create-agent-templates {
+  display: grid;
+  gap: var(--sp1);
+  margin-top: 2px;
+}
+
+/* A row, not a card: the starters are a short list of one-line choices, and a
+   card each would make picking the default feel like a decision it isn't. */
+.create-agent-template {
+  display: flex;
+  gap: var(--sp2);
+  align-items: flex-start;
+  padding: var(--sp2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+}
+
+.create-agent-template:hover {
+  background: var(--bg-hover);
+}
+
+/* The selected row is marked by its BORDER, not a fill: `--accent` is full
+   brand green (see css-brand-surface.test.ts), and a filled row here would be
+   the fifth time that mistake shipped. */
+.create-agent-template[data-selected="true"] {
+  border-color: var(--border-strong);
+  background: var(--bg-3);
+}
+
+.create-agent-template-text {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+}
+
+.create-agent-template-name {
+  color: var(--text);
+  font-size: var(--type-ui);
+}
+
+.create-agent-template-desc {
+  color: var(--text-faint);
+  font-size: var(--type-meta);
+  line-height: 1.45;
+}
+
+/* The one multi-line field: `.modal-input` is single-line height, so the
+   textarea takes its skin and its own box. */
+.create-agent-instruction {
+  height: auto;
+  padding: var(--sp2);
+  font-family: inherit;
+  line-height: 1.5;
+  resize: vertical;
+}
+
+.create-agent-link {
+  color: var(--text-dim);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.create-agent-link:hover {
+  color: var(--text);
+}

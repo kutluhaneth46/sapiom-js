@@ -50,21 +50,10 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Router, type Router as ExpressRouter } from "express";
 
+import { refuseAgentName } from "../shared/agent-name.js";
+import type { AgentScaffoldResponse } from "../shared/types.js";
 import { childPath, hasTraversalSegment } from "../core/path-safety.js";
 
-/** `POST /api/agents/scaffold` response. */
-export interface AgentScaffoldResponse {
-  ok: true;
-  /** Absolute path of the new agent's directory — server-authored, never the
-   *  caller's string. */
-  path: string;
-  name: string;
-  template: string;
-  /** Whether the best-effort `npm install` succeeded. False is not a failure:
-   *  the Canvas degrades to its "run npm install" hint (see
-   *  `@sapiom/agent-core`'s install-deps). */
-  dependenciesInstalled: boolean;
-}
 
 export interface AgentScaffoldDeps {
   /**
@@ -122,40 +111,6 @@ function samePath(a: string, b: string): boolean {
     return process.platform === "win32" ? resolved.toLowerCase() : resolved;
   };
   return norm(a) === norm(b);
-}
-
-/**
- * Characters that cannot appear in a directory name on every platform the
- * Studio runs on, plus the C0 controls. A NUL in particular reaches `fs` as a
- * thrown `ERR_INVALID_ARG_VALUE` rather than a refusal, so it is answered here
- * where the caller gets a sentence instead of a 500.
- */
-// eslint-disable-next-line no-control-regex
-const FORBIDDEN_IN_NAME = /[\u0000-\u001f<>:"|?*]/;
-
-/**
- * Why this name cannot be a new agent's folder, or null when it can.
- *
- * The message is shown verbatim in the dialog, so it says what to do rather
- * than what a regex thinks. The rule is `childPath`'s — one plain segment
- * under the project root, enforced again at the join below — plus a length cap
- * and a leading-dot refusal: a dotted directory is hidden from the agent scan,
- * so `.notes` would scaffold successfully and then never appear in the rail,
- * which is the "did it work?" failure this whole endpoint exists to end.
- */
-export function refuseAgentName(name: unknown): string | null {
-  if (typeof name !== "string" || name.trim() === "")
-    return "Give the agent a name.";
-  if (name.trim() !== name)
-    return "An agent name can't start or end with a space.";
-  if (name.length > 64)
-    return "That name is too long — keep it under 64 characters.";
-  if (/[/\\]/.test(name))
-    return "An agent name is one folder name — it can't contain / or \\.";
-  if (name.startsWith("."))
-    return "An agent name can't start with a dot — a dotted folder is hidden from the rail.";
-  if (FORBIDDEN_IN_NAME.test(name)) return `'${name}' isn't a folder name.`;
-  return null;
 }
 
 /**

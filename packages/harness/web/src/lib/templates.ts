@@ -275,7 +275,8 @@ export function cloneDefinitionPrompt(definitionId: string, dir: string): string
   );
 }
 
-/** Exact local MCP handoff shared by every bundled-starter entry point. */
+/** Exact local MCP handoff for the one door that still asks for a scaffold in
+ *  English — see {@link composerScaffoldPrompt}. */
 export function starterScaffoldInstruction(
   dir: string,
   template: string,
@@ -283,6 +284,50 @@ export function starterScaffoldInstruction(
   return (
     "call the sapiom_dev_agents_scaffold tool with " +
     JSON.stringify({ dir, template })
+  );
+}
+
+/**
+ * The composer's scaffold prompt — the LAST prompt-driven create (SAP-2981).
+ *
+ * There were three near-identical copies of this sentence: the project `+`, the
+ * bare-project affordance, and the composer. The first two now go through
+ * `POST /api/agents/scaffold`, where a failure is an error message instead of a
+ * confused model. The composer keeps a prompt because it is the home screen —
+ * no project, no name, and a folder that does not exist yet — so there is no
+ * row to create in and nothing for a dialog to state.
+ *
+ * `idea` rides along verbatim: the agent needs the user's intent, not our
+ * paraphrase of it.
+ */
+export function composerScaffoldPrompt(dir: string, idea?: string): string {
+  const base =
+    `Scaffold a new Sapiom agent project in this directory: ${starterScaffoldInstruction(dir, "default")}, ` +
+    "then run npm install, read AGENTS.md, and use the sapiom-agent-authoring skill to";
+  const trimmed = idea?.trim();
+  return trimmed
+    ? `${base} build this:\n\n${trimmed}`
+    : `${base} define the first agent.`;
+}
+
+/**
+ * What a session opens on after the HARNESS created the agent.
+ *
+ * It is not a scaffold prompt and must never read like one: the project is
+ * already on disk, installed and committed, and an agent told to "scaffold a
+ * new project in this directory" would find a non-empty folder and either
+ * refuse or start over. So it says the scaffold is done, names the directory,
+ * and hands over the only thing left — the user's instruction.
+ */
+export function firstInstructionPrompt(
+  agentDir: string,
+  instruction: string,
+): string {
+  return (
+    `A new Sapiom agent project has just been created at ${agentDir} — the scaffold is done, ` +
+    "so do not scaffold or clone anything. Read its AGENTS.md, then use the sapiom-agent-authoring " +
+    `skill to build this:\n\n${instruction.trim()}\n\n` +
+    "When the agent is ready, offer a local test run with no Sapiom capability spend (sapiom_dev_agents_run_local) as the next step."
   );
 }
 

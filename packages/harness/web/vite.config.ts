@@ -90,6 +90,9 @@ export default defineConfig({
       // build against one source of truth — no vendored copy to drift.
       "@shared/types": fileURLToPath(new URL("../src/shared/types.ts", import.meta.url)),
       "@shared/system-graph": fileURLToPath(new URL("../src/shared/system-graph.ts", import.meta.url)),
+      // One agent-name rule for the dialog and the create route: a name the
+      // field accepts and the server refuses reads as a broken app.
+      "@shared/agent-name": fileURLToPath(new URL("../src/shared/agent-name.ts", import.meta.url)),
       // The local-run mapper is a pure fn shared with the server (its canonical
       // home is src/core/render-local-run.ts, per the ticket). The SPA imports
       // the SAME implementation to map an offline stub run's NDJSON traces into

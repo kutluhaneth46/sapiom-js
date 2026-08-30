@@ -20,12 +20,8 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import {
-  createAgentScaffoldRouter,
-  refuseAgentName,
-  refuseScaffoldOnDisk,
-  type AgentScaffoldResponse,
-} from "./scaffold.js";
+import type { AgentScaffoldResponse } from "../shared/types.js";
+import { createAgentScaffoldRouter, refuseScaffoldOnDisk } from "./scaffold.js";
 
 let tmp: string;
 
@@ -113,31 +109,6 @@ const exists = async (p: string): Promise<boolean> =>
     .lstat(p)
     .then(() => true)
     .catch(() => false);
-
-describe("refuseAgentName", () => {
-  it("accepts an ordinary agent folder name", () => {
-    expect(refuseAgentName("order-triage")).toBeNull();
-    expect(refuseAgentName("Order_Triage2")).toBeNull();
-  });
-
-  it("refuses the shapes that would escape the project", () => {
-    // Each of these is a directory the caller must not be able to name, and
-    // each carries its own sentence because the user reads it verbatim.
-    expect(refuseAgentName("../evil")).toMatch(/one folder name/);
-    expect(refuseAgentName("a/b")).toMatch(/one folder name/);
-    expect(refuseAgentName("..")).toMatch(/dot/);
-    expect(refuseAgentName(".hidden")).toMatch(/dot/);
-    expect(refuseAgentName("")).toMatch(/Give the agent a name/);
-    expect(refuseAgentName("   ")).toMatch(/Give the agent a name/);
-    expect(refuseAgentName(" leading")).toMatch(/space/);
-    expect(refuseAgentName(42)).toMatch(/Give the agent a name/);
-    expect(refuseAgentName("x".repeat(65))).toMatch(/too long/);
-  });
-
-  it("refuses a NUL, which reaches fs as a throw rather than a refusal", () => {
-    expect(refuseAgentName("ok\u0000name")).toMatch(/isn't a folder name/);
-  });
-});
 
 describe("refuseScaffoldOnDisk", () => {
   it("passes an absent destination and refuses anything already there", async () => {

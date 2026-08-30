@@ -77,6 +77,7 @@ import { Toast } from "./components/Toast";
 import { TooltipLayer } from "./components/TooltipLayer";
 import { NewSessionComposer } from "./components/NewSessionComposer";
 import { HelpOverlay } from "./components/HelpOverlay";
+import { CreateAgentDialog } from "./components/CreateAgentDialog";
 import { OverviewModal } from "./components/OverviewModal";
 import { WorkflowsRail } from "./components/WorkflowsRail";
 import { WorkspaceGraphView } from "./components/WorkspaceGraphView";
@@ -90,7 +91,7 @@ import {
   resolveProjectRoot,
   slugifyIdea,
 } from "./lib/project-dir";
-import { basenameOf, isWithinDir, samePath } from "./lib/paths";
+import { basenameOf, isWithinDir, parentOf, samePath } from "./lib/paths";
 import {
   canvasSourceFor,
   canvasSubject,
@@ -124,7 +125,8 @@ import { editorLabel, editorUrl, resolveEditor } from "./lib/editors";
 import { CloneAgentConfirm } from "./components/CloneAgentConfirm";
 import {
   cloneDefinitionPrompt,
-  starterScaffoldInstruction,
+  composerScaffoldPrompt,
+  firstInstructionPrompt,
   useTemplatePrompt,
   type GalleryTemplate,
   type StudioTemplate,
@@ -286,6 +288,19 @@ export const App = (): JSX.Element => {
     label: string;
   } | null>(null);
   const startingProjectRootsRef = useRef(new Set<string>());
+  /**
+   * The project a create-agent dialog is open for (SAP-2981), or null.
+   *
+   * It holds the SUBJECT, not a form: the row that was clicked answers "where",
+   * and the dialog only asks what that row cannot. `sessionId` is set by the
+   * bare-project door, where a live session in the folder is already the
+   * session the new agent should bind to.
+   */
+  const [creatingAgent, setCreatingAgent] = useState<{
+    root: string;
+    label: string;
+    sessionId?: string;
+  } | null>(null);
   /**
    * Leave map altitude — unless the thing being opened lives INSIDE the
    * selected project.
@@ -1249,6 +1264,14 @@ export const App = (): JSX.Element => {
    * do not: that folder is the new project's root by construction, and
    * resolving it upward would drop the new agent into its parent project.
    */
+  /**
+   * The provider a create-initiated session boots with — the same stored
+   * preference the rail used to read before it dispatched. It moved here with
+   * the create itself; the rail no longer starts sessions.
+   */
+  const preferredHarness = (): HarnessKind =>
+    loadUiPrefs().preferredHarness === "codex" ? "codex" : "claude-code";
+
   const sessionCwdForAgent = (agentPath: string): string =>
     projectRootForAgent(agentPath, knownProjectRoots());
 
@@ -1302,20 +1325,25 @@ export const App = (): JSX.Element => {
     await createSessionAt(cwd, agentHarness);
   };
 
+  /**
+   * The composer's scaffold prompt — the ONE door left where the coding agent
+   * creates the project (SAP-2981).
+   *
+   * Everywhere the project is already known, the harness creates the agent
+   * itself (`handleCreateAgentInProject` below). The composer is the home
+   * screen: no project, no name, just an idea, and the folder it invents does
+   * not exist yet — so there is nothing here to state and no row to create in.
+   * The prompt is honest about being a prompt, and its failure message names
+   * the tool the user would have to ask for by hand.
+   */
   const sendScaffoldPrompt = (
     session: HarnessSession,
     cwd: string,
     idea?: string,
   ): void => {
-    const base =
-      `Scaffold a new Sapiom agent project in this directory: ${starterScaffoldInstruction(cwd, "default")}, ` +
-      "then run npm install, read AGENTS.md, and use the sapiom-agent-authoring skill to";
-    const trimmedIdea = idea?.trim();
     sendPromptWhenReady(
       session.id,
-      trimmedIdea
-        ? `${base} build this:\n\n${trimmedIdea}`
-        : `${base} define the first agent.`,
+      composerScaffoldPrompt(cwd, idea),
       "Couldn't send the scaffold prompt. Ask the coding agent to call sapiom_dev_agents_scaffold.",
     );
   };
@@ -1337,6 +1365,73 @@ export const App = (): JSX.Element => {
   ): Promise<void> => {
     const session = await createSessionAt(cwd, agentHarness);
     sendScaffoldPrompt(session, cwd, idea);
+  };
+
+  /**
+   * THE IN-PROJECT CREATE (SAP-2981; design.md § E4).
+   *
+   * The `+` on a project row used to start a session and inject an English
+   * sentence asking the coding agent to please call the scaffold MCP tool. The
+   * harness does it now: the dialog collects a name and a starter, the endpoint
+   * creates the directory and rescans it, and only THEN does a session open.
+   *
+   * The order is the feature. Creation completes before the chat starts, so a
+   * failure is a sentence in the dialog rather than a confused model, and the
+   * agent is a row in the rail before anything can ask "did it work?".
+   *
+   * The project is not asked for — it is the row that was clicked.
+   */
+  const handleCreateAgentInProject = (root: string, label: string): void => {
+    setCreatingAgent({ root, label });
+  };
+
+  const createAgentInProject = async (input: {
+    name: string;
+    template: string;
+    instruction: string;
+  }): Promise<void> => {
+    const request = creatingAgent;
+    if (!request) return;
+    // Throws on refusal, and the dialog shows the server's own sentence. It
+    // resolves only once the agent is on disk AND in the registry.
+    const created = await harness.scaffoldAgent(
+      request.root,
+      input.name,
+      input.template,
+    );
+    setCreatingAgent(null);
+    // The rail already has it (the server rescanned before answering); this is
+    // the selection following the thing the user just made.
+    setSelectedProject(null);
+    setFocusedAgentPath(created.path);
+
+    // EVERYTHING BELOW IS THE CHAT, and the agent already exists. A session
+    // that fails to start is a session failure, reported as one — it must
+    // never read as "the agent wasn't created", because it was.
+    try {
+      const existing = request.sessionId
+        ? (state.sessions.find((s) => s.id === request.sessionId) ?? null)
+        : null;
+      const session =
+        existing ??
+        (await createSessionAt(request.root, preferredHarness()));
+      await harness.bindWorkflow(session.id, created.path);
+      harness.setActiveSessionId(session.id);
+      setFocusedAgentPath(created.path);
+      if (input.instruction) {
+        sendPromptWhenReady(
+          session.id,
+          firstInstructionPrompt(created.path, input.instruction),
+          "Couldn't send your first instruction — the agent is created; type it into the terminal.",
+        );
+      }
+    } catch (err) {
+      harness.showToast(
+        `${created.name} was created, but its session didn't start. ${
+          (err as Error).message ?? ""
+        }`.trim(),
+      );
+    }
   };
 
   // The workbench tab + starts a fresh coding-agent process beside the active
@@ -1428,20 +1523,38 @@ export const App = (): JSX.Element => {
     })();
   };
 
-  // Bare-scaffold folder affordance: a live session sits in a folder
-  // with no agent yet. Ask that session to scaffold its first agent in place.
+  /**
+   * Bare-project affordance: a live session sits in a folder with no agent yet.
+   *
+   * It used to inject the scaffold prompt into that session — the third copy of
+   * the same English sentence. It is the same create as any other project now,
+   * aimed at the session's own folder, and the session it already has is the
+   * one the new agent binds to rather than a second pty beside it.
+   */
   const handleScaffoldInSession = (sessionId: string): void => {
-    const cwd =
-      state.sessions.find((session) => session.id === sessionId)?.cwd ?? ".";
-    sendPromptWhenReady(
+    const session = state.sessions.find((s) => s.id === sessionId);
+    if (!session) return;
+    setCreatingAgent({
+      root: session.cwd,
+      label: basenameOf(session.cwd) || session.cwd,
       sessionId,
-      `Scaffold a new Sapiom agent project in this directory: ${starterScaffoldInstruction(cwd, "default")}, then run npm install, read AGENTS.md, and use the sapiom-agent-authoring skill to define the first agent.`,
-      "Couldn't send the scaffold prompt. Ask the coding agent to call sapiom_dev_agents_scaffold.",
-    );
+    });
   };
 
-  // Templates journey v0: "Use template" starts a session in the destination
-  // folder and hands the agent the real operation.
+  /**
+   * "Use template" — one journey, two operations, and only one of them is a
+   * prompt (SAP-2981, E4.6).
+   *
+   * A STARTER is the same local scaffold the project `+` does, so it goes
+   * through the same endpoint: the folder is created before the session opens,
+   * and a refusal is an error the dialog shows. Two creation paths for one
+   * operation is exactly how they drift.
+   *
+   * A GALLERY template is a different operation — it forks a published agent
+   * into a repo the user owns, over the network, with an auth failure mode —
+   * and the harness has no route for that. It stays the coding agent's job, and
+   * says so.
+   */
   const handleUseTemplate = async (
     cwd: string,
     template: StudioTemplate,
@@ -1450,21 +1563,43 @@ export const App = (): JSX.Element => {
       | "template_gallery"
       | "template_detail" = "template_gallery",
   ): Promise<void> => {
-    const session = await createSessionAt(cwd, "claude-code");
     // Product metric — "templates used". Fires at the choke point every
     // template surface funnels through; `agent.created` fires later when the
     // clone produces a real sapiom.json, so built ≥ templates holds.
-    trackProduct("agent.template_cloned", {
-      template_slug: template.id,
-      template_id: template.id,
-      surface,
-    });
+    const trackUse = (): void => {
+      trackProduct("agent.template_cloned", {
+        template_slug: template.id,
+        template_id: template.id,
+        surface,
+      });
+    };
+    if (template.kind === "starter") {
+      // `cwd` is the folder the destination picker settled on: its parent is
+      // the project, its basename the agent's name. The endpoint refuses both
+      // on its own findings, so a rejection here is the server's sentence and
+      // the dialog shows it verbatim.
+      const parent = parentOf(cwd);
+      if (!parent)
+        throw new Error(`Can't create an agent at ${cwd} — pick a folder inside a project.`);
+      const created = await harness.scaffoldAgent(
+        parent,
+        basenameOf(cwd),
+        template.id,
+      );
+      trackUse();
+      setTemplatesOpen(false);
+      setFocusedAgentPath(created.path);
+      const session = await createSessionAt(parent, "claude-code");
+      await harness.bindWorkflow(session.id, created.path);
+      setFocusedAgentPath(created.path);
+      return;
+    }
+    const session = await createSessionAt(cwd, "claude-code");
+    trackUse();
     sendPromptWhenReady(
       session.id,
       useTemplatePrompt(template, cwd),
-      template.kind === "gallery"
-        ? "Couldn't send the clone prompt. Ask the coding agent to run sapiom_dev_agents_clone."
-        : "Couldn't send the starter prompt. Ask the coding agent to call sapiom_dev_agents_scaffold.",
+      "Couldn't send the clone prompt. Ask the coding agent to run sapiom_dev_agents_clone.",
     );
   };
 
@@ -2008,7 +2143,7 @@ export const App = (): JSX.Element => {
             listDir={harness.listDir}
             onCreateSession={handleCreateSession}
             listHarnesses={harness.listHarnesses}
-            onScaffoldSession={handleScaffoldSession}
+            onCreateAgent={handleCreateAgentInProject}
             onScaffoldInSession={handleScaffoldInSession}
             onBrowseTemplates={() => {
               setSelectedProject(null);
@@ -2690,6 +2825,25 @@ export const App = (): JSX.Element => {
             setTemplatesOpen(true);
           }}
           onDismiss={() => setOverviewOpen(false)}
+        />
+      )}
+
+      {/* The create-agent dialog (SAP-2981). Mounted here, beside the other
+          cards-on-top, because the create has to outlive the rail popover that
+          opened it — the menu unmounts on click, and a dialog rendered inside
+          it would go with it. */}
+      {creatingAgent && (
+        <CreateAgentDialog
+          projectLabel={creatingAgent.label}
+          projectRoot={creatingAgent.root}
+          onCancel={() => setCreatingAgent(null)}
+          onCreate={createAgentInProject}
+          onBrowseTemplates={() => {
+            setCreatingAgent(null);
+            setSelectedProject(null);
+            setTemplatesOpen(true);
+            setOverviewOpen(false);
+          }}
         />
       )}
 

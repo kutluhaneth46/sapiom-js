@@ -8,6 +8,7 @@
 import type {
   AccountPlanView,
   AdoptSessionRequest,
+  AgentScaffoldResponse,
   AppState,
   AttachFileRequest,
   AttachFileResponse,
@@ -44,6 +45,7 @@ import type { LocalStepTrace, LocalRunOutcome } from "@sapiom/agent-core";
 
 import { getTheme } from "./theme";
 import { parseSystemGraphSnapshot } from "./system-graph";
+import { refuseAgentName } from "@shared/agent-name";
 import { refuseMove, remapUnder } from "./agent-move";
 import { basenameOf, isWithinDir, samePath } from "./paths";
 
@@ -392,6 +394,23 @@ export interface HarnessApi {
    * `workflows.changed` and the rail re-derives the tree from the new path.
    */
   moveAgent(from: string, to: string): Promise<void>;
+  /**
+   * Creates an agent on disk — the create flow's ONE mechanism (SAP-2981).
+   *
+   * The harness does the scaffold; nothing here asks a coding agent to perform
+   * a filesystem operation by natural language. So a failure is an `ApiError`
+   * carrying the server's own sentence (a name already taken in that project,
+   * a name that is not one folder segment, a root the rail cannot show) — a
+   * thing the dialog can show — instead of a prompt whose outcome only the
+   * terminal knows. Resolves once the agent is on disk AND the server has
+   * rescanned it into the registry, so the rail can show it before any session
+   * opens.
+   */
+  scaffoldAgent(
+    root: string,
+    name: string,
+    template?: string,
+  ): Promise<AgentScaffoldResponse>;
   /** Adapter registry (GET /api/harnesses): every known harness with its
    *  mode/installed/experimental flags plus per-agent Sapiom MCP install
    *  instructions — the new-session picker and MCP setup block feed on it. */
@@ -665,6 +684,17 @@ class RealApi implements HarnessApi {
     await this.request<{ ok: true }>("/api/agents/move", {
       method: "POST",
       body: JSON.stringify({ from, to }),
+    });
+  }
+
+  scaffoldAgent(
+    root: string,
+    name: string,
+    template?: string,
+  ): Promise<AgentScaffoldResponse> {
+    return this.request<AgentScaffoldResponse>("/api/agents/scaffold", {
+      method: "POST",
+      body: JSON.stringify({ root, name, template }),
     });
   }
 
@@ -2118,6 +2148,55 @@ class MockApi implements HarnessApi {
     void import("./events").then(({ publishMockBusMessage }) => {
       publishMockBusMessage({ type: "workflows.changed" });
     });
+  }
+
+  /**
+   * The mock's stand-in for `POST /api/agents/scaffold`.
+   *
+   * A SECOND GUARD, like the mock's mover beside it: the dialog validates the
+   * name before it submits, but the create path must not be a thing only the
+   * dialog can refuse. The real server owns the disk (`src/server/scaffold.ts`)
+   * — the mock has none, so it checks what the registry can see, which is the
+   * same guard set minus the `lstat`.
+   *
+   * The new agent JOINS the fixture list and `workflows.changed` is announced,
+   * the same signal the real server broadcasts, so the rail shows the agent
+   * before the caller opens a session on it — the criterion this endpoint
+   * exists for, exercisable in a browser.
+   */
+  async scaffoldAgent(
+    root: string,
+    name: string,
+    template = "default",
+  ): Promise<AgentScaffoldResponse> {
+    await delay(180);
+    const refusal = refuseAgentName(name);
+    if (refusal)
+      throw new ApiError(400, "POST /api/agents/scaffold \u2192 400 (mock)", refusal);
+    const path = `${root.replace(/\/+$/, "")}/${name}`;
+    if (this.workflows.some((workflow) => samePath(workflow.path, path)))
+      throw new ApiError(
+        409,
+        "POST /api/agents/scaffold \u2192 409 (mock)",
+        `${basenameOf(root)} already has an agent called ${name}.`,
+      );
+    this.workflows = [
+      ...this.workflows,
+      {
+        name,
+        path,
+        definitionId: null,
+        definitionSlug: null,
+        source: "scan",
+        // The real scaffold writes the starter's id into sapiom.json, and the
+        // rail reads provenance from it.
+        starterId: template,
+      },
+    ];
+    void import("./events").then(({ publishMockBusMessage }) => {
+      publishMockBusMessage({ type: "workflows.changed" });
+    });
+    return { ok: true, path, name, template, dependenciesInstalled: true };
   }
 
   async scanWorkflows(root: string): Promise<WorkflowScanOutcome> {
