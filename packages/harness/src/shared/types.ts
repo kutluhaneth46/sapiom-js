@@ -987,6 +987,8 @@ export interface SessionRecord {
 // POST   /api/sessions/:id/input        InjectInputRequest → { ok: true }
 // POST   /api/sessions/:id/attachments  AttachFileRequest → AttachFileResponse (materialize only)
 // PATCH  /api/sessions/:id/workflow     BindWorkflowRequest → HarnessSession
+// POST   /api/agents/scaffold           { root, name, template? } → AgentScaffoldResponse (the harness creates the agent)
+// POST   /api/agents/move               { from, to } → AgentMoveResponse (rename an agent's directory)
 // GET    /api/workflows                 → WorkflowInfo[]
 // POST   /api/workflows/connect         { path } → WorkflowInfo
 // POST   /api/workflows/scan            { root } → WorkflowInfo[]

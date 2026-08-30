@@ -36,7 +36,6 @@
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import * as fs from "node:fs/promises";
-import { createRequire } from "node:module";
 import * as path from "node:path";
 
 import {
@@ -47,22 +46,10 @@ import {
   type ResolvedVersions,
 } from "@sapiom/agent-core";
 
+import { agentCoreTemplatesDir } from "./agent-core-templates.js";
 import { TEMPLATE_HTML, renderCanvasDocument } from "./canvas-template.js";
 
-const nodeRequire = createRequire(import.meta.url);
-
 export const SAMPLE_PROJECT_NAME = "order-triage";
-
-/** Locate @sapiom/agent-core's bundled templates dir (no `__dirname` in ESM). */
-function agentCoreTemplatesDir(): string {
-  const entry = nodeRequire.resolve("@sapiom/agent-core");
-  const dir = path.resolve(path.dirname(entry), "..", "..", "templates");
-  // Embedded in Electron, require.resolve reports the app.asar (virtual) path;
-  // scaffold()'s cpSync can't opendir inside the asar archive (ENOTDIR), so
-  // point at the unpacked twin. No-op under the CLI (real filesystem path).
-  // The desktop host must asarUnpack node_modules (it unpacks all of them).
-  return dir.replace(/([\\/])app\.asar([\\/])/, "$1app.asar.unpacked$2");
-}
 
 function tryGit(cwd: string, args: string[]): boolean {
   try {

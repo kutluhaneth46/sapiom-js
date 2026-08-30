@@ -15,6 +15,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import express, { type Express } from "express";
+import { scaffold } from "@sapiom/agent-core";
 import { WebSocketServer } from "ws";
 import open from "open";
 
@@ -87,6 +88,7 @@ import {
   removeGeneratedSessionDir,
   sweepGeneratedDirs,
 } from "../core/inject/retention.js";
+import { agentCoreTemplatesDir } from "../core/agent-core-templates.js";
 import { CanvasWatcherManager } from "../core/canvas-watcher.js";
 import { WorkspaceWatcherManager } from "../core/workspace-watcher.js";
 import { InstallWatcherManager } from "../core/install-watcher.js";
@@ -150,6 +152,7 @@ import {
   moveTargetDirs,
   remapSessions,
 } from "./agent-move.js";
+import { createAgentScaffoldRouter } from "./scaffold.js";
 import { createMacrosRouter } from "./macros.js";
 import { createFsRouter } from "./fs.js";
 import { createRunsRouter } from "./runs.js";
@@ -319,6 +322,7 @@ type WorkflowScanReason =
   | "session-create"
   | "workspace-change"
   | "agent-linked"
+  | "agent-created"
   | "agent-moved"
   | "graph-refresh"
   | "requested";
@@ -1728,6 +1732,55 @@ export const startServer = async (
             refreshSystemGraphScopesForRoot(dirname(to));
           },
         });
+      },
+    }),
+  );
+  // SAP-2981: the harness CREATES the agent. Every create door used to end in
+  // an English sentence injected into a terminal asking the coding agent to
+  // call the scaffold MCP tool, so a failed create surfaced as a confused model
+  // and "did it work?" was answered by reading a terminal. The route runs the
+  // same `scaffold` routine that tool runs, and its guards live in the module:
+  // one plain segment for the name, a plain segment for the template (which
+  // `resolveTemplate` JOINS onto the bundled templates dir), and a root matched
+  // against the SAME directory list the move route drops into — so "a folder
+  // the rail can show" and "a folder the studio will create a project in" stay
+  // one answer.
+  app.use(
+    createAgentScaffoldRouter({
+      listProjectDirs: async () => {
+        const stored = await loadSettings(statePaths.settings);
+        return moveTargetDirs(
+          [
+            ...stored.recentDirs,
+            ...(stored.projectRoot ? [stored.projectRoot] : []),
+            ...sessionManager.list().map((session) => session.cwd),
+          ],
+          workflowsCache.map((w) => w.path),
+        );
+      },
+      resolveAgent: (agentPath) =>
+        workflowsCache.find((w) => resolve(w.path) === agentPath) ?? null,
+      scaffoldAgent: async ({ targetDir, template }) => {
+        // `installDependencies: true` for the same reason the MCP tool passes
+        // it: the Canvas bundles the project on its first, unprompted render
+        // and resolves `@sapiom/agent`/`zod` from the project's own
+        // node_modules, so a never-installed agent opens on a "Could not
+        // resolve …" error. Best-effort inside agent-core — a failed install
+        // still returns a created project.
+        const result = await scaffold({
+          targetDir,
+          template,
+          templatesDir: agentCoreTemplatesDir(),
+          installDependencies: true,
+        });
+        return { dependenciesInstalled: result.dependenciesInstalled };
+      },
+      // Rescan the PROJECT root, not the agent directory: the registry has to
+      // learn the new agent under the project the rail draws it in, and the
+      // scan broadcasts `workflows.changed` so the row is there before the
+      // dialog's caller opens a session on it.
+      onScaffolded: async (agentDir) => {
+        await scanWorkflowsAndBroadcast(dirname(agentDir), "agent-created");
       },
     }),
   );
