@@ -4223,6 +4223,16 @@ button.rail-footer-card:hover {
   stroke-dasharray: 5 5;
 }
 
+/* Two systems that touch. Dotted and lighter than the wiring inside a
+   container, because "these two are connected" is a weaker claim than "this is
+   how this system is built" — and these are the only connectors that cross a
+   border, so they must not read as that border being wrong. */
+.system-graph-edge.is-cross-group {
+  stroke: var(--text-faint);
+  stroke-dasharray: 2 4;
+  opacity: 0.75;
+}
+
 .system-graph-arrow {
   fill: var(--text-faint);
 }
@@ -4235,6 +4245,33 @@ button.rail-footer-card:hover {
   font-family: var(--font-mono);
   font-size: var(--type-meta);
   pointer-events: none;
+}
+
+/* A named, bounded container around one system's cards — the shape the
+   fourfold map reference draws around "THE LOOP". Behind everything (the edge
+   svg and the cards are later siblings), and NOT interactive: a group is
+   edited in the rail, which is the surface that owns the arrangement. */
+.system-graph-group {
+  position: absolute;
+  box-sizing: border-box;
+  padding: var(--sp2) var(--sp3);
+  border: 1px solid var(--ui-line);
+  border-radius: calc(var(--radius) * 2);
+  background: var(--surface-inset);
+  pointer-events: none;
+}
+
+.system-graph-group-label {
+  display: block;
+  max-width: 100%;
+  overflow: hidden;
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: var(--type-meta);
+  letter-spacing: 0.08em;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
 }
 
 .system-graph-node {

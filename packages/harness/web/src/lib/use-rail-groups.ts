@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useSyncExternalStore } from "react";
 import type { WorkflowInfo } from "@shared/types";
 
 import { createApi } from "./api";
@@ -27,6 +27,69 @@ const api = createApi();
  *  path the settings file or a session cwd produced, a space can. */
 const ROOTS_SEP = "\n";
 
+/**
+ * ONE arrangement per project root, shared by every consumer on the page.
+ *
+ * The rail and the project MAP are two views of the same groups (SAP-2983), and
+ * two hook instances holding two copies is exactly how they come to disagree:
+ * an edit in the rail would leave the map still drawing the arrangement from
+ * before it, with no event to tell it otherwise — the file is the only shared
+ * medium, and nothing re-reads it. So the cache is module-level for the same
+ * reason the file is per project: there is one answer, and both surfaces read
+ * it.
+ *
+ * `requested` lives here too, so a second surface mounting does not re-issue a
+ * read the first one already has in flight.
+ */
+interface RailGroupsStore {
+  /** A property of the INSTALL, not of a root, so one read serves every
+   *  project. Null until it lands. */
+  edges: LaunchEdge[] | null;
+  edgesRequested: boolean;
+  states: Map<string, RailState>;
+  loaded: Set<string>;
+  requested: Set<string>;
+  listeners: Set<() => void>;
+  /** Bumped on every mutation. `useSyncExternalStore` compares it by identity,
+   *  and every accessor below takes it as a dependency — a Map mutated in place
+   *  cannot be compared, and a version number can. */
+  version: number;
+}
+
+const store: RailGroupsStore = {
+  edges: null,
+  edgesRequested: false,
+  states: new Map(),
+  loaded: new Set(),
+  requested: new Set(),
+  listeners: new Set(),
+  version: 0,
+};
+
+function notify(): void {
+  store.version += 1;
+  for (const listener of [...store.listeners]) listener();
+}
+
+function subscribe(listener: () => void): () => void {
+  store.listeners.add(listener);
+  return () => {
+    store.listeners.delete(listener);
+  };
+}
+
+const snapshot = (): number => store.version;
+
+/** Roots are compared canonically — the rail holds what the user typed and the
+ *  map holds what the server resolved, and `<root>/` and `<root>` are one
+ *  directory. Storing under the raw spelling would give one project two
+ *  arrangements. */
+const canonicalRoot = (root: string): string =>
+  root.replace(/\\/g, "/").replace(/(.)\/+$/, "$1");
+
+/** Writes in flight, per canonical root. See `commit` below. */
+const writeChain = new Map<string, Promise<void>>();
+
 export interface RailGroups {
   /** The rows to render for one project root: the stored groups if the user has
    *  any, the derived ones until then, `Ungrouped` last either way. */
@@ -43,6 +106,10 @@ export interface RailGroups {
    * arrangement that is still in flight; materializing before the edges land
    * would freeze an EMPTY derived set as the user's own, which is the stuck
    * state `Reset to detected` exists to escape — reached by clicking fast.
+   *
+   * The map reads it for a different reason and the same one: drawing before
+   * both halves land would show every agent in `Ungrouped` for a beat, which is
+   * a real arrangement and would read as the answer.
    */
   isReady: (root: string) => boolean;
   /** The stored state, for the reset control's copy ("Discards 3 groups"). */
@@ -88,9 +155,7 @@ export function useRailGroups(
   sort: RailSort,
   enabled: boolean,
 ): RailGroups {
-  const [edges, setEdges] = useState<LaunchEdge[] | null>(null);
-  const [states, setStates] = useState<Record<string, RailState>>({});
-  const [loaded, setLoaded] = useState<Record<string, true>>({});
+  const version = useSyncExternalStore(subscribe, snapshot, snapshot);
 
   // The registry changes as agents are scanned, and the load effect below must
   // not re-run for that — it would re-read every project's file. It reads the
@@ -98,39 +163,34 @@ export function useRailGroups(
   const workflowsRef = useRef(workflows);
   workflowsRef.current = workflows;
 
-  /** Roots a read has already been started for. A ref, not state, so it updates
-   *  synchronously and a re-render mid-flight cannot start a second read. */
-  const requested = useRef(new Set<string>());
-
   // Launch edges are a property of the INSTALL, not of a root, so one read
   // serves every project. Fetched only once the axis is in use: it greps every
   // registered agent's sources, and the Project axis has no use for the answer.
   useEffect(() => {
-    if (!enabled) return;
-    let live = true;
+    if (!enabled || store.edgesRequested) return;
+    store.edgesRequested = true;
     void api
       .listLaunchEdges()
       .then((next) => {
-        if (live) setEdges(next);
+        store.edges = next;
+        notify();
       })
       .catch(() => {
         // No edges is a truthful degradation: every agent shows in `Ungrouped`,
         // which is what a repo with no launch calls looks like anyway. Recorded
         // as an empty ARRAY rather than left null so the axis becomes editable —
         // hand-grouping is the whole point when detection finds nothing.
-        if (live) setEdges([]);
+        store.edges = [];
+        notify();
       });
-    return () => {
-      live = false;
-    };
   }, [enabled]);
 
-  const rootsKey = roots.join(ROOTS_SEP);
+  const rootsKey = roots.map(canonicalRoot).join(ROOTS_SEP);
   useEffect(() => {
     if (!enabled) return;
     for (const root of rootsKey.split(ROOTS_SEP).filter(Boolean)) {
-      if (requested.current.has(root)) continue;
-      requested.current.add(root);
+      if (store.requested.has(root)) continue;
+      store.requested.add(root);
       void api
         .getRailState(root)
         .then((raw) => {
@@ -138,27 +198,31 @@ export function useRailGroups(
           // member path belonging to a neighbouring project is still a real
           // agent, and pruning it here would silently drop it from a file the
           // next edit rewrites.
-          setStates((prev) => ({ ...prev, [root]: readRailState(raw, workflowsRef.current) }));
-          setLoaded((prev) => ({ ...prev, [root]: true }));
+          store.states.set(root, readRailState(raw, workflowsRef.current));
+          store.loaded.add(root);
+          notify();
         })
         .catch(() => {
           // An older server with no such route, or an unreadable project. Both
           // read as "nothing stored", which shows the derived groups — but the
           // root stays NOT loaded, so nothing can be edited into a file we were
           // unable to read.
-          setStates((prev) => ({ ...prev, [root]: EMPTY_RAIL_STATE }));
+          store.states.set(root, EMPTY_RAIL_STATE);
+          notify();
         });
     }
   }, [enabled, rootsKey]);
 
   const stateFor = useCallback(
-    (root: string): RailState => states[root] ?? EMPTY_RAIL_STATE,
-    [states],
+    (root: string): RailState => store.states.get(canonicalRoot(root)) ?? EMPTY_RAIL_STATE,
+    // `version` stands in for the store: a Map mutated in place cannot be a
+    // dependency, and the counter it bumps can.
+    [version],
   );
 
   const isReady = useCallback(
-    (root: string): boolean => edges !== null && loaded[root] === true,
-    [edges, loaded],
+    (root: string): boolean => store.edges !== null && store.loaded.has(canonicalRoot(root)),
+    [version],
   );
 
   /**
@@ -169,23 +233,21 @@ export function useRailGroups(
    * here: the reset's DELETE finishing before the drag's PUT leaves the file
    * holding the arrangement the reset was meant to erase, which is the stuck
    * state all over again. Chaining makes the file end where the user left off.
-   */
-  const writeChain = useRef(new Map<string, Promise<void>>());
-
-  /**
-   * The ONE place a rail-state file is written. `railStateWrite` returns the
-   * DECISION — write this text, or remove the file — so the null/empty
-   * distinction cannot be lost at a call site.
+   *
+   * Module-level with the rest of the store, because two SURFACES editing one
+   * root are the same race as two edits from one.
    */
   const commit = useCallback((root: string, next: RailState): void => {
-    setStates((prev) => ({ ...prev, [root]: next }));
+    const key = canonicalRoot(root);
+    store.states.set(key, next);
+    notify();
     const write = railStateWrite(next);
-    const previous = writeChain.current.get(root) ?? Promise.resolve();
+    const previous = writeChain.get(key) ?? Promise.resolve();
     const persisted = previous.then(() =>
       write.kind === "write" ? api.saveRailState(root, write.raw) : api.clearRailState(root),
     );
-    writeChain.current.set(
-      root,
+    writeChain.set(
+      key,
       persisted.catch(() => {
         // A read-only checkout or an older server. The arrangement still applies
         // for this session; it simply will not be there next time — and the
@@ -200,19 +262,21 @@ export function useRailGroups(
       rootWorkflows: readonly WorkflowInfo[],
       fn: (state: MaterializedRailState) => MaterializedRailState,
     ): void => {
-      if (edges === null || !loaded[root]) return;
-      const current = states[root] ?? EMPTY_RAIL_STATE;
-      commit(root, fn(materialize(current, rootWorkflows, edges, sort)));
+      const key = canonicalRoot(root);
+      if (store.edges === null || !store.loaded.has(key)) return;
+      const current = store.states.get(key) ?? EMPTY_RAIL_STATE;
+      commit(root, fn(materialize(current, rootWorkflows, store.edges, sort)));
     },
-    [commit, edges, loaded, sort, states],
+    [commit, sort],
   );
 
   const reset = useCallback(
     (root: string): void => {
-      if (!loaded[root]) return;
-      commit(root, resetToDetected(states[root] ?? EMPTY_RAIL_STATE));
+      const key = canonicalRoot(root);
+      if (!store.loaded.has(key)) return;
+      commit(root, resetToDetected(store.states.get(key) ?? EMPTY_RAIL_STATE));
     },
-    [commit, loaded, states],
+    [commit],
   );
 
   const agentsIn = useCallback(
@@ -223,8 +287,13 @@ export function useRailGroups(
 
   const groupsFor = useCallback(
     (root: string, rootWorkflows: readonly WorkflowInfo[]): GroupNode[] =>
-      deriveOrStored(rootWorkflows, states[root] ?? EMPTY_RAIL_STATE, edges ?? [], sort),
-    [edges, sort, states],
+      deriveOrStored(
+        rootWorkflows,
+        store.states.get(canonicalRoot(root)) ?? EMPTY_RAIL_STATE,
+        store.edges ?? [],
+        sort,
+      ),
+    [sort, version],
   );
 
   return useMemo(

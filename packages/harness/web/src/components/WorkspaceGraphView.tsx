@@ -11,7 +11,9 @@ import type { BusMessage, WorkflowInfo } from "@shared/types";
 
 import type { HarnessApi } from "../lib/api";
 import { systemGraphLoader } from "../lib/system-graph-loader";
+import { systemGraphNodeGroups } from "../lib/system-graph-groups";
 import { mapSystemGraphNavigation } from "../lib/system-graph-navigation";
+import { useRailGroups } from "../lib/use-rail-groups";
 import { trackingAttrs } from "../lib/analytics/tracking-attrs";
 import { EmptyState } from "./EmptyState";
 import { Icon } from "./Icon";
@@ -138,6 +140,44 @@ export function WorkspaceGraphView({
         : new Map<AgentKey, WorkflowInfo>(),
     [graph, workspaceKey, workflows, workspaceScopes],
   );
+
+  /* THE MAP READS THE RAIL'S GROUPS (SAP-2983).
+     The Group axis is stored per project ROOT, and a workspace scope is the one
+     thing that joins this opaque key back to one — the graph payload carries no
+     filesystem path on purpose. Sorted by name because a container's order on
+     the map is its own (`shelfPack` keeps the rail's group order); this only
+     settles the order of agents inside one, which the layout re-decides from
+     the topology anyway. */
+  const projectRoot = useMemo(
+    () =>
+      workspaceScopes.find((scope) => scope.workspaceKey === workspaceKey)
+        ?.cwd ?? null,
+    [workspaceKey, workspaceScopes],
+  );
+  const railRoots = useMemo(
+    () => (projectRoot === null ? [] : [projectRoot]),
+    [projectRoot],
+  );
+  const railGroups = useRailGroups(
+    railRoots,
+    workflows,
+    "name",
+    projectRoot !== null,
+  );
+  const groups = useMemo(() => {
+    // `isReady` is BOTH halves — the stored arrangement and the launch edges.
+    // Drawing before either lands would put every agent in one `Ungrouped`
+    // container for a beat, and that is a real arrangement, not a placeholder:
+    // it would read as this project's answer and then silently rearrange.
+    if (!graph || projectRoot === null || !railGroups.isReady(projectRoot)) {
+      return undefined;
+    }
+    return systemGraphNodeGroups(
+      graph.nodes,
+      railGroups.groupsFor(projectRoot, railGroups.agentsIn(projectRoot)),
+      navigation,
+    );
+  }, [graph, navigation, projectRoot, railGroups]);
 
   return (
     /* The MAP altitude of the right pane (`lib/canvas-altitude.ts`) — a
@@ -268,6 +308,7 @@ export function WorkspaceGraphView({
             graph={graph}
             workspaceKey={workspaceKey}
             navigableAgentKeys={new Set(navigation.keys())}
+            groups={groups}
             onOpenAgent={(agentKey) => {
               const workflow = navigation.get(agentKey);
               if (workflow) onOpenAgent(workflow.path);

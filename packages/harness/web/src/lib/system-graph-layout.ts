@@ -20,9 +20,71 @@ const PORT_LIMIT = 24;
 const PORT_STEP = 8;
 const LABEL_HEIGHT = 16;
 
+/**
+ * Inside a container, around everything it holds.
+ *
+ * Not a taste number: a cycle gutter reaches `8 + 9 * 4 = 44px` past the right
+ * edge of its component and a rank-skipping corridor reaches `12 + 4 * 4 = 28px`
+ * above the top of one. Anything smaller and a group's own wiring would be
+ * drawn crossing the border drawn around it, which reads as an edge leaving the
+ * system when it never did.
+ */
+const GROUP_PADDING = 48;
+/** The label strip along the top of a container, above its content. */
+const GROUP_HEADER = 26;
+/** Between containers. Wider than `COMPONENT_GAP` so the boundary between two
+ *  systems reads as a bigger break than the boundary between two components of
+ *  one system. */
+const GROUP_GAP = 80;
+/**
+ * Target width:height for a packed region.
+ *
+ * The defect this whole file's packing exists to fix is a project of 76 agents
+ * with 8 edges rendering as a single ~70-node column roughly 8,700px tall.
+ * Shelf packing needs a width to wrap at, and the pane it lands in is wide, so
+ * aim landscape rather than square.
+ */
+const SHELF_ASPECT = 2.2;
+
+/**
+ * The label the Group axis gives agents no group claims (`agent-groups.ts`).
+ *
+ * Repeated here rather than imported because the dependency runs the other way:
+ * `system-graph-groups.ts` maps the rail's model onto this one. The e2e spec
+ * asserts the map's container labels against the RAIL's rows, so the two
+ * spellings cannot drift apart unnoticed.
+ */
+export const SYSTEM_GRAPH_UNGROUPED_LABEL = "Ungrouped";
+
 export interface SystemGraphPoint {
   x: number;
   y: number;
+}
+
+/**
+ * One container to draw: a named set of node ids.
+ *
+ * The map does not decide these. They come from the Group axis the rail already
+ * renders (`lib/agent-groups.ts`, mapped by `lib/system-graph-groups.ts`) — two
+ * views of one arrangement, which is the whole point of SAP-2983. A second
+ * opinion about which agents belong together would be a second answer to a
+ * question the user has already answered.
+ */
+export interface SystemGraphNodeGroup {
+  id: string;
+  label: string;
+  nodeIds: readonly string[];
+}
+
+/** A drawn container: the box, and the label that names it. */
+export interface SystemGraphLayoutGroup {
+  id: string;
+  label: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  nodeCount: number;
 }
 
 export interface SystemGraphLayoutNode {
@@ -32,6 +94,9 @@ export interface SystemGraphLayoutNode {
   width: number;
   height: number;
   componentId: string;
+  /** The container this card sits inside, or null when the graph was laid out
+   *  without groups. */
+  groupId: string | null;
 }
 
 export interface SystemGraphLabelBounds {
@@ -52,11 +117,18 @@ export interface SystemGraphLayoutEdge {
   labelY: number;
   labelBounds: SystemGraphLabelBounds;
   route: "forward" | "cycle";
+  /** True when the two ends sit in different containers. Drawn differently,
+   *  because "these two systems touch" is a different claim from "this system
+   *  is wired like this". */
+  crossesGroup: boolean;
 }
 
 export interface SystemGraphLayout {
   nodes: SystemGraphLayoutNode[];
   edges: SystemGraphLayoutEdge[];
+  /** Empty when laid out without groups — the map draws no chrome it was not
+   *  given a reason to draw. */
+  groups: SystemGraphLayoutGroup[];
   bounds: { width: number; height: number };
 }
 
@@ -96,6 +168,7 @@ interface EdgeSeed {
   targetOffset: number;
   cycleLane: number;
   forwardLane: number;
+  crossesGroup: boolean;
 }
 
 interface RoutedEdge extends EdgeSeed {
@@ -330,19 +403,73 @@ export function analyzeSystemGraph(graph: SystemGraph): SystemGraphTopology {
   return { components };
 }
 
-function placeNodes(topology: SystemGraphTopology): {
+interface Sized {
+  width: number;
+  height: number;
+}
+
+/**
+ * Left-to-right shelves, wrapping at a width derived from the total area.
+ *
+ * Boxes keep their given ORDER — for containers that order is the rail's, and a
+ * map that reshuffles the rail's rows is a map you have to re-read. Wrapping is
+ * what stops a list of boxes becoming a column: stacking 68 single-agent
+ * components produced a subject 8,700px tall, which no amount of fitting makes
+ * legible.
+ */
+function shelfPack(
+  sizes: readonly Sized[],
+  gap: number,
+): { offsets: SystemGraphPoint[]; width: number; height: number } {
+  if (sizes.length === 0) return { offsets: [], width: 0, height: 0 };
+  const widest = Math.max(...sizes.map((size) => size.width));
+  // Each box is counted WITH its gutter, so the estimate holds for the many
+  // small boxes case — which is the shape that produced the column.
+  const area = sizes.reduce(
+    (total, size) => total + (size.width + gap) * (size.height + gap),
+    0,
+  );
+  const target = Math.max(widest, Math.sqrt(area * SHELF_ASPECT));
+  const offsets: SystemGraphPoint[] = [];
+  let shelfTop = 0;
+  let shelfHeight = 0;
+  let cursorX = 0;
+  let width = 0;
+  for (const size of sizes) {
+    if (cursorX > 0 && cursorX + size.width > target) {
+      shelfTop += shelfHeight + gap;
+      shelfHeight = 0;
+      cursorX = 0;
+    }
+    offsets.push({ x: cursorX, y: shelfTop });
+    cursorX += size.width + gap;
+    width = Math.max(width, cursorX - gap);
+    shelfHeight = Math.max(shelfHeight, size.height);
+  }
+  return { offsets, width, height: shelfTop + shelfHeight };
+}
+
+/**
+ * Every component of one region, ranked internally and then shelf-packed.
+ *
+ * Components are laid out at their own origin first because packing needs each
+ * box's size up front — the vertical stack this replaces never had to know one.
+ */
+function placeRegionNodes(
+  topology: SystemGraphTopology,
+  groupId: string | null,
+): {
   nodes: SystemGraphLayoutNode[];
   componentBoxes: Map<string, ComponentBox>;
   componentByNode: Map<string, string>;
   strongByNode: Map<string, string>;
+  width: number;
+  height: number;
 } {
-  const nodes: SystemGraphLayoutNode[] = [];
-  const componentBoxes = new Map<string, ComponentBox>();
   const componentByNode = new Map<string, string>();
   const strongByNode = new Map<string, string>();
-  let yCursor = 0;
 
-  for (const component of topology.components) {
+  const laid = topology.components.map((component) => {
     const byRank = new Map<number, string[]>();
     for (const strong of component.stronglyConnected) {
       const rankNodes = byRank.get(strong.rank) ?? [];
@@ -362,41 +489,56 @@ function placeNodes(topology: SystemGraphTopology): {
         Math.max(0, count - 1) * SYSTEM_GRAPH_SLOT_GAP
       );
     };
-    const componentHeight = Math.max(
+    const height = Math.max(
       SYSTEM_GRAPH_NODE_HEIGHT,
       ...ranks.map(rankHeight),
     );
+    const local: SystemGraphLayoutNode[] = [];
     for (const rank of ranks) {
       const rankNodes = byRank.get(rank)!;
-      const startY = yCursor + (componentHeight - rankHeight(rank)) / 2;
+      const startY = (height - rankHeight(rank)) / 2;
       rankNodes.forEach((id, row) => {
-        nodes.push({
+        local.push({
           id,
           x: rank * (SYSTEM_GRAPH_NODE_WIDTH + SYSTEM_GRAPH_RANK_GAP),
           y: startY + row * (SYSTEM_GRAPH_NODE_HEIGHT + SYSTEM_GRAPH_SLOT_GAP),
           width: SYSTEM_GRAPH_NODE_WIDTH,
           height: SYSTEM_GRAPH_NODE_HEIGHT,
           componentId: component.id,
+          groupId,
         });
       });
     }
-    const componentNodes = nodes.filter(
-      (candidate) => candidate.componentId === component.id,
-    );
-    componentBoxes.set(component.id, {
-      minX: Math.min(...componentNodes.map((candidate) => candidate.x)),
-      minY: Math.min(...componentNodes.map((candidate) => candidate.y)),
-      maxX: Math.max(
-        ...componentNodes.map((candidate) => candidate.x + candidate.width),
-      ),
-      maxY: Math.max(
-        ...componentNodes.map((candidate) => candidate.y + candidate.height),
-      ),
+    const width = Math.max(...local.map((node) => node.x + node.width));
+    return { component, local, width, height };
+  });
+
+  const packed = shelfPack(laid, COMPONENT_GAP);
+  const nodes: SystemGraphLayoutNode[] = [];
+  const componentBoxes = new Map<string, ComponentBox>();
+  laid.forEach((entry, index) => {
+    const at = packed.offsets[index]!;
+    for (const node of entry.local) {
+      nodes.push({ ...node, x: node.x + at.x, y: node.y + at.y });
+    }
+    // The ranked block spans its full box: the tallest rank starts at the top
+    // and reaches the bottom, and rank 0 starts at the left.
+    componentBoxes.set(entry.component.id, {
+      minX: at.x,
+      minY: at.y,
+      maxX: at.x + entry.width,
+      maxY: at.y + entry.height,
     });
-    yCursor += componentHeight + COMPONENT_GAP;
-  }
+  });
   nodes.sort((left, right) => compareIds(left.id, right.id));
-  return { nodes, componentBoxes, componentByNode, strongByNode };
+  return {
+    nodes,
+    componentBoxes,
+    componentByNode,
+    strongByNode,
+    width: packed.width,
+    height: packed.height,
+  };
 }
 
 function spreadPortOffsets(
@@ -531,14 +673,15 @@ function chooseLabelBounds(
 }
 
 function routeEdges(
-  graph: SystemGraph,
-  nodes: SystemGraphLayoutNode[],
+  visible: readonly VisibleSystemGraphEdge[],
+  nodes: readonly SystemGraphLayoutNode[],
   componentBoxes: ReadonlyMap<string, ComponentBox>,
   componentByNode: ReadonlyMap<string, string>,
   strongByNode: ReadonlyMap<string, string>,
+  labels: SystemGraphLabelBounds[],
 ): RoutedEdge[] {
   const nodeById = new Map(nodes.map((node) => [node.id, node]));
-  const seeds: EdgeSeed[] = groupSystemGraphEdges(graph.edges).map((edge) => {
+  const seeds: EdgeSeed[] = visible.map((edge) => {
     const componentId = componentByNode.get(edge.from)!;
     return {
       edge,
@@ -551,6 +694,7 @@ function routeEdges(
       targetOffset: 0,
       cycleLane: 0,
       forwardLane: 0,
+      crossesGroup: false,
     };
   });
   spreadPortOffsets(seeds, nodeById, "source");
@@ -598,7 +742,6 @@ function routeEdges(
       });
   }
 
-  const labels: SystemGraphLabelBounds[] = [];
   return seeds.map((seed): RoutedEdge => {
     const source = nodeById.get(seed.edge.from)!;
     const target = nodeById.get(seed.edge.to)!;
@@ -689,6 +832,97 @@ function routeEdges(
   });
 }
 
+/** How far outside a card a cross-container connector runs before it turns. */
+const CROSS_GROUP_GUTTER = 16;
+const CROSS_GROUP_LANE = 6;
+
+/**
+ * Connectors whose two ends sit in DIFFERENT containers.
+ *
+ * They exist because a group is editable: pull half a detected system into a
+ * group of its own and the edge between the halves is still real. Dropping it
+ * would make the map claim two systems never touch, which is the one thing an
+ * edge is for.
+ *
+ * Routed after the containers are packed, in global coordinates, and
+ * deliberately NOT confined to a gutter: a corridor wide enough to skirt every
+ * container between two ends would dominate the drawing for the rarest edge on
+ * it. They pass BEHIND cards (the edge layer sits under the node layer) and the
+ * design reference draws them the same way — the connector out of "THE LOOP" to
+ * TikTok crosses its border.
+ */
+function routeCrossGroupEdges(
+  visible: readonly VisibleSystemGraphEdge[],
+  nodes: readonly SystemGraphLayoutNode[],
+  labels: SystemGraphLabelBounds[],
+): RoutedEdge[] {
+  const nodeById = new Map(nodes.map((node) => [node.id, node]));
+  return visible.map((edge, index): RoutedEdge => {
+    const source = nodeById.get(edge.from)!;
+    const target = nodeById.get(edge.to)!;
+    const lane = index % 6;
+    const start = {
+      x: source.x + source.width,
+      y: source.y + source.height / 2,
+    };
+    const end = { x: target.x - 1, y: target.y + target.height / 2 };
+    let points: SystemGraphPoint[];
+    if (end.x - start.x > SYSTEM_GRAPH_RANK_GAP) {
+      const elbowX = start.x + (end.x - start.x) * 0.5 + lane * CROSS_GROUP_LANE;
+      points = [
+        start,
+        { x: elbowX, y: start.y },
+        { x: elbowX, y: end.y },
+        end,
+      ];
+    } else {
+      // The target is level with or behind the source: leave to the right, run
+      // above both cards, and come back down into the target's left edge.
+      const outX = start.x + CROSS_GROUP_GUTTER + lane * CROSS_GROUP_LANE;
+      const inX = end.x - CROSS_GROUP_GUTTER - lane * CROSS_GROUP_LANE;
+      const overY =
+        Math.min(source.y, target.y) -
+        CROSS_GROUP_GUTTER -
+        lane * CROSS_GROUP_LANE;
+      points = [
+        start,
+        { x: outX, y: start.y },
+        { x: outX, y: overY },
+        { x: inX, y: overY },
+        { x: inX, y: end.y },
+        end,
+      ];
+    }
+    points = points.map((point) => ({ x: round(point.x), y: round(point.y) }));
+    const label = labelForModes(edge.modes);
+    const partial = {
+      edge,
+      route: "forward" as const,
+      componentId: "",
+      sourceOffset: 0,
+      targetOffset: 0,
+      cycleLane: 0,
+      forwardLane: 0,
+      crossesGroup: true,
+      points,
+      label,
+    };
+    const labelBounds = chooseLabelBounds(partial, nodeById, nodes, labels, {
+      minX: Math.min(source.x, target.x),
+      minY: Math.min(source.y, target.y),
+      maxX: Math.max(source.x + source.width, target.x + target.width),
+      maxY: Math.max(source.y + source.height, target.y + target.height),
+    });
+    labels.push(labelBounds);
+    return {
+      ...partial,
+      labelBounds,
+      labelX: round(labelBounds.x + labelBounds.width / 2),
+      labelY: round(labelBounds.y + labelBounds.height - 3),
+    };
+  });
+}
+
 function pathFromPoints(points: readonly SystemGraphPoint[]): string {
   if (points.length === 0) return "";
   const parts = [`M ${round(points[0]!.x)} ${round(points[0]!.y)}`];
@@ -702,15 +936,187 @@ function pathFromPoints(points: readonly SystemGraphPoint[]): string {
   return parts.join(" ");
 }
 
+const translateNode = (
+  node: SystemGraphLayoutNode,
+  dx: number,
+  dy: number,
+): SystemGraphLayoutNode => ({
+  ...node,
+  x: round(node.x + dx),
+  y: round(node.y + dy),
+});
+
+const translateRouted = (
+  edge: RoutedEdge,
+  dx: number,
+  dy: number,
+): RoutedEdge => ({
+  ...edge,
+  points: edge.points.map((point) => ({
+    x: round(point.x + dx),
+    y: round(point.y + dy),
+  })),
+  labelX: round(edge.labelX + dx),
+  labelY: round(edge.labelY + dy),
+  labelBounds: {
+    ...edge.labelBounds,
+    x: round(edge.labelBounds.x + dx),
+    y: round(edge.labelBounds.y + dy),
+  },
+});
+
+interface Region {
+  id: string;
+  /** null for the single implicit region of an ungrouped layout — the one case
+   *  where nothing is drawn around the content. */
+  label: string | null;
+  nodeIds: string[];
+}
+
+/**
+ * The containers to draw, as an exhaustive partition of the graph's nodes.
+ *
+ * `undefined` groups means "no grouping information" — the graph is laid out as
+ * one unlabelled region, exactly as before this existed. That is not the same
+ * as an EMPTY group list, and the caller must keep them apart: the map is
+ * handed groups only once the project's stored arrangement AND the launch edges
+ * have landed, so a project mid-load never flashes an "Ungrouped" container
+ * that then turns out to be wrong.
+ */
+function toRegions(
+  graph: SystemGraph,
+  groups: readonly SystemGraphNodeGroup[] | undefined,
+): Region[] {
+  const order = graph.nodes.map((node) => node.id);
+  if (!groups) return [{ id: "", label: null, nodeIds: order }];
+  const known = new Set(order);
+  const claimed = new Set<string>();
+  const regions: Region[] = [];
+  for (const group of groups) {
+    const nodeIds: string[] = [];
+    for (const id of group.nodeIds) {
+      // Group membership is MANY-to-many — a shared subagent genuinely belongs
+      // to every system that calls it — but a map draws each agent once. First
+      // claim wins, in the rail's own order, so the card sits where the rail
+      // first mentions it rather than in whichever container drew last.
+      if (!known.has(id) || claimed.has(id)) continue;
+      claimed.add(id);
+      nodeIds.push(id);
+    }
+    // A group whose every member resolved to nothing is chrome around nothing.
+    if (nodeIds.length > 0) {
+      regions.push({ id: group.id, label: group.label, nodeIds });
+    }
+  }
+  const leftover = order.filter((id) => !claimed.has(id));
+  if (leftover.length > 0) {
+    // `systemGraphNodeGroups` hands over an exhaustive partition, so this is a
+    // backstop rather than a path — and deliberately not a throw. A node that
+    // silently disappears from the map is worse than a node filed in the bucket
+    // that means "nothing claims this".
+    const bucket = regions.find(
+      (region) => region.label === SYSTEM_GRAPH_UNGROUPED_LABEL,
+    );
+    if (bucket) bucket.nodeIds.push(...leftover);
+    else {
+      regions.push({
+        id: "group:unclaimed",
+        label: SYSTEM_GRAPH_UNGROUPED_LABEL,
+        nodeIds: leftover,
+      });
+    }
+  }
+  return regions;
+}
+
+interface LaidRegion extends Sized {
+  id: string;
+  label: string | null;
+  nodes: SystemGraphLayoutNode[];
+  edges: RoutedEdge[];
+  insetX: number;
+  insetY: number;
+}
+
+/**
+ * One container, laid out in its OWN coordinates and measured afterwards.
+ *
+ * Measuring after routing is what makes the container honest: its box is the
+ * union of its cards, its connectors and its connector labels, so nothing a
+ * group draws can end up outside the border drawn around it. Sizing the box
+ * from the cards alone would let a cycle gutter or a displaced label spill into
+ * the neighbouring system.
+ */
+function layoutRegion(graph: SystemGraph, region: Region): LaidRegion {
+  const members = new Set(region.nodeIds);
+  const subgraph: SystemGraph = {
+    ...graph,
+    nodes: graph.nodes.filter((node) => members.has(node.id)),
+    edges: graph.edges.filter(
+      (edge) => members.has(edge.from) && members.has(edge.to),
+    ),
+  };
+  const placed = placeRegionNodes(
+    analyzeSystemGraph(subgraph),
+    region.label === null ? null : region.id,
+  );
+  const labels: SystemGraphLabelBounds[] = [];
+  const routed = routeEdges(
+    groupSystemGraphEdges(subgraph.edges),
+    placed.nodes,
+    placed.componentBoxes,
+    placed.componentByNode,
+    placed.strongByNode,
+    labels,
+  );
+
+  const xs: number[] = [];
+  const ys: number[] = [];
+  for (const node of placed.nodes) {
+    xs.push(node.x, node.x + node.width);
+    ys.push(node.y, node.y + node.height);
+  }
+  for (const edge of routed) {
+    for (const point of edge.points) {
+      xs.push(point.x);
+      ys.push(point.y);
+    }
+    xs.push(edge.labelBounds.x, edge.labelBounds.x + edge.labelBounds.width);
+    ys.push(edge.labelBounds.y, edge.labelBounds.y + edge.labelBounds.height);
+  }
+  const minX = Math.min(...xs);
+  const minY = Math.min(...ys);
+  const contentWidth = round(Math.max(...xs) - minX);
+  const contentHeight = round(Math.max(...ys) - minY);
+  const labelled = region.label !== null;
+  return {
+    id: region.id,
+    label: region.label,
+    nodes: placed.nodes.map((node) => translateNode(node, -minX, -minY)),
+    edges: routed.map((edge) => translateRouted(edge, -minX, -minY)),
+    insetX: labelled ? GROUP_PADDING : 0,
+    insetY: labelled ? GROUP_PADDING + GROUP_HEADER : 0,
+    width: labelled ? contentWidth + GROUP_PADDING * 2 : contentWidth,
+    height: labelled
+      ? contentHeight + GROUP_PADDING * 2 + GROUP_HEADER
+      : contentHeight,
+  };
+}
+
 function shiftLayout(
   nodes: SystemGraphLayoutNode[],
   edges: RoutedEdge[],
+  groups: SystemGraphLayoutGroup[],
 ): SystemGraphLayout {
   const xs: number[] = [];
   const ys: number[] = [];
   for (const node of nodes) {
     xs.push(node.x, node.x + node.width);
     ys.push(node.y, node.y + node.height);
+  }
+  for (const group of groups) {
+    xs.push(group.x, group.x + group.width);
+    ys.push(group.y, group.y + group.height);
   }
   for (const edge of edges) {
     for (const point of edge.points) {
@@ -721,7 +1127,7 @@ function shiftLayout(
     ys.push(edge.labelBounds.y, edge.labelBounds.y + edge.labelBounds.height);
   }
   if (xs.length === 0 || ys.length === 0) {
-    return { nodes: [], edges: [], bounds: { width: 0, height: 0 } };
+    return { nodes: [], edges: [], groups: [], bounds: { width: 0, height: 0 } };
   }
   const minX = Math.min(...xs);
   const minY = Math.min(...ys);
@@ -729,37 +1135,32 @@ function shiftLayout(
   const maxY = Math.max(...ys);
   const dx = LAYOUT_PADDING - minX;
   const dy = LAYOUT_PADDING - minY;
-  const shiftedNodes = nodes.map((node) => ({
-    ...node,
-    x: round(node.x + dx),
-    y: round(node.y + dy),
+  const shiftedNodes = nodes.map((node) => translateNode(node, dx, dy));
+  const shiftedGroups = groups.map((group) => ({
+    ...group,
+    x: round(group.x + dx),
+    y: round(group.y + dy),
   }));
   const shiftedEdges = edges.map((edge): SystemGraphLayoutEdge => {
-    const points = edge.points.map((point) => ({
-      x: round(point.x + dx),
-      y: round(point.y + dy),
-    }));
-    const labelBounds = {
-      ...edge.labelBounds,
-      x: round(edge.labelBounds.x + dx),
-      y: round(edge.labelBounds.y + dy),
-    };
+    const moved = translateRouted(edge, dx, dy);
     return {
-      from: edge.edge.from,
-      to: edge.edge.to,
-      modes: [...edge.edge.modes],
-      path: pathFromPoints(points),
-      points,
-      label: edge.label,
-      labelX: round(edge.labelX + dx),
-      labelY: round(edge.labelY + dy),
-      labelBounds,
-      route: edge.route,
+      from: moved.edge.from,
+      to: moved.edge.to,
+      modes: [...moved.edge.modes],
+      path: pathFromPoints(moved.points),
+      points: moved.points,
+      label: moved.label,
+      labelX: moved.labelX,
+      labelY: moved.labelY,
+      labelBounds: moved.labelBounds,
+      route: moved.route,
+      crossesGroup: moved.crossesGroup,
     };
   });
   return {
     nodes: shiftedNodes,
     edges: shiftedEdges,
+    groups: shiftedGroups,
     bounds: {
       width: round(maxX - minX + LAYOUT_PADDING * 2),
       height: round(maxY - minY + LAYOUT_PADDING * 2),
@@ -767,20 +1168,54 @@ function shiftLayout(
   };
 }
 
-export function layoutSystemGraph(graph: SystemGraph): SystemGraphLayout {
-  const topology = analyzeSystemGraph(graph);
+export function layoutSystemGraph(
+  graph: SystemGraph,
+  groups?: readonly SystemGraphNodeGroup[],
+): SystemGraphLayout {
+  validateGraph(graph);
   if (graph.nodes.length === 0) {
-    return { nodes: [], edges: [], bounds: { width: 0, height: 0 } };
+    return { nodes: [], edges: [], groups: [], bounds: { width: 0, height: 0 } };
   }
-  const placed = placeNodes(topology);
-  const edges = routeEdges(
-    graph,
-    placed.nodes,
-    placed.componentBoxes,
-    placed.componentByNode,
-    placed.strongByNode,
+  const laid = toRegions(graph, groups).map((region) =>
+    layoutRegion(graph, region),
   );
-  return shiftLayout(placed.nodes, edges);
+  const packed = shelfPack(laid, GROUP_GAP);
+
+  const nodes: SystemGraphLayoutNode[] = [];
+  const routed: RoutedEdge[] = [];
+  const labels: SystemGraphLabelBounds[] = [];
+  const boxes: SystemGraphLayoutGroup[] = [];
+  laid.forEach((region, index) => {
+    const at = packed.offsets[index]!;
+    const dx = at.x + region.insetX;
+    const dy = at.y + region.insetY;
+    for (const node of region.nodes) nodes.push(translateNode(node, dx, dy));
+    for (const edge of region.edges) {
+      const moved = translateRouted(edge, dx, dy);
+      routed.push(moved);
+      labels.push(moved.labelBounds);
+    }
+    if (region.label !== null) {
+      boxes.push({
+        id: region.id,
+        label: region.label,
+        x: round(at.x),
+        y: round(at.y),
+        width: region.width,
+        height: region.height,
+        nodeCount: region.nodes.length,
+      });
+    }
+  });
+  nodes.sort((left, right) => compareIds(left.id, right.id));
+
+  const groupOfNode = new Map(nodes.map((node) => [node.id, node.groupId]));
+  const crossing = groupSystemGraphEdges(graph.edges).filter(
+    (edge) => groupOfNode.get(edge.from) !== groupOfNode.get(edge.to),
+  );
+  routed.push(...routeCrossGroupEdges(crossing, nodes, labels));
+
+  return shiftLayout(nodes, routed, boxes);
 }
 
 export function systemGraphNodeById(
