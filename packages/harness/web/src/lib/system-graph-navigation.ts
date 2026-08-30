@@ -17,12 +17,6 @@ export type SystemGraphNavigationResolution =
   | { kind: "unavailable" };
 
 /**
- * Resolve the path-bearing sidecar against the graph revision currently on
- * screen. An older response may have straddled a graph commit, so retry it;
- * a newer one asks the caller to advance the graph. Foreign, failed, and
- * repeatedly stale responses all fail closed.
- */
-/**
  * Give the commit the resolver is behind a moment to land. Retrying in the
  * same breath just re-reads the value that lost the race, so the bounded loop
  * would spend all three attempts on one pre-commit snapshot.
@@ -31,6 +25,12 @@ function backOffBeforeRetry(attempt: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 20 * 2 ** attempt));
 }
 
+/**
+ * Resolve the path-bearing sidecar against the graph revision currently on
+ * screen. An older response may have straddled a graph commit, so retry it;
+ * a newer one asks the caller to advance the graph. Foreign, failed, and
+ * repeatedly stale responses all fail closed.
+ */
 export async function resolveSystemGraphNavigationForRevision(
   source: SystemGraphNavigationSource,
   workspaceKey: WorkspaceKey,

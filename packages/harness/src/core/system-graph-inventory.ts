@@ -18,7 +18,6 @@ import type { WorkflowInfo } from "../shared/types.js";
 import { fingerprintWorkflowSources } from "./canvas-cache.js";
 import type { ManifestNameInspection } from "./definition-name.js";
 
-
 export interface WorkspaceScope {
   workspaceKey: WorkspaceKey;
   root: string;
