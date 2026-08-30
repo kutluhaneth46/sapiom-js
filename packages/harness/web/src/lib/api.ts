@@ -237,6 +237,22 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * The sentence to SHOW for a failed request.
+ *
+ * `ApiError.message` is the wire shape — `POST /api/agents/scaffold → 409:
+ * {"error":"…"}` — which is right for a log and wrong in a dialog: measured on
+ * a real server, the create dialog showed the user a JSON body inside a status
+ * line. `.reason` is the server's own sentence, written to be read, so every
+ * user-facing catch prefers it. The fallback covers a non-Error rejection and a
+ * response that was not JSON.
+ */
+export function errorMessage(err: unknown, fallback: string): string {
+  if (err instanceof ApiError) return err.reason ?? err.message ?? fallback;
+  if (err instanceof Error && err.message) return err.message;
+  return fallback;
+}
+
 /** Read once at module load: `window.__HARNESS__ = {token}` (baked in by the server), falling back to `?token=`. */
 export function getBootToken(): string {
   const injected = (window as unknown as { __HARNESS__?: { token?: string } })

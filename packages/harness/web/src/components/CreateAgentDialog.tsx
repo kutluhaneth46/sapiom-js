@@ -29,6 +29,7 @@ import type { JSX, RefObject } from "react";
 
 import { refuseAgentName } from "@shared/agent-name";
 
+import { errorMessage } from "../lib/api";
 import type { StarterTemplate } from "../lib/templates";
 import { STARTER_TEMPLATES } from "../lib/templates";
 import { trackingAttrs } from "../lib/analytics/tracking-attrs";
@@ -96,9 +97,10 @@ export function CreateAgentDialog({
     try {
       await onCreate({ name, template, instruction: instruction.trim() });
     } catch (err) {
-      // The server's sentence, verbatim — it knows things this dialog cannot
-      // (a folder already sitting there, a project the rail stopped showing).
-      setError((err as Error).message || `Couldn't create ${name}.`);
+      // The server's SENTENCE, not the wire shape: `ApiError.message` is
+      // "POST /api/agents/scaffold → 409: {…}", which is a log line, not
+      // something to show someone who just tried to name an agent.
+      setError(errorMessage(err, `Couldn't create ${name}.`));
       setBusy(false);
       nameRef.current?.focus();
     }

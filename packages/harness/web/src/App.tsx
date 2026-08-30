@@ -81,7 +81,7 @@ import { CreateAgentDialog } from "./components/CreateAgentDialog";
 import { OverviewModal } from "./components/OverviewModal";
 import { WorkflowsRail } from "./components/WorkflowsRail";
 import { WorkspaceGraphView } from "./components/WorkspaceGraphView";
-import { boundWorkflowPathOf, createApi } from "./lib/api";
+import { boundWorkflowPathOf, createApi, errorMessage } from "./lib/api";
 import { classifyConnectivity, useConnectivity } from "./lib/connectivity";
 import { historyDirs } from "./lib/history-meta";
 import {
@@ -1427,9 +1427,7 @@ export const App = (): JSX.Element => {
       }
     } catch (err) {
       harness.showToast(
-        `${created.name} was created, but its session didn't start. ${
-          (err as Error).message ?? ""
-        }`.trim(),
+        `${created.name} was created, but its session didn't start. ${errorMessage(err, "")}`.trim(),
       );
     }
   };
