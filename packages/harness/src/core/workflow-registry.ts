@@ -29,6 +29,7 @@ import {
   walkAgentProjectTreeAsync,
 } from "./agent-project-discovery.js";
 import { hasTraversalSegment, resolveWithinRoot } from "./path-safety.js";
+import { canonicalGraphPath } from "./system-graph-inventory.js";
 
 function expandHome(inputPath: string): string {
   if (inputPath === "~") return os.homedir();
@@ -428,8 +429,18 @@ export class WorkflowRegistry {
         starterId: marker?.starterId ?? null,
         source: "connect",
       };
-      const idx = this.workflows.findIndex((workflow) => workflow.path === absolutePath);
-      if (idx >= 0) this.workflows[idx] = info;
+      // Match on the resolved directory, not the spelling given: connecting a
+      // symlinked path to an already-scanned project otherwise registers a
+      // second row for one directory, and the pair collides into `local:`
+      // fallback keys that make every reference between agents ambiguous.
+      // The existing row keeps its own `path` — registry paths are compared by
+      // exact string elsewhere (a session auto-binds on `path === cwd`), so
+      // rewriting one silently unbinds whatever matched it.
+      const canonical = canonicalGraphPath(absolutePath);
+      const idx = this.workflows.findIndex(
+        (workflow) => canonicalGraphPath(workflow.path) === canonical,
+      );
+      if (idx >= 0) this.workflows[idx] = { ...info, path: this.workflows[idx]!.path };
       else this.workflows.push(info);
       await this.persist();
       return info;

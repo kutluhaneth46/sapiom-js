@@ -1,4 +1,7 @@
-import { describe, expect, it, vi } from "vitest";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { inspectManifestName, resolveManifestName } from "./definition-name.js";
 
@@ -72,14 +75,72 @@ describe("inspectManifestName", () => {
     ).resolves.toEqual({ status: "absent" });
     await expect(inspectManifestName("/proj/broken", failed)).resolves.toEqual({
       status: "failed",
+      retryable: false,
     });
   });
 
   it("reports a thrown extraction as failed", async () => {
     const extract = vi.fn().mockRejectedValue(new Error("boom"));
 
+    // The extractor told us nothing about why, so keep the retry affordance.
     await expect(inspectManifestName("/proj/broken", extract)).resolves.toEqual(
-      { status: "failed" },
+      { status: "failed", retryable: true },
     );
+  });
+
+  describe("classifying a failure as still clearable", () => {
+    const roots: string[] = [];
+    const failed = () =>
+      vi.fn().mockResolvedValue({
+        result: { ok: false as const, reason: "run npm install first" },
+        cached: false,
+        fingerprint: "0:0",
+      });
+
+    async function project(files: Record<string, string>): Promise<string> {
+      const root = await fs.mkdtemp(path.join(os.tmpdir(), "definition-name-"));
+      roots.push(root);
+      for (const [relative, contents] of Object.entries(files)) {
+        const file = path.join(root, relative);
+        await fs.mkdir(path.dirname(file), { recursive: true });
+        await fs.writeFile(file, contents);
+      }
+      return root;
+    }
+
+    afterEach(async () => {
+      await Promise.all(
+        roots.splice(0).map((root) => fs.rm(root, { recursive: true, force: true })),
+      );
+    });
+
+    it("is retryable with sources present but nothing installed", async () => {
+      const root = await project({ "index.ts": "export {};\n" });
+      await expect(inspectManifestName(root, failed())).resolves.toEqual({
+        status: "failed",
+        retryable: true,
+      });
+    });
+
+    it("is settled once dependencies are installed", async () => {
+      const root = await project({
+        "index.ts": "export {};\n",
+        "node_modules/.keep": "",
+      });
+      await expect(inspectManifestName(root, failed())).resolves.toEqual({
+        status: "failed",
+        retryable: false,
+      });
+    });
+
+    it("is settled when the project has no TypeScript to name", async () => {
+      // A dashboard companion: no install can produce a `defineAgent` that
+      // was never written, so this failure has nowhere left to go.
+      const root = await project({ "server.js": "module.exports = {};\n" });
+      await expect(inspectManifestName(root, failed())).resolves.toEqual({
+        status: "failed",
+        retryable: false,
+      });
+    });
   });
 });

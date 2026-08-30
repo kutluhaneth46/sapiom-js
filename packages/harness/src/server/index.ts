@@ -1221,6 +1221,9 @@ export const startServer = async (
     // symlinked path, then the first graph open registered them all again
     // under the real one. The duplicates collided into `local:` fallback keys,
     // so every cross-agent target became ambiguous and its edge vanished.
+    // Resolved here rather than inside the registry: registry paths are
+    // compared by exact string elsewhere (a session auto-binds on
+    // `path === cwd`, index.ts:1057), so rewriting stored paths unbinds them.
     const root = canonicalGraphPath(scanRoot);
     const before = workflowsCache;
     const budget = new AgentProjectScanBudget();

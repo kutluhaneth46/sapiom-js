@@ -394,6 +394,43 @@ describe("WorkflowRegistry", () => {
  * both halves of what replaced it: the reach, and the reconciliation rule that
  * keeps a *bounded* scan from mistaking "I didn't look there" for "it's gone".
  */
+describe("WorkflowRegistry path identity under symlinks", () => {
+  let tmpRoot: string;
+  let registryPath: string;
+
+  beforeEach(async () => {
+    // Resolve up front: on macOS `os.tmpdir()` is itself a symlink, which
+    // would make every path in the test canonical by accident.
+    tmpRoot = await fs.realpath(
+      await fs.mkdtemp(path.join(os.tmpdir(), "harness-registry-symlink-")),
+    );
+    registryPath = path.join(tmpRoot, "state", "workflows.json");
+  });
+
+  afterEach(async () => {
+    await fs.rm(tmpRoot, { recursive: true, force: true });
+  });
+
+  it("connects a symlinked path onto the scanned row instead of duplicating it", async () => {
+    const real = path.join(tmpRoot, "workspace");
+    await writeMarker(path.join(real, "growth"), null, { name: "growth" });
+    const link = path.join(tmpRoot, "linked-workspace");
+    await fs.symlink(real, link, "dir");
+
+    const registry = new WorkflowRegistry(registryPath);
+    await registry.scan(real, new AgentProjectScanBudget());
+    await registry.connectPath(path.join(link, "growth"));
+
+    // One row, still under the spelling the scan stored: a second row for the
+    // same directory collides into `local:` keys and drops every edge, while
+    // rewriting the kept row's path would unbind a session matching on it.
+    expect((await registry.list()).map((workflow) => workflow.path)).toEqual([
+      path.join(real, "growth"),
+    ]);
+  });
+
+});
+
 describe("WorkflowRegistry scan rootedness (the 88-agent accumulation)", () => {
   let tmpRoot: string;
   let registry: WorkflowRegistry;

@@ -40,12 +40,12 @@ export interface AgentInventoryWarning {
 export interface AgentInventoryResult {
   agents: AgentInventoryItem[];
   /**
-   * False only while identity work is still in flight, so a later graph open
-   * retries it. An agent that will never be nameable — no `defineAgent`
-   * export, no installed dependencies — keeps its warning but does not veto
-   * the project's cache: re-projecting cannot improve it, and vetoing pinned
-   * every real workspace to `degraded` and its "graph may be incomplete"
-   * banner forever.
+   * False while identity work could still produce a different answer — it is
+   * in flight, or it failed in a way a later projection of the same source
+   * can clear. An agent a re-projection cannot improve — no `defineAgent` to
+   * find — keeps its warning but does not veto the project's cache. Vetoing
+   * on any failure pinned whole workspaces to `degraded` and its "graph may
+   * be incomplete" banner permanently, over agents that were never nameable.
    */
   cacheable: boolean;
   warnings: AgentInventoryWarning[];
@@ -420,20 +420,21 @@ export class HarnessRegistryInventoryProvider implements AgentInventoryProvider 
     const definitionSlug = normalizedAlias(workflow.definitionSlug);
     let manifestName: string | null = null;
     let extractionFailed = false;
-    // An inspection that returns has settled: the same source yields the same
-    // answer next time, and a source edit re-projects through the watcher. An
-    // inspector that throws told us nothing about which it was, so it stays
-    // pending — the conservative half of the split.
     let identityPending = false;
     if (!definitionSlug && this.options.inspectManifestName) {
       try {
         const inspected = await this.options.inspectManifestName(sourceRoot);
         if (inspected.status === "found") {
           manifestName = normalizedAlias(inspected.name);
-        } else {
-          extractionFailed = inspected.status === "failed";
+        } else if (inspected.status === "failed") {
+          extractionFailed = true;
+          // Only a failure the inspector says is still clearable keeps the
+          // project uncacheable. A settled one has nowhere left to go: its
+          // warning stands, and the cache stops paying for it forever.
+          identityPending = inspected.retryable;
         }
       } catch {
+        // The inspector threw, so we learned nothing about which it was.
         extractionFailed = true;
         identityPending = true;
       }

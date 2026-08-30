@@ -168,7 +168,7 @@ describe("HarnessRegistryInventoryProvider", () => {
       started.push(sourceRoot);
       await gate;
       if (sourceRoot.endsWith("/broken")) {
-        return { status: "failed" as const };
+        return { status: "failed" as const, retryable: false };
       }
       if (sourceRoot.endsWith("/thrown")) {
         throw new Error(`unreadable ${sourceRoot}`);
@@ -227,7 +227,7 @@ describe("HarnessRegistryInventoryProvider", () => {
     // "graph may be incomplete" banner permanently.
     const inspectManifestName = vi.fn(async (sourceRoot: string) =>
       sourceRoot.endsWith("/dashboard")
-        ? ({ status: "failed" } as const)
+        ? ({ status: "failed", retryable: false } as const)
         : ({ status: "found", name: "growth-manifest" } as const),
     );
 
@@ -248,6 +248,31 @@ describe("HarnessRegistryInventoryProvider", () => {
     ]);
   });
 
+  it("keeps a project uncacheable when a failure is still clearable", async () => {
+    // "Run install first" is the one failure a later projection of the SAME
+    // unchanged source can clear, and nothing fires the watcher when
+    // `node_modules` lands. Caching it would strip the degraded banner that
+    // carries the only Retry button, freezing a `local:` label on screen.
+    const inspectManifestName = vi.fn(async (sourceRoot: string) =>
+      sourceRoot.endsWith("/needs-install")
+        ? ({ status: "failed", retryable: true } as const)
+        : ({ status: "found", name: "growth-manifest" } as const),
+    );
+
+    const result = await provider(
+      [
+        workflow("Growth", "growth", null),
+        workflow("Needs install", "needs-install", null),
+      ],
+      { inspectManifestName },
+    ).listAgents(SCOPE);
+
+    expect(result.cacheable).toBe(false);
+    expect(
+      result.warnings.map(({ code, agentKey }) => [code, agentKey]),
+    ).toEqual([["inventory-extraction-failed", "local:needs-install"]]);
+  });
+
   it("keeps a project uncacheable while an inspection is still in flight", async () => {
     // The budget cut this inspection off mid-read. Its name is still
     // recoverable, so caching the provisional local label would freeze the
@@ -255,7 +280,9 @@ describe("HarnessRegistryInventoryProvider", () => {
     const started: string[] = [];
     const inspectManifestName = vi.fn(async (sourceRoot: string) => {
       started.push(sourceRoot);
-      if (sourceRoot.endsWith("/settled")) return { status: "failed" as const };
+      if (sourceRoot.endsWith("/settled")) {
+        return { status: "failed" as const, retryable: false };
+      }
       await new Promise(() => {});
       return { status: "absent" as const };
     });
