@@ -10738,6 +10738,18 @@ button.system-graph-node.is-navigable:focus-visible {
   pointer-events: none;
 }
 
+/* …EXCEPT the action inside it (SAP-2981). The inert row predates it carrying
+   a button: the empty project used to be a label that stated a fact, and the
+   rule kept it from eating hover on the rows around it. Once "Create the first
+   agent here" moved in, the same rule swallowed every click on it — measured,
+   `elementFromPoint` over the middle of that button returned the enclosing
+   `.workspace-group`, and Playwright's click retried for 30s against a control
+   that could never receive one. The spec beside it only ever asserted
+   `toBeEnabled()`, which a control nobody can click passes. */
+.workspace-row-empty .tree-row-empty-action {
+  pointer-events: auto;
+}
+
 .tree-row-empty {
   padding-left: var(--tree-pad-x);
   color: var(--text-faint);
@@ -10868,6 +10880,10 @@ button.system-graph-node.is-navigable:focus-visible {
   display: grid;
   gap: var(--sp1);
   margin-top: 2px;
+  /* The radio's ON state is the brand, the same answer `.toggle-switch.is-on`
+     gives. `accent-color` tints the control itself, not a surface — the native
+     blue was the one thing in this dialog that belonged to no palette. */
+  accent-color: var(--brand);
 }
 
 /* A row, not a card: the starters are a short list of one-line choices, and a
@@ -10921,8 +10937,14 @@ button.system-graph-node.is-navigable:focus-visible {
   resize: vertical;
 }
 
+/* Inline text, not a control: it sits mid-sentence, and the button chrome it
+   inherited drew a box around three words of prose. */
 .create-agent-link {
+  padding: 0;
+  border: none;
+  background: none;
   color: var(--text-dim);
+  font: inherit;
   text-decoration: underline;
   text-underline-offset: 2px;
 }

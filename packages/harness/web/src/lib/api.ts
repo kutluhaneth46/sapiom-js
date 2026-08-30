@@ -1174,6 +1174,26 @@ function recordAgentMove(entry: { from: string; to: string }): void {
   };
 }
 
+/**
+ * The ORDER of the two halves of a create, recorded for the spec that asserts
+ * it (SAP-2981): the agent is scaffolded, and only then does a session open.
+ *
+ * An order is the one thing a pair of separate call logs cannot prove — each
+ * says it happened, neither says when — and this criterion IS the order:
+ * creation completes before the chat starts, so a failure is an error message
+ * rather than a confused model. One append-only list, so a spec can read the
+ * sequence instead of racing two counters.
+ */
+function recordCreateStep(kind: "scaffold" | "session", path: string): void {
+  if (typeof window === "undefined") return;
+  const win = window as unknown as { __HARNESS_TEST__?: Record<string, unknown> };
+  const previous = (win.__HARNESS_TEST__?.createOrder as string[]) ?? [];
+  win.__HARNESS_TEST__ = {
+    ...(win.__HARNESS_TEST__ ?? {}),
+    createOrder: [...previous, `${kind}:${path}`],
+  };
+}
+
 /** In-memory, mutable copies of the fixtures — mutations persist for the tab's lifetime, reset on reload. */
 /**
  * Mock mode's stand-in for the workflow-keyed board (IA-01).
@@ -1764,6 +1784,7 @@ class MockApi implements HarnessApi {
         lastCreateSession: { req },
         createSessionCalls: [...previous, { req }],
       };
+      recordCreateStep("session", req.cwd);
       if (win.__MOCK_CREATE_SESSION_FAIL_ONCE__) {
         win.__MOCK_CREATE_SESSION_FAIL_ONCE__ = false;
         throw new Error("mock: couldn't create session");
@@ -2209,6 +2230,7 @@ class MockApi implements HarnessApi {
         starterId: template,
       },
     ];
+    recordCreateStep("scaffold", path);
     void import("./events").then(({ publishMockBusMessage }) => {
       publishMockBusMessage({ type: "workflows.changed" });
     });

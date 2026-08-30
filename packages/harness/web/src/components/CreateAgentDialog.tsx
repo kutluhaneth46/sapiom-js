@@ -147,7 +147,9 @@ export function CreateAgentDialog({
           {/* The destination, stated. `title` carries the full path for a root
               long enough to ellipsize. */}
           <p className="modal-field-hint create-agent-target" title={projectRoot}>
-            In <strong data-testid="create-agent-project">{projectLabel}</strong>
+            <span>
+              In <strong data-testid="create-agent-project">{projectLabel}</strong>
+            </span>
             <span className="create-agent-path">{projectRoot}</span>
           </p>
 
@@ -171,9 +173,18 @@ export function CreateAgentDialog({
                 setError(null);
               }}
             />
+            {/* Both refusals land HERE, under the field that produces them —
+                the typed-name rule and the server's own sentence ("probes
+                already has an agent called hello-world"), which was showing at
+                the foot of the dialog, three fields away from the input the
+                user has to change. */}
             {nameRefusal ? (
               <p className="modal-error" data-testid="create-agent-name-error">
                 {nameRefusal}
+              </p>
+            ) : error ? (
+              <p className="modal-error" data-testid="create-agent-error" role="alert">
+                {error}
               </p>
             ) : (
               <p className="modal-field-hint">
@@ -246,15 +257,9 @@ export function CreateAgentDialog({
               placeholder="Triage inbound support email and route it to the right queue."
               onChange={(event) => setInstruction(event.target.value)}
             />
-            {error ? (
-              <p className="modal-error" data-testid="create-agent-error" role="alert">
-                {error}
-              </p>
-            ) : (
-              <p className="modal-field-hint">
-                The agent is created first; this is what the session starts on.
-              </p>
-            )}
+            <p className="modal-field-hint">
+              The agent is created first; this is what the session starts on.
+            </p>
           </section>
         </div>
 
