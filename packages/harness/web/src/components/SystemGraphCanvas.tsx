@@ -317,7 +317,11 @@ export function SystemGraphCanvas({
               width: layout.bounds.width,
               height: layout.bounds.height,
               transform: `translate(-50%, -50%) translate(${view.x}px, ${view.y}px) scale(${view.zoom})`,
-            } satisfies CSSProperties
+              // Published for the container labels, which counter-scale against
+              // it so a system stays NAMED at the altitude you zoom out to read
+              // its shape from (see .system-graph-group-label).
+              "--system-graph-zoom": view.zoom,
+            } as CSSProperties
           }
           role="group"
           aria-label="Workspace dependency graph"

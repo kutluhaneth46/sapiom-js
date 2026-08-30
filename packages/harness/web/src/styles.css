@@ -4261,10 +4261,21 @@ button.rail-footer-card:hover {
   pointer-events: none;
 }
 
+/* Counter-scaled against the view zoom.
+
+   A container's NAME is the whole thing the container adds, and the map's own
+   arrival zoom on a real project is around 20% — measured on a 9-system,
+   76-agent tree: the label rendered 3.65px tall, and 2.96px after Fit. That is
+   not a label. Growing it as the view shrinks keeps the systems named at
+   exactly the altitude you zoom out to read them from, and the clamp stops
+   there: at 70% and above the cards are legible on their own and the label is
+   1:1. transform-origin pins it to the corner it already sits in. */
 .system-graph-group-label {
   display: block;
   max-width: 100%;
   overflow: hidden;
+  transform: scale(clamp(1, calc(0.7 / var(--system-graph-zoom, 1)), 4));
+  transform-origin: 0 0;
   color: var(--text-faint);
   font-family: var(--font-mono);
   font-size: var(--type-meta);
