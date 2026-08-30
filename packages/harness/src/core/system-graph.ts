@@ -240,7 +240,8 @@ function sanitizeInventoryWarnings(
 interface ConsumedInventory {
   agents: AgentInventoryItem[];
   warnings: GraphWarning[];
-  complete: boolean;
+  /** Every identity has finished resolving, however it resolved. */
+  settled: boolean;
   startEnrichment?: () => void;
 }
 
@@ -303,7 +304,23 @@ function consumeInventory(
       inventory.agents,
       agents,
     ),
-    complete: inventory.status === "complete",
+    // A degraded inventory is not the same as an unfinished one, and only
+    // the second is a reason to refuse the cache. `identity-unavailable`,
+    // `identity-invalid` and `duplicate-agent-key` have all finished
+    // resolving: re-projecting cannot improve them, and a source edit
+    // re-projects through the watcher anyway. Only `identity-pending` still
+    // has enrichment in flight, and caching that would freeze provisional
+    // names on screen. Gating on `status` — which the contract forces to
+    // `degraded` whenever any identity is provisional — handed one
+    // permanently unidentifiable agent (a dashboard with no `defineAgent`, a
+    // package with no `node_modules`) a veto over the whole project's fast
+    // path, so the graph re-projected on every open and never left
+    // `degraded`.
+    settled: !inventory.agents.some(
+      (agent) =>
+        agent.identityStatus === "provisional" &&
+        agent.identityIssue === "identity-pending",
+    ),
     ...(typeof result.startEnrichment === "function"
       ? { startEnrichment: result.startEnrichment }
       : {}),
@@ -470,7 +487,7 @@ export class StaticSystemGraphBuilder implements SystemGraphBuilder {
     ].sort(warningOrder);
 
     return {
-      cacheable: consumed.complete && relationshipsComplete,
+      cacheable: consumed.settled && relationshipsComplete,
       graph: {
         kind: "system",
         scope: { kind: "working-tree", workspaceKey: scope.workspaceKey },

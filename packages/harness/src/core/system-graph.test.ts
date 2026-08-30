@@ -1172,6 +1172,100 @@ describe("StaticSystemGraphBuilder", () => {
     expect(JSON.stringify(graph)).not.toContain("/private/");
   });
 
+  it("caches a project whose one unidentifiable agent has finished resolving", async () => {
+    // The failure this prevents: a single agent that can never be named — a
+    // dashboard with no `defineAgent`, a package with no `node_modules` — used
+    // to veto the whole project's cache, so the graph re-projected on every
+    // open and never left `degraded`. Its identity has settled; only
+    // `identity-pending` is a reason to refuse the cache.
+    const inventory: AgentInventoryProvider = {
+      listAgents: vi.fn(async () =>
+        inventoryResult(
+          scope,
+          [
+            { agentKey: "research", label: "Research" },
+            { agentKey: "growth", label: "Growth" },
+            {
+              agentKey: "local:dashboard",
+              label: "Dashboard",
+              provisional: true,
+              identityIssue: "identity-unavailable",
+            },
+          ],
+          {
+            degraded: true,
+            warnings: [
+              {
+                code: "inventory-extraction-failed",
+                agentKey: "local:dashboard",
+                message:
+                  "Could not resolve Dashboard's source identity; using its provisional identity.",
+              },
+            ],
+          },
+        ),
+      ),
+    };
+
+    const built = await new StaticSystemGraphBuilder(
+      inventory,
+      relationshipProvider(async () => EMPTY_RELATIONSHIPS),
+    ).build(scope);
+
+    expect(built.cacheable).toBe(true);
+    // Cacheable is not the same as silent: the agent that could not be named
+    // still says so on the graph.
+    expect(built.graph.warnings).toEqual([
+      {
+        code: "inventory-extraction-failed",
+        agentKey: "local:dashboard",
+        message:
+          "Could not resolve Dashboard's source identity; using its provisional identity.",
+      },
+    ]);
+    expect(built.graph.nodes.map((node) => node.agentKey)).toEqual([
+      "growth",
+      "local:dashboard",
+      "research",
+    ]);
+  });
+
+  it("refuses the cache while any one identity is still being resolved", async () => {
+    // The other half of the rule. Caching a projection mid-enrichment would
+    // freeze the provisional names on screen for as long as nothing else
+    // invalidated the workspace.
+    const inventory: AgentInventoryProvider = {
+      listAgents: vi.fn(async () =>
+        inventoryResult(
+          scope,
+          [
+            { agentKey: "research", label: "Research" },
+            {
+              agentKey: "local:dashboard",
+              label: "Dashboard",
+              provisional: true,
+              identityIssue: "identity-unavailable",
+            },
+            {
+              agentKey: "local:growth",
+              label: "Growth",
+              provisional: true,
+              identityIssue: "identity-pending",
+            },
+          ],
+          { degraded: true },
+        ),
+      ),
+    };
+
+    const built = await new StaticSystemGraphBuilder(
+      inventory,
+      relationshipProvider(async () => EMPTY_RELATIONSHIPS),
+    ).build(scope);
+
+    expect(built.cacheable).toBe(false);
+  });
+
   it("keeps degraded cache policy outside the public graph contract", async () => {
     const inventory: AgentInventoryProvider = {
       listAgents: vi.fn(async () =>
@@ -1212,11 +1306,16 @@ describe("StaticSystemGraphBuilder", () => {
     expect(built.graph).not.toHaveProperty("cacheable");
   });
 
-  it("uses the normalized inventory status even if a provider mutates its result", async () => {
-    let release!: () => void;
-    const relationshipsPending = new Promise<void>((resolve) => {
-      release = resolve;
-    });
+  it("rejects an inventory whose status contradicts its own identities", async () => {
+    // The re-parse in consumeInventory is the last boundary before
+    // projection, and this is what proves it still runs: the contract forbids
+    // `complete` alongside a provisional identity, so a provider that claims
+    // the fast path it has not earned is refused rather than believed.
+    //
+    // Mutating the result object after `listAgents` resolves is deliberately
+    // NOT the test here. `build` consumes the inventory in the same tick it
+    // receives it, so no external mutation can land in between — an assertion
+    // written that way passes whether or not the boundary exists.
     const result = inventoryResult(
       scope,
       [
@@ -1230,22 +1329,15 @@ describe("StaticSystemGraphBuilder", () => {
       ],
       { degraded: true },
     );
-    const listRelationships = vi.fn(async () => {
-      await relationshipsPending;
-      return EMPTY_RELATIONSHIPS;
-    });
-    const building = new StaticSystemGraphBuilder(
-      { listAgents: async () => result },
-      { listRelationships },
-    ).build(scope);
-    await vi.waitFor(() => expect(listRelationships).toHaveBeenCalledTimes(1));
-
     (result.inventory as { status: "complete" | "degraded" }).status =
       "complete";
-    release();
-    const built = await building;
 
-    expect(built.cacheable).toBe(false);
+    await expect(
+      new StaticSystemGraphBuilder(
+        { listAgents: async () => result },
+        relationshipProvider(async () => EMPTY_RELATIONSHIPS),
+      ).build(scope),
+    ).rejects.toThrow();
   });
 
   it("retains caller caches across active workspaces and prunes retired ones", async () => {

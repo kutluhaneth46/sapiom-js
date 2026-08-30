@@ -110,19 +110,27 @@ describe("workspace graph freshness wiring", () => {
         expect(raw).not.toContain(workspaceRoot);
         return JSON.parse(raw) as SystemGraphSnapshot;
       };
+      // The first read is served from provisional identities, before any
+      // source has been inspected: usable immediately, and honestly labelled
+      // as not yet settled.
       const initial = await readGraph();
-      // These fixtures intentionally have no defineAgent export. The graph is
-      // useful immediately through their marker identities while background
-      // source inspection honestly leaves the inventory degraded.
       expect(initial).toMatchObject({ state: "degraded" });
       expect(initial.graph?.edges).toEqual([]);
-      let absentSettled!: SystemGraphSnapshot;
+
+      // These fixtures have no `defineAgent` export, so enrichment can never
+      // name them — and the projection still has to reach `ready`. An agent
+      // whose identity has finished resolving badly is settled, not pending,
+      // and a settled projection is the fast path. Asserting `ready` here is
+      // what keeps a permanently unidentifiable agent from re-acquiring its
+      // veto over the whole workspace's cache.
+      let settled!: SystemGraphSnapshot;
       await vi.waitFor(
         async () => {
-          absentSettled = await readGraph();
-          expect(absentSettled.revision).toBeGreaterThan(initial.revision);
+          settled = await readGraph();
+          expect(settled.revision).toBeGreaterThan(initial.revision);
+          expect(settled.state).toBe("ready");
           expect(
-            absentSettled.graph?.warnings.some(
+            settled.graph?.warnings.some(
               (warning) => warning.code === "inventory-extraction-failed",
             ),
           ).toBe(false);
@@ -139,8 +147,8 @@ describe("workspace graph freshness wiring", () => {
       await vi.waitFor(
         async () => {
           sourceRefresh = await readGraph();
-          expect(sourceRefresh.revision).toBeGreaterThan(initial.revision);
-          expect(sourceRefresh.state).toBe("degraded");
+          expect(sourceRefresh.revision).toBeGreaterThan(settled.revision);
+          expect(sourceRefresh.state).toBe("ready");
           expect(sourceRefresh.graph?.edges).toEqual([
             expect.objectContaining({
               from: "agent:research",
@@ -152,8 +160,20 @@ describe("workspace graph freshness wiring", () => {
         { timeout: 8_000, interval: 150 },
       );
       expect(graphEvents.some((event) => event.state === "stale")).toBe(true);
-      expect(graphEvents.some((event) => event.state === "degraded")).toBe(
-        true,
+      // Bound to the revision the read observed, not just to the state: a bare
+      // `some(state === "ready")` is satisfied by events that were already in
+      // flight when the edit landed, so it survives the bus going quiet.
+      await vi.waitFor(
+        () => {
+          expect(
+            graphEvents.some(
+              (event) =>
+                event.state === "ready" &&
+                event.revision === sourceRefresh.revision,
+            ),
+          ).toBe(true);
+        },
+        { timeout: 4_000, interval: 50 },
       );
 
       await fs.writeFile(path.join(researchRoot, "index.ts"), "export {};\n");
@@ -251,7 +271,7 @@ describe("workspace graph freshness wiring", () => {
       expect(manualRetryResponse.status).toBe(200);
       const manualRetry =
         (await manualRetryResponse.json()) as SystemGraphSnapshot;
-      expect(manualRetry).toMatchObject({ state: "degraded" });
+      expect(manualRetry).toMatchObject({ state: "ready" });
       expect(manualRetry.revision).toBeGreaterThan(beforeManualRetry.revision);
     },
   );
