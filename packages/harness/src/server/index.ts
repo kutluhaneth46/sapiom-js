@@ -114,10 +114,10 @@ import { ensureCanvasTemplate } from "../core/canvas-template.js";
 import { renderCanvasForSession } from "../core/canvas-render.js";
 import { invalidateExtractionCache } from "../core/canvas-cache.js";
 import {
-  CachedAgentRelationshipProvider,
+  CachedAgentInvocationProvider,
   HarnessRegistryInventoryProvider,
   LocalWorkspaceScopeCatalog,
-  SourceAgentRelationshipProvider,
+  SourceAgentInvocationProvider,
   StaticSystemGraphBuilder,
   type WorkspaceScope,
 } from "../core/system-graph.js";
@@ -768,7 +768,7 @@ export const startServer = async (
     const canonicalRoot = acceptedCanonicalScopeRoot(root);
     return sourceObservationsWithinScope(canonicalRoot, [
       ...acceptedSourceObservations,
-      ...systemGraphRelationships.sourceObservations(),
+      ...systemGraphInvocations.invocationObservations(),
     ]);
   };
 
@@ -1039,8 +1039,8 @@ export const startServer = async (
     ...sessionManager.list().map((session) => session.cwd),
   ]);
   const activeSystemGraphScopes = new Map<string, WorkspaceScope>();
-  const systemGraphRelationships = new CachedAgentRelationshipProvider(
-    new SourceAgentRelationshipProvider(),
+  const systemGraphInvocations = new CachedAgentInvocationProvider(
+    new SourceAgentInvocationProvider(),
     undefined,
     {
       onChange: (sourceRoots) => {
@@ -1086,10 +1086,7 @@ export const startServer = async (
     },
   });
   const systemGraphStore = new SystemGraphStore(
-    new StaticSystemGraphBuilder(
-      systemGraphInventory,
-      systemGraphRelationships,
-    ),
+    new StaticSystemGraphBuilder(systemGraphInventory, systemGraphInvocations),
     {
       onChange: ({ workspaceKey, revision, state }) => {
         bus.publish({
@@ -1295,7 +1292,7 @@ export const startServer = async (
       supersedePublication();
       coordinatorEpoch += 1;
       systemGraphInventory.invalidateScope(root);
-      systemGraphRelationships.invalidateScope(root);
+      systemGraphInvocations.invalidateScope(root);
       workflowRegistry.markDiscoveryDirty(root);
       markAcceptedInventoryDirty(root);
     },
@@ -1619,7 +1616,7 @@ export const startServer = async (
     supersedePublication();
     coordinatorEpoch += 1;
     systemGraphInventory.invalidateScope(lexicalRoot);
-    systemGraphRelationships.invalidateScope(lexicalRoot);
+    systemGraphInvocations.invalidateScope(lexicalRoot);
     workflowRegistry.markDiscoveryDirty(lexicalRoot);
     markAcceptedInventoryDirty(lexicalRoot);
     outstandingDirtyPrerequisites.set(token, canonicalRoot);
@@ -2144,7 +2141,7 @@ export const startServer = async (
         prepareDirtyWorkflowRoot(scope.root, undefined, discoveryBudget);
         if (sourcePaths === null) {
           systemGraphInventory.invalidateScope(scope.root);
-          systemGraphRelationships.invalidateScope(scope.root);
+          systemGraphInvocations.invalidateScope(scope.root);
         } else {
           for (const root of dirtyGraphSourceRoots(
             scope.root,
@@ -2153,7 +2150,7 @@ export const startServer = async (
           )) {
             prepareDirtyWorkflowRoot(root, undefined, discoveryBudget);
             systemGraphInventory.invalidateSource(root);
-            systemGraphRelationships.invalidateSource(root);
+            systemGraphInvocations.invalidateSource(root);
           }
         }
       },
@@ -2172,11 +2169,11 @@ export const startServer = async (
               );
         if (sourcePaths === null) {
           systemGraphInventory.invalidateScope(canonicalScope.root);
-          systemGraphRelationships.invalidateScope(canonicalScope.root);
+          systemGraphInvocations.invalidateScope(canonicalScope.root);
         } else {
           for (const workflowRoot of dirtyRoots) {
             systemGraphInventory.invalidateSource(workflowRoot);
-            systemGraphRelationships.invalidateSource(workflowRoot);
+            systemGraphInvocations.invalidateSource(workflowRoot);
           }
         }
         const discoveryBudget = workspaceDiscoveryBudget(scope.root);
@@ -2540,7 +2537,7 @@ export const startServer = async (
       onScopeRefresh: async (scope) => {
         try {
           systemGraphInventory.retryFailedInspections(scope);
-          systemGraphRelationships.retryFailed(scope.root);
+          systemGraphInvocations.retryFailed(scope.root);
           return await refreshSystemGraphInventory(scope);
         } catch {
           console.error("[harness] workspace graph manual refresh failed");
@@ -3062,7 +3059,7 @@ export const startServer = async (
       workspaceWatcher.stopAll();
       systemGraphWatcher.stopAll();
       activeSystemGraphScopes.clear();
-      systemGraphRelationships.clear();
+      systemGraphInvocations.clear();
       systemGraphInventory.clear();
       systemGraphStore.clear();
       installWatcher.stopAll();

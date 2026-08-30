@@ -36,7 +36,7 @@ POST /api/workspaces/:workspaceKey/system-graph/refresh
 
 `GET` returns the current accepted process-memory snapshot. On a cold read,
 known inventory nodes and revision-matched navigation render immediately in a
-degraded projection; bounded relationship extraction and background discovery
+degraded projection; bounded direct invocation extraction and background discovery
 may publish a later revision. Concurrent reads share that work, and ordinary
 reads never await a filesystem baseline or discovery scan. `POST .../refresh`
 reruns registry prerequisites, requests a fresh projection, waits for that
@@ -106,9 +106,30 @@ and retries the join within a bounded loop.
 
 `SystemGraph` is path-free and has `kind: "system"`. Its scope repeats only the
 opaque key. Nodes contain an `id`, Project-scoped `agentKey`, and display
-`label`. Edges are static `invokes` relationships with a `blocking` or `async`
-mode. Blocking and asynchronous calls between the same pair remain distinct in
-the JSON even when the UI groups them into one connector.
+`label`. Public direct-invocation edges are explicit and extensible:
+
+```ts
+interface StaticInvocationGraphEdge {
+  from: string;
+  to: string;
+  kind: "invokes";
+  basis: "static-invocation";
+  mode: "blocking" | "async";
+}
+
+type SystemGraphEdge = StaticInvocationGraphEdge;
+```
+
+Blocking and asynchronous calls between the same pair remain distinct in the
+JSON even when the UI groups them into one connector.
+
+Direct invocation analysis is syntax-only. It never creates a TypeScript
+`Program` or `TypeChecker`, and it never imports, bundles, or executes customer
+code. The provider scans each inventoried agent source root separately for
+literal calls. It does not inspect the provenance of invocation inputs, follow
+agent outputs through formatter/helper/router code, or scan arbitrary workspace
+router modules outside those roots. Cross-agent output-to-input analysis will
+use a separate package-level evidence provider.
 
 Projection can remain useful while reporting warnings:
 
@@ -116,8 +137,8 @@ Projection can remain useful while reporting warnings:
 | ----------------------------- | ------------------------------------------------------------------------------------------------- |
 | `unresolved-target`           | A literal target does not resolve to an agent in the selected Project.                            |
 | `dynamic-target`              | Source contains a call whose target cannot be proven statically.                                  |
-| `duplicate-edge`              | The same mode-specific relationship was discovered more than once.                                |
-| `projection-failed`           | A relationship projection failed and the remaining graph was preserved.                           |
+| `duplicate-edge`              | The same mode-specific direct invocation was discovered more than once.                           |
+| `projection-failed`           | A direct invocation projection failed and the remaining graph was preserved.                      |
 | `duplicate-agent-key`         | More than one contained agent proposed the same key; local fallback identities disambiguate them. |
 | `inventory-extraction-failed` | One agent could not be enriched, so the remaining inventory was returned.                         |
 
@@ -126,7 +147,7 @@ immediately. A syntax-proven source definition name is canonical without
 bundling or executing project code; a retained marker/cloud slug remains only a
 compatibility alias. Unknown or invalid identity uses a safe provisional marker
 or `local:` key and makes the snapshot degraded. Marker-authorized legacy name
-inspection and relationship extraction run in bounded background queues after
+inspection and direct invocation extraction run in bounded background queues after
 the inventory projection commits. Settled identities/edges publish a later
 revision; failures preserve provisional nodes and unambiguous direct edges.
 
