@@ -143,11 +143,15 @@ export function WorkspaceGraphView({
 
   /* THE MAP READS THE RAIL'S GROUPS (SAP-2983).
      The Group axis is stored per project ROOT, and a workspace scope is the one
-     thing that joins this opaque key back to one — the graph payload carries no
-     filesystem path on purpose. Sorted by name because a container's order on
-     the map is its own (`shelfPack` keeps the rail's group order); this only
-     settles the order of agents inside one, which the layout re-decides from
-     the topology anyway. */
+     thing that joins this opaque key back to one — a graph payload carries no
+     filesystem path on purpose.
+
+     A fixed "name" sort rather than the rail's own setting, deliberately: sort
+     only settles the order of AGENTS inside a group, and the map re-decides
+     that from the topology. Group order — the thing the two surfaces must
+     agree on — is size for a derived set and the user's for a stored one, on
+     either setting, so reading the rail's preference here would couple the map
+     to a control that cannot change its answer. */
   const projectRoot = useMemo(
     () =>
       workspaceScopes.find((scope) => scope.workspaceKey === workspaceKey)
@@ -165,11 +169,17 @@ export function WorkspaceGraphView({
     projectRoot !== null,
   );
   const groups = useMemo(() => {
-    // `isReady` is BOTH halves — the stored arrangement and the launch edges.
-    // Drawing before either lands would put every agent in one `Ungrouped`
-    // container for a beat, and that is a real arrangement, not a placeholder:
-    // it would read as this project's answer and then silently rearrange.
-    if (!graph || projectRoot === null || !railGroups.isReady(projectRoot)) {
+    /* `hasSettled`, NOT `isReady`. Both need the launch edges and the stored
+       arrangement, but `isReady` is the WRITE gate and stays false forever on a
+       read that failed — so a map gated on it would fall back to an unlabelled
+       flat layout on a read-only checkout while the rail beside it kept showing
+       the systems by name. Settled means both surfaces have the same answer.
+
+       Something has to gate it, though: drawing before the edges land would put
+       every agent in one `Ungrouped` container for a beat, and that is a real
+       arrangement rather than a placeholder — it would read as this project's
+       answer and then silently rearrange. */
+    if (!graph || projectRoot === null || !railGroups.hasSettled(projectRoot)) {
       return undefined;
     }
     return systemGraphNodeGroups(

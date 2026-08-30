@@ -7,9 +7,9 @@ endless column of agents.
 
 A project map used to draw every agent it contained as one flat set, ignoring
 the structure the rail was showing right beside it. Open a folder holding
-several systems and you got a single vertical column — a nine-system, 76-agent
-folder came out 9,700 pixels tall and one card wide, which no amount of zooming
-out makes readable.
+several systems and you got a single vertical column — a folder holding a few
+dozen agents came out thousands of pixels tall and one card wide, which no
+amount of zooming out makes readable.
 
 - **One labelled container per group.** The map now reads the same groups the
   rail does, so a system you named in the rail is a system you can see on the

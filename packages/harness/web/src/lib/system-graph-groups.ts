@@ -63,7 +63,15 @@ export function systemGraphNodeGroups(
     // A group whose members are all agents this graph does not have would draw
     // an empty box with a name on it — chrome around nothing.
     if (nodeIds.length > 0) {
-      containers.push({ id: group.id, label: group.label, nodeIds });
+      containers.push({
+        id: group.id,
+        label: group.label,
+        nodeIds,
+        // Carried from the rail, never inferred from the label: a user may name
+        // a group of their own "Ungrouped", and that group is a real system, not
+        // the bucket for what nothing claims.
+        isUngrouped: group.isUngrouped,
+      });
     }
   }
 
@@ -75,14 +83,13 @@ export function systemGraphNodeGroups(
     .map((node) => node.id)
     .filter((nodeId) => !claimed.has(nodeId));
   if (rest.length > 0) {
-    const index = containers.findIndex(
-      (container) => container.label === SYSTEM_GRAPH_UNGROUPED_LABEL,
-    );
+    const index = containers.findIndex((container) => container.isUngrouped);
     if (index === -1) {
       containers.push({
         id: UNGROUPED_ID,
         label: SYSTEM_GRAPH_UNGROUPED_LABEL,
         nodeIds: rest,
+        isUngrouped: true,
       });
     } else {
       // Re-appended rather than edited in place: Ungrouped is last in the rail

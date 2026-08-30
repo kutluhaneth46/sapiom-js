@@ -217,4 +217,50 @@ describe("systemGraphNodeGroups", () => {
     expect(drawn[0]!.label).toBe("Everything");
     expect(drawn[0]!.nodeIds).toHaveLength(NODES.length);
   });
+
+  it("does not mistake a group the user NAMED `Ungrouped` for the bucket", () => {
+    /* `renameGroup` only trims — nothing stops a user calling a real system
+       `Ungrouped`. Recognising the bucket by its LABEL would then file every
+       card that failed the navigation join inside that system, and move it to
+       the end of the map, breaking the rail order this feature is about.
+       `isUngrouped` is carried from the rail instead. */
+    const collision: RailState = {
+      version: 1,
+      renames: {},
+      groups: [
+        {
+          id: "g_named",
+          label: "Ungrouped",
+          members: [`${ROOT}/gateway`, `${ROOT}/queue`],
+        },
+        { id: "g_second", label: "Second", members: [`${ROOT}/worker`] },
+      ],
+    };
+    const rows = railRows(collision);
+    // The rail itself draws two rows called `Ungrouped`: the user's, and the
+    // real bucket. That is the shape the map has to survive.
+    expect(rows.map((row) => [row.label, row.isUngrouped])).toEqual([
+      ["Ungrouped", false],
+      ["Second", false],
+      ["Ungrouped", true],
+    ]);
+
+    const drawn = systemGraphNodeGroups(
+      NODES,
+      rows,
+      // `sender` drops out of the navigation join, so its card is unclaimed.
+      navigationFor(WORKFLOWS.filter((workflow) => workflow.name !== "sender")),
+    );
+    expect(drawn.map((c) => [c.label, c.isUngrouped, c.nodeIds])).toEqual([
+      ["Ungrouped", false, ["agent:gateway", "agent:queue"]],
+      ["Second", false, ["agent:worker"]],
+      [
+        "Ungrouped",
+        true,
+        ["agent:loner", "agent:mailer", "agent:sender"],
+      ],
+    ]);
+    // The user's group keeps its position and its exact membership.
+    expect(drawn[0]!.nodeIds).not.toContain("agent:sender");
+  });
 });

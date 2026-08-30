@@ -294,14 +294,19 @@ describe("layoutSystemGraph", () => {
  * in geometry, because "it looks better" is not a rule anything can hold.
  *
  * Geometry only. That containers carry the RAIL's labels is
- * `system-graph-groups.test.ts`; that they reach the DOM is `project-map.spec.ts`.
+ * `system-graph-groups.test.ts`; that they reach the DOM is `project-map-groups.spec.ts`.
  */
 describe("layoutSystemGraph with groups", () => {
   const group = (
     id: string,
     label: string,
     nodeIds: string[],
-  ): SystemGraphNodeGroup => ({ id, label, nodeIds });
+  ): SystemGraphNodeGroup => ({
+    id,
+    label,
+    nodeIds,
+    isUngrouped: label === "Ungrouped",
+  });
 
   /** The box a container claims, by label. */
   function boxOf(layout: SystemGraphLayout, label: string) {

@@ -328,12 +328,12 @@ export function SystemGraphCanvas({
         >
           {/* Behind the connectors and the cards, so an edge that leaves its
               system reads as crossing the boundary rather than being clipped by
-              it — the shape the design reference draws. */}
+              it. */}
           {layout.groups.map((group) => (
             <div
               key={group.id}
               className="system-graph-group"
-              data-testid="system-graph-group"
+              data-testid={`system-graph-group-${group.id}`}
               data-group-id={group.id}
               data-group-label={group.label}
               data-group-nodes={group.nodeCount}

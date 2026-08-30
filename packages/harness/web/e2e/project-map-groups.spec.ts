@@ -35,11 +35,17 @@ const railGroups = (page: Page): Promise<string[]> =>
     .locator('[data-testid^="group-row-"] .tree-row-label')
     .allInnerTexts();
 
-/** Switch the rail to the Group axis and wait for it to be editable. */
-async function openGroupAxis(page: Page): Promise<void> {
+/** Switch the rail to the Group axis. */
+async function selectGroupAxis(page: Page): Promise<void> {
   await page.getByTestId("history-trigger").click();
   await page.getByTestId("filing-group-by").selectOption("group");
   await page.keyboard.press("Escape");
+}
+
+/** …and wait for it to be EDITABLE: the create row appears only once the
+ *  arrangement and the launch edges have both loaded. */
+async function openGroupAxis(page: Page): Promise<void> {
+  await selectGroupAxis(page);
   await expect(page.getByTestId("group-create-polsia")).toBeVisible();
 }
 
@@ -188,4 +194,145 @@ test("an edge whose ends the user split across groups is still drawn", async ({
   await expect(page.locator(".system-graph-edge.is-cross-group")).not.toHaveCount(
     0,
   );
+});
+
+test("a container's name stays inside its own box at every zoom", async ({
+  page,
+}) => {
+  /* The name counter-scales against the view zoom, because at the map's own
+     arrival zoom it renders under 4px tall. A `transform: scale()` would do
+     that WITHOUT re-laying the line out — the label's on-screen width would
+     then stay constant while its container's shrank, so below ~70% a long group
+     name draws past its own box and over its neighbour, invisible to any check
+     that measures the boxes alone. It grows by font-size instead, so the
+     ellipsis still applies.
+
+     Asserted at the far end of the clamp, where a transform would be worst. */
+  await page.getByTestId("system-graph-zoom-out").click({ clickCount: 8 });
+
+  const measured = await page.evaluate(() => {
+    const groups = [...document.querySelectorAll(".system-graph-group")];
+    const cards = [...document.querySelectorAll(".system-graph-node")].map(
+      (el) => el.getBoundingClientRect(),
+    );
+    const hits = (a: DOMRect, b: DOMRect) =>
+      !(a.right <= b.left || b.right <= a.left || a.bottom <= b.top || b.bottom <= a.top);
+    return {
+      zoom: document.querySelector('[data-testid="system-graph-zoom-reset"]')!
+        .textContent,
+      labelHeight: Math.round(
+        groups[0]!
+          .querySelector(".system-graph-group-label")!
+          .getBoundingClientRect().height,
+      ),
+      escaping: groups.filter((group) => {
+        const outer = group.getBoundingClientRect();
+        const label = group
+          .querySelector(".system-graph-group-label")!
+          .getBoundingClientRect();
+        return (
+          label.right > outer.right + 0.5 || label.bottom > outer.bottom + 0.5
+        );
+      }).length,
+      overCards: groups.filter((group) => {
+        const label = group
+          .querySelector(".system-graph-group-label")!
+          .getBoundingClientRect();
+        return cards.some((card) => hits(label, card));
+      }).length,
+    };
+  });
+
+  // The fixture is only evidence while the label is actually being grown.
+  expect(Number.parseInt(measured.zoom!, 10)).toBeLessThan(70);
+  expect(measured.labelHeight).toBeGreaterThan(6);
+  expect(measured.escaping).toBe(0);
+  expect(measured.overCards).toBe(0);
+});
+
+test("a project whose arrangement cannot be READ still draws its groups", async ({
+  page,
+}) => {
+  /* The write gate and the draw gate are different questions. A read that fails
+     answers "nothing stored", which shows the DERIVED groups — the rail renders
+     those, because a group axis you cannot write to is still one you can look
+     at. Gating the map on the write gate instead would leave it flat and
+     unlabelled on a read-only checkout while the rail six inches away named
+     every system, which is the divergence this whole feature removes. */
+  await page.goto("/?mockFixtures=deep");
+  await expect(page.locator(".rail-workflows")).toBeVisible();
+  await page.evaluate(() => {
+    (window as unknown as { __MOCK_RAIL_STATE_FAIL__?: boolean }).__MOCK_RAIL_STATE_FAIL__ =
+      true;
+  });
+  await page.getByTestId("project-select-polsia").click();
+  await expect(page.getByTestId("workspace-graph-view")).toBeVisible();
+
+  await expect
+    .poll(() => mapContainers(page))
+    .toEqual(["gateway", "mailer", "Ungrouped"]);
+
+  // The rail draws the same rows — read-only, which is why the map cannot be
+  // gated on the same signal: `group-create-polsia` is deliberately absent.
+  await selectGroupAxis(page);
+  await expect
+    .poll(() => railGroups(page))
+    .toEqual(["gateway", "mailer", "Ungrouped"]);
+  await expect(page.getByTestId("group-create-polsia")).toHaveCount(0);
+  expect(await railGroups(page)).toEqual(await mapContainers(page));
+});
+
+test("a read that failed is tried again when the map is reopened", async ({
+  page,
+}) => {
+  /* The arrangement cache is shared by both surfaces so an edit in one moves
+     the other. What must NOT be shared is "have I asked for this yet": a
+     module-level request latch would mean one bad response is permanent, and
+     that this committable file is never re-read after a branch switch or a hand
+     edit either. So the latch stays per surface, and a remount re-reads. */
+  await page.goto("/?mockFixtures=deep");
+  await expect(page.locator(".rail-workflows")).toBeVisible();
+  await page.evaluate(() => {
+    // A stored arrangement, so a successful read is distinguishable from a
+    // failed one by more than timing.
+    window.localStorage.setItem(
+      "sapiom-mock-studio-rail:/Users/demo/polsia",
+      JSON.stringify({
+        version: 1,
+        renames: {},
+        groups: [
+          {
+            id: "g_custom",
+            label: "Custom",
+            members: [
+              "/Users/demo/polsia/services/gateway",
+              "/Users/demo/polsia/services/workers/queue",
+            ],
+          },
+        ],
+      }),
+    );
+    (window as unknown as { __MOCK_RAIL_STATE_FAIL__?: boolean }).__MOCK_RAIL_STATE_FAIL__ =
+      true;
+  });
+
+  await page.getByTestId("project-select-polsia").click();
+  await expect(page.getByTestId("workspace-graph-view")).toBeVisible();
+  // The read failed, so the map falls back to the DERIVED groups.
+  await expect
+    .poll(() => mapContainers(page))
+    .toEqual(["gateway", "mailer", "Ungrouped"]);
+
+  await page.evaluate(() => {
+    (window as unknown as { __MOCK_RAIL_STATE_FAIL__?: boolean }).__MOCK_RAIL_STATE_FAIL__ =
+      false;
+  });
+
+  // Drill into an agent and back out: the map remounts, and the remount reads.
+  await page.locator(".system-graph-node.is-navigable").first().click();
+  await expect(page.getByTestId("workspace-graph-view")).toHaveCount(0);
+  await page.getByTestId("project-select-polsia").click();
+  await expect(page.getByTestId("workspace-graph-view")).toBeVisible();
+
+  await expect.poll(() => mapContainers(page)).toEqual(["Custom", "Ungrouped"]);
 });

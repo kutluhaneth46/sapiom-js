@@ -30,8 +30,16 @@ const LABEL_HEIGHT = 16;
  * system when it never did.
  */
 const GROUP_PADDING = 48;
-/** The label strip along the top of a container, above its content. */
-const GROUP_HEADER = 26;
+/**
+ * The label strip along the top of a container, above its content.
+ *
+ * Sized for the BIGGEST line the label can produce, not for its natural one:
+ * `.system-graph-group-label` grows its type up to 4x as the view zooms out, so
+ * at the clamp it is `4 * --type-meta * 1.2` plus the container's own top
+ * padding. Sized for the natural line instead, the name of a system would sit
+ * across the first row of its cards at exactly the zoom it becomes readable.
+ */
+const GROUP_HEADER = 64;
 /** Between containers. Wider than `COMPONENT_GAP` so the boundary between two
  *  systems reads as a bigger break than the boundary between two components of
  *  one system. */
@@ -47,12 +55,15 @@ const GROUP_GAP = 80;
 const SHELF_ASPECT = 2.2;
 
 /**
- * The label the Group axis gives agents no group claims (`agent-groups.ts`).
+ * The label for the bucket this module synthesizes when a node reaches it that
+ * no container claimed — see `toRegions`. It matches the rail's own spelling
+ * (`agent-groups.ts`), repeated rather than imported because the dependency
+ * runs the other way: `system-graph-groups.ts` maps the rail's model onto this
+ * one. The e2e spec asserts the map's labels against the RAIL's rows, so the
+ * two spellings cannot drift apart unnoticed.
  *
- * Repeated here rather than imported because the dependency runs the other way:
- * `system-graph-groups.ts` maps the rail's model onto this one. The e2e spec
- * asserts the map's container labels against the RAIL's rows, so the two
- * spellings cannot drift apart unnoticed.
+ * It is a LABEL, never an identity test: `isUngrouped` is how the bucket is
+ * recognised.
  */
 export const SYSTEM_GRAPH_UNGROUPED_LABEL = "Ungrouped";
 
@@ -74,6 +85,14 @@ export interface SystemGraphNodeGroup {
   id: string;
   label: string;
   nodeIds: readonly string[];
+  /**
+   * The bucket for agents no group claims, carried by IDENTITY rather than
+   * inferred from the label. Nothing stops a user creating or renaming a group
+   * to "Ungrouped" in the rail, and matching on the string would then file
+   * unresolved cards inside that named system and move it to the end of the
+   * map — breaking the rail-order agreement this whole feature is about.
+   */
+  isUngrouped: boolean;
 }
 
 /** A drawn container: the box, and the label that names it. */
@@ -463,8 +482,6 @@ function placeRegionNodes(
   componentBoxes: Map<string, ComponentBox>;
   componentByNode: Map<string, string>;
   strongByNode: Map<string, string>;
-  width: number;
-  height: number;
 } {
   const componentByNode = new Map<string, string>();
   const strongByNode = new Map<string, string>();
@@ -531,14 +548,7 @@ function placeRegionNodes(
     });
   });
   nodes.sort((left, right) => compareIds(left.id, right.id));
-  return {
-    nodes,
-    componentBoxes,
-    componentByNode,
-    strongByNode,
-    width: packed.width,
-    height: packed.height,
-  };
+  return { nodes, componentBoxes, componentByNode, strongByNode };
 }
 
 function spreadPortOffsets(
@@ -847,9 +857,9 @@ const CROSS_GROUP_LANE = 6;
  * Routed after the containers are packed, in global coordinates, and
  * deliberately NOT confined to a gutter: a corridor wide enough to skirt every
  * container between two ends would dominate the drawing for the rarest edge on
- * it. They pass BEHIND cards (the edge layer sits under the node layer) and the
- * design reference draws them the same way — the connector out of "THE LOOP" to
- * TikTok crosses its border.
+ * it. They pass BEHIND cards, because the edge layer sits under the node layer
+ * — a connector between two containers is drawn CROSSING the border rather than
+ * clipped by it, which is what makes it read as a link out of the system.
  */
 function routeCrossGroupEdges(
   visible: readonly VisibleSystemGraphEdge[],
@@ -971,6 +981,7 @@ interface Region {
    *  where nothing is drawn around the content. */
   label: string | null;
   nodeIds: string[];
+  isUngrouped: boolean;
 }
 
 /**
@@ -988,7 +999,9 @@ function toRegions(
   groups: readonly SystemGraphNodeGroup[] | undefined,
 ): Region[] {
   const order = graph.nodes.map((node) => node.id);
-  if (!groups) return [{ id: "", label: null, nodeIds: order }];
+  if (!groups) {
+    return [{ id: "", label: null, nodeIds: order, isUngrouped: false }];
+  }
   const known = new Set(order);
   const claimed = new Set<string>();
   const regions: Region[] = [];
@@ -1005,7 +1018,12 @@ function toRegions(
     }
     // A group whose every member resolved to nothing is chrome around nothing.
     if (nodeIds.length > 0) {
-      regions.push({ id: group.id, label: group.label, nodeIds });
+      regions.push({
+        id: group.id,
+        label: group.label,
+        nodeIds,
+        isUngrouped: group.isUngrouped,
+      });
     }
   }
   const leftover = order.filter((id) => !claimed.has(id));
@@ -1014,15 +1032,14 @@ function toRegions(
     // backstop rather than a path — and deliberately not a throw. A node that
     // silently disappears from the map is worse than a node filed in the bucket
     // that means "nothing claims this".
-    const bucket = regions.find(
-      (region) => region.label === SYSTEM_GRAPH_UNGROUPED_LABEL,
-    );
+    const bucket = regions.find((region) => region.isUngrouped);
     if (bucket) bucket.nodeIds.push(...leftover);
     else {
       regions.push({
         id: "group:unclaimed",
         label: SYSTEM_GRAPH_UNGROUPED_LABEL,
         nodeIds: leftover,
+        isUngrouped: true,
       });
     }
   }

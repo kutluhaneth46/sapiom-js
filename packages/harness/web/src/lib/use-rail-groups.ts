@@ -38,17 +38,23 @@ const ROOTS_SEP = "\n";
  * reason the file is per project: there is one answer, and both surfaces read
  * it.
  *
- * `requested` lives here too, so a second surface mounting does not re-issue a
- * read the first one already has in flight.
+ * What deliberately does NOT live here is "have I asked for this yet". That
+ * stays per hook, so mounting a surface re-reads the file — it is a committable
+ * file that a branch switch or a hand edit can change under the app, and a
+ * module-level request latch would mean the page never looked again, and never
+ * retried a read that failed. Two surfaces mounting therefore issue two GETs of
+ * the same file, which is a cheap read and idempotent.
  */
 interface RailGroupsStore {
   /** A property of the INSTALL, not of a root, so one read serves every
    *  project. Null until it lands. */
   edges: LaunchEdge[] | null;
-  edgesRequested: boolean;
   states: Map<string, RailState>;
+  /** Roots whose file READ SUCCEEDED. Gates writes. */
   loaded: Set<string>;
-  requested: Set<string>;
+  /** Roots whose read has SETTLED, successfully or not. Gates drawing.
+   *  See `hasSettled` — the two must stay different sets. */
+  settled: Set<string>;
   listeners: Set<() => void>;
   /** Bumped on every mutation. `useSyncExternalStore` compares it by identity,
    *  and every accessor below takes it as a dependency — a Map mutated in place
@@ -58,10 +64,9 @@ interface RailGroupsStore {
 
 const store: RailGroupsStore = {
   edges: null,
-  edgesRequested: false,
   states: new Map(),
   loaded: new Set(),
-  requested: new Set(),
+  settled: new Set(),
   listeners: new Set(),
   version: 0,
 };
@@ -112,6 +117,21 @@ export interface RailGroups {
    * a real arrangement and would read as the answer.
    */
   isReady: (root: string) => boolean;
+  /**
+   * Whether this root's arrangement is safe to DRAW: the edges landed and the
+   * read has settled — successfully or not.
+   *
+   * Deliberately weaker than `isReady`, and the difference is a real failure.
+   * A read that fails is answered as "nothing stored", which shows the DERIVED
+   * groups; the rail renders those, because a group axis you cannot write to is
+   * still a group axis you can look at. `isReady` stays false for that root
+   * forever, on purpose, so nothing can be edited into a file we were unable to
+   * read. A map gated on `isReady` would therefore fall back to an unlabelled
+   * flat layout on a read-only checkout or a 5xx, while the rail six inches away
+   * showed the systems by name — which is the exact divergence this feature
+   * exists to remove.
+   */
+  hasSettled: (root: string) => boolean;
   /** The stored state, for the reset control's copy ("Discards 3 groups"). */
   stateFor: (root: string) => RailState;
   /** Apply a pure operation to one root's arrangement and persist the result.
@@ -157,6 +177,12 @@ export function useRailGroups(
 ): RailGroups {
   const version = useSyncExternalStore(subscribe, snapshot, snapshot);
 
+  /** Roots and edges this INSTANCE has already asked for. Refs, not state, so
+   *  they update synchronously and a re-render mid-flight cannot start a second
+   *  read; per instance, so a remount re-reads. */
+  const requested = useRef(new Set<string>());
+  const edgesRequested = useRef(false);
+
   // The registry changes as agents are scanned, and the load effect below must
   // not re-run for that — it would re-read every project's file. It reads the
   // latest registry through a ref instead of depending on it.
@@ -167,8 +193,8 @@ export function useRailGroups(
   // serves every project. Fetched only once the axis is in use: it greps every
   // registered agent's sources, and the Project axis has no use for the answer.
   useEffect(() => {
-    if (!enabled || store.edgesRequested) return;
-    store.edgesRequested = true;
+    if (!enabled || edgesRequested.current) return;
+    edgesRequested.current = true;
     void api
       .listLaunchEdges()
       .then((next) => {
@@ -189,8 +215,8 @@ export function useRailGroups(
   useEffect(() => {
     if (!enabled) return;
     for (const root of rootsKey.split(ROOTS_SEP).filter(Boolean)) {
-      if (store.requested.has(root)) continue;
-      store.requested.add(root);
+      if (requested.current.has(root)) continue;
+      requested.current.add(root);
       void api
         .getRailState(root)
         .then((raw) => {
@@ -200,14 +226,20 @@ export function useRailGroups(
           // next edit rewrites.
           store.states.set(root, readRailState(raw, workflowsRef.current));
           store.loaded.add(root);
+          store.settled.add(root);
           notify();
         })
         .catch(() => {
           // An older server with no such route, or an unreadable project. Both
           // read as "nothing stored", which shows the derived groups — but the
           // root stays NOT loaded, so nothing can be edited into a file we were
-          // unable to read.
+          // unable to read. It IS settled: both surfaces now have the same
+          // answer to draw, which is the point of the two sets being different.
           store.states.set(root, EMPTY_RAIL_STATE);
+          store.settled.add(root);
+          // Forget the request so a later mount tries the read again; a
+          // permanent latch would make one bad response permanent.
+          requested.current.delete(root);
           notify();
         });
     }
@@ -222,6 +254,11 @@ export function useRailGroups(
 
   const isReady = useCallback(
     (root: string): boolean => store.edges !== null && store.loaded.has(canonicalRoot(root)),
+    [version],
+  );
+
+  const hasSettled = useCallback(
+    (root: string): boolean => store.edges !== null && store.settled.has(canonicalRoot(root)),
     [version],
   );
 
@@ -297,7 +334,7 @@ export function useRailGroups(
   );
 
   return useMemo(
-    () => ({ groupsFor, agentsIn, isReady, stateFor, edit, reset }),
-    [groupsFor, agentsIn, isReady, stateFor, edit, reset],
+    () => ({ groupsFor, agentsIn, isReady, hasSettled, stateFor, edit, reset }),
+    [groupsFor, agentsIn, isReady, hasSettled, stateFor, edit, reset],
   );
 }
