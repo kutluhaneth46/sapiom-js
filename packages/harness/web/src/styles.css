@@ -10843,6 +10843,18 @@ button.system-graph-node.is-navigable:focus-visible {
    inventing a second dialog shape. */
 .modal-create-agent {
   width: 460px;
+  /* MEASURED: four blocks make this the tallest dialog in the app (658px), and
+     a 620px-tall window pushed its header 19px ABOVE the viewport — the close
+     button and the title, unreachable, on a dialog that cannot be scrolled to.
+     The frame is capped and the body scrolls instead, so the header and the
+     actions stay put at any height. */
+  display: flex;
+  flex-direction: column;
+  max-height: calc(100vh - 48px);
+}
+
+.modal-create-agent .modal-body {
+  overflow-y: auto;
 }
 
 /* The destination, stated. The label is the sentence; the path sits under it
