@@ -12,9 +12,6 @@
  * a bundle error, the check process timing out) comes back as null and the
  * caller falls back to a weaker name source.
  */
-import * as fs from "node:fs/promises";
-import * as path from "node:path";
-
 import { extractWorkflowGraphCached } from "./canvas-cache.js";
 import { listSourceFiles } from "./canvas-interconnections.js";
 
@@ -25,27 +22,28 @@ export type ManifestNameInspection =
   | { status: "failed"; retryable: boolean };
 
 /**
- * The one extraction failure a later projection of the SAME unchanged source
- * can still clear: there is TypeScript to extract from, but nothing installed
- * to run the extraction with. Failures are deliberately not cached
- * (core/canvas-cache.ts), so re-running after an install succeeds — but the
- * graph watcher only reacts to `.ts`/`.tsx` outside ignored directories, so
- * `node_modules` landing fires nothing. Callers must keep offering a retry.
+ * Whether a later projection of the SAME unchanged source could still name
+ * this agent. Extraction failures are deliberately not cached
+ * (core/canvas-cache.ts), so a re-run is free to succeed — and several causes
+ * do resolve on their own terms: dependencies get installed, a check process
+ * that crashed or timed out under load succeeds on the next attempt. None of
+ * those fire the graph watcher, which only reacts to `.ts`/`.tsx` outside
+ * ignored directories, so the caller must keep offering a manual retry.
  *
- * A project with no TypeScript at all is NOT this case: no install can produce
- * a `defineAgent` that was never written.
+ * `reason` cannot answer this — it is free-form text assembled from an agent's
+ * own error message, a stderr tail, or a timeout string — so the only claim
+ * made here is the one the filesystem proves outright: a project with no
+ * TypeScript in it has no `defineAgent` to find, and no install or re-run
+ * will invent one. Adding a source file changes the answer, and adding one is
+ * precisely what the watcher does see.
+ *
+ * Deliberately one-directional. Guessing "settled" wrongly caches a
+ * provisional label and removes the retry that would have fixed it; guessing
+ * "retryable" wrongly just leaves the project as it behaves today.
  */
-async function installCouldStillName(projectDir: string): Promise<boolean> {
-  let sources: string[];
+async function couldStillBeNamed(projectDir: string): Promise<boolean> {
   try {
-    sources = await listSourceFiles(projectDir);
-  } catch {
-    return false;
-  }
-  if (sources.length === 0) return false;
-  try {
-    await fs.access(path.join(projectDir, "node_modules"));
-    return false;
+    return (await listSourceFiles(projectDir)).length > 0;
   } catch {
     return true;
   }
@@ -64,7 +62,7 @@ export async function inspectManifestName(
   try {
     const { result } = await extract(projectDir);
     if (!result.ok) {
-      return { status: "failed", retryable: await installCouldStillName(projectDir) };
+      return { status: "failed", retryable: await couldStillBeNamed(projectDir) };
     }
     const name = result.graph.manifestName.trim();
     return name === "" ? { status: "absent" } : { status: "found", name };

@@ -114,7 +114,7 @@ describe("inspectManifestName", () => {
       );
     });
 
-    it("is retryable with sources present but nothing installed", async () => {
+    it("is retryable while the project still has TypeScript to name", async () => {
       const root = await project({ "index.ts": "export {};\n" });
       await expect(inspectManifestName(root, failed())).resolves.toEqual({
         status: "failed",
@@ -122,20 +122,24 @@ describe("inspectManifestName", () => {
       });
     });
 
-    it("is settled once dependencies are installed", async () => {
+    it("stays retryable with dependencies installed", async () => {
+      // Installed deps prove nothing: workspaces hoist `node_modules` to the
+      // repo root, and a check process that crashed or timed out under load
+      // succeeds on the next run. Only "no TypeScript at all" is provable.
       const root = await project({
         "index.ts": "export {};\n",
         "node_modules/.keep": "",
       });
       await expect(inspectManifestName(root, failed())).resolves.toEqual({
         status: "failed",
-        retryable: false,
+        retryable: true,
       });
     });
 
     it("is settled when the project has no TypeScript to name", async () => {
-      // A dashboard companion: no install can produce a `defineAgent` that
-      // was never written, so this failure has nowhere left to go.
+      // A dashboard companion: no install and no re-run can produce a
+      // `defineAgent` that was never written, so this failure is the one we
+      // can prove has nowhere left to go.
       const root = await project({ "server.js": "module.exports = {};\n" });
       await expect(inspectManifestName(root, failed())).resolves.toEqual({
         status: "failed",
