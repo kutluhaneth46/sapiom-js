@@ -22,14 +22,28 @@ export type SystemGraphNavigationResolution =
  * a newer one asks the caller to advance the graph. Foreign, failed, and
  * repeatedly stale responses all fail closed.
  */
+/**
+ * Give the commit the resolver is behind a moment to land. Retrying in the
+ * same breath just re-reads the value that lost the race, so the bounded loop
+ * would spend all three attempts on one pre-commit snapshot.
+ */
+function backOffBeforeRetry(attempt: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 20 * 2 ** attempt));
+}
+
 export async function resolveSystemGraphNavigationForRevision(
   source: SystemGraphNavigationSource,
   workspaceKey: WorkspaceKey,
   revision: number,
   signal?: AbortSignal,
+  waitBeforeRetry: (attempt: number) => Promise<void> = backOffBeforeRetry,
 ): Promise<SystemGraphNavigationResolution> {
   for (let attempt = 0; attempt < 3; attempt += 1) {
     if (signal?.aborted) return { kind: "unavailable" };
+    if (attempt > 0) {
+      await waitBeforeRetry(attempt - 1);
+      if (signal?.aborted) return { kind: "unavailable" };
+    }
     try {
       const response = await source.getSystemGraphNavigation(workspaceKey);
       if (signal?.aborted) return { kind: "unavailable" };

@@ -100,6 +100,34 @@ describe("resolveSystemGraphNavigationForRevision", () => {
     expect(getSystemGraphNavigation).toHaveBeenCalledTimes(2);
   });
 
+  it("waits between attempts so a behind resolver can catch its commit up", async () => {
+    // Without the pause the three attempts re-read one pre-commit snapshot as
+    // fast as the network answers, and the retry never gives the commit it is
+    // waiting for a chance to land.
+    const waits: number[] = [];
+    const stale = response({ revision: snapshot.revision - 1 });
+    const matching = response();
+    const getSystemGraphNavigation = vi
+      .fn()
+      .mockResolvedValueOnce(stale)
+      .mockResolvedValueOnce(stale)
+      .mockResolvedValueOnce(matching);
+
+    await expect(
+      resolveSystemGraphNavigationForRevision(
+        { getSystemGraphNavigation },
+        snapshot.workspaceKey,
+        snapshot.revision,
+        undefined,
+        async (attempt) => {
+          waits.push(attempt);
+        },
+      ),
+    ).resolves.toEqual({ kind: "matched", response: matching });
+    expect(getSystemGraphNavigation).toHaveBeenCalledTimes(3);
+    expect(waits).toEqual([0, 1]);
+  });
+
   it("tells the view to advance when the resolver has the newer committed revision", async () => {
     const getSystemGraphNavigation = vi.fn(async () =>
       response({ revision: snapshot.revision + 1 }),

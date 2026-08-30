@@ -9,11 +9,11 @@ import {
   graphSourceRootsWithinScope,
   HarnessRegistryInventoryProvider,
   inventorySourceRoot,
-  workspaceRelativeLocalKey,
   type AgentInventoryResult,
   type HarnessRegistryInventoryProviderOptions,
   type WorkspaceScope,
 } from "./system-graph-inventory.js";
+import { workspaceRelativeLocalKey } from "../shared/system-graph.js";
 import type { ManifestNameInspection } from "./definition-name.js";
 
 const WORKSPACE = "/private/workspaces/acme";
