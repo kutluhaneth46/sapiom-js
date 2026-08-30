@@ -237,4 +237,92 @@ describe("workspace graph freshness wiring", () => {
       expect(manualRetry.revision).toBeGreaterThan(beforeManualRetry.revision);
     },
   );
+
+  it(
+    "registers each agent once when the launch directory is a symlink",
+    { timeout: 30_000 },
+    async () => {
+      // The registry keys rows by path. Boot scanned the launch directory as
+      // given while the first graph open scanned its resolved form, so every
+      // agent registered twice; the duplicates collided into `local:` fallback
+      // keys and each cross-agent target became ambiguous, dropping its edge.
+      // macOS hits this on any `os.tmpdir()` path (`/var` -> `/private/var`).
+      await scaffoldAgent(
+        workspaceRoot,
+        "research",
+        'ctx.sapiom.agents.run({ definition: "growth" });\n',
+      );
+      await scaffoldAgent(workspaceRoot, "growth");
+      const linkedRoot = path.join(tempRoot, "linked-workspace");
+      await fs.symlink(workspaceRoot, linkedRoot, "dir");
+      await fs.writeFile(
+        path.join(stateRoot, "settings.json"),
+        JSON.stringify({ recentDirs: [linkedRoot] }),
+      );
+
+      server = await startServer({
+        port: 0,
+        bootToken: "test-token",
+        telemetryOptIn: false,
+        adapters: {},
+        stateRoot,
+        launchDir: linkedRoot,
+        autoCreateSession: false,
+      });
+      const baseUrl = `http://127.0.0.1:${server.port}`;
+      const headers = { "X-Harness-Token": "test-token" };
+
+      await vi.waitFor(
+        async () => {
+          const response = await fetch(`${baseUrl}/api/workflows`, { headers });
+          const workflows = (await response.json()) as WorkflowInfo[];
+          expect(workflows).toHaveLength(2);
+        },
+        { timeout: 8_000, interval: 150 },
+      );
+
+      const state = (await (
+        await fetch(`${baseUrl}/api/state`, { headers })
+      ).json()) as AppState;
+      const workspaceKey = state.workspaceScopes?.[0]?.workspaceKey;
+      expect(workspaceKey).toBeTruthy();
+
+      const readGraph = async (): Promise<SystemGraphSnapshot> =>
+        (await (
+          await fetch(`${baseUrl}/api/workspaces/${workspaceKey}/system-graph`, {
+            headers,
+          })
+        ).json()) as SystemGraphSnapshot;
+
+      await vi.waitFor(
+        async () => {
+          expect((await readGraph()).state).toBe("ready");
+        },
+        { timeout: 8_000, interval: 150 },
+      );
+
+      // The duplicate rows only appear once a SECOND scan runs under the
+      // resolved spelling, which is what a graph refresh does. Adding an agent
+      // is the cheapest way to make the watcher trigger one.
+      await scaffoldAgent(workspaceRoot, "reporting");
+      await vi.waitFor(
+        async () => {
+          const graph = await readGraph();
+          expect(graph.graph?.nodes.map((node) => node.agentKey)).toEqual([
+            "growth",
+            "reporting",
+            "research",
+          ]);
+          expect(graph.graph?.warnings).toEqual([]);
+          expect(graph.graph?.edges).toEqual([
+            expect.objectContaining({
+              from: "agent:research",
+              to: "agent:growth",
+            }),
+          ]);
+        },
+        { timeout: 10_000, interval: 150 },
+      );
+    },
+  );
 });
