@@ -4,14 +4,6 @@ import { z } from "zod/v4";
 /** Protocol version for the package inventory exchanged by build and Studio tooling. */
 export const PACKAGE_INVENTORY_PROTOCOL = 1 as const;
 
-type JsonValue =
-  | null
-  | boolean
-  | number
-  | string
-  | readonly JsonValue[]
-  | { readonly [key: string]: JsonValue };
-
 export type PackageInventoryVersion =
   | {
       /** Mutable checkout identity plus its normalized public-content revision. */
@@ -29,20 +21,6 @@ export type PackageInventoryVersion =
       readonly bundleDigest: `sha256:${string}`;
     };
 
-/**
- * Optional, producer-owned static-analysis evidence attached to one agent.
- *
- * `protocol` versions the producer's JSON-only `payload`; consumers must
- * interpret only protocols they explicitly support and otherwise preserve or
- * ignore the envelope. Protocol 1 intentionally does not prescribe a signal
- * payload yet, so future extractors can add evidence without changing the
- * package-inventory identity and location fields.
- */
-export interface PackageInventoryStaticSignals {
-  readonly protocol: number;
-  readonly payload: JsonValue;
-}
-
 type PackageInventoryIdentityIssue =
   | "identity-pending"
   | "identity-unavailable"
@@ -55,8 +33,6 @@ interface PackageInventoryAgentBase {
   readonly path: string;
   /** POSIX path relative to the agent directory. */
   readonly entrypoint: string;
-  /** Advisory versioned evidence; never required to identify the agent. */
-  readonly staticSignals?: PackageInventoryStaticSignals;
 }
 
 export type PackageInventoryAgent = PackageInventoryAgentBase &
@@ -81,6 +57,13 @@ export type PackageInventoryAgent = PackageInventoryAgentBase &
       }
   );
 
+/**
+ * Describes which agents exist in a package, their stable identities, and
+ * package-relative locations only.
+ *
+ * Future factual agent profiles and cross-agent relationships will use
+ * separately versioned contracts.
+ */
 export interface PackageInventory {
   readonly protocol: typeof PACKAGE_INVENTORY_PROTOCOL;
   readonly version: PackageInventoryVersion;
@@ -169,25 +152,6 @@ const entrypointSchema = z
     "Expected an agent-root-relative POSIX path",
   );
 
-const jsonValueSchema: z.ZodType<JsonValue> = z.lazy(() =>
-  z.union([
-    z.null(),
-    z.boolean(),
-    z.number().finite(),
-    z.string(),
-    z.array(jsonValueSchema),
-    z.record(z.string(), jsonValueSchema),
-  ]),
-);
-
-const packageInventoryStaticSignalsSchema: z.ZodType<PackageInventoryStaticSignals> =
-  z
-    .object({
-      protocol: z.number().int().positive(),
-      payload: jsonValueSchema,
-    })
-    .strict();
-
 const packageInventoryAgentSchema = z
   .object({
     agentKey: provisionalAgentKeySchema,
@@ -203,7 +167,6 @@ const packageInventoryAgentSchema = z
     candidateAgentKey: canonicalAgentKeySchema.optional(),
     path: packagePathSchema,
     entrypoint: entrypointSchema,
-    staticSignals: packageInventoryStaticSignalsSchema.optional(),
   })
   .strict()
   .superRefine((agent, context) => {

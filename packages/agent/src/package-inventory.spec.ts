@@ -44,10 +44,6 @@ describe("packageInventorySchema", () => {
         identityStatus: "canonical" as const,
         path: ".",
         entrypoint: "src/index.ts",
-        staticSignals: {
-          protocol: 1,
-          payload: { nested: [true, null, 3] },
-        },
       },
     ];
     const working = packageInventorySchema.parse(
@@ -307,32 +303,6 @@ describe("packageInventorySchema", () => {
     expect(() =>
       packageInventorySchema.parse(
         workingTree({ status: "degraded", agents: [agent] as never }),
-      ),
-    ).toThrow();
-  });
-
-  it.each([
-    { protocol: 0, payload: null },
-    { protocol: 1.5, payload: null },
-    { protocol: 1, payload: Number.NaN },
-    { protocol: 1, payload: Number.POSITIVE_INFINITY },
-    { protocol: 1, payload: undefined },
-    { protocol: 1, payload: () => undefined },
-    { protocol: 1, payload: BigInt(1) },
-  ])("rejects invalid static signals %#", (staticSignals) => {
-    expect(() =>
-      packageInventorySchema.parse(
-        workingTree({
-          agents: [
-            {
-              agentKey: "research",
-              identityStatus: "canonical",
-              path: "research",
-              entrypoint: "index.ts",
-              staticSignals,
-            },
-          ] as never,
-        }),
       ),
     ).toThrow();
   });
