@@ -5,7 +5,8 @@ name: Desktop Release
 # @sapiom/harness NPM package via OIDC) — desktop installers are a different
 # artifact type with a different toolchain (electron-builder + a native
 # node-pty rebuild per platform), so they get their own workflow and their own
-# tag namespace (`harness-desktop-v*`) that never triggers the npm publish.
+# tag namespace (`v*`). That never triggers the npm publish either: publish.yml
+# subscribes to pushes on `main`, not to tags at all.
 #
 # Phase 4 = UNSIGNED multi-OS build. macOS is the required shipping target, so
 # it's exercised here early (on a hosted macos-14 runner) rather than deferred:
@@ -14,10 +15,10 @@ name: Desktop Release
 # Phases 5–6 and layer on top of this same build.
 #
 # Trigger, and the tag convention that drives the update channel:
-#   - `harness-desktop-v1.2.3`        → FINAL release, `latest` channel. Every user
+#   - `v1.2.3`                        → FINAL release, `latest` channel. Every user
 #                                       gets it, and it becomes the target of the
 #                                       permanent /releases/latest/download/… links.
-#   - `harness-desktop-v1.2.3-beta.1` → PRE-release, `beta` channel. Only installs
+#   - `v1.2.3-beta.1`                 → PRE-release, `beta` channel. Only installs
 #                                       already following betas are offered it.
 #   - workflow_dispatch (manual)      → build all OSes, artifacts only
 #                                       (no tag ⇒ no Release; download them from
@@ -30,7 +31,13 @@ name: Desktop Release
 on:
   push:
     tags:
-      - "harness-desktop-v*"
+      # `v*`, NOT `harness-desktop-v*`. electron-updater's GitHubProvider runs
+      # `semver.valid(tag)` on every releases.atom entry when resolving a
+      # pre-release channel, and skips the ones that fail — `harness-desktop-v0.3.8`
+      # is not valid semver, so under the old namespace EVERY release was skipped
+      # and a beta install threw "No published versions on GitHub". A leading `v`
+      # is the only prefix semver tolerates. See SAP-2965.
+      - "v*"
   workflow_dispatch:
 
 # Minimal token scope, declared at the top so it is the DEFAULT every job
@@ -99,11 +106,22 @@ jobs:
           # We have already tagged v0.1.0 against a package that later became
           # 0.1.1 — this is a mistake we've made, not one we're imagining.
           if [ "${{ github.ref_type }}" = "tag" ]; then
-            expected="harness-desktop-v${version}"
+            expected="v${version}"
             if [ "${{ github.ref_name }}" != "$expected" ]; then
               echo "::error::Tag '${{ github.ref_name }}' does not match packages/harness-desktop/package.json (${version}). Expected '${expected}'. Bump the package version or retag."
               exit 1
             fi
+          fi
+
+          # The tag must ALSO be semver-parseable, because electron-updater's
+          # pre-release resolution silently skips any releases.atom entry that
+          # isn't. A tag that fails here publishes fine and then cannot be
+          # installed by anyone on a pre-release channel — the exact failure that
+          # made `harness-desktop-v0.3.8-beta.1` undiscoverable. This is the cheap
+          # guard; release-tags.test.ts asserts the same pattern from the other side.
+          if ! printf '%s' "$version" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'; then
+            echo "::error::Version '${version}' is not valid semver, so the release tag would be invisible to pre-release update checks. Fix packages/harness-desktop/package.json."
+            exit 1
           fi
 
           echo "version=$version"       >> "$GITHUB_OUTPUT"
@@ -442,7 +460,7 @@ jobs:
   # on a real tag push (workflow_dispatch has no tag, so it stops at Artifacts).
   release:
     needs: [prepare, build]
-    if: startsWith(github.ref, 'refs/tags/harness-desktop-v')
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write # create/update the GitHub Release and upload assets

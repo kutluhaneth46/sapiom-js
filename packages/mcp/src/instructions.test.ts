@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { describe, it, expect } from "vitest";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -40,10 +41,50 @@ describe("server instructions", () => {
     expect(AUTHORING_INSTRUCTIONS).toContain("https://docs.sapiom.ai/agents");
     expect(AUTHORING_INSTRUCTIONS).toContain("AGENTS.md");
     expect(AUTHORING_INSTRUCTIONS).toContain("sapiom-agent-authoring");
-    // The two-MCP frame: agents learn the remote MCP exists for direct tool calls
-    expect(AUTHORING_INSTRUCTIONS).toContain("remote MCP");
-    expect(AUTHORING_INSTRUCTIONS).toContain("api.sapiom.ai/v1/mcp");
+  });
+
+  it("keeps local authoring and hosted direct access on distinct aliases", () => {
+    // Two-MCP frame: this server authors agents under the local `sapiom` alias; the
+    // hosted capability MCP answers one-off calls under the distinct `sapiom-direct`
+    // alias. The 2.6-era copy conflated them onto one `sapiom` alias, which is why
+    // the negative assertions below exist.
+    expect(AUTHORING_INSTRUCTIONS).toContain(
+      "`sapiom-dev` is this package's MCP server identity",
+    );
+    expect(AUTHORING_INSTRUCTIONS).toContain(
+      "supported local alias `sapiom` with `claude mcp add sapiom -- npx -y @sapiom/mcp`",
+    );
+    expect(AUTHORING_INSTRUCTIONS).toContain(
+      "claude mcp add --scope user --transport http sapiom-direct https://api.sapiom.ai/v1/mcp",
+    );
     expect(AUTHORING_INSTRUCTIONS).toContain("tool_discover");
+    expect(AUTHORING_INSTRUCTIONS).not.toContain(
+      "claude mcp add sapiom --transport http",
+    );
+    expect(AUTHORING_INSTRUCTIONS).not.toContain("it exposes every capability");
+    expect(AUTHORING_INSTRUCTIONS).not.toContain(
+      "# Sapiom dev MCP (sapiom-dev)",
+    );
+  });
+
+  it("points the preview path at App Links for durable sharing (SAP-2923)", () => {
+    // A preview URL dies with its sandbox. Without a named durable successor here,
+    // App Links are undiscoverable from the one surface every session reads on
+    // connect — and this fallback is the copy served when the live fetch fails,
+    // i.e. the path with no other source of truth.
+    expect(AUTHORING_INSTRUCTIONS).toContain("App Link");
+    expect(AUTHORING_INSTRUCTIONS).toContain(
+      "https://apps.sapiom.ai/{org}/{slug}",
+    );
+    expect(AUTHORING_INSTRUCTIONS).toContain("sapiom_app_publish");
+    expect(AUTHORING_INSTRUCTIONS).toContain(
+      "https://docs.sapiom.ai/capabilities/app-links",
+    );
+    // The local one-call path, version-gated: the backend live-fetches this text to
+    // every install, including clients on an older @sapiom/mcp whose server never
+    // advertised the tool. The gate is the part that keeps naming it honest.
+    expect(AUTHORING_INSTRUCTIONS).toContain("sapiom_dev_app_publish");
+    expect(AUTHORING_INSTRUCTIONS).toContain("`@sapiom/mcp` >= 0.13");
   });
 
   it("names the entry step's inputSchema as the agent's public API (SAP-2227)", () => {
@@ -80,29 +121,55 @@ describe("server instructions", () => {
     expect(AUTHORING_INSTRUCTIONS).not.toContain("If you must pin");
   });
 
-  it("documents the complete ctx.shared quota contract", () => {
+  it("carries the served primer's one-line ctx.shared contract (SAP-2959)", () => {
+    // This file used to assert an 11-line `ctx.shared` quota contract: the inclusive
+    // 256 KiB / 262,144-byte limit, compact-`JSON.stringify` measurement, setter-time
+    // validation, no `delete()`, structural guards over `instanceof`. That paragraph
+    // was in THIS fallback and not in the served primer, so online sessions — the vast
+    // majority — never saw it. Syncing to the served text drops it here too.
+    //
+    // That is a consequence of the sync, not an oversight, and it is the direction the
+    // rule requires: the two copies are one canonical text, and the digest below cannot
+    // hold if they differ by a paragraph. The contract still reaches authors through
+    // packages/agent/README.md and the scaffold-shipped `sapiom-agent-authoring` skill.
+    // Putting it back in the primer is a server-side content release, not an edit here.
     expect(AUTHORING_INSTRUCTIONS).toContain(
-      "inclusive 256 KiB (262,144-byte) quota",
+      "Cross-step state: `ctx.shared` — the entry input reaches only the entry step.",
     );
-    expect(AUTHORING_INSTRUCTIONS).toContain("measured as compact");
-    expect(AUTHORING_INSTRUCTIONS).toContain("`JSON.stringify` UTF-8 bytes");
-    expect(AUTHORING_INSTRUCTIONS).toContain(
-      "IDs/references here instead of bulk state",
-    );
-    expect(AUTHORING_INSTRUCTIONS).toContain(
-      "`ctx.shared.set()` validates the complete candidate synchronously",
-    );
-    expect(AUTHORING_INSTRUCTIONS).toContain(
-      "construct this SDK version's `InMemoryContextStore`",
-    );
-    expect(AUTHORING_INSTRUCTIONS).toContain(
-      "snapshot unchanged after an oversized or unserializable write",
-    );
-    expect(AUTHORING_INSTRUCTIONS).toContain("structural payload guards");
-    expect(AUTHORING_INSTRUCTIONS).toContain("than `instanceof`");
-    expect(AUTHORING_INSTRUCTIONS).toContain("Hosts that have not adopted");
-    expect(AUTHORING_INSTRUCTIONS).toContain(
-      "There is no `delete()` operation",
+  });
+
+  it("is byte-identical to the backend primer (frozen sha-256, SAP-2959)", () => {
+    // THE SYNC RULE, which lives here rather than in instructions.ts because that
+    // file's JSDoc is emitted into dist/instructions.d.ts and published to npm, where
+    // none of this is actionable for a consumer: AUTHORING_INSTRUCTIONS is duplicated
+    // verbatim from the server's canonical primer (a private companion repo). The
+    // package must work offline, so it cannot import it. The two are one canonical
+    // text — KEEP THEM IDENTICAL whenever either changes.
+    //
+    // The `contain` assertions above are what let this copy fall two content
+    // releases behind the server without anything going red: each one still
+    // passed against the older text. This digest is what actually binds the two
+    // copies, and it works from both ends: the server-side spec pins this same
+    // value against ITS current primer, so a content release there reddens that
+    // spec and forces its author onto this pin, while an in-place edit here
+    // reddens this one. Neither suite makes a network call.
+    //
+    // Be honest about the limit: neither pin can block a merge in the other
+    // repository, and an author can still move one side alone. What the pair
+    // removes is the silent path — drifting now takes a deliberate edit to a line
+    // that says what it is for.
+    //
+    // To change the primer: ship the server-side content release, copy its new
+    // body here verbatim, and update both pins to the new digest in the same pair
+    // of PRs. Never re-point this digest on its own — that just re-blesses the
+    // drift the guard exists to catch.
+    //
+    // Current release: 2.8 (App Links + `sapiom_dev_app_publish`).
+    const sha256 = createHash("sha256")
+      .update(AUTHORING_INSTRUCTIONS, "utf8")
+      .digest("hex");
+    expect(sha256).toBe(
+      "7f518d9c4a80122e51d45e9e28dc5f6cacfd3b05f4101aa1a5b8ae5d4494c0df",
     );
   });
 });
