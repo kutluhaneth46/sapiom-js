@@ -1255,6 +1255,14 @@ export const App = (): JSX.Element => {
   };
 
   /**
+   * The provider a create-initiated session boots with — the same stored
+   * preference the rail used to read before it dispatched. It moved here with
+   * the create itself; the rail no longer starts sessions.
+   */
+  const preferredHarness = (): HarnessKind =>
+    loadUiPrefs().preferredHarness === "codex" ? "codex" : "claude-code";
+
+  /**
    * The ONE answer to "where does a session for this agent boot" (SAP-2927).
    *
    * Every path that starts a session ON AN EXISTING AGENT — the tab-strip `+`,
@@ -1264,14 +1272,6 @@ export const App = (): JSX.Element => {
    * do not: that folder is the new project's root by construction, and
    * resolving it upward would drop the new agent into its parent project.
    */
-  /**
-   * The provider a create-initiated session boots with — the same stored
-   * preference the rail used to read before it dispatched. It moved here with
-   * the create itself; the rail no longer starts sessions.
-   */
-  const preferredHarness = (): HarnessKind =>
-    loadUiPrefs().preferredHarness === "codex" ? "codex" : "claude-code";
-
   const sessionCwdForAgent = (agentPath: string): string =>
     projectRootForAgent(agentPath, knownProjectRoots());
 

@@ -18,7 +18,7 @@
 import { useRef, useState } from "react";
 import type { JSX, RefObject } from "react";
 
-import type { FsListResponse } from "../lib/api";
+import { errorMessage, type FsListResponse } from "../lib/api";
 import type { StudioTemplate } from "../lib/templates";
 import { useDismissable } from "../lib/use-dismissable";
 import { DirectoryPicker } from "./DirectoryPicker";
@@ -62,7 +62,11 @@ export function TemplateUseDialog({
     try {
       await onConfirm(trimmed);
     } catch (err) {
-      setError((err as Error).message);
+      // The server's sentence, not the wire shape it arrives in: a starter now
+      // goes through `POST /api/agents/scaffold` (SAP-2981), so a real refusal
+      // — a name already taken there, a folder Studio doesn't show as a project
+      // — lands here and has to be readable.
+      setError(errorMessage(err, "Couldn't use this template."));
       setBusy(false);
     }
   };

@@ -49,10 +49,15 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Router, type Router as ExpressRouter } from "express";
+import rateLimit from "express-rate-limit";
 
 import { refuseAgentName } from "../shared/agent-name.js";
 import type { AgentScaffoldResponse } from "../shared/types.js";
-import { childPath, hasTraversalSegment } from "../core/path-safety.js";
+import {
+  childPath,
+  hasTraversalSegment,
+  resolveWithinRoot,
+} from "../core/path-safety.js";
 
 
 export interface AgentScaffoldDeps {
@@ -135,6 +140,23 @@ export async function refuseScaffoldOnDisk(
 }
 
 /**
+ * Remove what a failed scaffold left behind.
+ *
+ * NOTHING HALF-CREATED. `scaffold` makes the directory before it copies into
+ * it, and every guard above proved the destination was absent, so whatever is
+ * there now is this attempt's own wreckage. A half-created agent is worse than
+ * a refusal: the retry then fails on "already contains" and the user has to
+ * clean up a folder they never made.
+ *
+ * `force` so an attempt that failed before the mkdir is a no-op, and the whole
+ * thing is swallowed: the caller is already being told the create failed, and a
+ * cleanup error would replace that sentence with a worse one.
+ */
+async function removeFailedScaffold(dir: string): Promise<void> {
+  await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+}
+
+/**
  * POST /api/agents/scaffold  { root, name, template? } -> AgentScaffoldResponse
  *
  * 400 — a malformed body, a name that is not one folder segment, a template
@@ -148,8 +170,22 @@ export function createAgentScaffoldRouter(
   deps: AgentScaffoldDeps,
 ): ExpressRouter {
   const router = Router();
+  /**
+   * A create is the most expensive request this server serves — a template
+   * copy, an `npm install` and a `git init` per call — so it is the one worth
+   * bounding. The window is far above anything a person clicking a dialog can
+   * reach; it exists so a stuck client cannot turn a create loop into a disk
+   * full of half-built projects. Same shape as the attachment-upload limiter
+   * in `server/rest.ts`.
+   */
+  const scaffoldRateLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 30,
+    standardHeaders: true,
+    legacyHeaders: false,
+  });
 
-  router.post("/api/agents/scaffold", async (req, res, next) => {
+  router.post("/api/agents/scaffold", scaffoldRateLimiter, async (req, res, next) => {
     const body = (req.body ?? {}) as {
       root?: unknown;
       name?: unknown;
@@ -188,11 +224,25 @@ export function createAgentScaffoldRouter(
         return;
       }
       const projectLabel = path.basename(path.resolve(projectDir)) || projectDir;
-      // `path.resolve` on the LIST's entry, not the request's, and `childPath`
-      // re-derives the join it already blessed above: the guard that produces
-      // the path is the guard that proved it, so no later edit can separate
-      // them.
-      const target = childPath(path.resolve(projectDir), name as string);
+      // THE JOIN, on `path.resolve` of the LIST's entry rather than the
+      // request's. `childPath` is the rule: one plain child of this project,
+      // nothing else — it is what refuses every escaping name, and the
+      // co-located test proves that by posting them.
+      //
+      // `resolveWithinRoot` is a SINK-LOCAL RE-ASSERTION on top of it, and
+      // deliberately unreachable: nothing `childPath` returns can fail it
+      // today, so no test can make it fire (stubbing it out leaves the suite
+      // green — said plainly rather than dressed up as a second guard). It
+      // earns its place twice over anyway: it is the containment check in the
+      // form static analysis recognizes — CodeQL reads `childPath`'s
+      // `dirname(...) === root` comparison as no barrier at all and flags every
+      // `fs` call below as path injection — and it survives a reordering of the
+      // guards above it, which is exactly the edit that would make the rule
+      // reachable again. Same shape `server/canvas.ts` uses for its
+      // user-supplied sub-path.
+      const child = childPath(path.resolve(projectDir), name as string);
+      const target =
+        child == null ? null : resolveWithinRoot(path.resolve(projectDir), child);
       if (target == null) {
         res.status(400).json({ error: `'${String(name)}' isn't a folder name.` });
         return;
@@ -215,9 +265,7 @@ export function createAgentScaffoldRouter(
       try {
         result = await deps.scaffoldAgent({ targetDir: target, template });
       } catch (err) {
-        // NOTHING HALF-CREATED. Everything above proved the destination was
-        // absent, so whatever is there now is this attempt's own wreckage.
-        await fs.rm(target, { recursive: true, force: true }).catch(() => {});
+        await removeFailedScaffold(target);
         res.status(500).json({
           error: (err as Error).message || `Couldn't create ${String(name)}.`,
         });
