@@ -167,6 +167,27 @@ test.describe("create an agent in a project", () => {
     expect(await createOrder(page)).toEqual([]);
   });
 
+  test("Return submits from the name field — and Return on Cancel cancels", async ({
+    page,
+  }) => {
+    await openProjectMenu(page, "acme-app");
+    await page.getByTestId("project-create-agent-acme-app").click();
+    await page.getByTestId("create-agent-name").fill("returned");
+    await page.getByTestId("create-agent-name").press("Enter");
+    await expect(page.getByTestId("workflow-returned")).toBeVisible();
+
+    // The dialog took Return for the whole form, so a focused Cancel took it
+    // too: pressing Return on "Cancel" closed the dialog AND created the
+    // agent — the opposite of what was pressed. Measured, before the guard.
+    await openProjectMenu(page, "acme-app");
+    await page.getByTestId("project-create-agent-acme-app").click();
+    await page.getByTestId("create-agent-name").fill("cancelled");
+    await page.getByRole("button", { name: "Cancel" }).focus();
+    await page.keyboard.press("Enter");
+    await expect(page.getByTestId("create-agent-dialog")).toHaveCount(0);
+    await expect(page.getByTestId("workflow-cancelled")).toHaveCount(0);
+  });
+
   test("the empty-project row opens the same dialog", async ({ page }) => {
     // One create flow, not one per door: the empty project's CTA is the same
     // subject and must not be a second mechanism that drifts.

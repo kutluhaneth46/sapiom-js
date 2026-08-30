@@ -123,9 +123,12 @@ export function CreateAgentDialog({
           // Return submits from the single-line field; the textarea keeps
           // Return for newlines and takes ⌘/Ctrl+Return instead.
           if (event.key !== "Enter") return;
-          const inTextarea =
-            (event.target as HTMLElement).tagName === "TEXTAREA";
-          if (inTextarea && !(event.metaKey || event.ctrlKey)) return;
+          const tag = (event.target as HTMLElement).tagName;
+          // A focused control already has its own answer to Return, and
+          // stealing it would make Return on Cancel submit the form — the
+          // opposite of what the user pressed.
+          if (tag === "BUTTON" || tag === "A") return;
+          if (tag === "TEXTAREA" && !(event.metaKey || event.ctrlKey)) return;
           event.preventDefault();
           void submit();
         }}
