@@ -4,13 +4,14 @@ import { z } from "zod/v4";
 /** Protocol version for the package inventory exchanged by build and Studio tooling. */
 export const PACKAGE_INVENTORY_PROTOCOL = 1 as const;
 
-type JsonValue =
+/** The JSON a producer may attach as static-analysis evidence. */
+export type PackageInventoryJsonValue =
   | null
   | boolean
   | number
   | string
-  | readonly JsonValue[]
-  | { readonly [key: string]: JsonValue };
+  | readonly PackageInventoryJsonValue[]
+  | { readonly [key: string]: PackageInventoryJsonValue };
 
 export type PackageInventoryVersion =
   | {
@@ -40,10 +41,15 @@ export type PackageInventoryVersion =
  */
 export interface PackageInventoryStaticSignals {
   readonly protocol: number;
-  readonly payload: JsonValue;
+  readonly payload: PackageInventoryJsonValue;
 }
 
-type PackageInventoryIdentityIssue =
+/**
+ * Why an identity is provisional. Exported so a consumer can exhaustively
+ * switch over the reasons rather than re-declaring the union, which would
+ * silently diverge when a later protocol adds one.
+ */
+export type PackageInventoryIdentityIssue =
   | "identity-pending"
   | "identity-unavailable"
   | "identity-invalid"
@@ -169,7 +175,7 @@ const entrypointSchema = z
     "Expected an agent-root-relative POSIX path",
   );
 
-const jsonValueSchema: z.ZodType<JsonValue> = z.lazy(() =>
+const jsonValueSchema: z.ZodType<PackageInventoryJsonValue> = z.lazy(() =>
   z.union([
     z.null(),
     z.boolean(),

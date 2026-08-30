@@ -2,6 +2,9 @@ import {
   PACKAGE_INVENTORY_PROTOCOL,
   packageInventorySchema,
   type PackageInventory,
+  type PackageInventoryIdentityIssue,
+  type PackageInventoryJsonValue,
+  type PackageInventoryStaticSignals,
 } from "./index.js";
 
 const SHA_A = `sha256:${"a".repeat(64)}` as const;
@@ -335,5 +338,29 @@ describe("packageInventorySchema", () => {
         }),
       ),
     ).toThrow();
+  });
+});
+
+describe("package inventory public type surface", () => {
+  // Both of these are reachable from exported types — `PackageInventoryAgent`
+  // is defined in terms of the issue union, and `staticSignals.payload` is the
+  // JSON type — so a consumer that cannot name them has to re-declare them by
+  // hand, and that copy diverges the moment a later protocol adds a reason.
+  it("names every type a consumer needs to handle an inventory", () => {
+    const reasons: PackageInventoryIdentityIssue[] = [
+      "identity-pending",
+      "identity-unavailable",
+      "identity-invalid",
+      "duplicate-agent-key",
+    ];
+    const payload: PackageInventoryJsonValue = {
+      calls: ["billing", { name: "payments", async: true }],
+      depth: 2,
+      unknown: null,
+    };
+    const signals: PackageInventoryStaticSignals = { protocol: 1, payload };
+
+    expect(reasons).toHaveLength(4);
+    expect(signals.payload).toBe(payload);
   });
 });

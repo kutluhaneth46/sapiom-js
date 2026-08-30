@@ -117,6 +117,8 @@ export { PACKAGE_INVENTORY_PROTOCOL, packageInventorySchema } from './package-in
 export type {
   PackageInventory,
   PackageInventoryAgent,
+  PackageInventoryIdentityIssue,
+  PackageInventoryJsonValue,
   PackageInventoryStaticSignals,
   PackageInventoryVersion,
 } from './package-inventory.js';
