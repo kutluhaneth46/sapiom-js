@@ -504,6 +504,11 @@ export const startServer = async (
   // already exists or when HOME is unwritable.
   await migrateHarnessIdentity(statePaths.machineId);
   const launchDir = options.launchDir ?? process.cwd();
+  /** Where a NEW agent project goes before the user saves a `projectRoot` of
+   *  their own — the host's answer (`<launchDir>/projects` under Electron),
+   *  reported to the SPA as `AppState.defaultProjectRoot` and counted as a
+   *  place the create route may write (see `listProjectDirs` below). */
+  const defaultProjectRoot = options.projectRoot ?? launchDir;
 
   // Serve-time slug enrichment: resolves each workflow's definitionSlug from
   // the Sapiom Agents API when it's absent (deployed sapiom.json files carry
@@ -1532,7 +1537,7 @@ export const startServer = async (
           });
       },
       launchDir,
-      defaultProjectRoot: options.projectRoot ?? launchDir,
+      defaultProjectRoot,
       agentsBaseUrl: resolveAgentsBaseUrl(),
       availableHarnesses: options.availableHarnesses,
       listTasks: () => taskManager.list(),
@@ -1753,6 +1758,16 @@ export const startServer = async (
           [
             ...stored.recentDirs,
             ...(stored.projectRoot ? [stored.projectRoot] : []),
+            // THE HOST'S DEFAULT, which the move route does not need and this
+            // one does. `AppState.defaultProjectRoot` is where the SPA puts a
+            // NEW project when the user has saved no `projectRoot` of their own
+            // — `<launchDir>/projects` under Electron — and the host does not
+            // persist it into settings. Without it, the first template a user
+            // ever starts from is refused at its own suggested destination
+            // ("Studio doesn't show that folder as a project"), and the flow
+            // cannot bootstrap: `recentDirs` only learns a root once a session
+            // has been created there, and creation now happens FIRST.
+            ...(defaultProjectRoot ? [defaultProjectRoot] : []),
             ...sessionManager.list().map((session) => session.cwd),
           ],
           workflowsCache.map((w) => w.path),

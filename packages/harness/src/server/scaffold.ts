@@ -140,17 +140,57 @@ export async function refuseScaffoldOnDisk(
 }
 
 /**
+ * CLAIM the directory, atomically — the request's one exclusive act.
+ *
+ * A plain `mkdir` (NOT recursive) is the whole mechanism: the filesystem
+ * decides who gets the name, and the loser is told `EEXIST`. The `lstat` above
+ * is a nicer message, not a lock — between it and the scaffold, a second POST
+ * with the same body (the route is directly postable) or a person making the
+ * folder in Finder can take the destination.
+ *
+ * Getting that ordering wrong is not a cosmetic race. The cleanup below deletes
+ * the directory recursively when the scaffold throws, and it is only entitled
+ * to do that BECAUSE this call created it: two simultaneous creates would
+ * otherwise have the loser `rm -rf` the winner's freshly installed agent while
+ * the winner's caller was being told it exists.
+ *
+ * `scaffold` accepts an existing EMPTY directory (agent-core's
+ * `isScaffoldableTarget`), so claiming it first costs nothing.
+ *
+ * Returns null on success, or the sentence to refuse with.
+ */
+async function claimTarget(
+  target: string,
+  projectLabel: string,
+): Promise<string | null> {
+  try {
+    await fs.mkdir(target);
+    return null;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "EEXIST")
+      return `${projectLabel} already contains ${path.basename(target)}.`;
+    if (code === "ENOENT")
+      return `Can't create an agent in ${path.dirname(target)} — that folder no longer exists.`;
+    return `Couldn't create ${path.basename(target)}: ${(err as Error).message}`;
+  }
+}
+
+/**
  * Remove what a failed scaffold left behind.
  *
- * NOTHING HALF-CREATED. `scaffold` makes the directory before it copies into
- * it, and every guard above proved the destination was absent, so whatever is
- * there now is this attempt's own wreckage. A half-created agent is worse than
- * a refusal: the retry then fails on "already contains" and the user has to
- * clean up a folder they never made.
+ * NOTHING HALF-CREATED. `scaffold` copies a template into the directory, so a
+ * failure part-way leaves a folder the user never made — worse than a refusal,
+ * because the retry then dies on "already contains" and they have to clean up
+ * after us.
  *
- * `force` so an attempt that failed before the mkdir is a no-op, and the whole
- * thing is swallowed: the caller is already being told the create failed, and a
- * cleanup error would replace that sentence with a worse one.
+ * Only ever called on a directory THIS request created (see `claimTarget`).
+ * That is what makes a recursive delete safe here, and it is the reason the
+ * claim is a `mkdir` rather than a `stat`.
+ *
+ * `force` so an attempt that failed before writing anything is a no-op, and the
+ * whole thing is swallowed: the caller is already being told the create failed,
+ * and a cleanup error would replace that sentence with a worse one.
  */
 async function removeFailedScaffold(dir: string): Promise<void> {
   await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
@@ -258,6 +298,13 @@ export function createAgentScaffoldRouter(
       const diskRefusal = await refuseScaffoldOnDisk(target, projectLabel);
       if (diskRefusal != null) {
         res.status(409).json({ error: diskRefusal });
+        return;
+      }
+      // THE CLAIM, and the last word on who owns this name. Everything above is
+      // a reason to refuse early; this is the one act that cannot be raced.
+      const claimRefusal = await claimTarget(target, projectLabel);
+      if (claimRefusal != null) {
+        res.status(409).json({ error: claimRefusal });
         return;
       }
 

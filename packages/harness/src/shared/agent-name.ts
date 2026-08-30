@@ -47,6 +47,12 @@ export function refuseAgentName(name: unknown): string | null {
     return "An agent name is one folder name — it can't contain / or \\.";
   if (name.startsWith("."))
     return "An agent name can't start with a dot — a dotted folder is hidden from the rail.";
+  // A TRAILING dot is not the same mistake, and it is worse: Windows silently
+  // strips it, so `mkdir foo.` makes `foo` and the created directory no longer
+  // matches the name the caller was told it got — the SPA then focuses and
+  // binds a path that does not exist.
+  if (name.endsWith("."))
+    return "An agent name can't end with a dot.";
   if (FORBIDDEN_IN_NAME.test(name)) return `'${name}' isn't a folder name.`;
   return null;
 }

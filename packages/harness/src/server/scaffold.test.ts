@@ -299,6 +299,51 @@ describe("POST /api/agents/scaffold", () => {
     }
   });
 
+  it("two simultaneous creates of the same name: one wins, and the loser deletes nothing", async () => {
+    // THE RACE THE CLEANUP MADE DANGEROUS. Both requests pass the `lstat` —
+    // nothing is there when either looks — and then one of them scaffolds while
+    // the other's scaffold refuses a non-empty directory. Without the atomic
+    // claim, the loser's cleanup recursively deleted the WINNER's freshly
+    // installed agent, while the winner's caller had already been told it
+    // exists.
+    const srv = await serve({
+      scaffoldAgent: async ({ targetDir }) => {
+        const entries = await fs.readdir(targetDir);
+        if (entries.length > 0)
+          throw new Error(`Target directory '${targetDir}' already exists and is not empty.`);
+        await fs.writeFile(path.join(targetDir, "index.ts"), "// the winner\n");
+        return { dependenciesInstalled: false };
+      },
+    });
+    try {
+      const [a, b] = await Promise.all([
+        srv.post({ root: tmp, name: "contested" }),
+        srv.post({ root: tmp, name: "contested" }),
+      ]);
+      const statuses = [a.status, b.status].sort();
+      expect(statuses).toEqual([200, 409]);
+      // The winner's work is intact — this is the assertion the old cleanup
+      // failed: it deleted the directory it had just been told was occupied.
+      expect(await fs.readFile(path.join(tmp, "contested", "index.ts"), "utf8")).toBe(
+        "// the winner\n",
+      );
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it("refuses when the project directory has been deleted under it", async () => {
+    const gone = path.join(tmp, "gone");
+    const srv = await serve({ projectDirs: [gone] });
+    try {
+      const res = await srv.post({ root: gone, name: "orphan" });
+      expect(res.status).toBe(409);
+      expect(res.body.error).toMatch(/no longer exists/);
+    } finally {
+      await srv.close();
+    }
+  });
+
   it("creates in a nested project directory the rail shows, using the LIST's spelling", async () => {
     // The move route's rule, applied here: the directory that gets written into
     // is the one from the list, so a request may not smuggle a different

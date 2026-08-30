@@ -27,6 +27,9 @@ describe("refuseAgentName", () => {
     expect(refuseAgentName(" leading")).toMatch(/space/);
     expect(refuseAgentName(42)).toMatch(/Give the agent a name/);
     expect(refuseAgentName("x".repeat(65))).toMatch(/too long/);
+    // Windows makes `foo.` into `foo`, so the name the caller is told it got
+    // and the directory on disk would disagree.
+    expect(refuseAgentName("trailing.")).toMatch(/end with a dot/);
   });
 
   it("refuses a NUL, which reaches fs as a throw rather than a refusal", () => {

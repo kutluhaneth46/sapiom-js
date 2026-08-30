@@ -25,7 +25,7 @@
  */
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { JSX, RefObject } from "react";
+import type { JSX } from "react";
 
 import { refuseAgentName } from "@shared/agent-name";
 
@@ -43,7 +43,6 @@ export function CreateAgentDialog({
   onCancel,
   onCreate,
   onBrowseTemplates,
-  triggerRef,
 }: {
   /** The project's rail label — what the user actually read on the row. */
   projectLabel: string;
@@ -63,8 +62,12 @@ export function CreateAgentDialog({
   /** Leaves for the template gallery — the clone journey this dialog does not
    *  own. Omitted, the link is not rendered. */
   onBrowseTemplates?: () => void;
-  /** The control that opened this — Escape returns focus to it. */
-  triggerRef?: RefObject<HTMLElement | null>;
+  /* NO `triggerRef`. Every door into this dialog is a control that unmounts
+     when it is used — the project row's popover menu closes on click, the
+     empty-project row is replaced by the agent it creates — so a ref handed in
+     here would point at a detached node and Escape would restore focus to
+     <body> anyway, only less obviously. Same reason the rail's remove-confirm
+     takes the `⋮` itself rather than the menu item. */
 }): JSX.Element {
   const [name, setName] = useState("");
   const [template, setTemplate] = useState(templates[0]?.id ?? "default");
@@ -75,7 +78,7 @@ export function CreateAgentDialog({
   const nameRef = useRef<HTMLInputElement>(null);
   // Never dismissable mid-flight: the agent is being written to disk, and
   // pulling the dialog would leave the user with no report of how it went.
-  useDismissable(!busy, { onDismiss: onCancel, containerRef: panelRef, triggerRef });
+  useDismissable(!busy, { onDismiss: onCancel, containerRef: panelRef });
 
   useEffect(() => {
     nameRef.current?.focus();

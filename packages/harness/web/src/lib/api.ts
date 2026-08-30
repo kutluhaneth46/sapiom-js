@@ -47,7 +47,7 @@ import { getTheme } from "./theme";
 import { parseSystemGraphSnapshot } from "./system-graph";
 import { refuseAgentName } from "@shared/agent-name";
 import { refuseMove, remapUnder } from "./agent-move";
-import { basenameOf, isWithinDir, samePath } from "./paths";
+import { basenameOf, isWithinDir, parentOf, samePath } from "./paths";
 
 import type { CanvasGraph, CanvasGraphNode } from "./canvas-graph";
 import {
@@ -2210,6 +2210,18 @@ class MockApi implements HarnessApi {
     const refusal = refuseAgentName(name);
     if (refusal)
       throw new ApiError(400, "POST /api/agents/scaffold \u2192 400 (mock)", refusal);
+    // THE ROOT BARRIER, and the reason it is here: the real route only writes
+    // into a folder the rail can show, and this mock originally skipped that
+    // guard — so `templates.spec.ts` asserted a scaffold into
+    // `<defaultProjectRoot>` succeeded while a fresh install would have been
+    // refused at exactly that path. A mock that is missing a guard is a suite
+    // that certifies the bug.
+    if (!this.projectDirs().some((dir) => samePath(dir, root)))
+      throw new ApiError(
+        409,
+        "POST /api/agents/scaffold \u2192 409 (mock)",
+        `Can't create an agent in ${root} — Studio doesn't show that folder as a project.`,
+      );
     const path = `${root.replace(/\/+$/, "")}/${name}`;
     if (this.workflows.some((workflow) => samePath(workflow.path, path)))
       throw new ApiError(
@@ -2235,6 +2247,36 @@ class MockApi implements HarnessApi {
       publishMockBusMessage({ type: "workflows.changed" });
     });
     return { ok: true, path, name, template, dependenciesInstalled: true };
+  }
+
+  /**
+   * The mock's twin of the server's `listProjectDirs`: the roots the rail can
+   * show — stored recents, the host's default parent for new projects, and
+   * every live session's cwd — plus the directories between a root and an
+   * agent, which is where the Project axis draws its folder rows.
+   */
+  private projectDirs(): string[] {
+    const roots = [
+      // THIS instance's settings, not the fixture constant: a `fresh` mock has
+      // no recents at all, which is the state the fresh-install bug lived in.
+      ...this.settings.recentDirs,
+      `${MOCK_LAUNCH_DIR}/projects`,
+      ...this.sessions.map((session) => session.cwd),
+    ];
+    const dirs = new Set(roots);
+    for (const workflow of this.workflows) {
+      for (const root of roots) {
+        if (!isWithinDir(root, workflow.path)) continue;
+        let dir = parentOf(workflow.path);
+        while (dir && isWithinDir(root, dir)) {
+          dirs.add(dir);
+          const parent = parentOf(dir);
+          if (!parent || parent === dir) break;
+          dir = parent;
+        }
+      }
+    }
+    return [...dirs];
   }
 
   async scanWorkflows(root: string): Promise<WorkflowScanOutcome> {

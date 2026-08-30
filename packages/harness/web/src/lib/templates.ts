@@ -228,32 +228,31 @@ export function matchesQuery(template: StudioTemplate, query: string): boolean {
 
 /**
  * The prompt handed to the session's agent after "Use template" starts a session
- * in the destination folder. Both branches name the REAL operation: the clone
- * MCP tool for gallery templates (with its auth failure path), the local
- * scaffold MCP tool for starters. Both end with the same next move (a local
- * test with no Sapiom capability spend), so use → edit → run is one continuous path rather than a
- * journey that stops at the clone.
+ * in the destination folder — for a GALLERY template only.
+ *
+ * It had a second branch for the bundled starters, handing them to the local
+ * scaffold MCP tool by name. SAP-2981 moved starters onto
+ * `POST /api/agents/scaffold`, where the folder exists before the session opens
+ * and a failure is an error message; the branch survived, unreachable, with a
+ * test certifying it. Deleted rather than left as a second answer to a question
+ * that now has one.
+ *
+ * A clone is not a scaffold and stays here: it forks a published agent into a
+ * repo the user owns, over the network, with an auth failure path — none of
+ * which the harness has a route for. It names the real tool and ends with the
+ * next move (a local test with no Sapiom capability spend), so use → edit → run
+ * is one continuous path rather than a journey that stops at the clone.
  */
 export function useTemplatePrompt(
-  template: StudioTemplate,
+  template: GalleryTemplate,
   dir: string,
 ): string {
-  const runContinuation =
-    "When the project is ready, offer a local test run with no Sapiom capability spend (sapiom_dev_agents_run_local) as the next step.";
-  if (template.kind === "gallery") {
-    return (
-      `Clone the Sapiom gallery template "${template.id}" into this directory: ` +
-      `call the sapiom_dev_agents_clone tool with dir "${dir}" and templateId "${template.id}". ` +
-      "If it reports you are not authenticated, run sapiom_authenticate first and retry. " +
-      "After the clone, read the project's AGENTS.md and run npm install. " +
-      runContinuation
-    );
-  }
   return (
-    `Scaffold the "${template.id}" starter in this directory: ` +
-    `${starterScaffoldInstruction(dir, template.id)}, then run npm install and read AGENTS.md. ` +
-    "Keep the shipped starter unchanged until the user describes what to build. " +
-    runContinuation
+    `Clone the Sapiom gallery template "${template.id}" into this directory: ` +
+    `call the sapiom_dev_agents_clone tool with dir "${dir}" and templateId "${template.id}". ` +
+    "If it reports you are not authenticated, run sapiom_authenticate first and retry. " +
+    "After the clone, read the project's AGENTS.md and run npm install. " +
+    "When the project is ready, offer a local test run with no Sapiom capability spend (sapiom_dev_agents_run_local) as the next step."
   );
 }
 
