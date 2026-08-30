@@ -332,13 +332,21 @@ describe("POST /api/agents/scaffold", () => {
     }
   });
 
-  it("refuses when the project directory has been deleted under it", async () => {
-    const gone = path.join(tmp, "gone");
-    const srv = await serve({ projectDirs: [gone] });
+  it("creates the project directory when it does not exist yet", async () => {
+    // THE FRESH-INSTALL CASE. `<launchDir>/projects` is the desktop host's
+    // default parent for new projects and nothing creates it — the scaffold's
+    // own recursive mkdir used to, until the atomic claim started running ahead
+    // of it, and the first template a new user ever picked was refused at its
+    // own suggested destination.
+    const unmade = path.join(tmp, "projects");
+    const srv = await serve({ projectDirs: [unmade] });
     try {
-      const res = await srv.post({ root: gone, name: "orphan" });
-      expect(res.status).toBe(409);
-      expect(res.body.error).toMatch(/no longer exists/);
+      const res = await srv.post({ root: unmade, name: "first-ever" });
+      expect(res.status).toBe(200);
+      expect((res.body as AgentScaffoldResponse).path).toBe(
+        path.join(unmade, "first-ever"),
+      );
+      expect(await exists(path.join(unmade, "first-ever", "sapiom.json"))).toBe(true);
     } finally {
       await srv.close();
     }

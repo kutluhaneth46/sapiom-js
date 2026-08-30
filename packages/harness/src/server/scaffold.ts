@@ -161,9 +161,20 @@ export async function refuseScaffoldOnDisk(
  */
 async function claimTarget(
   target: string,
+  projectDir: string,
   projectLabel: string,
 ): Promise<string | null> {
   try {
+    // THE PROJECT ROOT MAY NOT EXIST YET, and the claim must not be the thing
+    // that discovers it. `<launchDir>/projects` is the desktop host's default
+    // parent for new projects and NOTHING creates it — the scaffold's own
+    // `mkdir(recursive)` used to, and this claim now runs ahead of it. A fresh
+    // install's very first template landed on "that folder no longer exists".
+    //
+    // Recursive, and only on the directory the rail's list already vetted — so
+    // the claim below stays a single non-recursive `mkdir` on the agent's own
+    // name, which is what makes it exclusive.
+    await fs.mkdir(projectDir, { recursive: true });
     await fs.mkdir(target);
     return null;
   } catch (err) {
@@ -302,7 +313,7 @@ export function createAgentScaffoldRouter(
       }
       // THE CLAIM, and the last word on who owns this name. Everything above is
       // a reason to refuse early; this is the one act that cannot be raced.
-      const claimRefusal = await claimTarget(target, projectLabel);
+      const claimRefusal = await claimTarget(target, path.resolve(projectDir), projectLabel);
       if (claimRefusal != null) {
         res.status(409).json({ error: claimRefusal });
         return;
