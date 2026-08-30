@@ -273,8 +273,20 @@ export class SystemGraphStore {
     generation: number,
     result: Awaited<ReturnType<SystemGraphBuilder["build"]>>,
   ): SystemGraphSnapshot | Promise<SystemGraphSnapshot> {
+    // Enrichment is armed on both exits, never only on the commit. A build
+    // that loses its generation still carries the only callback that starts
+    // identity work, and `reportRefreshFailure` supersedes an in-flight build
+    // with `refreshPending` already false and `automaticRetryUsed` already
+    // true — so nothing schedules a follow-up and no later read queues one.
+    // Dropping the callback there leaves every identity `identity-pending`,
+    // which can never be cacheable: the stuck-`degraded` state through another
+    // door. It has to be armed *after* the commit decision, though, because a
+    // callback that refreshes synchronously would otherwise bump the
+    // generation out from under the very result being committed.
     if (!this.canCommit(entry, generation)) {
-      return this.continueAfterSupersededBuild(entry);
+      const superseded = this.continueAfterSupersededBuild(entry);
+      this.afterCommit(result.afterCommit);
+      return superseded;
     }
     entry.activeBuild = null;
     const navigation = (result.navigation ?? []).map((target) => ({

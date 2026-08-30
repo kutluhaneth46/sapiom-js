@@ -246,6 +246,30 @@ describe("SystemGraphStore", () => {
     expect(onChange).toHaveBeenCalledTimes(1);
   });
 
+  it("arms background enrichment even when the build that carried it is superseded", async () => {
+    // `reportRefreshFailure` bumps the generation with `refreshPending` already
+    // false and `automaticRetryUsed` true, so an in-flight build loses its
+    // commit and nothing schedules a follow-up — not the superseded-build path,
+    // not the next read. If the enrichment callback goes down with it, no
+    // identity ever leaves `identity-pending`, the projection can never become
+    // cacheable, and the workspace is stuck degraded until an unrelated watcher
+    // event arrives. Enrichment is idempotent, so it is armed before the commit
+    // is decided.
+    const pending = deferred<SystemGraphBuildResult>();
+    const startEnrichment = vi.fn();
+    const store = new SystemGraphStore({ build: vi.fn(() => pending.promise) });
+
+    const cold = store.get(scope);
+    store.reportRefreshFailure(scope);
+    pending.resolve({
+      ...buildResult("initial", false),
+      afterCommit: startEnrichment,
+    });
+    await cold;
+
+    expect(startEnrichment).toHaveBeenCalledTimes(1);
+  });
+
   it("allows an explicit refresh after automatic recovery was exhausted", async () => {
     const build = vi
       .fn()
