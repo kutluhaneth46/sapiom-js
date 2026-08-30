@@ -39,7 +39,14 @@ export interface AgentInventoryWarning {
 
 export interface AgentInventoryResult {
   agents: AgentInventoryItem[];
-  /** False when a later graph open should retry degraded enrichment. */
+  /**
+   * False only while identity work is still in flight, so a later graph open
+   * retries it. An agent that will never be nameable — no `defineAgent`
+   * export, no installed dependencies — keeps its warning but does not veto
+   * the project's cache: re-projecting cannot improve it, and vetoing pinned
+   * every real workspace to `degraded` and its "graph may be incomplete"
+   * banner forever.
+   */
   cacheable: boolean;
   warnings: AgentInventoryWarning[];
 }
@@ -250,7 +257,10 @@ interface PreparedAgent {
   fallbackKey: AgentKey;
   definitionId: number | null;
   definitionSlug: string | null;
+  /** Identity work finished without a name; the agent keeps its warning. */
   extractionFailed: boolean;
+  /** Identity work never finished. Only this may veto the project's cache. */
+  identityPending: boolean;
   label: string;
   resolutionAliases: string[];
   sourceRoot: string;
@@ -397,7 +407,7 @@ export class HarnessRegistryInventoryProvider implements AgentInventoryProvider 
     warnings.sort(warningOrder);
     return {
       agents,
-      cacheable: prepared.every((agent) => !agent.extractionFailed),
+      cacheable: prepared.every((agent) => !agent.identityPending),
       warnings,
     };
   }
@@ -410,6 +420,11 @@ export class HarnessRegistryInventoryProvider implements AgentInventoryProvider 
     const definitionSlug = normalizedAlias(workflow.definitionSlug);
     let manifestName: string | null = null;
     let extractionFailed = false;
+    // An inspection that returns has settled: the same source yields the same
+    // answer next time, and a source edit re-projects through the watcher. An
+    // inspector that throws told us nothing about which it was, so it stays
+    // pending — the conservative half of the split.
+    let identityPending = false;
     if (!definitionSlug && this.options.inspectManifestName) {
       try {
         const inspected = await this.options.inspectManifestName(sourceRoot);
@@ -420,6 +435,7 @@ export class HarnessRegistryInventoryProvider implements AgentInventoryProvider 
         }
       } catch {
         extractionFailed = true;
+        identityPending = true;
       }
     }
 
@@ -438,6 +454,7 @@ export class HarnessRegistryInventoryProvider implements AgentInventoryProvider 
       definitionId: workflow.definitionId,
       definitionSlug,
       extractionFailed,
+      identityPending,
       label: safeLabel(
         workflow.name,
         definitionSlug ??
@@ -461,7 +478,11 @@ export class HarnessRegistryInventoryProvider implements AgentInventoryProvider 
       fallbackKey,
       definitionId: workflow.definitionId,
       definitionSlug,
+      // This agent's inspection never finished (deadline miss, or it never
+      // started). Re-projecting can still name it, so it must veto the cache:
+      // caching now would freeze a provisional local label on screen.
       extractionFailed: !definitionSlug,
+      identityPending: !definitionSlug,
       label: safeLabel(
         workflow.name,
         definitionSlug ?? (fallbackKey.slice("local:".length) || "Local agent"),

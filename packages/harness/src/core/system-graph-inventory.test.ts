@@ -220,6 +220,55 @@ describe("HarnessRegistryInventoryProvider", () => {
     expect(JSON.stringify(result.warnings)).not.toContain(WORKSPACE);
   });
 
+  it("caches a project whose extraction failures have all settled", async () => {
+    // A companion package with no `defineAgent` export, or one whose
+    // dependencies were never installed, fails identically on every open.
+    // Letting it veto the cache pinned real workspaces to `degraded` and its
+    // "graph may be incomplete" banner permanently.
+    const inspectManifestName = vi.fn(async (sourceRoot: string) =>
+      sourceRoot.endsWith("/dashboard")
+        ? ({ status: "failed" } as const)
+        : ({ status: "found", name: "growth-manifest" } as const),
+    );
+
+    const result = await provider(
+      [workflow("Growth", "growth", null), workflow("Dashboard", "dashboard", null)],
+      { inspectManifestName },
+    ).listAgents(SCOPE);
+
+    expect(result.cacheable).toBe(true);
+    // The graph becomes cacheable; it does not go quiet about what it could
+    // not resolve.
+    expect(result.warnings).toEqual([
+      {
+        code: "inventory-extraction-failed",
+        agentKey: "local:dashboard",
+        message: "Could not inspect Dashboard; using its local identity.",
+      },
+    ]);
+  });
+
+  it("keeps a project uncacheable while an inspection is still in flight", async () => {
+    // The budget cut this inspection off mid-read. Its name is still
+    // recoverable, so caching the provisional local label would freeze the
+    // wrong text on screen until the next source edit.
+    const started: string[] = [];
+    const inspectManifestName = vi.fn(async (sourceRoot: string) => {
+      started.push(sourceRoot);
+      if (sourceRoot.endsWith("/settled")) return { status: "failed" as const };
+      await new Promise(() => {});
+      return { status: "absent" as const };
+    });
+
+    const result = await provider(
+      [workflow("Settled", "settled", null), workflow("Slow", "slow", null)],
+      { inspectManifestName, manifestInspectionBudgetMs: 20 },
+    ).listAgents(SCOPE);
+
+    expect(started).toEqual([`${WORKSPACE}/settled`, `${WORKSPACE}/slow`]);
+    expect(result.cacheable).toBe(false);
+  });
+
   it("returns partial inventory when the enrichment budget expires", async () => {
     let release!: () => void;
     const gate = new Promise<void>((resolve) => {
