@@ -515,6 +515,11 @@ export class HarnessRegistryInventoryProvider implements AgentInventoryProvider 
     const canonicalCounts = new Map<AgentKey, number>();
     const provisionalCounts = new Map<AgentKey, number>();
     for (const agent of prepared) {
+      // A pending agent's candidate key is a guess, not a claim: two agents
+      // that merely share a marker while their sources are still being read
+      // are not yet a collision, and calling them one flashes a warning that
+      // enrichment retracts a moment later.
+      if (agent.identityIssue === "identity-pending") continue;
       const counts = agent.canonicalName ? canonicalCounts : provisionalCounts;
       counts.set(agent.candidateKey, (counts.get(agent.candidateKey) ?? 0) + 1);
     }

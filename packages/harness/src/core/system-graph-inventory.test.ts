@@ -168,6 +168,51 @@ describe("HarnessRegistryInventoryProvider", () => {
     expect(after.context[0]?.resolutionAliases).toEqual(["marker-name"]);
   });
 
+  it("does not call two pending agents a collision before their sources are read", async () => {
+    // Two agents sharing a registry marker look identical only until their
+    // sources are read. Counting them as a duplicate at that point reports
+    // `duplicate-agent-key` — an issue the contract treats as settled — so the
+    // projection above declares the identities finished and caches a graph
+    // whose names are still guesses. Enrichment then retracts the warning.
+    let release!: () => void;
+    const inspectionGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const inspectManifestName = vi.fn(async (sourceRoot: string) => {
+      await inspectionGate;
+      return {
+        status: "found" as const,
+        name: sourceRoot.endsWith("/first") ? "payments" : "billing",
+      };
+    });
+    const changed = vi.fn();
+    const inventory = provider(
+      [
+        workflow("First", "first", "shared-marker"),
+        workflow("Second", "second", "shared-marker"),
+      ],
+      { inspectManifestName, onIdentityChange: changed },
+    );
+
+    const pending = await inventory.listAgents(SCOPE);
+    expect(pending.warnings).toEqual([]);
+    expect(
+      pending.inventory.agents.map((agent) => agent.identityIssue),
+    ).toEqual(["identity-pending", "identity-pending"]);
+
+    pending.startEnrichment?.();
+    release();
+    await vi.waitFor(() => expect(changed).toHaveBeenCalled());
+    const settled = await inventory.listAgents(SCOPE);
+
+    // They were never the same agent; reading the sources proves it.
+    expect(settled.inventory.agents.map((agent) => agent.agentKey)).toEqual([
+      "billing",
+      "payments",
+    ]);
+    expect(settled.warnings).toEqual([]);
+  });
+
   it("keeps duplicate source names as separate deterministic local identities", async () => {
     const inspectManifestName = vi.fn(async () => ({
       status: "found" as const,
