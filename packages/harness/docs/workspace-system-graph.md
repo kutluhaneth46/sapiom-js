@@ -120,12 +120,24 @@ Projection can remain useful while reporting warnings:
 
 Registry-known agents enter a working-tree package inventory and render
 immediately; source inspection does not block the first graph. An unresolved
-agent uses a safe provisional marker or `local:` identity and makes that
-snapshot `degraded`. After the snapshot and its navigation sidecar commit,
-source-name inspection runs in the background. A valid current source
-definition name becomes canonical and publishes a newer graph revision, while
-the older marker remains only a compatibility alias. Inspection failure or an
-invalid name preserves the provisional node and any unambiguous direct edges.
+agent uses a safe provisional marker or `local:` identity. After the snapshot
+and its navigation sidecar commit, source-name inspection runs in the
+background. A valid current source definition name becomes canonical and
+publishes a newer graph revision, while the older marker remains only a
+compatibility alias. Inspection failure or an invalid name preserves the
+provisional node and any unambiguous direct edges.
+
+Cacheability follows whether identity work has *finished*, not how it
+finished. While any agent is still awaiting inspection the snapshot is
+`degraded` and is not cached, because caching mid-enrichment would freeze
+provisional names in place. Once every identity has resolved — including the
+ones that resolved to an unavailable, invalid, or duplicate key — the snapshot
+is `ready` and cached, and the agents that could not be named carry
+`inventory-extraction-failed` instead. A source edit invalidates that agent's
+fingerprint and re-projects, so an agent that is later fixed recovers its
+canonical identity without an explicit retry. One permanently unidentifiable
+agent therefore costs its own node's name, not the whole workspace's fast
+path.
 
 ## Freshness event
 

@@ -304,18 +304,15 @@ function consumeInventory(
       inventory.agents,
       agents,
     ),
-    // A degraded inventory is not the same as an unfinished one, and only
-    // the second is a reason to refuse the cache. `identity-unavailable`,
-    // `identity-invalid` and `duplicate-agent-key` have all finished
-    // resolving: re-projecting cannot improve them, and a source edit
-    // re-projects through the watcher anyway. Only `identity-pending` still
-    // has enrichment in flight, and caching that would freeze provisional
-    // names on screen. Gating on `status` — which the contract forces to
-    // `degraded` whenever any identity is provisional — handed one
-    // permanently unidentifiable agent (a dashboard with no `defineAgent`, a
-    // package with no `node_modules`) a veto over the whole project's fast
-    // path, so the graph re-projected on every open and never left
-    // `degraded`.
+    // A degraded inventory is not the same as an unfinished one, and only the
+    // second is a reason to refuse the cache: an identity that resolved to
+    // unavailable, invalid, or a duplicate key cannot be improved by
+    // re-projecting, and a source edit re-projects through the watcher anyway.
+    // Only `identity-pending` still has enrichment in flight, and caching that
+    // would freeze provisional names on screen. Gating on `status` instead —
+    // which the contract forces to `degraded` whenever any identity is
+    // provisional — gave one permanently unidentifiable agent a veto over the
+    // whole project's fast path.
     settled: !inventory.agents.some(
       (agent) =>
         agent.identityStatus === "provisional" &&
