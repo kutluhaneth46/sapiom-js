@@ -19,6 +19,7 @@ import {
   layoutSystemGraph,
   systemGraphNodeById,
   type SystemGraphLayoutNode,
+  type SystemGraphNodeGroup,
 } from "../lib/system-graph-layout";
 import {
   SYSTEM_GRAPH_DEFAULT_MIN_ZOOM,
@@ -46,6 +47,12 @@ interface SystemGraphCanvasProps {
   graph: SystemGraph;
   workspaceKey: WorkspaceKey;
   navigableAgentKeys: ReadonlySet<AgentKey>;
+  /**
+   * The containers to draw, from the rail's Group axis. `undefined` while the
+   * project's stored arrangement is still in flight — NOT an empty list, which
+   * would be a real answer ("nothing is grouped") and would flash a wrong one.
+   */
+  groups: readonly SystemGraphNodeGroup[] | undefined;
   onOpenAgent: (agentKey: AgentKey) => void;
 }
 
@@ -66,15 +73,16 @@ export function SystemGraphCanvas({
   graph,
   workspaceKey,
   navigableAgentKeys,
+  groups,
   onOpenAgent,
 }: SystemGraphCanvasProps): JSX.Element {
   const computed = useMemo(() => {
     try {
-      return { layout: layoutSystemGraph(graph), failed: false } as const;
+      return { layout: layoutSystemGraph(graph, groups), failed: false } as const;
     } catch {
       return { layout: null, failed: true } as const;
     }
-  }, [graph]);
+  }, [graph, groups]);
   const layout = computed.layout;
   const graphNodes = useMemo(() => systemGraphNodeById(graph), [graph]);
   const [view, setView] = useState<SystemGraphView>(
@@ -309,11 +317,41 @@ export function SystemGraphCanvas({
               width: layout.bounds.width,
               height: layout.bounds.height,
               transform: `translate(-50%, -50%) translate(${view.x}px, ${view.y}px) scale(${view.zoom})`,
-            } satisfies CSSProperties
+              // Published for the container labels, which counter-scale against
+              // it so a system stays NAMED at the altitude you zoom out to read
+              // its shape from (see .system-graph-group-label).
+              "--system-graph-zoom": view.zoom,
+            } as CSSProperties
           }
           role="group"
           aria-label="Workspace dependency graph"
         >
+          {/* Behind the connectors and the cards, so an edge that leaves its
+              system reads as crossing the boundary rather than being clipped by
+              it. */}
+          {layout.groups.map((group) => (
+            <div
+              key={group.id}
+              className="system-graph-group"
+              data-testid={`system-graph-group-${group.id}`}
+              data-group-id={group.id}
+              data-group-label={group.label}
+              data-group-nodes={group.nodeCount}
+              style={
+                {
+                  left: group.x,
+                  top: group.y,
+                  width: group.width,
+                  height: group.height,
+                } satisfies CSSProperties
+              }
+            >
+              <span className="system-graph-group-label" title={group.label}>
+                {group.label}
+              </span>
+            </div>
+          ))}
+
           <svg
             className="system-graph-edges"
             width={layout.bounds.width}
@@ -340,7 +378,10 @@ export function SystemGraphCanvas({
                 data-testid={`system-graph-edge-${edge.from}-${edge.to}`}
               >
                 <path
-                  className={`system-graph-edge ${edgeModeClass(edge.modes)}`}
+                  className={
+                    `system-graph-edge ${edgeModeClass(edge.modes)}` +
+                    (edge.crossesGroup ? " is-cross-group" : "")
+                  }
                   d={edge.path}
                   markerEnd={`url(#${markerId})`}
                 />

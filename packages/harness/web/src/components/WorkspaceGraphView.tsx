@@ -11,7 +11,9 @@ import type { BusMessage, WorkflowInfo } from "@shared/types";
 
 import type { HarnessApi } from "../lib/api";
 import { systemGraphLoader } from "../lib/system-graph-loader";
+import { systemGraphNodeGroups } from "../lib/system-graph-groups";
 import { mapSystemGraphNavigation } from "../lib/system-graph-navigation";
+import { useRailGroups } from "../lib/use-rail-groups";
 import { trackingAttrs } from "../lib/analytics/tracking-attrs";
 import { EmptyState } from "./EmptyState";
 import { Icon } from "./Icon";
@@ -138,6 +140,54 @@ export function WorkspaceGraphView({
         : new Map<AgentKey, WorkflowInfo>(),
     [graph, workspaceKey, workflows, workspaceScopes],
   );
+
+  /* THE MAP READS THE RAIL'S GROUPS (SAP-2983).
+     The Group axis is stored per project ROOT, and a workspace scope is the one
+     thing that joins this opaque key back to one — a graph payload carries no
+     filesystem path on purpose.
+
+     A fixed "name" sort rather than the rail's own setting, deliberately: sort
+     only settles the order of AGENTS inside a group, and the map re-decides
+     that from the topology. Group order — the thing the two surfaces must
+     agree on — is size for a derived set and the user's for a stored one, on
+     either setting, so reading the rail's preference here would couple the map
+     to a control that cannot change its answer. */
+  const projectRoot = useMemo(
+    () =>
+      workspaceScopes.find((scope) => scope.workspaceKey === workspaceKey)
+        ?.cwd ?? null,
+    [workspaceKey, workspaceScopes],
+  );
+  const railRoots = useMemo(
+    () => (projectRoot === null ? [] : [projectRoot]),
+    [projectRoot],
+  );
+  const railGroups = useRailGroups(
+    railRoots,
+    workflows,
+    "name",
+    projectRoot !== null,
+  );
+  const groups = useMemo(() => {
+    /* `hasSettled`, NOT `isReady`. Both need the launch edges and the stored
+       arrangement, but `isReady` is the WRITE gate and stays false forever on a
+       read that failed — so a map gated on it would fall back to an unlabelled
+       flat layout on a read-only checkout while the rail beside it kept showing
+       the systems by name. Settled means both surfaces have the same answer.
+
+       Something has to gate it, though: drawing before the edges land would put
+       every agent in one `Ungrouped` container for a beat, and that is a real
+       arrangement rather than a placeholder — it would read as this project's
+       answer and then silently rearrange. */
+    if (!graph || projectRoot === null || !railGroups.hasSettled(projectRoot)) {
+      return undefined;
+    }
+    return systemGraphNodeGroups(
+      graph.nodes,
+      railGroups.groupsFor(projectRoot, railGroups.agentsIn(projectRoot)),
+      navigation,
+    );
+  }, [graph, navigation, projectRoot, railGroups]);
 
   return (
     /* The MAP altitude of the right pane (`lib/canvas-altitude.ts`) — a
@@ -268,6 +318,7 @@ export function WorkspaceGraphView({
             graph={graph}
             workspaceKey={workspaceKey}
             navigableAgentKeys={new Set(navigation.keys())}
+            groups={groups}
             onOpenAgent={(agentKey) => {
               const workflow = navigation.get(agentKey);
               if (workflow) onOpenAgent(workflow.path);
