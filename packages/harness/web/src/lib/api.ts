@@ -1122,6 +1122,60 @@ const MOCK_LAUNCH_EDGES: StudioRailLaunchEdge[] = [
 const MOCK_RAIL_STATE_PREFIX = "sapiom-mock-studio-rail:";
 
 /**
+ * Mock mode's stand-in for the ONE settings field whose whole contract is
+ * "survives a reload": `helpSeen` (SAP-2991).
+ *
+ * The rest of `MockApi`'s settings are per-instance and reset on reload, which
+ * is right — a fixture that remembered `telemetryOptIn` or `recentDirs` across
+ * page loads would leak one spec's state into the next. But the first-run card
+ * is only interesting ACROSS a load, so its flag needs the same treatment
+ * `getRailState` already gives the rail file: `localStorage`, because it is the
+ * only store in the fixture that outlives the page.
+ *
+ * The irony is deliberate and harmless. In the mock, the browser origin is
+ * stable (Playwright serves one port) and there is no settings file to write;
+ * in the real app it is the other way round, which is the entire bug. This key
+ * stands in for `~/.sapiom/harness/settings.json`, not for the storage the
+ * component stopped using.
+ */
+const MOCK_HELP_SEEN_KEY = "sapiom-mock-help-seen";
+
+function readMockHelpSeen(): boolean {
+  try {
+    return window.localStorage.getItem(MOCK_HELP_SEEN_KEY) === "1";
+  } catch {
+    // Blocked storage: "not seen" shows the card, which is the fixture's
+    // default state anyway.
+    return false;
+  }
+}
+
+function writeMockHelpSeen(seen: boolean): void {
+  try {
+    if (seen) window.localStorage.setItem(MOCK_HELP_SEEN_KEY, "1");
+    else window.localStorage.removeItem(MOCK_HELP_SEEN_KEY);
+  } catch {
+    // Private mode / quota: the in-memory copy still answers this page load.
+  }
+}
+
+/**
+ * `?mockState=fresh` is a BRAND-NEW INSTALL, so the stand-in settings file
+ * starts empty. Cleared here, once, rather than by forcing `helpSeen: false`
+ * on the read.
+ *
+ * Two reasons for that shape. There is one settings file and several `MockApi`
+ * instances (`mockMoves` below makes the same argument about one disk), so the
+ * reset belongs to the page load, not to an instance — and running at module
+ * scope puts it before any construction, so it can never land after a dismiss.
+ * And clearing beats a forced read, which would silently throw away the write
+ * `updateSettings` still makes and break this key's whole contract — that a
+ * dismiss survives a reload — for the fixture most likely to want it: dismiss
+ * on a fresh install, reload as a returning user, stay dismissed.
+ */
+if (typeof window !== "undefined" && isFreshMockState()) writeMockHelpSeen(false);
+
+/**
  * Every rail-state write the mock has served this page load, newest last, for
  * Playwright to read back.
  *
@@ -1768,13 +1822,19 @@ export class MockApi implements HarnessApi {
   private set sessions(next: HarnessSession[]) {
     this.sessionsStore = next;
   }
-  private settings: HarnessSettings = this.fresh
-    ? { ...MOCK_SETTINGS, recentDirs: [] }
-    : {
-        ...MOCK_SETTINGS,
-        recentDirs: [...MOCK_SETTINGS.recentDirs],
-        ...(this.promptedConsent ? { telemetryOptIn: true } : {}),
-      };
+  private settings: HarnessSettings = {
+    ...(this.fresh
+      ? { ...MOCK_SETTINGS, recentDirs: [] }
+      : {
+          ...MOCK_SETTINGS,
+          recentDirs: [...MOCK_SETTINGS.recentDirs],
+          ...(this.promptedConsent ? { telemetryOptIn: true } : {}),
+        }),
+    // Seeded from the reload-surviving store rather than from the fixture —
+    // see MOCK_HELP_SEEN_KEY, which the `fresh` fixture has already emptied by
+    // the time any instance is built.
+    helpSeen: readMockHelpSeen(),
+  };
 
   private workspaceKey(cwd: string): WorkspaceKey {
     const existing = this.workspaceKeys.get(cwd);
@@ -2716,6 +2776,11 @@ export class MockApi implements HarnessApi {
   async updateSettings(
     patch: Partial<HarnessSettings>,
   ): Promise<HarnessSettings> {
+    // Persisted BEFORE the simulated latency, for the same reason
+    // `saveRailState` is: dismissing the card hides it immediately, so a
+    // reload can (and in the spec does) start before this delay resolves. A
+    // write behind the delay would lose the dismiss to its own fixture.
+    if (patch.helpSeen !== undefined) writeMockHelpSeen(patch.helpSeen);
     await delay();
     this.settings = { ...this.settings, ...patch };
     return this.settings;
