@@ -39,7 +39,14 @@ export interface AgentInventoryWarning {
 
 export interface AgentInventoryResult {
   agents: AgentInventoryItem[];
-  /** False when a later graph open should retry degraded enrichment. */
+  /**
+   * False while identity work could still produce a different answer — it is
+   * in flight, or it failed in a way a later projection of the same source
+   * can clear. An agent a re-projection cannot improve — no `defineAgent` to
+   * find — keeps its warning but does not veto the project's cache. Vetoing
+   * on any failure pinned whole workspaces to `degraded` and its "graph may
+   * be incomplete" banner permanently, over agents that were never nameable.
+   */
   cacheable: boolean;
   warnings: AgentInventoryWarning[];
 }
@@ -250,7 +257,10 @@ interface PreparedAgent {
   fallbackKey: AgentKey;
   definitionId: number | null;
   definitionSlug: string | null;
+  /** Identity work finished without a name; the agent keeps its warning. */
   extractionFailed: boolean;
+  /** Identity work never finished. Only this may veto the project's cache. */
+  identityPending: boolean;
   label: string;
   resolutionAliases: string[];
   sourceRoot: string;
@@ -397,7 +407,7 @@ export class HarnessRegistryInventoryProvider implements AgentInventoryProvider 
     warnings.sort(warningOrder);
     return {
       agents,
-      cacheable: prepared.every((agent) => !agent.extractionFailed),
+      cacheable: prepared.every((agent) => !agent.identityPending),
       warnings,
     };
   }
@@ -410,16 +420,23 @@ export class HarnessRegistryInventoryProvider implements AgentInventoryProvider 
     const definitionSlug = normalizedAlias(workflow.definitionSlug);
     let manifestName: string | null = null;
     let extractionFailed = false;
+    let identityPending = false;
     if (!definitionSlug && this.options.inspectManifestName) {
       try {
         const inspected = await this.options.inspectManifestName(sourceRoot);
         if (inspected.status === "found") {
           manifestName = normalizedAlias(inspected.name);
-        } else {
-          extractionFailed = inspected.status === "failed";
+        } else if (inspected.status === "failed") {
+          extractionFailed = true;
+          // Only a failure the inspector says is still clearable keeps the
+          // project uncacheable. A settled one has nowhere left to go: its
+          // warning stands, and the cache stops paying for it forever.
+          identityPending = inspected.retryable;
         }
       } catch {
+        // The inspector threw, so we learned nothing about which it was.
         extractionFailed = true;
+        identityPending = true;
       }
     }
 
@@ -438,6 +455,7 @@ export class HarnessRegistryInventoryProvider implements AgentInventoryProvider 
       definitionId: workflow.definitionId,
       definitionSlug,
       extractionFailed,
+      identityPending,
       label: safeLabel(
         workflow.name,
         definitionSlug ??
@@ -461,7 +479,11 @@ export class HarnessRegistryInventoryProvider implements AgentInventoryProvider 
       fallbackKey,
       definitionId: workflow.definitionId,
       definitionSlug,
+      // This agent's inspection never finished (deadline miss, or it never
+      // started). Re-projecting can still name it, so it must veto the cache:
+      // caching now would freeze a provisional local label on screen.
       extractionFailed: !definitionSlug,
+      identityPending: !definitionSlug,
       label: safeLabel(
         workflow.name,
         definitionSlug ?? (fallbackKey.slice("local:".length) || "Local agent"),

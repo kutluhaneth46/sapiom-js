@@ -13,15 +13,47 @@
  * caller falls back to a weaker name source.
  */
 import { extractWorkflowGraphCached } from "./canvas-cache.js";
+import { listSourceFiles } from "./canvas-interconnections.js";
 
 export type ManifestNameInspection =
   | { status: "found"; name: string }
-  | { status: "absent" | "failed" };
+  | { status: "absent" }
+  /** `retryable`: the same unchanged source could still name this agent. */
+  | { status: "failed"; retryable: boolean };
+
+/**
+ * Whether a later projection of the SAME unchanged source could still name
+ * this agent. Extraction failures are deliberately not cached
+ * (core/canvas-cache.ts), so a re-run is free to succeed — and several causes
+ * do resolve on their own terms: dependencies get installed, a check process
+ * that crashed or timed out under load succeeds on the next attempt. None of
+ * those fire the graph watcher, which only reacts to `.ts`/`.tsx` outside
+ * ignored directories, so the caller must keep offering a manual retry.
+ *
+ * `reason` cannot answer this — it is free-form text assembled from an agent's
+ * own error message, a stderr tail, or a timeout string — so the only claim
+ * made here is the one the filesystem proves outright: a project with no
+ * TypeScript in it has no `defineAgent` to find, and no install or re-run
+ * will invent one. Adding a source file changes the answer, and adding one is
+ * precisely what the watcher does see.
+ *
+ * Deliberately one-directional. Guessing "settled" wrongly caches a
+ * provisional label and removes the retry that would have fixed it; guessing
+ * "retryable" wrongly just leaves the project as it behaves today.
+ */
+async function couldStillBeNamed(projectDir: string): Promise<boolean> {
+  try {
+    return (await listSourceFiles(projectDir)).length > 0;
+  } catch {
+    return true;
+  }
+}
 
 /**
  * Inspect the declared manifest name while preserving the difference between
  * a valid unnamed agent and an extraction failure. Inventory uses the richer
- * result to avoid warning for the normal unnamed case.
+ * result to avoid warning for the normal unnamed case, and `retryable` to
+ * decide whether the failure can still be cleared without a source edit.
  */
 export async function inspectManifestName(
   projectDir: string,
@@ -29,11 +61,15 @@ export async function inspectManifestName(
 ): Promise<ManifestNameInspection> {
   try {
     const { result } = await extract(projectDir);
-    if (!result.ok) return { status: "failed" };
+    if (!result.ok) {
+      return { status: "failed", retryable: await couldStillBeNamed(projectDir) };
+    }
     const name = result.graph.manifestName.trim();
     return name === "" ? { status: "absent" } : { status: "found", name };
   } catch {
-    return { status: "failed" };
+    // The extractor itself misbehaved; we learned nothing about why. Assume
+    // recoverable so the caller keeps its retry affordance.
+    return { status: "failed", retryable: true };
   }
 }
 

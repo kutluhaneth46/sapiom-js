@@ -1210,10 +1210,21 @@ export const startServer = async (
   // archaeology session. Now every scan says its root, its reason, what it
   // found, what it cost, and what it declined to enter.
   const scanWorkflowsAndBroadcast = async (
-    root: string,
+    scanRoot: string,
     reason: WorkflowScanReason,
     options: { refreshGraphs?: () => Promise<void> } = {},
   ): Promise<WorkflowInfo[]> => {
+    // The registry keys rows by path, so two spellings of one directory
+    // register the same agent twice. Only the graph-refresh caller resolved
+    // symlinks: booting under a symlinked launch dir (macOS `os.tmpdir()` is
+    // `/var/...` for `/private/var/...`) registered every agent under the
+    // symlinked path, then the first graph open registered them all again
+    // under the real one. The duplicates collided into `local:` fallback keys,
+    // so every cross-agent target became ambiguous and its edge vanished.
+    // Resolved here rather than inside the registry: registry paths are
+    // compared by exact string elsewhere (a session auto-binds on
+    // `path === cwd`, index.ts:1057), so rewriting stored paths unbinds them.
+    const root = canonicalGraphPath(scanRoot);
     const before = workflowsCache;
     const budget = new AgentProjectScanBudget();
     const found = await workflowRegistry.scan(root, budget);
