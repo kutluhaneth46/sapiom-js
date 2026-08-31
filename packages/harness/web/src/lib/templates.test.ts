@@ -254,22 +254,22 @@ describe("useTemplatePrompt", () => {
     expect(prompt).toContain('templateId "cold-outreach-engine"');
   });
 
-  it("starter: names the local scaffold tool with exact arguments", () => {
-    const prompt = useTemplatePrompt(STARTER_TEMPLATES[1], "/tmp/coding-pause");
-    expect(prompt).toContain("sapiom_dev_agents_scaffold");
-    expect(prompt).toContain(
-      '{"dir":"/tmp/coding-pause","template":"coding-pause"}',
+  // The starter branch is GONE (SAP-2981): a bundled starter is created by
+  // `POST /api/agents/scaffold` before its session opens, so there is no prompt
+  // to write and nothing here to test. The test that used to certify that
+  // branch outlived its own caller — it asserted the exact arguments of a
+  // handoff nothing performed any more.
+
+  it("ends with the no-capability-spend local test continuation", () => {
+    expect(useTemplatePrompt(summary(), "/tmp/x")).toContain(
+      "local test run with no Sapiom capability spend (sapiom_dev_agents_run_local)",
     );
-    expect(prompt).toContain("Keep the shipped starter unchanged");
-    expect(prompt.toLowerCase()).not.toContain("workflow");
   });
 
-  it("both paths end with the no-capability-spend local test continuation", () => {
-    for (const template of [summary(), STARTER_TEMPLATES[1]]) {
-      expect(useTemplatePrompt(template, "/tmp/x")).toContain(
-        "local test run with no Sapiom capability spend (sapiom_dev_agents_run_local)",
-      );
-    }
+  it("says nothing about scaffolding — a clone is a different operation", () => {
+    const prompt = useTemplatePrompt(summary(), "/tmp/x");
+    expect(prompt).not.toContain("sapiom_dev_agents_scaffold");
+    expect(prompt.toLowerCase()).not.toContain("workflow");
   });
 });
 

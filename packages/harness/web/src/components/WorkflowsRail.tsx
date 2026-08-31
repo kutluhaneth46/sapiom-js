@@ -160,19 +160,24 @@ interface WorkflowsRailProps {
   onCreateSession: (cwd: string, harness: HarnessKind) => Promise<void>;
   /** Adapter registry fetch — the add dialog's picker and MCP setup block. */
   listHarnesses: () => Promise<HarnessEntry[]>;
-  /** Session-plus-scaffold-prompt at a folder that doesn't exist yet. `idea`
-   *  is the "start from an idea" door's text, passed verbatim to the agent. */
-  onScaffoldSession: (
-    cwd: string,
-    harness: HarnessKind,
-    idea?: string,
-  ) => Promise<void>;
+  /**
+   * Create an agent IN a project (SAP-2981). Opens the create dialog App owns;
+   * the harness then does the scaffold and the agent joins the rail before any
+   * session starts.
+   *
+   * It used to be `onScaffoldSession(root, harness)` — start a pty and inject
+   * an English sentence asking the coding agent to call the scaffold MCP tool.
+   * The row's own menu item said "Create an agent in {project}" while the thing
+   * it did was send a chat message, which is why a failed create arrived as a
+   * confused model instead of an error.
+   */
+  onCreateAgent: (root: string, label: string) => void;
   /** Where NEW projects are created (resolveProjectRoot in App). */
   projectRoot: string | null;
   /** Persist a changed project root as the user's default. */
   onSaveProjectRoot: (root: string) => Promise<void>;
-  /** Bare-scaffold folder affordance: ask the folder's live session to
-   *  scaffold its first agent (sapiom.json) in place. */
+  /** Bare-project affordance: create the folder's first agent, binding the
+   *  live session it already has rather than opening a second one. */
   onScaffoldInSession: (sessionId: string) => void;
   /** Navigate to the templates destination (App owns the center view). */
   onBrowseTemplates: () => void;
@@ -220,9 +225,6 @@ const SHORTCUT_HINT = IS_MAC ? "⌘K" : "Ctrl+K";
  */
 /** The agent the user last chose in the composer, for actions that must pick one
  *  without asking. Defaults to Claude Code, which is what a fresh install has. */
-const preferredHarness = (): HarnessKind =>
-  loadUiPrefs().preferredHarness === "codex" ? "codex" : "claude-code";
-
 const RAIL_AXES: readonly RailAxis[] = ["project", "group"];
 const AXIS_LABELS: Record<RailAxis, string> = {
   project: "Project",
@@ -463,7 +465,7 @@ export function WorkflowsRail({
   listDir,
   onCreateSession,
   listHarnesses,
-  onScaffoldSession,
+  onCreateAgent,
   onScaffoldInSession,
   projectRoot,
   onSaveProjectRoot,
@@ -1334,18 +1336,8 @@ export function WorkflowsRail({
                                   kind: "create",
                                   testid: `project-create-agent-${project.label}`,
                                   label: `Create an agent in ${project.label}`,
-                                  run: () => {
-                                    void onScaffoldSession(
-                                      project.root,
-                                      preferredHarness(),
-                                    ).catch((err: unknown) => {
-                                      onToast(
-                                        err instanceof Error
-                                          ? err.message
-                                          : `Couldn't start an agent in ${project.label}.`,
-                                      );
-                                    });
-                                  },
+                                  run: () =>
+                                    onCreateAgent(project.root, project.label),
                                 }
                         }
                         onRemove={(trigger) => {
@@ -1392,18 +1384,7 @@ export function WorkflowsRail({
                       className="tree-row tree-row-empty-action"
                       data-testid={`project-empty-${project.label}`}
                       data-tooltip={`Start an agent in ${project.root}`}
-                      onClick={() => {
-                        void onScaffoldSession(
-                          project.root,
-                          preferredHarness(),
-                        ).catch((err: unknown) => {
-                          onToast(
-                            err instanceof Error
-                              ? err.message
-                              : `Couldn't start an agent in ${project.label}.`,
-                          );
-                        });
-                      }}
+                      onClick={() => onCreateAgent(project.root, project.label)}
                     >
                       <Icon name="Sparkles" size={13} />
                       <span className="tree-row-label">

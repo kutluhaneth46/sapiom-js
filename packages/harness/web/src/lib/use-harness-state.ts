@@ -19,6 +19,7 @@ import type {
 } from "@shared/types";
 
 import type {
+  AgentScaffoldResponse,
   HarnessEntry,
   TemplateDetailView,
   TemplateListResponse,
@@ -189,6 +190,20 @@ export interface HarnessStateHook {
   /** Bulk discovery: POST /api/workflows/scan under a root, then
    *  refreshes the registry list so found agents join the rail at once. */
   scanWorkflows: (root: string) => Promise<WorkflowScanOutcome>;
+  /**
+   * Creates an agent in a project — the create flow's one mechanism
+   * (SAP-2981). Rejects with the server's own sentence when it refuses.
+   *
+   * Re-lists the registry before it resolves, on top of the server's own
+   * rescan-and-broadcast: the caller's next move is to open a session on the
+   * new agent, and it must not have to race a websocket event to see the row
+   * it just created.
+   */
+  scaffoldAgent: (
+    root: string,
+    name: string,
+    template?: string,
+  ) => Promise<AgentScaffoldResponse>;
   /**
    * Checkouts a scan of a given root stopped at rather than entering, keyed by
    * the root that was scanned. Empty for a normal project. Non-empty means an
@@ -1605,6 +1620,28 @@ export function useHarnessState(): HarnessStateHook {
     [rememberProjectDir, reopenProjects],
   );
 
+  const scaffoldAgent = useCallback(
+    async (
+      root: string,
+      name: string,
+      template?: string,
+    ): Promise<AgentScaffoldResponse> => {
+      const created = await api.scaffoldAgent(root, name, template);
+      // The agent is on disk and in the server's registry by now; this is the
+      // SPA catching up in the same turn rather than on the broadcast, so
+      // "the agent appears in the rail before any session opens" holds even if
+      // the events socket is asleep.
+      // NOT baselined into `seenAgentPathsRef`, deliberately: an agent created
+      // here is exactly what the built-agents metric counts, and the
+      // `workflows.changed` handler is the one place that emits
+      // `agent.created`. Baselining it here would create the agent and lose it
+      // from the count in the same call.
+      await refreshWorkflows();
+      return created;
+    },
+    [refreshWorkflows],
+  );
+
   const scanWorkflows = useCallback(
     async (root: string): Promise<WorkflowScanOutcome> => {
       const outcome = await api.scanWorkflows(root);
@@ -2163,6 +2200,7 @@ export function useHarnessState(): HarnessStateHook {
     closeSession,
     connectWorkflow,
     scanWorkflows,
+    scaffoldAgent,
     closedProjects,
     unsearchedCheckouts,
     removeProject,

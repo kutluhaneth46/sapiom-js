@@ -987,6 +987,8 @@ export interface SessionRecord {
 // POST   /api/sessions/:id/input        InjectInputRequest → { ok: true }
 // POST   /api/sessions/:id/attachments  AttachFileRequest → AttachFileResponse (materialize only)
 // PATCH  /api/sessions/:id/workflow     BindWorkflowRequest → HarnessSession
+// POST   /api/agents/scaffold           { root, name, template? } → AgentScaffoldResponse (the harness creates the agent)
+// POST   /api/agents/move               { from, to } → AgentMoveResponse (rename an agent's directory)
 // GET    /api/workflows                 → WorkflowInfo[]
 // POST   /api/workflows/connect         { path } → WorkflowInfo
 // POST   /api/workflows/scan            { root } → WorkflowInfo[]
@@ -1004,6 +1006,24 @@ export interface SessionRecord {
 // GET    /api/studio-rail/launch-edges  → StudioRailLaunchEdgesResponse
 // POST   /api/track                     UiTrackRequest → { ok: true }  (UI-interaction analytics)
 // POST   /ingest                        (hook payloads; bearer = ingest token)
+
+/**
+ * `POST /api/agents/scaffold` response — the agent the harness just created.
+ *
+ * `path` is SERVER-AUTHORED: the project directory came from the list of
+ * folders the rail can show and the name from a validated single segment, so
+ * nothing here is the caller's string reflected back. The SPA focuses and binds
+ * on this path rather than on the one it asked for.
+ */
+export interface AgentScaffoldResponse {
+  ok: true;
+  path: string;
+  name: string;
+  template: string;
+  /** Whether the best-effort `npm install` succeeded. False is not a failure —
+   *  the Canvas degrades to its "run npm install" hint. */
+  dependenciesInstalled: boolean;
+}
 
 /** The app's active UI theme, as tracked client-side (web/src/lib/theme.ts). */
 export type UiTheme = "light" | "dark";

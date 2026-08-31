@@ -1,3 +1,4 @@
+import { useEffect, useRef } from "react";
 import type { CSSProperties, DragEvent, JSX } from "react";
 import type { WorkflowInfo } from "@shared/types";
 
@@ -74,6 +75,23 @@ export function WorkflowRow({
    * `project-tree.prefixIsPathTail`; the row only picks the glyph.
    */
   const pathTail = prefixIsPathTail(workflow, name);
+  /**
+   * Bring the focused row into view when focus arrives from OUTSIDE the rail —
+   * a create (SAP-2981), a palette hit, a deep link.
+   *
+   * Measured on the real 76-agent install: creating an agent in `probes` left
+   * the rail scrolled to `social-content`, so the row the create had just added
+   * was three screens away and the flow ended with "did it work?" — the exact
+   * question the endpoint exists to answer.
+   *
+   * `block: "nearest"` so a row that is already visible is not moved: a click
+   * on a row must not scroll the list under the cursor.
+   */
+  const rowRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!isFocused) return;
+    rowRef.current?.scrollIntoView({ block: "nearest" });
+  }, [isFocused]);
   const deploymentState = workflowDeploymentState(workflow);
   const deployed = deploymentState === "ready";
   const statusTitle =
@@ -88,6 +106,7 @@ export function WorkflowRow({
             : "Draft. Not deployed to Sapiom yet.";
   return (
     <div
+      ref={rowRef}
       className={"workflow-item" + (isFocused ? " is-focused" : "")}
       data-testid={`workflow-${workflow.name}`}
       /* THE UNIQUE HANDLE. `workflow-<name>` is not one: the registry takes an

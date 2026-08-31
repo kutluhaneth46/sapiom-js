@@ -70,41 +70,42 @@ test.describe("project row grammar", () => {
     await expect(page.getByTestId("project-remove-scratch")).toBeVisible();
   });
 
-  test("creating from the menu still starts a session rooted in THAT project", async ({
+  test("creating from the menu creates IN that project, and only then talks", async ({
     page,
   }) => {
-    // The menu changed what the control SAYS. What it does is unchanged, and a
-    // grammar fix that quietly broke the action would be the worse bug.
+    // The menu changed what the control SAYS; SAP-2981 changed what it does —
+    // it opens the create dialog instead of starting a pty and asking the
+    // coding agent, in English, to scaffold. What must not change is the
+    // SUBJECT: the project named on the row is the project it creates in, and
+    // the session that follows is rooted there.
     //
     // THE REQUEST, not a tab count. This spec first counted
     // `[data-testid^='session-tab-']` and was worthless: `/?seed=0` renders two
     // session tabs plus `session-tab-new` before anything is clicked, so the
     // assertion held with the handler stubbed to a no-op — a spec that cannot
     // fail, guarding the one behaviour this PR promises it did not change.
-    // A COUNT TAKEN BEFORE, then the newest call — not `lastCreateSession.cwd`
-    // on its own, because the boot session is already rooted at
-    // `/Users/demo/acme-app` (`MOCK_LAUNCH_DIR`) and a value the click is
-    // supposed to produce may already be sitting there. Mutation-checked:
-    // stubbing `create.run()` to a no-op fails this spec.
-    const calls = (): Promise<{ n: number; cwd: string | null }> =>
-      page.evaluate(() => {
-        const state = (
-          window as unknown as {
-            __HARNESS_TEST__?: {
-              createSessionCalls?: Array<{ req?: { cwd?: string } }>;
-            };
-          }
-        ).__HARNESS_TEST__;
-        const list = state?.createSessionCalls ?? [];
-        return { n: list.length, cwd: list[list.length - 1]?.req?.cwd ?? null };
-      });
-    const before = await calls();
+    const order = (): Promise<string[]> =>
+      page.evaluate(
+        () =>
+          ((window as unknown as { __HARNESS_TEST__?: { createOrder?: string[] } })
+            .__HARNESS_TEST__?.createOrder ?? []) as string[],
+      );
 
     await openProjectMenu(page, "acme-app");
     await page.getByTestId("project-create-agent-acme-app").click();
     await expect(page.getByTestId("project-menu-card-acme-app")).toHaveCount(0);
-    await expect.poll(async () => (await calls()).n).toBe(before.n + 1);
-    expect((await calls()).cwd).toBe("/Users/demo/acme-app");
+    await expect(page.getByTestId("create-agent-project")).toHaveText("acme-app");
+    // Nothing has started yet — the old handler started a pty on this click.
+    expect(await order()).toEqual([]);
+
+    await page.getByTestId("create-agent-name").fill("menu-made");
+    await page.getByTestId("create-agent-submit").click();
+    await expect
+      .poll(order)
+      .toEqual([
+        "scaffold:/Users/demo/acme-app/menu-made",
+        "session:/Users/demo/acme-app",
+      ]);
   });
 });
 

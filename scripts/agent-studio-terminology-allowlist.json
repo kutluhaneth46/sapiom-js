@@ -507,7 +507,7 @@
     "id": "web-api-workflow-change-event",
     "path": "packages/harness/web/src/lib/api.ts",
     "pattern": "^workflows\\.changed$",
-    "occurrences": 1,
-    "reason": "The internal WebSocket event name remains stable for existing clients."
+    "occurrences": 2,
+    "reason": "The internal WebSocket event name remains stable for existing clients. Announced by the mock's mover and its scaffold, the two mutations that change what the rail shows."
   }
 ]

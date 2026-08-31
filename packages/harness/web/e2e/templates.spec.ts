@@ -267,9 +267,12 @@ test.describe("templates journey (from the composer)", () => {
     );
   });
 
-  test("use (starter): the real bundled-template scaffold tool", async ({
-    page,
-  }) => {
+  test("use (starter): the HARNESS scaffolds it, no prompt", async ({ page }) => {
+    // SAP-2981, E4.6. A bundled starter is the same local scaffold the project
+    // `+` does, so it goes through the same endpoint: two creation paths for
+    // one operation is how they drift. The clone path above still hands the
+    // work to the coding agent, because forking a published template over the
+    // network is a different operation with a different failure mode.
     await open(page, "coding-pause");
     await page.getByTestId("template-use-btn").click();
     await expect(page.getByTestId("dir-picker-input")).toHaveValue(
@@ -277,20 +280,24 @@ test.describe("templates journey (from the composer)", () => {
     );
     await page.getByTestId("template-use-confirm").click();
 
-    await expect(page.getByTestId("session-context-title")).toContainText(
-      "coding-pause",
-    );
+    // Created first, THEN talked to — the same order the create dialog keeps.
     await expect
-      .poll(async () => (await lastInject(page))?.req.text ?? "")
-      .toContain("sapiom_dev_agents_scaffold");
-    // The starter path carries the same run continuation as the clone path.
-    const prompt = (await lastInject(page))?.req.text ?? "";
-    expect(prompt).toContain(
-      '{"dir":"/Users/demo/acme-app/projects/coding-pause","template":"coding-pause"}',
+      .poll(async () =>
+        page.evaluate(
+          () =>
+            ((window as unknown as { __HARNESS_TEST__?: { createOrder?: string[] } })
+              .__HARNESS_TEST__?.createOrder ?? []) as string[],
+        ),
+      )
+      .toEqual([
+        "scaffold:/Users/demo/acme-app/projects/coding-pause",
+        "session:/Users/demo/acme-app/projects",
+      ]);
+    await expect(page.getByTestId("workflow-coding-pause")).toBeVisible();
+    // And nobody was asked, in English, to perform a filesystem operation.
+    expect((await lastInject(page))?.req.text ?? "").not.toContain(
+      "sapiom_dev_agents_scaffold",
     );
-    expect(prompt).toContain("sapiom_dev_agents_run_local");
-    expect(prompt).toContain("Keep the shipped starter unchanged");
-    expect(prompt.toLowerCase()).not.toContain("workflow");
   });
 
   test("use: straight from a card's spec sheet, skipping the read", async ({

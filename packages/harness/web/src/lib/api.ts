@@ -8,6 +8,7 @@
 import type {
   AccountPlanView,
   AdoptSessionRequest,
+  AgentScaffoldResponse,
   AppState,
   AttachFileRequest,
   AttachFileResponse,
@@ -44,8 +45,9 @@ import type { LocalStepTrace, LocalRunOutcome } from "@sapiom/agent-core";
 
 import { getTheme } from "./theme";
 import { parseSystemGraphSnapshot } from "./system-graph";
+import { refuseAgentName } from "@shared/agent-name";
 import { refuseMove, remapUnder } from "./agent-move";
-import { basenameOf, isWithinDir, samePath } from "./paths";
+import { basenameOf, isWithinDir, parentOf, samePath } from "./paths";
 
 import type { CanvasGraph, CanvasGraphNode } from "./canvas-graph";
 import {
@@ -235,6 +237,22 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * The sentence to SHOW for a failed request.
+ *
+ * `ApiError.message` is the wire shape — `POST /api/agents/scaffold → 409:
+ * {"error":"…"}` — which is right for a log and wrong in a dialog: measured on
+ * a real server, the create dialog showed the user a JSON body inside a status
+ * line. `.reason` is the server's own sentence, written to be read, so every
+ * user-facing catch prefers it. The fallback covers a non-Error rejection and a
+ * response that was not JSON.
+ */
+export function errorMessage(err: unknown, fallback: string): string {
+  if (err instanceof ApiError) return err.reason ?? err.message ?? fallback;
+  if (err instanceof Error && err.message) return err.message;
+  return fallback;
+}
+
 /** Read once at module load: `window.__HARNESS__ = {token}` (baked in by the server), falling back to `?token=`. */
 export function getBootToken(): string {
   const injected = (window as unknown as { __HARNESS__?: { token?: string } })
@@ -392,6 +410,23 @@ export interface HarnessApi {
    * `workflows.changed` and the rail re-derives the tree from the new path.
    */
   moveAgent(from: string, to: string): Promise<void>;
+  /**
+   * Creates an agent on disk — the create flow's ONE mechanism (SAP-2981).
+   *
+   * The harness does the scaffold; nothing here asks a coding agent to perform
+   * a filesystem operation by natural language. So a failure is an `ApiError`
+   * carrying the server's own sentence (a name already taken in that project,
+   * a name that is not one folder segment, a root the rail cannot show) — a
+   * thing the dialog can show — instead of a prompt whose outcome only the
+   * terminal knows. Resolves once the agent is on disk AND the server has
+   * rescanned it into the registry, so the rail can show it before any session
+   * opens.
+   */
+  scaffoldAgent(
+    root: string,
+    name: string,
+    template?: string,
+  ): Promise<AgentScaffoldResponse>;
   /** Adapter registry (GET /api/harnesses): every known harness with its
    *  mode/installed/experimental flags plus per-agent Sapiom MCP install
    *  instructions — the new-session picker and MCP setup block feed on it. */
@@ -665,6 +700,17 @@ class RealApi implements HarnessApi {
     await this.request<{ ok: true }>("/api/agents/move", {
       method: "POST",
       body: JSON.stringify({ from, to }),
+    });
+  }
+
+  scaffoldAgent(
+    root: string,
+    name: string,
+    template?: string,
+  ): Promise<AgentScaffoldResponse> {
+    return this.request<AgentScaffoldResponse>("/api/agents/scaffold", {
+      method: "POST",
+      body: JSON.stringify({ root, name, template }),
     });
   }
 
@@ -1125,6 +1171,26 @@ function recordAgentMove(entry: { from: string; to: string }): void {
   win.__HARNESS_TEST__ = {
     ...(win.__HARNESS_TEST__ ?? {}),
     agentMoves: [...previous, entry],
+  };
+}
+
+/**
+ * The ORDER of the two halves of a create, recorded for the spec that asserts
+ * it (SAP-2981): the agent is scaffolded, and only then does a session open.
+ *
+ * An order is the one thing a pair of separate call logs cannot prove — each
+ * says it happened, neither says when — and this criterion IS the order:
+ * creation completes before the chat starts, so a failure is an error message
+ * rather than a confused model. One append-only list, so a spec can read the
+ * sequence instead of racing two counters.
+ */
+function recordCreateStep(kind: "scaffold" | "session", path: string): void {
+  if (typeof window === "undefined") return;
+  const win = window as unknown as { __HARNESS_TEST__?: Record<string, unknown> };
+  const previous = (win.__HARNESS_TEST__?.createOrder as string[]) ?? [];
+  win.__HARNESS_TEST__ = {
+    ...(win.__HARNESS_TEST__ ?? {}),
+    createOrder: [...previous, `${kind}:${path}`],
   };
 }
 
@@ -1718,6 +1784,7 @@ class MockApi implements HarnessApi {
         lastCreateSession: { req },
         createSessionCalls: [...previous, { req }],
       };
+      recordCreateStep("session", req.cwd);
       if (win.__MOCK_CREATE_SESSION_FAIL_ONCE__) {
         win.__MOCK_CREATE_SESSION_FAIL_ONCE__ = false;
         throw new Error("mock: couldn't create session");
@@ -2118,6 +2185,98 @@ class MockApi implements HarnessApi {
     void import("./events").then(({ publishMockBusMessage }) => {
       publishMockBusMessage({ type: "workflows.changed" });
     });
+  }
+
+  /**
+   * The mock's stand-in for `POST /api/agents/scaffold`.
+   *
+   * A SECOND GUARD, like the mock's mover beside it: the dialog validates the
+   * name before it submits, but the create path must not be a thing only the
+   * dialog can refuse. The real server owns the disk (`src/server/scaffold.ts`)
+   * — the mock has none, so it checks what the registry can see, which is the
+   * same guard set minus the `lstat`.
+   *
+   * The new agent JOINS the fixture list and `workflows.changed` is announced,
+   * the same signal the real server broadcasts, so the rail shows the agent
+   * before the caller opens a session on it — the criterion this endpoint
+   * exists for, exercisable in a browser.
+   */
+  async scaffoldAgent(
+    root: string,
+    name: string,
+    template = "default",
+  ): Promise<AgentScaffoldResponse> {
+    await delay(180);
+    const refusal = refuseAgentName(name);
+    if (refusal)
+      throw new ApiError(400, "POST /api/agents/scaffold \u2192 400 (mock)", refusal);
+    // THE ROOT BARRIER, and the reason it is here: the real route only writes
+    // into a folder the rail can show, and this mock originally skipped that
+    // guard — so `templates.spec.ts` asserted a scaffold into
+    // `<defaultProjectRoot>` succeeded while a fresh install would have been
+    // refused at exactly that path. A mock that is missing a guard is a suite
+    // that certifies the bug.
+    if (!this.projectDirs().some((dir) => samePath(dir, root)))
+      throw new ApiError(
+        409,
+        "POST /api/agents/scaffold \u2192 409 (mock)",
+        `Can't create an agent in ${root} — Studio doesn't show that folder as a project.`,
+      );
+    const path = `${root.replace(/\/+$/, "")}/${name}`;
+    if (this.workflows.some((workflow) => samePath(workflow.path, path)))
+      throw new ApiError(
+        409,
+        "POST /api/agents/scaffold \u2192 409 (mock)",
+        `${basenameOf(root)} already has an agent called ${name}.`,
+      );
+    this.workflows = [
+      ...this.workflows,
+      {
+        name,
+        path,
+        definitionId: null,
+        definitionSlug: null,
+        source: "scan",
+        // The real scaffold writes the starter's id into sapiom.json, and the
+        // rail reads provenance from it.
+        starterId: template,
+      },
+    ];
+    recordCreateStep("scaffold", path);
+    void import("./events").then(({ publishMockBusMessage }) => {
+      publishMockBusMessage({ type: "workflows.changed" });
+    });
+    return { ok: true, path, name, template, dependenciesInstalled: true };
+  }
+
+  /**
+   * The mock's twin of the server's `listProjectDirs`: the roots the rail can
+   * show — stored recents, the host's default parent for new projects, and
+   * every live session's cwd — plus the directories between a root and an
+   * agent, which is where the Project axis draws its folder rows.
+   */
+  private projectDirs(): string[] {
+    const roots = [
+      // THIS instance's settings, not the fixture constant: a `fresh` mock has
+      // no recents at all, which is the state the fresh-install bug lived in.
+      ...this.settings.recentDirs,
+      `${MOCK_LAUNCH_DIR}/projects`,
+      ...this.sessions.map((session) => session.cwd),
+    ];
+    const dirs = new Set(roots);
+    for (const workflow of this.workflows) {
+      for (const root of roots) {
+        if (!isWithinDir(root, workflow.path)) continue;
+        let dir = parentOf(workflow.path);
+        while (dir && isWithinDir(root, dir)) {
+          dirs.add(dir);
+          const parent = parentOf(dir);
+          if (!parent || parent === dir) break;
+          dir = parent;
+        }
+      }
+    }
+    return [...dirs];
   }
 
   async scanWorkflows(root: string): Promise<WorkflowScanOutcome> {
