@@ -6,12 +6,13 @@ import type { PackageInventoryAgent } from "@sapiom/agent";
 import type { WorkflowInfo } from "../shared/types.js";
 import {
   HarnessRegistryInventoryProvider,
+  CachedAgentInvocationProvider,
   LocalWorkspaceScopeCatalog,
   StaticSystemGraphBuilder,
   type AgentInventoryProvider,
   type AgentInventoryResult,
-  type AgentRelationshipProvider,
-  type AgentRelationshipProviderResult,
+  type AgentInvocationProvider,
+  type AgentInvocationProviderResult,
   type WorkspaceScope,
 } from "./system-graph.js";
 
@@ -42,18 +43,18 @@ async function buildGraph(
   return (await builder.build(scope)).graph;
 }
 
-function relationshipProvider(
-  listRelationships: (
+function invocationProvider(
+  listInvocations: (
     sourceRoot: string,
-  ) => Promise<AgentRelationshipProviderResult>,
-): AgentRelationshipProvider {
+  ) => Promise<AgentInvocationProviderResult>,
+): AgentInvocationProvider {
   return {
-    listRelationships: vi.fn((caller) => listRelationships(caller.sourceRoot)),
+    listInvocations: vi.fn((caller) => listInvocations(caller.sourceRoot)),
   };
 }
 
-const EMPTY_RELATIONSHIPS: AgentRelationshipProviderResult = {
-  relationships: [],
+const EMPTY_INVOCATIONS: AgentInvocationProviderResult = {
+  invocations: [],
   warnings: [],
 };
 
@@ -82,6 +83,7 @@ function inventoryResult(
     warnings?: AgentInventoryResult["warnings"];
     degraded?: boolean;
     identitySettled?: boolean;
+    discoveryComplete?: boolean;
   } = {},
 ): AgentInventoryResult {
   const records = agents.map((agent) => {
@@ -160,6 +162,7 @@ function inventoryResult(
           record.public.identityStatus === "provisional" &&
           record.public.identityIssue === "identity-pending",
       ),
+    discoveryComplete: options.discoveryComplete ?? true,
   };
 }
 
@@ -228,10 +231,22 @@ describe("StaticSystemGraphBuilder", () => {
       ),
     };
 
-    const graph = await buildGraph(
-      new StaticSystemGraphBuilder(inventory),
-      scope,
-    );
+    const builder = new StaticSystemGraphBuilder(inventory);
+    const first = await builder.build(scope);
+
+    // The cold phase is inventory-only: all cards and navigation are available
+    // before bounded project invocation I/O starts.
+    expect(first.cacheable).toBe(false);
+    expect(first.graph.nodes).toHaveLength(2);
+    expect(first.graph.edges).toEqual([]);
+    expect(first.navigation).toHaveLength(2);
+    first.afterCommit?.();
+
+    let graph = first.graph;
+    await vi.waitFor(async () => {
+      graph = (await builder.build(scope)).graph;
+      expect(graph.edges).toHaveLength(2);
+    });
 
     expect(graph).toEqual({
       kind: "system",
@@ -245,20 +260,95 @@ describe("StaticSystemGraphBuilder", () => {
           from: "agent:research",
           to: "agent:growth",
           kind: "invokes",
-          basis: "static",
+          basis: "static-invocation",
           mode: "blocking",
         },
         {
           from: "agent:research",
           to: "agent:growth",
           kind: "invokes",
-          basis: "static",
+          basis: "static-invocation",
           mode: "async",
         },
       ],
       warnings: [],
     });
     expect(JSON.stringify(graph)).not.toContain(FIXTURE);
+  });
+
+  it("returns inventory navigation while invocation extraction is still held", async () => {
+    const inventory: AgentInventoryProvider = {
+      listAgents: vi.fn(async () =>
+        inventoryResult(scope, [
+          {
+            agentKey: "growth",
+            label: "Growth",
+            resolutionAliases: ["growth"],
+          },
+          {
+            agentKey: "research",
+            label: "Research",
+            resolutionAliases: ["research"],
+          },
+        ]),
+      ),
+    };
+    let release!: (result: AgentInvocationProviderResult) => void;
+    const held = new Promise<AgentInvocationProviderResult>((resolve) => {
+      release = resolve;
+    });
+    const inner = invocationProvider(async (root) =>
+      root.endsWith("research") ? held : EMPTY_INVOCATIONS,
+    );
+    const onChange = vi.fn();
+    const invocations = new CachedAgentInvocationProvider(
+      inner,
+      async () => "unused",
+      { concurrency: 1, onChange },
+    );
+    const builder = new StaticSystemGraphBuilder(inventory, invocations);
+
+    const cold = await builder.build(scope);
+
+    expect(inner.listInvocations).not.toHaveBeenCalled();
+    expect(cold.cacheable).toBe(false);
+    expect(cold.graph.nodes.map((node) => node.agentKey)).toEqual([
+      "growth",
+      "research",
+    ]);
+    expect(cold.graph.edges).toEqual([]);
+    expect(cold.navigation?.map((target) => target.agentKey)).toEqual([
+      "growth",
+      "research",
+    ]);
+
+    cold.afterCommit?.();
+    await vi.waitFor(() => expect(inner.listInvocations).toHaveBeenCalled());
+    // The held project task cannot withhold the already-returned inventory.
+    expect(cold.graph.nodes).toHaveLength(2);
+    release({
+      invocations: [
+        {
+          target: "growth",
+          mode: "blocking",
+          evidence: EVIDENCE,
+        },
+      ],
+      warnings: [],
+    });
+
+    await vi.waitFor(() => expect(onChange).toHaveBeenCalledTimes(1));
+    const enriched = await builder.build(scope);
+    expect(enriched.graph.edges).toEqual([
+      {
+        from: "agent:research",
+        to: "agent:growth",
+        kind: "invokes",
+        basis: "static-invocation",
+        mode: "blocking",
+      },
+    ]);
+    expect(enriched.cacheable).toBe(true);
   });
 
   it("deduplicates by mode, retains dual-mode edges, and reports duplicate and unresolved targets", async () => {
@@ -282,10 +372,10 @@ describe("StaticSystemGraphBuilder", () => {
         ]),
       ),
     };
-    const relationships = relationshipProvider(async (root) =>
+    const invocations = invocationProvider(async (root) =>
       root.endsWith("research")
         ? {
-            relationships: [
+            invocations: [
               {
                 target: "growth",
                 mode: "blocking",
@@ -300,11 +390,11 @@ describe("StaticSystemGraphBuilder", () => {
             ],
             warnings: [],
           }
-        : EMPTY_RELATIONSHIPS,
+        : EMPTY_INVOCATIONS,
     );
 
     const graph = await buildGraph(
-      new StaticSystemGraphBuilder(inventory, relationships),
+      new StaticSystemGraphBuilder(inventory, invocations),
       scope,
     );
     expect(graph.edges).toEqual([
@@ -312,14 +402,14 @@ describe("StaticSystemGraphBuilder", () => {
         from: "agent:research",
         to: "agent:growth",
         kind: "invokes",
-        basis: "static",
+        basis: "static-invocation",
         mode: "blocking",
       },
       {
         from: "agent:research",
         to: "agent:growth",
         kind: "invokes",
-        basis: "static",
+        basis: "static-invocation",
         mode: "async",
       },
     ]);
@@ -349,8 +439,8 @@ describe("StaticSystemGraphBuilder", () => {
         ]),
       ),
     };
-    const relationships = relationshipProvider(async () => ({
-      relationships: [],
+    const invocations = invocationProvider(async () => ({
+      invocations: [],
       warnings: [
         {
           code: "dynamic-target",
@@ -362,7 +452,7 @@ describe("StaticSystemGraphBuilder", () => {
 
     const built = await new StaticSystemGraphBuilder(
       inventory,
-      relationships,
+      invocations,
     ).build(scope);
 
     expect(built.cacheable).toBe(true);
@@ -421,19 +511,19 @@ describe("StaticSystemGraphBuilder", () => {
         ),
       ),
     };
-    const relationships = relationshipProvider(async (root) =>
+    const invocations = invocationProvider(async (root) =>
       root.endsWith("caller")
         ? {
-            relationships: [
+            invocations: [
               { target: "shared", mode: "async", evidence: EVIDENCE },
             ],
             warnings: [],
           }
-        : EMPTY_RELATIONSHIPS,
+        : EMPTY_INVOCATIONS,
     );
 
     const graph = await buildGraph(
-      new StaticSystemGraphBuilder(inventory, relationships),
+      new StaticSystemGraphBuilder(inventory, invocations),
       scope,
     );
 
@@ -478,7 +568,7 @@ describe("StaticSystemGraphBuilder", () => {
     const graph = await buildGraph(
       new StaticSystemGraphBuilder(
         { listAgents: async () => result },
-        relationshipProvider(async () => EMPTY_RELATIONSHIPS),
+        invocationProvider(async () => EMPTY_INVOCATIONS),
       ),
       scope,
     );
@@ -519,7 +609,7 @@ describe("StaticSystemGraphBuilder", () => {
     const graph = await buildGraph(
       new StaticSystemGraphBuilder(
         { listAgents: async () => result },
-        relationshipProvider(async () => EMPTY_RELATIONSHIPS),
+        invocationProvider(async () => EMPTY_INVOCATIONS),
       ),
       scope,
     );
@@ -553,7 +643,7 @@ describe("StaticSystemGraphBuilder", () => {
       buildGraph(
         new StaticSystemGraphBuilder(
           { listAgents: async () => result },
-          relationshipProvider(async () => EMPTY_RELATIONSHIPS),
+          invocationProvider(async () => EMPTY_INVOCATIONS),
         ),
         scope,
       ),
@@ -588,15 +678,15 @@ describe("StaticSystemGraphBuilder", () => {
     const graph = await buildGraph(
       new StaticSystemGraphBuilder(
         { listAgents: async () => inventory },
-        relationshipProvider(async (sourceRoot) =>
+        invocationProvider(async (sourceRoot) =>
           sourceRoot.endsWith("caller")
             ? {
-                relationships: [
+                invocations: [
                   { target: "payments", mode: "async", evidence: EVIDENCE },
                 ],
                 warnings: [],
               }
-            : EMPTY_RELATIONSHIPS,
+            : EMPTY_INVOCATIONS,
         ),
       ),
       scope,
@@ -607,13 +697,13 @@ describe("StaticSystemGraphBuilder", () => {
         from: "agent:caller",
         to: "agent:payments",
         kind: "invokes",
-        basis: "static",
+        basis: "static-invocation",
         mode: "async",
       },
     ]);
   });
 
-  it("keeps a relationship ambiguous when only multiple aliases match", async () => {
+  it("keeps a invocation ambiguous when only multiple aliases match", async () => {
     const inventory = inventoryResult(
       scope,
       [
@@ -642,15 +732,15 @@ describe("StaticSystemGraphBuilder", () => {
     const graph = await buildGraph(
       new StaticSystemGraphBuilder(
         { listAgents: async () => inventory },
-        relationshipProvider(async (sourceRoot) =>
+        invocationProvider(async (sourceRoot) =>
           sourceRoot.endsWith("caller")
             ? {
-                relationships: [
+                invocations: [
                   { target: "legacy", mode: "async", evidence: EVIDENCE },
                 ],
                 warnings: [],
               }
-            : EMPTY_RELATIONSHIPS,
+            : EMPTY_INVOCATIONS,
         ),
       ),
       scope,
@@ -692,15 +782,15 @@ describe("StaticSystemGraphBuilder", () => {
     const graph = await buildGraph(
       new StaticSystemGraphBuilder(
         { listAgents: async () => inventory },
-        relationshipProvider(async (sourceRoot) =>
+        invocationProvider(async (sourceRoot) =>
           sourceRoot.endsWith("caller")
             ? {
-                relationships: [
+                invocations: [
                   { target: "legacy", mode: "async", evidence: EVIDENCE },
                 ],
                 warnings: [],
               }
-            : EMPTY_RELATIONSHIPS,
+            : EMPTY_INVOCATIONS,
         ),
       ),
       scope,
@@ -734,7 +824,7 @@ describe("StaticSystemGraphBuilder", () => {
       buildGraph(
         new StaticSystemGraphBuilder(
           inventory,
-          relationshipProvider(async () => EMPTY_RELATIONSHIPS),
+          invocationProvider(async () => EMPTY_INVOCATIONS),
         ),
         scope,
       ),
@@ -752,7 +842,7 @@ describe("StaticSystemGraphBuilder", () => {
       buildGraph(
         new StaticSystemGraphBuilder(
           { listAgents: async () => outside },
-          relationshipProvider(async () => EMPTY_RELATIONSHIPS),
+          invocationProvider(async () => EMPTY_INVOCATIONS),
         ),
         scope,
       ),
@@ -771,7 +861,7 @@ describe("StaticSystemGraphBuilder", () => {
       buildGraph(
         new StaticSystemGraphBuilder(
           { listAgents: async () => mismatchedLocation },
-          relationshipProvider(async () => EMPTY_RELATIONSHIPS),
+          invocationProvider(async () => EMPTY_INVOCATIONS),
         ),
         scope,
       ),
@@ -794,7 +884,7 @@ describe("StaticSystemGraphBuilder", () => {
     };
     const built = await new StaticSystemGraphBuilder(
       inventory,
-      relationshipProvider(async () => {
+      invocationProvider(async () => {
         throw new Error("boom at private source");
       }),
     ).build(scope);
@@ -828,7 +918,7 @@ describe("StaticSystemGraphBuilder", () => {
     const graph = await buildGraph(
       new StaticSystemGraphBuilder(
         inventory,
-        relationshipProvider(async () => EMPTY_RELATIONSHIPS),
+        invocationProvider(async () => EMPTY_INVOCATIONS),
       ),
       scope,
     );
@@ -860,10 +950,10 @@ describe("StaticSystemGraphBuilder", () => {
     });
     const builder = new StaticSystemGraphBuilder(
       inventory,
-      relationshipProvider(async (sourceRoot) =>
+      invocationProvider(async (sourceRoot) =>
         sourceRoot.endsWith("caller")
           ? {
-              relationships: [
+              invocations: [
                 {
                   target: "target-marker",
                   mode: "async",
@@ -872,7 +962,7 @@ describe("StaticSystemGraphBuilder", () => {
               ],
               warnings: [],
             }
-          : EMPTY_RELATIONSHIPS,
+          : EMPTY_INVOCATIONS,
       ),
     );
     const initial = await builder.build(scope);
@@ -890,7 +980,7 @@ describe("StaticSystemGraphBuilder", () => {
         from: "agent:caller-marker",
         to: "agent:target-marker",
         kind: "invokes",
-        basis: "static",
+        basis: "static-invocation",
         mode: "async",
       },
     ]);
@@ -928,7 +1018,7 @@ describe("StaticSystemGraphBuilder", () => {
     const graph = await buildGraph(
       new StaticSystemGraphBuilder(
         { listAgents: async () => result },
-        relationshipProvider(async () => EMPTY_RELATIONSHIPS),
+        invocationProvider(async () => EMPTY_INVOCATIONS),
       ),
       scope,
     );
@@ -964,7 +1054,7 @@ describe("StaticSystemGraphBuilder", () => {
     const graph = await buildGraph(
       new StaticSystemGraphBuilder(
         { listAgents: async () => result },
-        relationshipProvider(async () => EMPTY_RELATIONSHIPS),
+        invocationProvider(async () => EMPTY_INVOCATIONS),
       ),
       scope,
     );
@@ -1005,7 +1095,7 @@ describe("StaticSystemGraphBuilder", () => {
       buildGraph(
         new StaticSystemGraphBuilder(
           { listAgents: async () => result },
-          relationshipProvider(async () => EMPTY_RELATIONSHIPS),
+          invocationProvider(async () => EMPTY_INVOCATIONS),
         ),
         scope,
       ),
@@ -1065,7 +1155,7 @@ describe("StaticSystemGraphBuilder", () => {
         buildGraph(
           new StaticSystemGraphBuilder(
             { listAgents: async () => result },
-            relationshipProvider(async () => EMPTY_RELATIONSHIPS),
+            invocationProvider(async () => EMPTY_INVOCATIONS),
           ),
           scope,
         ),
@@ -1091,14 +1181,14 @@ describe("StaticSystemGraphBuilder", () => {
       buildGraph(
         new StaticSystemGraphBuilder(
           { listAgents: async () => result },
-          relationshipProvider(async () => EMPTY_RELATIONSHIPS),
+          invocationProvider(async () => EMPTY_INVOCATIONS),
         ),
         scope,
       ),
     ).rejects.toThrow("inventory context was invalid");
   });
 
-  it("normalizes arbitrary provider aliases before relationship resolution", async () => {
+  it("normalizes arbitrary provider aliases before invocation resolution", async () => {
     const result = inventoryResult(scope, [
       {
         agentKey: "reporting",
@@ -1107,19 +1197,19 @@ describe("StaticSystemGraphBuilder", () => {
         resolutionAliases: ["zeta", "alpha", "zeta"],
       },
     ]);
-    const listRelationships = vi.fn<
-      AgentRelationshipProvider["listRelationships"]
-    >(async () => EMPTY_RELATIONSHIPS);
+    const listInvocations = vi.fn<AgentInvocationProvider["listInvocations"]>(
+      async () => EMPTY_INVOCATIONS,
+    );
 
     await buildGraph(
       new StaticSystemGraphBuilder(
         { listAgents: async () => result },
-        { listRelationships },
+        { listInvocations },
       ),
       scope,
     );
 
-    expect(listRelationships.mock.calls[0]?.[0].resolutionAliases).toEqual([
+    expect(listInvocations.mock.calls[0]?.[0].resolutionAliases).toEqual([
       "alpha",
       "zeta",
     ]);
@@ -1162,7 +1252,7 @@ describe("StaticSystemGraphBuilder", () => {
     const graph = await buildGraph(
       new StaticSystemGraphBuilder(
         inventory,
-        relationshipProvider(async () => EMPTY_RELATIONSHIPS),
+        invocationProvider(async () => EMPTY_INVOCATIONS),
       ),
       scope,
     );
@@ -1203,7 +1293,7 @@ describe("StaticSystemGraphBuilder", () => {
 
     const built = await new StaticSystemGraphBuilder(
       inventory,
-      relationshipProvider(async () => EMPTY_RELATIONSHIPS),
+      invocationProvider(async () => EMPTY_INVOCATIONS),
     ).build(scope);
 
     expect(built.cacheable).toBe(false);
@@ -1249,7 +1339,7 @@ describe("StaticSystemGraphBuilder", () => {
 
     const built = await new StaticSystemGraphBuilder(
       { listAgents: async () => result },
-      relationshipProvider(async () => EMPTY_RELATIONSHIPS),
+      invocationProvider(async () => EMPTY_INVOCATIONS),
     ).build(scope);
 
     expect(built.cacheable).toBe(true);
@@ -1263,9 +1353,33 @@ describe("StaticSystemGraphBuilder", () => {
     ]);
   });
 
-  it("uses the normalized inventory status even if a provider mutates its result", async () => {
+  it("does not cache a settled identity when workspace discovery was incomplete", async () => {
+    const result = inventoryResult(
+      scope,
+      [
+        {
+          agentKey: "dashboard",
+          label: "Dashboard",
+        },
+      ],
+      {
+        degraded: true,
+        identitySettled: true,
+        discoveryComplete: false,
+      },
+    );
+
+    const built = await new StaticSystemGraphBuilder(
+      { listAgents: async () => result },
+      invocationProvider(async () => EMPTY_INVOCATIONS),
+    ).build(scope);
+
+    expect(built.cacheable).toBe(false);
+  });
+
+  it("uses normalized identity state even if a provider mutates inventory status", async () => {
     let release!: () => void;
-    const relationshipsPending = new Promise<void>((resolve) => {
+    const invocationsPending = new Promise<void>((resolve) => {
       release = resolve;
     });
     const result = inventoryResult(
@@ -1281,15 +1395,15 @@ describe("StaticSystemGraphBuilder", () => {
       ],
       { degraded: true },
     );
-    const listRelationships = vi.fn(async () => {
-      await relationshipsPending;
-      return EMPTY_RELATIONSHIPS;
+    const listInvocations = vi.fn(async () => {
+      await invocationsPending;
+      return EMPTY_INVOCATIONS;
     });
     const building = new StaticSystemGraphBuilder(
       { listAgents: async () => result },
-      { listRelationships },
+      { listInvocations },
     ).build(scope);
-    await vi.waitFor(() => expect(listRelationships).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(listInvocations).toHaveBeenCalledTimes(1));
 
     (result.inventory as { status: "complete" | "degraded" }).status =
       "complete";
@@ -1322,11 +1436,11 @@ describe("StaticSystemGraphBuilder", () => {
       retainSources,
     };
     const retainCallers = vi.fn();
-    const relationships: AgentRelationshipProvider = {
-      listRelationships: vi.fn(async () => EMPTY_RELATIONSHIPS),
+    const invocations: AgentInvocationProvider = {
+      listInvocations: vi.fn(async () => EMPTY_INVOCATIONS),
       retainCallers,
     };
-    const builder = new StaticSystemGraphBuilder(inventory, relationships);
+    const builder = new StaticSystemGraphBuilder(inventory, invocations);
 
     await builder.build(scope);
     await builder.build(secondScope);

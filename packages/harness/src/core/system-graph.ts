@@ -4,8 +4,8 @@ import { packageInventorySchema } from "@sapiom/agent";
 
 import type {
   GraphWarning,
+  StaticInvocationGraphEdge,
   SystemGraph,
-  SystemGraphEdge,
   SystemGraphNavigationTarget,
   WorkspaceKey,
   WorkspaceScopeSummary,
@@ -20,10 +20,10 @@ import {
   type WorkspaceScope,
 } from "./system-graph-inventory.js";
 import {
-  CachedAgentRelationshipProvider,
-  SourceAgentRelationshipProvider,
-  type AgentRelationshipProvider,
-  type AgentRelationshipProviderResult,
+  CachedAgentInvocationProvider,
+  SourceAgentInvocationProvider,
+  type AgentInvocationProvider,
+  type AgentInvocationProviderResult,
 } from "./system-graph-relationships.js";
 
 export { HarnessRegistryInventoryProvider } from "./system-graph-inventory.js";
@@ -35,14 +35,14 @@ export type {
   WorkspaceScope,
 } from "./system-graph-inventory.js";
 export {
-  CachedAgentRelationshipProvider,
-  SourceAgentRelationshipProvider,
+  CachedAgentInvocationProvider,
+  SourceAgentInvocationProvider,
 } from "./system-graph-relationships.js";
 export type {
-  AgentRelationshipCandidate,
-  AgentRelationshipProvider,
-  AgentRelationshipProviderResult,
-  AgentRelationshipWarning,
+  AgentInvocationCandidate,
+  AgentInvocationProvider,
+  AgentInvocationProviderResult,
+  AgentInvocationWarning,
 } from "./system-graph-relationships.js";
 
 export interface WorkspaceScopeResolver {
@@ -242,6 +242,8 @@ interface ConsumedInventory {
   warnings: GraphWarning[];
   /** Every identity has finished resolving, however it resolved. */
   identitySettled: boolean;
+  /** The accepted workspace walk considered every eligible discovery path. */
+  discoveryComplete: boolean;
   startEnrichment?: () => void;
 }
 
@@ -311,6 +313,7 @@ function consumeInventory(
           agent.identityStatus === "provisional" &&
           agent.identityIssue === "identity-pending",
       ),
+    discoveryComplete: result.discoveryComplete === true,
     ...(typeof result.startEnrichment === "function"
       ? { startEnrichment: result.startEnrichment }
       : {}),
@@ -325,8 +328,8 @@ export class StaticSystemGraphBuilder implements SystemGraphBuilder {
 
   constructor(
     private readonly inventory: AgentInventoryProvider,
-    private readonly relationships: AgentRelationshipProvider = new CachedAgentRelationshipProvider(
-      new SourceAgentRelationshipProvider(),
+    private readonly invocations: AgentInvocationProvider = new CachedAgentInvocationProvider(
+      new SourceAgentInvocationProvider(),
     ),
   ) {}
 
@@ -335,7 +338,7 @@ export class StaticSystemGraphBuilder implements SystemGraphBuilder {
     const consumed = consumeInventory(scope, inventory);
     const agents = consumed.agents;
     this.callersByWorkspace.set(scope.workspaceKey, agents);
-    this.retainRelationshipCallers();
+    this.retainInvocationCallers();
     const nodes = agents.map((agent) => ({
       id: `agent:${agent.agentKey}`,
       agentKey: agent.agentKey,
@@ -366,43 +369,77 @@ export class StaticSystemGraphBuilder implements SystemGraphBuilder {
       }
     }
 
-    const edges: SystemGraphEdge[] = [];
+    const edges: StaticInvocationGraphEdge[] = [];
     const warnings: GraphWarning[] = [...consumed.warnings];
     const seenEdges = new Set<string>();
-    let relationshipsComplete = true;
+    let invocationsComplete = true;
 
-    // Source walks are independent. Run them together so first-open latency is
-    // bounded by the slowest agent tree rather than the sum of every tree.
-    const scans = await Promise.all(
-      agents.map(async (caller) => {
-        try {
+    const supportsBackgroundInvocations =
+      typeof this.invocations.peekInvocations === "function" &&
+      typeof this.invocations.startInvocations === "function";
+    // Production is deliberately two-phase: project cache-only inventory now,
+    // then perform bounded invocation I/O after nodes/navigation are visible.
+    // Legacy/test providers without the cache surface retain the old awaited
+    // adapter behavior.
+    const scans = supportsBackgroundInvocations
+      ? agents.map((caller) => {
+          const snapshot = this.invocations.peekInvocations!(caller);
           return {
             caller,
-            result: await this.relationships.listRelationships(caller),
-            failed: false as const,
+            result:
+              snapshot?.result ??
+              ({
+                invocations: [],
+                warnings: [],
+              } satisfies AgentInvocationProviderResult),
+            failed: snapshot?.status === "failed",
+            pending: snapshot === undefined,
           };
-        } catch {
-          return {
-            caller,
-            result: {
-              relationships: [],
-              warnings: [],
-            } satisfies AgentRelationshipProviderResult,
-            failed: true as const,
-          };
-        }
-      }),
-    );
+        })
+      : await Promise.all(
+          agents.map(async (caller) => {
+            try {
+              return {
+                caller,
+                result: await this.invocations.listInvocations(caller),
+                failed: false,
+                pending: false,
+              };
+            } catch {
+              return {
+                caller,
+                result: {
+                  invocations: [],
+                  warnings: [],
+                } satisfies AgentInvocationProviderResult,
+                failed: true,
+                pending: false,
+              };
+            }
+          }),
+        );
 
-    for (const { caller, result, failed } of scans) {
+    for (const { caller, result, failed, pending } of scans) {
+      if (pending) {
+        invocationsComplete = false;
+        continue;
+      }
       if (failed) {
-        relationshipsComplete = false;
+        invocationsComplete = false;
         warnings.push({
           code: "projection-failed",
           agentKey: caller.agentKey,
           message: `Could not inspect ${caller.label}.`,
         });
         continue;
+      }
+      if (result.complete === false) {
+        invocationsComplete = false;
+        warnings.push({
+          code: "projection-failed",
+          agentKey: caller.agentKey,
+          message: `Could not fully inspect ${caller.label}.`,
+        });
       }
 
       for (const warning of result.warnings) {
@@ -415,14 +452,14 @@ export class StaticSystemGraphBuilder implements SystemGraphBuilder {
         }
       }
 
-      for (const relationship of result.relationships) {
-        const exact = canonicalTargets.get(relationship.target);
+      for (const invocation of result.invocations) {
+        const exact = canonicalTargets.get(invocation.target);
         const candidates = exact
           ? [exact]
-          : (candidateTargets.get(relationship.target) ?? []);
+          : (candidateTargets.get(invocation.target) ?? []);
         if (candidates.length !== 1) {
-          const target = /^[A-Za-z0-9@_.:-]+$/.test(relationship.target)
-            ? relationship.target
+          const target = /^[A-Za-z0-9@_.:-]+$/.test(invocation.target)
+            ? invocation.target
             : null;
           warnings.push({
             code: "unresolved-target",
@@ -440,8 +477,8 @@ export class StaticSystemGraphBuilder implements SystemGraphBuilder {
         if (target.agentKey === caller.agentKey) continue;
         const from = `agent:${caller.agentKey}`;
         const to = `agent:${target.agentKey}`;
-        const edgeKey = `${from}\0${to}\0${relationship.mode}`;
-        if (relationship.evidence.length > 1 || seenEdges.has(edgeKey)) {
+        const edgeKey = `${from}\0${to}\0${invocation.mode}`;
+        if (invocation.evidence.length > 1 || seenEdges.has(edgeKey)) {
           warnings.push({
             code: "duplicate-edge",
             agentKey: caller.agentKey,
@@ -454,8 +491,8 @@ export class StaticSystemGraphBuilder implements SystemGraphBuilder {
           from,
           to,
           kind: "invokes",
-          basis: "static",
-          mode: relationship.mode,
+          basis: "static-invocation",
+          mode: invocation.mode,
         });
       }
     }
@@ -476,8 +513,20 @@ export class StaticSystemGraphBuilder implements SystemGraphBuilder {
       ).values(),
     ].sort(warningOrder);
 
+    const afterCommit =
+      consumed.startEnrichment || supportsBackgroundInvocations
+        ? () => {
+            consumed.startEnrichment?.();
+            if (supportsBackgroundInvocations) {
+              this.invocations.startInvocations!(agents);
+            }
+          }
+        : undefined;
     return {
-      cacheable: consumed.identitySettled && relationshipsComplete,
+      cacheable:
+        consumed.identitySettled &&
+        consumed.discoveryComplete &&
+        invocationsComplete,
       graph: {
         kind: "system",
         scope: { kind: "working-tree", workspaceKey: scope.workspaceKey },
@@ -489,9 +538,7 @@ export class StaticSystemGraphBuilder implements SystemGraphBuilder {
         agentKey,
         workflowPath,
       })),
-      ...(consumed.startEnrichment
-        ? { afterCommit: consumed.startEnrichment }
-        : {}),
+      ...(afterCommit ? { afterCommit } : {}),
     };
   }
 
@@ -512,13 +559,13 @@ export class StaticSystemGraphBuilder implements SystemGraphBuilder {
     } catch {
       // Private cache pruning cannot make graph projection fail.
     }
-    this.retainRelationshipCallers();
+    this.retainInvocationCallers();
   }
 
-  private retainRelationshipCallers(): void {
+  private retainInvocationCallers(): void {
     const callers = [...this.callersByWorkspace.values()].flat();
     try {
-      this.relationships.retainCallers?.(callers);
+      this.invocations.retainCallers?.(callers);
     } catch {
       // Cache pruning is an optimization and cannot make projection fail.
     }
