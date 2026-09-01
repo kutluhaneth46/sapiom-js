@@ -94,6 +94,8 @@ import {
   removeGeneratedSessionDir,
   sweepGeneratedDirs,
 } from "../core/inject/retention.js";
+import { DEFAULT_SYSTEM_PROMPT } from "../profiles/default.js";
+import { fetchSystemPromptForActiveEnvironment } from "../profiles/system-prompt-fetch.js";
 import { agentCoreTemplatesDir } from "../core/agent-core-templates.js";
 import { CanvasWatcherManager } from "../core/canvas-watcher.js";
 import {
@@ -225,6 +227,11 @@ export interface HarnessServerOptions {
   /** Session registry file. Defaults to `<stateRoot>/sessions.json`. */
   sessionsPath?: string;
   buildLaunchOpts?: LaunchOptsBuilder;
+  /** Loads the coding-agent system prompt for each session start. Defaults to the
+   *  live fetch of GET /v1/harness/system-prompt (SAP-2810), which resolves to the
+   *  bundled DEFAULT_SYSTEM_PROMPT on any failure. Tests and offline hosts inject a
+   *  plain function instead of reaching the network. */
+  loadSystemPrompt?: () => Promise<string>;
   /** Host-supplied launcher for the local sapiom-dev MCP server, replacing the
    *  default `npx @sapiom/mcp@latest`. The Electron host passes its own binary
    *  (GUI-subsystem — allocates no console window on Windows, where the npx
@@ -461,6 +468,10 @@ function readVersion(): string {
  * null when unauthenticated / --no-auth) flows into the generated mcp-config
  * so the remote `sapiom` MCP is actually authenticated — a factory rather
  * than a plain function since it's per-server-instance state.
+ *
+ * The system prompt itself is FETCHED per session (SAP-2810) rather than read from
+ * the bundled profile, so prompt improvements reach installs that never upgrade the
+ * package; the bundled profile remains the offline fallback inside that fetch.
  */
 function createDefaultBuildLaunchOpts(
   apiKey: string | null,
@@ -472,6 +483,12 @@ function createDefaultBuildLaunchOpts(
     deliveryFor: (harness: HarnessKind) => SystemPromptDelivery;
   },
   sapiomDevMcp?: McpDevServerCommand,
+  /**
+   * Loads the coding-agent system prompt for this session (SAP-2810). Defaults to
+   * the live fetch of GET /v1/harness/system-prompt, which resolves to the bundled
+   * DEFAULT_SYSTEM_PROMPT offline — injectable so tests never touch the network.
+   */
+  loadSystemPrompt: () => Promise<string> = fetchSystemPromptForActiveEnvironment,
 ): LaunchOptsBuilder {
   return async (harnessSessionId, req) => {
     // Portable continue (SAP-2059). Resolved before the prompt file is
@@ -510,26 +527,35 @@ function createDefaultBuildLaunchOpts(
           ? "dark-ansi"
           : undefined;
 
-    const [settings, mcpConfigFile, systemPromptFile, pluginDir] =
-      await Promise.all([
-        generateClaudeSettings({
-          harnessSessionId,
-          generatedRoot,
-          ...(claudeTheme ? { claudeTheme } : {}),
-        }),
-        generateMcpConfig(harnessSessionId, {
-          environment: process.env.SAPIOM_ENVIRONMENT,
-          apiKey,
-          generatedRoot,
-          harnessVersion: readVersion(),
-          ...(sapiomDevMcp ? { devServer: sapiomDevMcp } : {}),
-        }),
-        generateSystemPromptFile(harnessSessionId, {
-          generatedRoot,
-          ...(viaSystemPrompt ? { appendix: brief } : {}),
-        }),
-        generateSkillsPlugin(harnessSessionId, { generatedRoot }),
-      ]);
+    // The served prompt (SAP-2810): loaded per session start, so a backend deploy
+    // reaches an install that never upgraded @sapiom/harness. The default loader
+    // resolves to the bundled DEFAULT_SYSTEM_PROMPT on any failure rather than
+    // throwing; the `.catch` covers an injected loader that does not, because a
+    // session must never fail to start over the text of its prompt.
+    const [settings, mcpConfigFile, prompt, pluginDir] = await Promise.all([
+      generateClaudeSettings({
+        harnessSessionId,
+        generatedRoot,
+        ...(claudeTheme ? { claudeTheme } : {}),
+      }),
+      generateMcpConfig(harnessSessionId, {
+        environment: process.env.SAPIOM_ENVIRONMENT,
+        apiKey,
+        generatedRoot,
+        harnessVersion: readVersion(),
+        ...(sapiomDevMcp ? { devServer: sapiomDevMcp } : {}),
+      }),
+      loadSystemPrompt().catch((err: unknown) => {
+        console.error("[harness] system-prompt load failed:", err);
+        return DEFAULT_SYSTEM_PROMPT;
+      }),
+      generateSkillsPlugin(harnessSessionId, { generatedRoot }),
+    ]);
+    const systemPromptFile = await generateSystemPromptFile(harnessSessionId, {
+      generatedRoot,
+      prompt,
+      ...(viaSystemPrompt ? { appendix: brief } : {}),
+    });
     return {
       settingsFile: settings.settingsPath,
       mcpConfigFile,
@@ -1022,6 +1048,7 @@ export const startServer = async (
         deliveryFor: (harness) => systemPromptDeliveryFor(adapters[harness]),
       },
       options.sapiomDevMcp,
+      options.loadSystemPrompt ?? fetchSystemPromptForActiveEnvironment,
     );
   const buildLaunchOpts: LaunchOptsBuilder = async (harnessSessionId, req) => {
     await pendingGeneratedRemovals.get(harnessSessionId);
