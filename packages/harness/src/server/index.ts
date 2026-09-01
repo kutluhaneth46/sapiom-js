@@ -11,6 +11,7 @@ import {
   createServer as createHttpServer,
   type Server as HttpServer,
 } from "node:http";
+import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -149,6 +150,9 @@ import { createBootTokenMiddleware } from "./auth.js";
 import { createApiKeyProvider } from "../core/api-key-provider.js";
 import { createRestRouter } from "./rest.js";
 import { createSystemGraphRouter } from "./system-graph.js";
+import { createAgentMapRouter } from "./agent-map.js";
+import { AgentMapWorkspaceStore } from "../core/agent-map-workspace-store.js";
+import { StudioProjectCatalog } from "../core/studio-project-catalog.js";
 import { createStaticRouter } from "./static.js";
 import { createTerminalWebSocketHandler } from "./terminal-ws.js";
 import { createEventsWebSocketHandler } from "./events-ws.js";
@@ -206,7 +210,10 @@ export interface HarnessServerOptions {
   port: number;
   /** Bind address. Defaults to 127.0.0.1 — the server must never listen on 0.0.0.0. */
   host?: string;
-  /** Per-boot secret; required on WS upgrades, /api (header) and hook scripts (bearer). */
+  /**
+   * Per-boot host/browser secret; required on WS upgrades and `/api` headers.
+   * This credential is deliberately never injected into coding-agent PTYs.
+   */
   bootToken: string;
   telemetryOptIn: boolean;
   /** Sapiom identity from CLI auth; omit/null when unauthenticated or --no-auth. */
@@ -332,6 +339,8 @@ export interface HarnessServerOptions {
 export interface HarnessServer {
   close(): Promise<void>;
   port: number;
+  /** Host-only credential used to authorize the initial browser HTML bootstrap. */
+  uiToken: string;
   sessionManager: SessionManager;
 }
 
@@ -574,6 +583,14 @@ export const startServer = async (
   options: HarnessServerOptions,
 ): Promise<HarnessServer> => {
   const host = options.host ?? "127.0.0.1";
+  // Coding-agent hooks need to authenticate only to /ingest. Keep that
+  // capability distinct from the host/browser boot token: a model can read
+  // its own PTY environment, so injecting the boot token would also grant it
+  // every mutation beneath /api (including durable project rebinding).
+  const ingestToken = randomUUID();
+  // The browser launch capability is separate again: it authorizes delivery
+  // of the boot token in initial HTML, but cannot call /api by itself.
+  const uiToken = randomUUID();
   const identity = options.identity ?? null;
   // The single source of truth for the Sapiom API key (`sk_…`) that Studio
   // actions authenticate with — distinct from the per-boot boot token that only
@@ -1058,7 +1075,7 @@ export const startServer = async (
   const sessionManager = new SessionManager({
     adapters,
     ingestUrl: `http://${host}:${options.port}`,
-    ingestToken: options.bootToken,
+    ingestToken,
     collectorUrl: options.collectorUrl,
     sessionsPath: options.sessionsPath ?? statePaths.sessions,
     buildLaunchOpts,
@@ -1074,6 +1091,9 @@ export const startServer = async (
     ...(await loadSettings(statePaths.settings)).recentDirs,
     ...sessionManager.list().map((session) => session.cwd),
   ]);
+  const studioProjectCatalog = new StudioProjectCatalog(
+    statePaths.studioProjects,
+  );
   const activeSystemGraphScopes = new Map<string, WorkspaceScope>();
   const systemGraphInvocations = new CachedAgentInvocationProvider(
     new SourceAgentInvocationProvider(),
@@ -1208,7 +1228,7 @@ export const startServer = async (
   const taskManager = new TaskManager({
     adapters,
     ingestUrl: `http://${host}:${options.port}`,
-    ingestToken: options.bootToken,
+    ingestToken,
     collectorUrl: options.collectorUrl,
     buildLaunchOpts,
     onCleanup: (taskId) => {
@@ -2246,7 +2266,14 @@ export const startServer = async (
         activeSystemGraphScopes.delete(workspaceKey);
       }
     }
-    return scopes;
+    try {
+      return (await studioProjectCatalog.reconcile(scopes)).workspaceScopes;
+    } catch {
+      // Agent Map is additive in E1. A bad/unavailable new catalog cannot
+      // strand the legacy rail or System Graph during coexistence.
+      console.error("[harness] Studio project catalog is unavailable");
+      return scopes;
+    }
   };
 
   /** Enrich only the bound workflow before a Canvas render. Canvas extraction
@@ -2467,6 +2494,40 @@ export const startServer = async (
   // and createIngestRouter) so the uiTrack closure can reference it lazily.
   const seqCounter = createSeqCounter();
 
+  const agentMapWorkspaceStore = new AgentMapWorkspaceStore(
+    statePaths.agentMap,
+    {
+      onEvent: (event) => {
+        const sessionId = `agent-map-${event.projectId}`;
+        const analyticsEvent: AnalyticsEvent = {
+          eventId: randomUUID(),
+          seq: seqCounter.next(sessionId),
+          ts: new Date().toISOString(),
+          userId: identity?.userId ?? null,
+          tenantId: identity?.tenantId ?? null,
+          machineId,
+          harnessSessionId: sessionId,
+          agentSessionId: null,
+          harness: "claude-code",
+          type: event.name,
+          payload: {
+            project_id: event.projectId,
+            ...(event.name === "agent_map.workspace_read_failed"
+              ? {
+                  error_code: event.errorCode,
+                  ...(event.schemaVersion !== undefined
+                    ? { schema_version: event.schemaVersion }
+                    : {}),
+                }
+              : {}),
+          },
+        };
+        void eventStore.append(analyticsEvent).catch(() => {});
+        batcher.enqueue(analyticsEvent);
+      },
+    },
+  );
+
   const app: Express = express();
   app.disable("x-powered-by");
 
@@ -2498,6 +2559,14 @@ export const startServer = async (
       listWorkflows: async () =>
         publicWorkflowInfos(await enrichWorkflows(workflowsCache)),
       listWorkspaceScopes: listWorkspaceScopesAndRetain,
+      listStudioProjects: async () => {
+        try {
+          return await studioProjectCatalog.list();
+        } catch {
+          console.error("[harness] Studio project catalog is unavailable");
+          return [];
+        }
+      },
       listMacros: () => DEFAULT_MACROS,
       findWorkflow: (workflowPath) =>
         workflowsCache.find((w) => w.path === workflowPath) ?? null,
@@ -2540,6 +2609,14 @@ export const startServer = async (
         tenantId: identity?.tenantId ?? null,
       },
       settingsPath: statePaths.settings,
+    }),
+  );
+  app.use(
+    "/api",
+    createAgentMapRouter({
+      catalog: studioProjectCatalog,
+      store: agentMapWorkspaceStore,
+      listWorkspaceScopes: () => workspaceScopeCatalog.list(),
     }),
   );
   app.use(
@@ -2904,7 +2981,7 @@ export const startServer = async (
   // Feeds the same seqCounter declared above — both hook POSTs and the Codex
   // transcript tailer run through processIngest(), which shares the counter.
   const ingestDeps: IngestDeps = {
-    ingestToken: options.bootToken,
+    ingestToken,
     normalize: normalizeHookEvent,
     resolveSession: resolveIngestSession,
     onAgentSessionResolved: (harnessSessionId, agentSessionId) => {
@@ -3080,7 +3157,9 @@ export const startServer = async (
   // NOTE: mount additional routers above this line — the static/SPA fallback
   // below is a catch-all and must stay last.
   const webDir = options.webDir ?? join(packageRoot(), "dist", "web");
-  app.use(createStaticRouter(webDir, options.bootToken));
+  app.use(
+    createStaticRouter(webDir, { bootToken: options.bootToken, uiToken }),
+  );
 
   app.use(unhandledRequestErrorHandler);
 
@@ -3142,6 +3221,7 @@ export const startServer = async (
 
   return {
     port: actualPort,
+    uiToken,
     sessionManager,
     close: async () => {
       coordinatorActive = false;
