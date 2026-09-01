@@ -63,7 +63,8 @@ out.video?.url; // provider-hosted URL (may be short-lived / unauthenticated)
 
 Video input takes `prompt`, plus the optional neutral params (`aspectRatio`,
 `resolution`, `duration`, `audio`, `seed`, `negativePrompt`, `referenceImage` —
-see [Input params](#input-params)), `storage`, `model`, and two async controls:
+see [Input params](#input-params)), `storage`, `model` / `select`
+(see [Choosing a model](#choosing-a-model)), and two async controls:
 `pollIntervalMs` (poll cadence, default 5s) and `timeoutMs` (give up and throw if
 it isn't ready in time, default 5 min). The returned `video` is
 `{ url, contentType?, fileId?, downloadUrl?, downloadUrlExpiresAt?, storageError? }`.
@@ -146,7 +147,7 @@ to this shape when wiring local tests.
 ## Input params
 
 Describe **what you want** with neutral params instead of provider-specific knobs.
-They're validated against the chosen model *before* you're charged and mapped to
+They're validated against the chosen model _before_ you're charged and mapped to
 that model's wire format, so switching models doesn't mean rewriting the call.
 Passing an unsupported param throws `ContentGenerationHttpError` (`unsupported_param`)
 **before any charge** — the response also carries `resolvedModel` and `cost`.
@@ -180,8 +181,11 @@ persist `cost.reference` and settle from it.
 
 Shared:
 
-- `model` (optional) — a semantic alias (e.g. `"flux-fast"`, `"veo3-fast"`);
-  defaults to a fast model. Most callers omit it.
+- `model` (optional) — a **public semantic alias** (e.g. `"flux-fast"`,
+  `"veo3-fast"`); defaults to a fast model. Most callers omit it. See
+  [Choosing a model](#choosing-a-model) — raw provider ids are deprecated.
+- `select` (optional) — capability-based model selection, used when `model` is
+  omitted. See [Choosing a model](#choosing-a-model).
 - `storage` (optional) — persist outputs; `{ visibility: "private" | "public" }`.
 - `idempotencyKey` (optional) — cross-call idempotency key; a repeat with the same
   key (per tenant) returns the existing generation instead of a new one, like
@@ -195,6 +199,126 @@ Shared:
 Each returned image is `{ url, contentType?, width?, height?, fileId?,
 downloadUrl?, downloadUrlExpiresAt?, storageError? }`; any additional
 model-specific fields are returned on the result as-is.
+
+## Choosing a model
+
+`model` takes a **public semantic alias** — Sapiom's own neutral name for a model,
+resolved to a concrete provider model server-side. Aliases are the supported input.
+
+Raw provider model ids are **deprecated**. An existing pin still works, and this
+release changes nothing about that, but raw ids are not part of the public surface and
+support for them will be removed in a future release — migrate pins to an alias.
+
+```typescript
+import { IMAGE_MODELS, VIDEO_MODEL_ALIASES } from "@sapiom/tools";
+
+await sapiom.contentGeneration.images.create({
+  prompt: "a red bicycle",
+  model: IMAGE_MODELS.fluxStandard, // or just "flux-standard"
+});
+```
+
+| Images (`IMAGE_MODELS`) | Video (`VIDEO_MODEL_ALIASES`) |
+| ----------------------- | ----------------------------- |
+| `flux-fast` (default)   | `veo3-fast` (default)         |
+| `flux-standard`         | `seedance-fast`               |
+| `ideogram-v3`           | `seedance-standard`           |
+| `flux-pro-kontext`      | `kling-standard`              |
+| `nano-banana-pro`       | `wan-standard`                |
+| `gpt-image-2`           | `minimax-h3-max`              |
+
+Both are listed in the platform's catalog order, which is the order it considers
+them in when you omit `model`. Treat it as a stable listing, not a price ranking — if
+you want the cheapest, ask for it with `select.prefer` below.
+
+Neither is a closed set: `model` is typed as a literal union widened to `string`, so a
+newly-cataloged alias works before this SDK catches up, and the SDK never validates the
+value locally — the platform catalog is the authority.
+
+> The `VIDEO_MODELS` export (raw provider model ids) is **deprecated**. Video routes
+> through the same alias-resolving capability as images, so the same guidance applies:
+> the pins still work, but migrate them — `veo3Fast` → `"veo3-fast"`,
+> `klingV16StandardText` → `"kling-standard"`, `wanV22Text` → `"wan-standard"`,
+> `seedance20Fast` → `"seedance-fast"`. `minimaxVideo01` has no cataloged alias —
+> switch it to a cataloged model such as `"minimax-h3-max"`.
+
+### Let the platform pick: `select`
+
+Omit `model` and the platform chooses one for you. Your neutral params already narrow
+the candidates on their own; `select` covers what they can't express, and the response
+echoes the choice as `resolvedModel`:
+
+```typescript
+const out = await sapiom.contentGeneration.video.create({
+  prompt: "a person speaking to camera",
+  aspectRatio: "9:16",
+  duration: 6,
+  select: {
+    requires: ["audio", "lipsync"], // intrinsic capabilities the model must declare
+    prefer: "cheapest", // re-rank the survivors by a live price join
+  },
+});
+out.resolvedModel; // e.g. "seedance-fast" — what the platform picked
+out.preferSatisfied; // true: cheapest verified against every candidate
+```
+
+- `requires` — capability tags the chosen model must declare: `"audio"`, `"lipsync"`,
+  `"referenceImage"`. **Video only** — see [`select` and images](#select-and-images)
+  below. An unknown tag is rejected as an unsupported param. `requires` is intended to
+  hold whether or not you also pin `model` — it states a requirement, not a tie-breaker.
+- `prefer: "cheapest"` — re-ranks the surviving candidates by a **live** price join. It
+  degrades, never fails: if the join is unavailable, slow, or incomplete, selection falls
+  back to deterministic catalog order and the response reports `preferSatisfied: false`.
+  A `true` means the cheapest was verified against _every_ candidate.
+- `preferSatisfied` is **absent** unless you asked for a preference — never a
+  fabricated `false`.
+
+`"cheapest"` compares the live price of your exact request as each candidate would run
+it, not a fixed per-model tier. Omit `duration` (video) / `count` (images) and each
+candidate is priced at its _own_ catalog default, so a model with a shorter default can
+win on absolute price — pin them to compare on equal terms.
+
+If no model satisfies the constraints, the request fails before any charge.
+
+### `select` and images
+
+`select` is typed per media type, because the two do not offer the same capabilities.
+**`requires` is video-only.** No image model in the catalog declares a capability tag, so
+`ImageSelect` declares `requires?: never` — a prohibition, not an option you can set —
+and asking an image call for `requires` is a compile error rather than a request that
+could only fail:
+
+```typescript
+// Images: prefer is the whole surface.
+await sapiom.contentGeneration.images.create({
+  prompt: "a red bicycle",
+  select: { prefer: "cheapest" },
+});
+```
+
+It is declared as `never` rather than simply left out because omitting it only catches
+inline object literals. TypeScript's excess-property check does not apply to a value built
+elsewhere and passed by reference, so this would have slipped through to a runtime
+rejection:
+
+```typescript
+// `as const` matters here: without it `prefer` widens to `string` and the call is
+// rejected for that instead, which would not demonstrate anything about `requires`.
+const opts = { prefer: "cheapest" as const, requires: ["lipsync"] };
+await sapiom.contentGeneration.images.create({ prompt, select: opts }); // caught
+```
+
+Declaring the property makes it a type error however the value was assembled. (With
+`exactOptionalPropertyTypes` off, the compiler words that as "not assignable to type
+`undefined`" rather than naming `never`.)
+
+If image conditioning is cataloged later, `requires` becomes a real tag list on
+`ImageSelect` — a non-breaking change.
+
+Writing code generic over both media types? `MediaSelect` is the shape the two share
+(`{ prefer?: "cheapest" }`), and a value of that type is accepted by either call. It is
+the shared shape rather than a union of the two, so it really is assignable to both —
+name the specific `VideoSelect` when you need `requires`.
 
 ## Gotchas
 

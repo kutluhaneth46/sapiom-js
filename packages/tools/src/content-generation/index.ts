@@ -115,15 +115,149 @@ export type Resolution = "480p" | "720p" | "1080p";
 /** Neutral output-format vocabulary (`"mp4"` for video; image formats otherwise). See {@link AspectRatio}. */
 export type OutputFormat = "png" | "jpeg" | "webp" | "mp4";
 
+/**
+ * `T` plus any other string — keeps editor autocomplete for the known literals in `T` while still
+ * accepting an arbitrary value, so a newly-cataloged model alias works before this SDK catches up.
+ * The SDK deliberately adds no client-side model validation: the platform catalog is the authority
+ * on what it accepts. The `Record<never, never>` is the lint-safe spelling of the `string & {}` idiom.
+ */
+type LiteralUnion<T extends string> = T | (string & Record<never, never>);
+
+/**
+ * What every `select` shares: the opt-in ranking preference. `requires` is NOT here — its vocabulary
+ * is per media type (an image model cannot lip-sync), so it lives on the media type that can
+ * actually satisfy it. See {@link VideoSelect.requires}.
+ */
+interface MediaSelectBase {
+  /**
+   * Opt-in preference over the surviving candidates. `"cheapest"` re-ranks them by a LIVE price join
+   * and picks the lowest, instead of the default deterministic catalog order. It DEGRADES, never
+   * fails: when the price join is unavailable, slow, or incomplete (not every candidate priced),
+   * selection falls back to catalog order and the response reports `preferSatisfied: false`. A
+   * `preferSatisfied: true` therefore means the cheapest was verified against EVERY candidate, never
+   * a partial comparison. Omit for deterministic catalog-order selection.
+   *
+   * What it compares is the live price of the EXACT request as each candidate would run it, not a
+   * fixed per-model tier — a model's price moves with the request. Pin `count` (images) / `duration`
+   * (video) to compare candidates on equal terms; omit one and each candidate is priced at its OWN
+   * catalog default, so a model with a shorter default can win on absolute price.
+   */
+  prefer?: "cheapest";
+}
+
+/**
+ * Capability-based model SELECTION (E5 / SAP-2580) for the IMAGE path — steers the choice when
+ * `model` is OMITTED. The neutral params you declare already narrow the candidate models on their
+ * own, so `select` is the escape hatch for what they cannot express, not the main path. Whichever
+ * model the platform picks comes back as `resolvedModel`. A malformed `select` or an unknown
+ * `prefer` value is rejected as an unsupported param BEFORE any charge — never silently ignored.
+ *
+ * `prefer` is the whole image surface today. Images accept no `requires`: no image model declares a
+ * capability tag, so the option could only ever narrow the candidates to none.
+ */
+export interface ImageSelect extends MediaSelectBase {
+  /**
+   * Not accepted on the image path — a PROHIBITION, not an option you can set. Typed `never` rather
+   * than omitted so that passing `requires` is a direct type error on the property itself, however
+   * the value was built: an inline literal, or an object assembled elsewhere and passed by
+   * reference. (Omitting it caught the literal via excess-property checking, but let a pre-built
+   * object carrying both `prefer` and `requires` through silently.)
+   *
+   * If the catalog grows an image capability tag, this becomes a real tag list — a non-breaking
+   * change to THIS type rather than a new export.
+   *
+   * Reading the error: this repo leaves `exactOptionalPropertyTypes` off, so the property's type is
+   * `never | undefined` — i.e. `undefined` — and TypeScript reports "Type '…' is not assignable to
+   * type 'undefined'" rather than naming `never`. Same prohibition, confusing wording.
+   */
+  requires?: never;
+}
+
+/**
+ * Capability-based model SELECTION (E5 / SAP-2580) for the VIDEO path. Same contract as
+ * {@link ImageSelect}, plus the `requires` vocabulary video models actually declare.
+ */
+export interface VideoSelect extends MediaSelectBase {
+  /**
+   * Intrinsic capability tags the selected video model MUST declare — the axes a neutral param
+   * cannot express. An unknown tag is rejected as an unsupported param, before any charge.
+   *
+   * Video-only: no image model declares any of these, so there is no image equivalent. If the
+   * platform catalogs a new tag, it works on the wire before this list names it — pass it through
+   * {@link VideoCreateInput.passthrough} rather than waiting for an SDK release.
+   */
+  requires?: Array<"audio" | "lipsync" | "referenceImage">;
+}
+
+/**
+ * The selection directives BOTH media types accept — for code that is generic over image and video.
+ * This is the shared shape itself (the fields common to {@link ImageSelect} and
+ * {@link VideoSelect}), not a union of them, so a value of this type is genuinely assignable to
+ * {@link ImageCreateInput.select} AND {@link VideoCreateInput.select}.
+ *
+ * A call site that knows its media type should name the specific type instead: only
+ * {@link VideoSelect} exposes `requires`, and going through `MediaSelect` would hide it.
+ */
+export type MediaSelect = MediaSelectBase;
+
+/**
+ * The public semantic image-model aliases the routed image capability serves, ready to pass as
+ * {@link ImageCreateInput.model} — e.g. `IMAGE_MODELS.fluxFast`. Listed in the platform's catalog
+ * order, which is the order it considers them in when you omit `model`. That is a stable listing,
+ * not a price ranking — to get the cheapest, ask for it with `select.prefer`.
+ *
+ * These are Sapiom's OWN neutral names, resolved to a concrete provider model server-side, and they
+ * are the SUPPORTED input for {@link ImageCreateInput.model}. A raw provider model id is DEPRECATED:
+ * it still works today, but it is not part of the public surface and support for it will be removed
+ * in a future release (SAP-2582) — migrate pins to an alias from this map.
+ *
+ * The map is an autocomplete convenience, not a closed set: `model` stays a {@link LiteralUnion}, so
+ * a newly-cataloged alias works before this SDK catches up.
+ */
+export const IMAGE_MODELS = {
+  /** Fast, low-cost text-to-image. The default when `model` is omitted. */
+  fluxFast: "flux-fast",
+  /** Higher-fidelity, slower. */
+  fluxStandard: "flux-standard",
+  /** Strong typography / logo rendering. */
+  ideogramV3: "ideogram-v3",
+  /** Per-image mid-tier. */
+  fluxProKontext: "flux-pro-kontext",
+  /** Top-quality text-to-image. */
+  nanoBananaPro: "nano-banana-pro",
+  /** Strong text rendering; the priciest alias. */
+  gptImage2: "gpt-image-2",
+} as const;
+
+/** A known public image-model alias — one of the values of {@link IMAGE_MODELS}. */
+export type KnownImageModel = (typeof IMAGE_MODELS)[keyof typeof IMAGE_MODELS];
+
 export interface ImageCreateInput {
   /** Text prompt describing the image to generate. */
   prompt: string;
   /**
-   * Optional model selector — a Sapiom semantic alias (e.g. `"flux-fast"`, `"flux-pro/kontext"`)
-   * resolved to a provider model server-side. A legacy raw provider id still works. Most callers
-   * omit it (defaults to a fast image model).
+   * Optional model selector — a PUBLIC semantic alias from {@link IMAGE_MODELS} (e.g.
+   * `"flux-fast"`), resolved to a concrete provider model server-side. Most callers omit it: the
+   * platform then selects one (the fast default, or the cheapest model that satisfies your params
+   * and {@link ImageCreateInput.select}), and echoes the choice as `resolvedModel`.
+   *
+   * A raw provider model id is DEPRECATED here (SAP-2582). It still routes today — this field
+   * deliberately stays a {@link LiteralUnion}, so an existing pin keeps compiling and keeps working
+   * — but it is not part of the public surface and support for it will be removed in a future
+   * release. Migrate pins to an {@link IMAGE_MODELS} alias. The SDK forwards whatever you pass and
+   * adds no local validation: the platform catalog is the authority on what it accepts, so a
+   * newly-cataloged alias works before this SDK catches up.
+   *
+   * @example "flux-fast"
    */
-  model?: string;
+  model?: LiteralUnion<KnownImageModel>;
+
+  /**
+   * Optional capability-based model selection (E5 / SAP-2580), honored when `model` is omitted:
+   * the platform picks a model satisfying your declared params plus `select.requires`, optionally
+   * re-ranked by `select.prefer`. See {@link ImageSelect}.
+   */
+  select?: ImageSelect;
 
   /**
    * Optional cross-call idempotency key: a repeat with the same key (per tenant) returns the
@@ -211,6 +345,13 @@ export interface ImageGenerationResult {
   resolvedModel: string;
   /** Per-generation cost (SAP-2576); omitted when the price join was unavailable. */
   cost?: MediaCostEnvelope;
+  /**
+   * E5 (SAP-2580): present ONLY when `select.prefer` was requested — `true` when the preference was
+   * honored (the cheapest verified against EVERY candidate), `false` when it degraded to
+   * deterministic catalog order because the live price join was unavailable, slow, or incomplete.
+   * Absent when you asked for no preference.
+   */
+  preferSatisfied?: boolean;
   /** Additional model-specific fields (e.g. `seed`, `timings`), returned as-is. */
   [key: string]: unknown;
 }
@@ -237,6 +378,7 @@ interface RawImageResult {
   images?: RawImage[];
   resolvedModel: string;
   cost?: MediaCostEnvelope;
+  preferSatisfied?: boolean;
   [key: string]: unknown;
 }
 
@@ -263,22 +405,40 @@ function mapResult(raw: RawImageResult): ImageGenerationResult {
 }
 
 /**
- * Thread a dispatch handle's SAP-2576 `resolvedModel` (always present) + optional `cost`
- * envelope onto a polled result. For video (and async image) the resolved model, price quote,
- * and transaction `reference` resolve at SUBMIT, so they ride the dispatch handle — but the
- * result is polled from the gateway's queue passthrough, which carries none of them. Merge them
- * here: `resolvedModel` unconditionally (the contract guarantees it), `cost` only when the
- * quote/reference resolved (omit-don't-fabricate). The `as` narrows the generic object spread.
+ * Thread a dispatch handle's submit-time metadata — SAP-2576 `resolvedModel` (always present) +
+ * optional `cost` envelope, and the E5 (SAP-2580) `preferSatisfied` flag — onto a polled result.
+ * For video (and async image) the model choice, price quote, and transaction `reference` all
+ * resolve at SUBMIT, so they ride the dispatch handle — but the result is polled from the gateway's
+ * queue passthrough, which carries none of them. Merge them here: `resolvedModel` unconditionally
+ * (the contract guarantees it), `cost` and `preferSatisfied` only when they resolved
+ * (omit-don't-fabricate — `preferSatisfied` is absent unless `select.prefer` was asked for, and a
+ * fabricated `false` would report a degrade that never happened). The `as` narrows the generic
+ * object spread.
  */
-function withDispatchCost<TBody extends Record<string, unknown>>(
+function withDispatchMetadata<TBody extends Record<string, unknown>>(
   body: TBody,
-  handle: { cost?: MediaCostEnvelope; resolvedModel: string },
-): TBody & { resolvedModel: string; cost?: MediaCostEnvelope } {
+  handle: {
+    cost?: MediaCostEnvelope;
+    resolvedModel: string;
+    preferSatisfied?: boolean;
+  },
+): TBody & {
+  resolvedModel: string;
+  cost?: MediaCostEnvelope;
+  preferSatisfied?: boolean;
+} {
   return {
     ...body,
     resolvedModel: handle.resolvedModel,
     ...(handle.cost !== undefined && { cost: handle.cost }),
-  } as TBody & { resolvedModel: string; cost?: MediaCostEnvelope };
+    ...(handle.preferSatisfied !== undefined && {
+      preferSatisfied: handle.preferSatisfied,
+    }),
+  } as TBody & {
+    resolvedModel: string;
+    cost?: MediaCostEnvelope;
+    preferSatisfied?: boolean;
+  };
 }
 
 // ----- Capability operations -----
@@ -365,9 +525,11 @@ function applyMediaParams(
  *
  * Routed (SAP-1116): goes through the shared {@link capabilityCall} seam to
  * `POST /v1/capabilities/content.generation.images` on the single Core base URL.
- * `model` is now a request-body field the router's adapter turns into the provider
- * path (and defaults when omitted) — the SDK no longer builds the `/run/<model>`
- * URL itself.
+ * `model` is a request-body field the router resolves from a public semantic alias to
+ * the provider path (defaulting, or SELECTING per `select`, when omitted) — the SDK
+ * no longer builds the `/run/<model>` URL itself, and never resolves an alias locally.
+ * A public alias is the supported `model` input; a raw provider id is deprecated but
+ * still routes (SAP-2582).
  */
 export async function createImage(
   input: ImageCreateInput,
@@ -382,11 +544,18 @@ export async function createImage(
   // validate + map (`params`/`passthrough` stay nested objects, forwarded verbatim).
   const body: Record<string, unknown> = { prompt: input.prompt };
   if (input.model != null) body.model = input.model;
+  // E5 (SAP-2580) selection directives — a request-level control like `model`, forwarded verbatim
+  // for the router to validate; the SDK neither inspects nor defaults it.
+  if (input.select != null) body.select = input.select;
   if (input.storage) body.storage = input.storage;
   // Request-level control (like `model`/`storage`), not a neutral media param: forwarded
   // verbatim for the platform to validate + dedup. `!= null` drops an explicit JS `null`.
   if (input.idempotencyKey != null) body.idempotencyKey = input.idempotencyKey;
-  applyMediaParams(body, input as unknown as Record<string, unknown>, IMAGE_PARAM_KEYS);
+  applyMediaParams(
+    body,
+    input as unknown as Record<string, unknown>,
+    IMAGE_PARAM_KEYS,
+  );
 
   const raw = await capabilityCall<RawImageResult>(
     "content.generation.images",
@@ -422,6 +591,11 @@ interface ImageDispatchResponse {
   resolvedModel: string;
   /** Per-generation cost estimate (SAP-2576), resolved at submit; omitted when the quote was unavailable. */
   cost?: MediaCostEnvelope;
+  /**
+   * E5 (SAP-2580): present ONLY when `select.prefer` was requested, resolved at submit — `true` when
+   * the preference was honored, `false` when it degraded to deterministic catalog order.
+   */
+  preferSatisfied?: boolean;
 }
 
 /**
@@ -455,6 +629,11 @@ export interface ImageLaunchHandle extends DispatchHandle {
    * settled charge out-of-band via `cost.reference`. Also merged onto the {@link wait} result.
    */
   cost?: MediaCostEnvelope;
+  /**
+   * E5 (SAP-2580): present ONLY when `select.prefer` was requested — `true` when the preference was
+   * honored, `false` when it degraded to catalog order. Also merged onto the {@link wait} result.
+   */
+  preferSatisfied?: boolean;
   /** Poll to completion and resolve the full result. */
   wait(opts?: {
     timeoutMs?: number;
@@ -566,11 +745,17 @@ export async function launchImage(
     dispatch: "async",
   };
   if (input.model != null) body.model = input.model;
+  // E5 (SAP-2580) selection directives — see createImage.
+  if (input.select != null) body.select = input.select;
   if (input.storage) body.storage = input.storage;
   // Request-level control (like `model`/`storage`), not a neutral media param: forwarded
   // verbatim for the platform to validate + dedup. `!= null` drops an explicit JS `null`.
   if (input.idempotencyKey != null) body.idempotencyKey = input.idempotencyKey;
-  applyMediaParams(body, input as unknown as Record<string, unknown>, IMAGE_PARAM_KEYS);
+  applyMediaParams(
+    body,
+    input as unknown as Record<string, unknown>,
+    IMAGE_PARAM_KEYS,
+  );
 
   const handle = await capabilityCall<ImageDispatchResponse>(
     "content.generation.images",
@@ -605,9 +790,10 @@ export async function launchImage(
       const res = await transport.fetch(responseUrl, { method: "GET" });
       if (res.ok) {
         const raw = (await res.json()) as RawImageResult;
-        // Thread the submit handle's SAP-2576 cost + resolvedModel onto the polled result.
+        // Thread the submit handle's SAP-2576 cost + resolvedModel and E5 preferSatisfied
+        // onto the polled result.
         if (Array.isArray(raw.images))
-          return withDispatchCost(mapResult(raw), handle);
+          return withDispatchMetadata(mapResult(raw), handle);
       } else {
         // Still generating, or a transient error. Drain the unread body so the
         // connection can be reused, then keep polling — `timeoutMs` is the backstop.
@@ -626,10 +812,14 @@ export async function launchImage(
 
   return {
     requestId,
-    // SAP-2576: surface the submit handle's resolvedModel + cost envelope on the handle too,
-    // so a caller reading them off `launch()` needn't await `wait()`.
+    // SAP-2576 + E5: surface the submit handle's resolvedModel, cost envelope, and
+    // preferSatisfied on the handle too, so a caller reading them off `launch()` needn't
+    // await `wait()`.
     resolvedModel: handle.resolvedModel,
     ...(handle.cost !== undefined && { cost: handle.cost }),
+    ...(handle.preferSatisfied !== undefined && {
+      preferSatisfied: handle.preferSatisfied,
+    }),
     dispatch: { correlationId: requestId, resultSignal: IMAGE_RESULT_SIGNAL },
     wait,
   };
@@ -645,22 +835,48 @@ export const images = { create: createImage, launch: launchImage };
 // ----- Video (async) -----
 
 /**
- * `T` plus any other string — keeps editor autocomplete for the known literals in `T`
- * while still accepting an arbitrary id (new gateway models work before this list catches
- * up). The `Record<never, never>` is the lint-safe spelling of the `string & {}` idiom.
+ * The public semantic video-model aliases the routed video capability serves, ready to pass as
+ * {@link VideoCreateInput.model} — e.g. `VIDEO_MODEL_ALIASES.veo3Fast`. The video counterpart of
+ * {@link IMAGE_MODELS}, in the same catalog order the platform selects in when you omit `model`.
+ *
+ * Prefer these over the deprecated raw-provider-id map {@link VIDEO_MODELS}: aliases are the
+ * supported input, and support for raw ids will be removed in a future release (SAP-2582). Not a
+ * closed set — `model` stays a {@link LiteralUnion}, so a newly-cataloged alias works before this
+ * SDK catches up.
  */
-type LiteralUnion<T extends string> = T | (string & Record<never, never>);
+export const VIDEO_MODEL_ALIASES = {
+  /** Fast text-to-video with native audio. The default when `model` is omitted. */
+  veo3Fast: "veo3-fast",
+  /** Native-audio + lip-sync single-call UGC. */
+  seedanceFast: "seedance-fast",
+  /** Premium native-audio text-to-video. */
+  seedanceStandard: "seedance-standard",
+  /** Silent text-to-video at a fixed native resolution. */
+  klingStandard: "kling-standard",
+  /** Silent text-to-video, 480p/720p. */
+  wanStandard: "wan-standard",
+  /** Fast silent text-to-video, 5–15s. */
+  minimaxH3Max: "minimax-h3-max",
+} as const;
+
+/** A known public video-model alias — one of the values of {@link VIDEO_MODEL_ALIASES}. */
+export type KnownVideoModelAlias =
+  (typeof VIDEO_MODEL_ALIASES)[keyof typeof VIDEO_MODEL_ALIASES];
 
 /**
  * The concrete provider video model ids the Sapiom video gateway serves, ready to pass as
  * {@link VideoCreateInput.model} — e.g. `VIDEO_MODELS.veo3Fast`.
  *
- * @deprecated Raw provider ids are no longer required. `video.create`/`video.launch` route
- * through the `content.generation.video` capability (SAP-2575), and that capability's adapter
- * resolves Sapiom's semantic aliases (`"veo3-fast"`, `"kling-standard"`, …) server-side — pass
- * one of those directly to {@link VideoCreateInput.model} instead. Kept exported for
- * back-compat: a raw provider id from this object still works, the adapter passes an
- * already-resolved id straight through.
+ * @deprecated Pass a public semantic alias from {@link VIDEO_MODEL_ALIASES} instead. Since
+ * `video.create`/`video.launch` were repointed onto the `content.generation.video` capability
+ * (SAP-2575) they go through the same routed, alias-resolving surface as images, where the alias is
+ * the supported input. These raw ids still route today and this map stays exported so existing code
+ * keeps compiling and working — but they are not part of the public surface, and support for them
+ * will be removed in a future release (SAP-2582). Every entry has an alias to migrate to:
+ * `veo3Fast` → `"veo3-fast"`, `klingV16StandardText` → `"kling-standard"`,
+ * `wanV22Text` → `"wan-standard"`, `seedance20Fast` → `"seedance-fast"`. The exception is
+ * `minimaxVideo01`, which has NO cataloged alias — switch it to a cataloged model such as
+ * `"minimax-h3-max"`.
  */
 export const VIDEO_MODELS = {
   /** Google Veo 3 Fast — fast text-to-video. The default. */
@@ -675,7 +891,13 @@ export const VIDEO_MODELS = {
   minimaxVideo01: "fal-ai/minimax/video-01",
 } as const;
 
-/** A known video model id — one of the values of {@link VIDEO_MODELS}. */
+/**
+ * A known raw provider video model id — one of the values of {@link VIDEO_MODELS}.
+ *
+ * @deprecated Use {@link KnownVideoModelAlias}. Raw provider ids still work, but the public
+ * semantic alias is the supported input and raw-id support will be removed in a future release
+ * (SAP-2582).
+ */
 export type KnownVideoModel = (typeof VIDEO_MODELS)[keyof typeof VIDEO_MODELS];
 
 /** How often to poll for the async result, and when to give up. Caller-overridable. */
@@ -686,16 +908,28 @@ export interface VideoCreateInput {
   /** Text prompt describing the video to generate. */
   prompt: string;
   /**
-   * Optional video model. Omit to use the router's default (currently Veo 3 Fast).
+   * Optional model selector — a PUBLIC semantic alias from {@link VIDEO_MODEL_ALIASES} (e.g.
+   * `"veo3-fast"`), resolved to a concrete provider model server-side. Omit it and the platform
+   * selects one (the fast default, or the cheapest model satisfying your params and
+   * {@link VideoCreateInput.select}), echoing the choice as `resolvedModel`.
    *
-   * Pass a Sapiom semantic alias (`"veo3-fast"`, `"kling-standard"`, …) or a raw *provider*
-   * model id from {@link VIDEO_MODELS} — both resolve: the request routes through the
-   * `content.generation.video` capability, whose adapter resolves an alias to its provider
-   * id server-side (SAP-2575).
+   * Video routes through the same alias-resolving capability as images (SAP-2575), so the same
+   * guidance applies: a raw provider id from the deprecated {@link VIDEO_MODELS} map is DEPRECATED
+   * but still routes today. Those ids stay in the accepted type — and this field stays a
+   * {@link LiteralUnion} — so existing code keeps compiling and working; support for them will be
+   * removed in a future release (SAP-2582). A {@link LiteralUnion} also means a newly-cataloged
+   * alias works before this SDK catches up.
    *
    * @example "veo3-fast"
    */
-  model?: LiteralUnion<KnownVideoModel>;
+  model?: LiteralUnion<KnownVideoModelAlias | KnownVideoModel>;
+
+  /**
+   * Optional capability-based model selection (E5 / SAP-2580), honored when `model` is omitted:
+   * the platform picks a model satisfying your declared params plus `select.requires`, optionally
+   * re-ranked by `select.prefer`. See {@link VideoSelect}.
+   */
+  select?: VideoSelect;
 
   /**
    * Optional cross-call idempotency key: a repeat with the same key (per tenant) returns the
@@ -788,6 +1022,11 @@ export interface VideoGenerationResult {
    * unavailable at submit.
    */
   cost?: MediaCostEnvelope;
+  /**
+   * E5 (SAP-2580), threaded from the submit handle: present ONLY when `select.prefer` was
+   * requested — `true` when the preference was honored, `false` when it degraded to catalog order.
+   */
+  preferSatisfied?: boolean;
   /** Additional model-specific fields (e.g. `seed`, `timings`), returned as-is. */
   [key: string]: unknown;
 }
@@ -829,6 +1068,11 @@ interface VideoDispatchResponse {
    * gateway's queue passthrough) carries neither, so this is the only place they ride.
    */
   cost?: MediaCostEnvelope;
+  /**
+   * E5 (SAP-2580): present ONLY when `select.prefer` was requested, resolved at submit — `true` when
+   * the preference was honored, `false` when it degraded to deterministic catalog order.
+   */
+  preferSatisfied?: boolean;
 }
 
 /**
@@ -859,7 +1103,7 @@ function mapVideo(raw: RawMedia): GeneratedVideo {
 }
 
 // Returns the camelCase video BODY only — the submit-only metadata (`resolvedModel`, `cost`) is
-// threaded on separately by `withDispatchCost`, since the queue passthrough omits it.
+// threaded on separately by `withDispatchMetadata`, since the queue passthrough omits it.
 function mapVideoResult(raw: RawVideoResult): {
   video?: GeneratedVideo;
   [key: string]: unknown;
@@ -884,8 +1128,10 @@ const sleep = (ms: number): Promise<void> =>
  * Routed (SAP-2575): the submit goes through the shared {@link capabilityCall} seam to
  * `POST /v1/capabilities/content.generation.video` on the single Core base URL — the
  * same seam {@link createImage} uses. `model` is a request-body field the router's video
- * adapter resolves (a semantic alias like `"veo3-fast"`, or a raw provider id, and
- * defaults when omitted); the SDK no longer builds a `/run/<model>` URL itself. The poll
+ * adapter resolves from a public semantic alias like `"veo3-fast"` (defaulting, or SELECTING
+ * per `select`, when omitted); the SDK no longer builds a `/run/<model>` URL itself. Video
+ * shares the routed surface with images, so the same guidance applies — a raw provider id is
+ * deprecated but still routes (SAP-2582). The poll
  * loop is unchanged: the submit response's `responseUrl`/`statusUrl` point at the
  * gateway's queue passthrough, which still returns the provider's raw snake_case result.
  */
@@ -901,11 +1147,17 @@ export async function createVideo(
   // params + deprecated `params` ride top-level via `applyMediaParams`.
   const body: Record<string, unknown> = { prompt: input.prompt };
   if (input.model != null) body.model = input.model;
+  // E5 (SAP-2580) selection directives — see createImage.
+  if (input.select != null) body.select = input.select;
   if (input.storage) body.storage = input.storage;
   // Request-level control (like `model`/`storage`), not a neutral media param: forwarded
   // verbatim for the platform to validate + dedup. `!= null` drops an explicit JS `null`.
   if (input.idempotencyKey != null) body.idempotencyKey = input.idempotencyKey;
-  applyMediaParams(body, input as unknown as Record<string, unknown>, VIDEO_PARAM_KEYS);
+  applyMediaParams(
+    body,
+    input as unknown as Record<string, unknown>,
+    VIDEO_PARAM_KEYS,
+  );
 
   // Submit through the capability router — the video capability's adapter always
   // returns a queue handle (camelCase requestId/statusUrl/responseUrl), never the
@@ -935,9 +1187,10 @@ export async function createVideo(
     const res = await transport.fetch(responseUrl, { method: "GET" });
     if (res.ok) {
       const raw = (await res.json()) as RawVideoResult;
-      // Thread the submit handle's SAP-2576 cost + resolvedModel onto the polled result —
-      // the queue passthrough (this `raw`) carries neither.
-      if (raw.video?.url) return withDispatchCost(mapVideoResult(raw), handle);
+      // Thread the submit handle's SAP-2576 cost + resolvedModel and E5 preferSatisfied onto
+      // the polled result — the queue passthrough (this `raw`) carries none of them.
+      if (raw.video?.url)
+        return withDispatchMetadata(mapVideoResult(raw), handle);
     } else {
       // Still generating, or a transient error. Drain the unread body so the
       // connection can be reused, then keep polling — `timeoutMs` is the backstop
@@ -971,6 +1224,11 @@ export interface VideoLaunchHandle extends DispatchHandle {
    * settled charge out-of-band via `cost.reference`. Also merged onto the {@link wait} result.
    */
   cost?: MediaCostEnvelope;
+  /**
+   * E5 (SAP-2580): present ONLY when `select.prefer` was requested — `true` when the preference was
+   * honored, `false` when it degraded to catalog order. Also merged onto the {@link wait} result.
+   */
+  preferSatisfied?: boolean;
   /** Poll to completion and resolve the full result. */
   wait(opts?: {
     timeoutMs?: number;
@@ -1068,8 +1326,8 @@ export function toVideoResumePayload(
  * dispatch handle (for workflow pause/resume) instead of polling to completion
  * itself. Workflow resume is driven by forwarding the engine's resume token via
  * {@link workflowResumeHeaders} so the service resumes the paused step on
- * completion. `model` resolves the same way as `createVideo` (semantic alias or
- * raw provider id, defaulted when omitted). The poll stays unchanged: `wait()`
+ * completion. `model` resolves the same way as `createVideo` (a public semantic
+ * alias, defaulted or selected when omitted). The poll stays unchanged: `wait()`
  * reads the gateway's queue passthrough, which still returns the provider's raw
  * snake_case result.
  */
@@ -1084,11 +1342,17 @@ export async function launchVideo(
   // (unlike launchImage, which sets `dispatch: 'async'`).
   const body: Record<string, unknown> = { prompt: input.prompt };
   if (input.model != null) body.model = input.model;
+  // E5 (SAP-2580) selection directives — see createImage.
+  if (input.select != null) body.select = input.select;
   if (input.storage) body.storage = input.storage;
   // Request-level control (like `model`/`storage`), not a neutral media param: forwarded
   // verbatim for the platform to validate + dedup. `!= null` drops an explicit JS `null`.
   if (input.idempotencyKey != null) body.idempotencyKey = input.idempotencyKey;
-  applyMediaParams(body, input as unknown as Record<string, unknown>, VIDEO_PARAM_KEYS);
+  applyMediaParams(
+    body,
+    input as unknown as Record<string, unknown>,
+    VIDEO_PARAM_KEYS,
+  );
 
   const handle = await capabilityCall<VideoDispatchResponse>(
     "content.generation.video",
@@ -1124,9 +1388,10 @@ export async function launchVideo(
       const res = await transport.fetch(responseUrl, { method: "GET" });
       if (res.ok) {
         const raw = (await res.json()) as RawVideoResult;
-        // Thread the submit handle's SAP-2576 cost + resolvedModel onto the polled result.
+        // Thread the submit handle's SAP-2576 cost + resolvedModel and E5 preferSatisfied
+        // onto the polled result.
         if (raw.video?.url)
-          return withDispatchCost(mapVideoResult(raw), handle);
+          return withDispatchMetadata(mapVideoResult(raw), handle);
       } else {
         try {
           await res.body?.cancel();
@@ -1143,10 +1408,14 @@ export async function launchVideo(
 
   return {
     requestId,
-    // SAP-2576: surface the submit handle's resolvedModel + cost envelope on the handle too,
-    // so a caller reading them off `launch()` needn't await `wait()`.
+    // SAP-2576 + E5: surface the submit handle's resolvedModel, cost envelope, and
+    // preferSatisfied on the handle too, so a caller reading them off `launch()` needn't
+    // await `wait()`.
     resolvedModel: handle.resolvedModel,
     ...(handle.cost !== undefined && { cost: handle.cost }),
+    ...(handle.preferSatisfied !== undefined && {
+      preferSatisfied: handle.preferSatisfied,
+    }),
     dispatch: { correlationId: requestId, resultSignal: VIDEO_RESULT_SIGNAL },
     wait,
   };

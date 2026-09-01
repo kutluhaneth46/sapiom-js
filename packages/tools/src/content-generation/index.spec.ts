@@ -11,11 +11,18 @@ import {
   toImageResumePayload,
   VIDEO_RESULT_SIGNAL,
   IMAGE_RESULT_SIGNAL,
+  IMAGE_MODELS,
+  VIDEO_MODEL_ALIASES,
   ContentGenerationHttpError,
 } from "./index.js";
 import type {
   ImageGenerationResult,
   VideoGenerationResult,
+  ImageSelect,
+  VideoSelect,
+  MediaSelect,
+  ImageCreateInput,
+  VideoCreateInput,
 } from "./index.js";
 
 // ---------------------------------------------------------------------------
@@ -102,7 +109,7 @@ describe("contentGeneration.images.create()", () => {
     });
   });
 
-  it("forwards numImages (camelCase), `params` as a nested field, and an explicit model verbatim", async () => {
+  it("forwards numImages (camelCase), `params` as a nested field, and an explicit alias model verbatim", async () => {
     const { transport, calls } = makeTransport([
       () => jsonResponse({ images: [] }),
     ]);
@@ -112,19 +119,20 @@ describe("contentGeneration.images.create()", () => {
         prompt: "x",
         numImages: 3,
         params: { image_size: "square", seed: 42 },
-        model: "fal-ai/flux/dev",
+        model: "flux-standard",
       },
       transport,
       BASE,
     );
 
-    // model rides in the body (the adapter turns it into the provider path), and
-    // params is nested — not spread — so the adapter forwards it verbatim.
+    // model rides in the body as the caller's PUBLIC alias (the router resolves it to the
+    // provider path server-side — an alias is the supported input), and params is nested —
+    // not spread — so the adapter forwards it verbatim.
     expect(JSON.parse(calls[0]!.init.body as string)).toEqual({
       prompt: "x",
       numImages: 3,
       params: { image_size: "square", seed: 42 },
-      model: "fal-ai/flux/dev",
+      model: "flux-standard",
     });
   });
 
@@ -1070,7 +1078,7 @@ describe("contentGeneration.images.launch()", () => {
         prompt: "x",
         numImages: 2,
         params: { image_size: "square" },
-        model: "fal-ai/flux/dev",
+        model: "flux-standard",
         storage: { visibility: "private" },
       },
       transport,
@@ -1082,7 +1090,7 @@ describe("contentGeneration.images.launch()", () => {
       dispatch: "async",
       numImages: 2,
       params: { image_size: "square" },
-      model: "fal-ai/flux/dev",
+      model: "flux-standard",
       storage: { visibility: "private" },
     });
   });
@@ -1433,7 +1441,9 @@ describe("neutral params (E4/SAP-2579)", () => {
   });
 
   it("keeps the deprecated numImages/params working (forwarded verbatim)", async () => {
-    const { transport, calls } = makeTransport([() => jsonResponse({ images: [] })]);
+    const { transport, calls } = makeTransport([
+      () => jsonResponse({ images: [] }),
+    ]);
 
     await createImage(
       { prompt: "x", numImages: 4, params: { image_size: "square" } },
@@ -1449,7 +1459,9 @@ describe("neutral params (E4/SAP-2579)", () => {
   });
 
   it("drops an explicit null neutral field (JS caller) instead of sending it", async () => {
-    const { transport, calls } = makeTransport([() => jsonResponse({ images: [] })]);
+    const { transport, calls } = makeTransport([
+      () => jsonResponse({ images: [] }),
+    ]);
 
     await createImage(
       {
@@ -1466,6 +1478,290 @@ describe("neutral params (E4/SAP-2579)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Public model aliases (SAP-2582) + E5 (SAP-2580) capability-based selection. The SDK
+// is a verbatim passthrough on both: it forwards the caller's model untouched (no local
+// resolution, no local validation) and rides `select` on the body only when set. The
+// platform catalog is the authority on which selectors it accepts.
+// ---------------------------------------------------------------------------
+
+describe("public model aliases (SAP-2582)", () => {
+  it("createImage forwards a public image alias unchanged — no local resolution", async () => {
+    const { transport, calls } = makeTransport([
+      () => jsonResponse({ images: [], resolvedModel: "nano-banana-pro" }),
+    ]);
+
+    const out = await createImage(
+      { prompt: "x", model: IMAGE_MODELS.nanoBananaPro },
+      transport,
+      BASE,
+    );
+
+    // The alias rides the body verbatim — never expanded to a provider id, never a /run/ URL.
+    expect(JSON.parse(calls[0]!.init.body as string)).toEqual({
+      prompt: "x",
+      model: "nano-banana-pro",
+    });
+    expect(calls.some((c) => c.url.includes("/run/"))).toBe(false);
+    expect(out.resolvedModel).toBe("nano-banana-pro");
+  });
+
+  it("IMAGE_MODELS carries the public aliases, no provider ids", () => {
+    // A `/` would mean a raw provider id leaked back onto the public surface.
+    for (const alias of Object.values(IMAGE_MODELS)) {
+      expect(alias).not.toContain("/");
+    }
+    expect(IMAGE_MODELS.fluxFast).toBe("flux-fast");
+  });
+
+  it("VIDEO_MODEL_ALIASES carries the public aliases, no provider ids", () => {
+    for (const alias of Object.values(VIDEO_MODEL_ALIASES)) {
+      expect(alias).not.toContain("/");
+    }
+    expect(VIDEO_MODEL_ALIASES.veo3Fast).toBe("veo3-fast");
+  });
+
+  it("still forwards a deprecated raw provider id untouched — no client-side rejection", async () => {
+    const { transport, calls } = makeTransport([
+      () => jsonResponse({ images: [], resolvedModel: "flux-standard" }),
+    ]);
+
+    // A raw id is deprecated, not refused: it still routes, so this must stay non-breaking.
+    // The SDK adds no local check either way — one would also block an alias the server knows
+    // but this SDK does not yet list. What the platform accepts is the platform's call.
+    await createImage(
+      { prompt: "x", model: "fal-ai/flux/dev" },
+      transport,
+      BASE,
+    );
+
+    expect(JSON.parse(calls[0]!.init.body as string)).toEqual({
+      prompt: "x",
+      model: "fal-ai/flux/dev",
+    });
+  });
+});
+
+describe("capability-based selection (E5/SAP-2580)", () => {
+  it("scopes `requires` to video — any `requires` is a compile error on the image path", () => {
+    // Compile-time guard, enforced by `tsc --noEmit`: if `requires` ever becomes settable on the
+    // image type, these `@ts-expect-error`s go unused and the typecheck fails. No image model
+    // declares ANY capability tag, so asking must fail at the keyboard, not after a round-trip.
+    // @ts-expect-error — `lipsync` is video-only; images accept no `requires`.
+    const videoOnlyTag: ImageSelect = { requires: ["lipsync"] };
+    // @ts-expect-error — images accept no `requires` at all, not even `referenceImage`.
+    const referenceTag: ImageSelect = { requires: ["referenceImage"] };
+    void videoOnlyTag;
+    void referenceTag;
+
+    // What each media type DOES accept.
+    const image: ImageSelect = { prefer: "cheapest" };
+    const video: VideoSelect = {
+      requires: ["audio", "lipsync", "referenceImage"],
+      prefer: "cheapest",
+    };
+    expect(image.prefer).toBe("cheapest");
+    expect(video.requires).toHaveLength(3);
+  });
+
+  it("rejects `requires` on images even when it is not an inline literal", () => {
+    // The case a `requires?: never` PROHIBITION catches and an omitted property does not. An
+    // omitted `requires` leans on excess-property checking, which only fires on object literals —
+    // a pre-built object carrying `prefer` alongside `requires` shares a property (so weak-type
+    // detection is satisfied too) and slipped through to a runtime rejection. `never` makes it a
+    // direct type error on the property, however the value was assembled.
+    const inferred = { prefer: "cheapest" as const, requires: ["lipsync"] };
+    // @ts-expect-error — `requires` is prohibited on the image path, literal or not.
+    const asImage: ImageSelect = inferred;
+    void asImage;
+
+    // A properly typed VideoSelect is rejected on the image path too — it is the property that is
+    // prohibited, not merely a loosely-inferred one.
+    const built: VideoSelect = { prefer: "cheapest", requires: ["lipsync"] };
+    // @ts-expect-error — a VideoSelect is deliberately NOT assignable to ImageSelect.
+    const videoAsImage: ImageSelect = built;
+    void videoAsImage;
+
+    // …and stays usable where it belongs.
+    expect(built.requires).toEqual(["lipsync"]);
+  });
+
+  it("`MediaSelect` is the shared shape — accepted by BOTH image and video inputs", () => {
+    // The generic-over-both claim its JSDoc makes, held to by the compiler. `MediaSelect` is the
+    // shared shape rather than `ImageSelect | VideoSelect`: a union would carry `VideoSelect`,
+    // which is deliberately NOT assignable to `ImageSelect` now that images prohibit `requires`.
+    const shared = {} as MediaSelect;
+    const imageInput: ImageCreateInput = { prompt: "x", select: shared };
+    const videoInput: VideoCreateInput = { prompt: "x", select: shared };
+    const asImage: ImageSelect = shared;
+    const asVideo: VideoSelect = shared;
+    void asImage;
+    void asVideo;
+    expect(imageInput.prompt).toBe("x");
+    expect(videoInput.prompt).toBe("x");
+  });
+
+  it("createImage rides `select` on the body when set", async () => {
+    const { transport, calls } = makeTransport([
+      () =>
+        jsonResponse({
+          images: [],
+          resolvedModel: "flux-fast",
+          preferSatisfied: true,
+        }),
+    ]);
+
+    const out = await createImage(
+      { prompt: "x", select: { prefer: "cheapest" } },
+      transport,
+      BASE,
+    );
+
+    // `select` is forwarded as a nested object verbatim — the router validates it. No `model`:
+    // `select` only steers when the caller left the choice to the platform. `prefer` is the whole
+    // image surface; `requires` is video-only (no image model declares a capability tag).
+    expect(JSON.parse(calls[0]!.init.body as string)).toEqual({
+      prompt: "x",
+      select: { prefer: "cheapest" },
+    });
+    // The router's echo of which model served it, and whether the preference was honored.
+    expect(out.resolvedModel).toBe("flux-fast");
+    expect(out.preferSatisfied).toBe(true);
+  });
+
+  it("createImage omits `select` when it is not set", async () => {
+    const { transport, calls } = makeTransport([
+      () => jsonResponse({ images: [], resolvedModel: "flux-fast" }),
+    ]);
+
+    const out = await createImage({ prompt: "x" }, transport, BASE);
+
+    const body = JSON.parse(calls[0]!.init.body as string);
+    expect(body).toEqual({ prompt: "x" });
+    expect("select" in body).toBe(false);
+    // Absent, not `false` — no preference was asked for, so none was degraded.
+    expect(out.preferSatisfied).toBeUndefined();
+  });
+
+  it("treats an explicit null `select` (JS caller bypassing types) as absent", async () => {
+    const { transport, calls } = makeTransport([
+      () => jsonResponse({ images: [] }),
+    ]);
+
+    await createImage(
+      { prompt: "x", select: null as unknown as undefined },
+      transport,
+      BASE,
+    );
+
+    expect(JSON.parse(calls[0]!.init.body as string)).toEqual({ prompt: "x" });
+  });
+
+  it("launchImage rides `select` alongside dispatch:'async' and surfaces preferSatisfied on the handle", async () => {
+    const { transport, calls } = makeTransport([
+      (c) =>
+        c.init.method === "POST"
+          ? jsonResponse({
+              requestId: "i",
+              responseUrl: `${BASE}/queue/i`,
+              resolvedModel: "flux-fast",
+              preferSatisfied: false,
+            })
+          : null,
+      (c) =>
+        c.init.method === "GET"
+          ? jsonResponse({ images: [{ url: "u" }], resolvedModel: "ignored" })
+          : null,
+    ]);
+
+    const handle = await launchImage(
+      { prompt: "x", select: { prefer: "cheapest" } },
+      transport,
+      BASE,
+    );
+
+    expect(JSON.parse(calls[0]!.init.body as string)).toEqual({
+      prompt: "x",
+      dispatch: "async",
+      select: { prefer: "cheapest" },
+    });
+    // Resolved at SUBMIT — the poll target carries neither, so both ride the handle and are
+    // threaded onto the awaited result.
+    expect(handle.preferSatisfied).toBe(false);
+    const result = await handle.wait({ pollMs: 1 });
+    expect(result.resolvedModel).toBe("flux-fast");
+    expect(result.preferSatisfied).toBe(false);
+  });
+
+  it("createVideo rides `select` on the body and threads preferSatisfied from the submit handle", async () => {
+    const { transport, calls } = makeTransport([
+      (c) =>
+        c.init.method === "POST"
+          ? jsonResponse({
+              requestId: "v",
+              responseUrl: `${BASE}/queue/v`,
+              resolvedModel: "seedance-fast",
+              preferSatisfied: true,
+            })
+          : null,
+      (c) =>
+        c.init.method === "GET"
+          ? jsonResponse({ video: { url: "https://media/v.mp4" } })
+          : null,
+    ]);
+
+    const out = await createVideo(
+      {
+        prompt: "a wave",
+        select: { requires: ["lipsync"], prefer: "cheapest" },
+        pollIntervalMs: 1,
+      },
+      transport,
+      BASE,
+    );
+
+    expect(JSON.parse(calls[0]!.init.body as string)).toEqual({
+      prompt: "a wave",
+      select: { requires: ["lipsync"], prefer: "cheapest" },
+    });
+    expect(out.resolvedModel).toBe("seedance-fast");
+    expect(out.preferSatisfied).toBe(true);
+  });
+
+  it("launchVideo rides `select` and omits preferSatisfied when the submit handle has none", async () => {
+    const { transport, calls } = makeTransport([
+      (c) =>
+        c.init.method === "POST"
+          ? jsonResponse({
+              requestId: "v",
+              responseUrl: `${BASE}/queue/v`,
+              resolvedModel: "veo3-fast",
+            })
+          : null,
+      (c) =>
+        c.init.method === "GET"
+          ? jsonResponse({ video: { url: "https://media/v.mp4" } })
+          : null,
+    ]);
+
+    const handle = await launchVideo(
+      { prompt: "x", select: { requires: ["audio"] } },
+      transport,
+      BASE,
+    );
+
+    expect(JSON.parse(calls[0]!.init.body as string)).toEqual({
+      prompt: "x",
+      select: { requires: ["audio"] },
+    });
+    // Omit-don't-fabricate: no preference was requested, so neither the handle nor the result
+    // carries the key at all (a fabricated `false` would report a degrade that never happened).
+    expect("preferSatisfied" in handle).toBe(false);
+    const result = await handle.wait({ pollMs: 1 });
+    expect("preferSatisfied" in result).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // E7 phase 3 (SAP-2578) — caller-supplied idempotencyKey reaches the request
 // body (cross-call dedup lives on the platform; the SDK is a verbatim passthrough,
 // so the only contract to prove is that the allow-list doesn't drop the field).
@@ -1473,7 +1769,9 @@ describe("neutral params (E4/SAP-2579)", () => {
 
 describe("idempotencyKey passthrough (E7 phase 3 / SAP-2578)", () => {
   it("createImage forwards idempotencyKey as a top-level body field", async () => {
-    const { transport, calls } = makeTransport([() => jsonResponse({ images: [] })]);
+    const { transport, calls } = makeTransport([
+      () => jsonResponse({ images: [] }),
+    ]);
 
     await createImage(
       { prompt: "x", idempotencyKey: "dedupe-abc-123" },
@@ -1544,7 +1842,9 @@ describe("idempotencyKey passthrough (E7 phase 3 / SAP-2578)", () => {
   });
 
   it("drops an explicit null idempotencyKey (JS caller) instead of sending it", async () => {
-    const { transport, calls } = makeTransport([() => jsonResponse({ images: [] })]);
+    const { transport, calls } = makeTransport([
+      () => jsonResponse({ images: [] }),
+    ]);
 
     await createImage(
       { prompt: "x", idempotencyKey: null as unknown as undefined },
