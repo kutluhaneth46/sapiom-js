@@ -20,6 +20,10 @@ out.images[0].url; // provider-hosted URL (may be short-lived / unauthenticated)
 
 Ambient import works too: `import { contentGeneration } from "@sapiom/tools"`.
 
+Both media types also have a **dispatchable** counterpart that returns a handle
+instead of holding the request open — [`images.launch`](#dispatchable-image-imageslaunch)
+and [`video.launch`](#dispatchable-video-videolaunch).
+
 ## The optional `storage` param
 
 Pass `storage` and each generated output is persisted to your tenant's file
@@ -43,6 +47,131 @@ for (const img of out.images ?? []) {
 
 Persisting is best-effort per image: if one fails, that image carries a
 `storageError` string instead of a `fileId` while the others still succeed.
+
+## Dispatchable image: `images.launch`
+
+`images.launch` is the dispatchable surface for image generation. It submits the
+job and returns a handle as soon as the job is enqueued, so you decide when — or
+whether — to wait for the result.
+
+Prefer `launch` over `create` when:
+
+- **the generation is long.** The routed sync `images.create` holds the request
+  open for the whole generate+store, so it is bounded by Core's 30s router cap —
+  the failure mode a fan-out of concurrent `create` calls hits. The `launch`
+  submit is a quick enqueue and never meets that cap.
+- **the call is a workflow step that should not hold a socket.** Pause the step
+  on the handle and the engine resumes it from the completion webhook instead of
+  running a step that sits waiting.
+
+`create` stays the simplest thing that works for a short generation you want
+inline in one call.
+
+Awaiting the result inline — the same result as `images.create`, but without the
+sync path's held-open request:
+
+```typescript
+import { createClient } from "@sapiom/tools";
+const sapiom = createClient({ apiKey: process.env.SAPIOM_API_KEY });
+
+const handle = await sapiom.contentGeneration.images.launch({
+  prompt: "a red bicycle",
+  storage: { visibility: "private" }, // optional — persist the outputs
+});
+const out = await handle.wait(); // polls until ready
+out.images?.[0]?.fileId; // + .downloadUrl for a ready-to-use URL
+```
+
+To suspend an agent step until the image is ready instead, pause on the handle —
+see [`IMAGE_RESULT_SIGNAL`](#image_result_signal) below.
+
+The handle is `{ requestId, resolvedModel, cost?, preferSatisfied?, dispatch,
+wait() }`. `requestId` is the queue request id, and it is also the
+`dispatch.correlationId` a workflow resumes on. `resolvedModel`, `cost`, and
+`preferSatisfied` resolve at submit, so a caller can read what ran and what it
+was quoted off the handle without awaiting `wait()`; `wait()` merges the same
+values onto its result.
+
+`handle.wait()` accepts `{ timeoutMs, pollMs }` — 2 min and 2s by default. Unlike
+video, `ImageCreateInput` has no `timeoutMs` / `pollIntervalMs` fields, so those
+are the only defaults and any override goes on the `wait()` call.
+
+On the `wait()` path a terminal provider failure is not currently distinguishable
+from a slow one: a non-OK poll is treated as "still generating", so a failed job
+surfaces as the deadline `Error` (`Image generation did not complete within
+…ms`) rather than a failure-specific error.
+
+### `IMAGE_RESULT_SIGNAL`
+
+The capability-stable signal constant (`"contentGeneration.images.result"`),
+fired when the job reaches a terminal state. Declare it in the **pausing** step's
+static `pause` edge — `signal` and `resumeStep` are both required — so the engine
+knows which signal to listen for and which step to resume with the result:
+
+```typescript
+import { defineStep, pauseUntilSignal, terminate } from "@sapiom/agent";
+import { IMAGE_RESULT_SIGNAL, type ImageResultPayload } from "@sapiom/tools";
+
+// The step that pauses declares the edge. `pause` is what gates this `run`'s
+// return type, so it belongs here — not on the step being resumed.
+const renderImage = defineStep({
+  name: "renderImage",
+  pause: { signal: IMAGE_RESULT_SIGNAL, resumeStep: "collectImage" },
+  async run(_input: unknown, ctx) {
+    const handle = await ctx.sapiom.contentGeneration.images.launch({
+      prompt: "a red bicycle",
+      storage: { visibility: "private" },
+    });
+    return pauseUntilSignal(handle, { resumeStep: "collectImage" });
+  },
+});
+
+// The resume target declares no `pause` — it receives the payload as its input.
+const collectImage = defineStep({
+  name: "collectImage",
+  terminal: true,
+  async run(result: ImageResultPayload, ctx) {
+    // `fileId` is the persisted file, if storage was requested.
+    return terminate({ fileId: result.outputs[0]?.fileId });
+  },
+});
+```
+
+The completion→resume path is media-agnostic: the engine reads the signal name
+off the paused step row and matches the resume on `correlationId` (the launch
+`requestId`), so images resume through the exact same rail as video.
+
+`defineStep`, `pauseUntilSignal`, and `terminate` come from `@sapiom/agent`; the
+signal constant and the payload type come from `@sapiom/tools`.
+
+### `ImageResultPayload`
+
+The shape delivered to a step resumed from `pauseUntilSignal` — the engine's
+generic `outputs[]` shape, identical to the one a resumed video step receives,
+with one entry per generated image (a `count: 4` launch resumes with four):
+
+```typescript
+interface ImageResultPayload {
+  // Generation metadata, so a step that bills AFTER the generation can still
+  // read what ran and what it cost (the launch handle is gone by resume time):
+  resolvedModel?: string; // the alias that served it (omitted for uncataloged models)
+  cost?: MediaCostEnvelope; // estimateUsd inline; settled charge via cost.reference
+  outputs: Array<{
+    fileId?: string; // durable ref — present when storage was requested and succeeded
+    downloadUrl?: string; // ready-to-use short-lived URL (may have expired by resume)
+    downloadUrlExpiresAt?: string; // ISO expiry of downloadUrl, when present
+    downloadUrlUnavailable?: boolean; // fileId is set but no URL could be minted — re-fetch from fileId
+    storageError?: string; // present when storage was requested but failed
+  }>;
+}
+```
+
+The per-image `width` / `height` / `url` fields of `images.create` are not on the
+resume payload — `fileId` is the durable handle to re-fetch from.
+
+Import `ImageResultPayload` from `@sapiom/tools` to annotate the resumed step's
+`input` type; import `toImageResumePayload` to map a live `ImageGenerationResult`
+to this shape when wiring local tests.
 
 ## Video (async)
 
@@ -75,28 +204,23 @@ it isn't ready in time, default 5 min). The returned `video` is
 job and returns a handle immediately, so you decide when (or whether) to wait for
 the result.
 
+Awaiting the result inline — the same result as `video.create`, but with the
+dispatchable handle:
+
 ```typescript
-import { createClient, VIDEO_RESULT_SIGNAL } from "@sapiom/tools";
+import { createClient } from "@sapiom/tools";
 const sapiom = createClient({ apiKey: process.env.SAPIOM_API_KEY });
 
-// Option A — block inline (same result as `video.create`, useful when you want
-// a handle for tracking but still `await` in the same step):
 const handle = await sapiom.contentGeneration.video.launch({
   prompt: "a calm ocean wave at sunset",
   storage: { visibility: "private" }, // optional — persist the output
 });
 const out = await handle.wait(); // polls until ready
 out.video?.fileId; // + out.video?.downloadUrl for a ready-to-use URL
-
-// Option B — suspend an agent step until the video is ready, then resume:
-// (Inside a Sapiom agent step; the orchestration engine handles the rest.)
-const handle = await sapiom.contentGeneration.video.launch({
-  prompt: "a calm ocean wave at sunset",
-});
-return pauseUntilSignal(handle, { resumeStep: finalize });
-// `finalize` receives a VideoResultPayload: the outputs plus the generation's
-// `resolvedModel` / `cost` metadata (see the interface below).
 ```
+
+To suspend an agent step until the video is ready instead, pause on the handle —
+see [`VIDEO_RESULT_SIGNAL`](#video_result_signal) below.
 
 `handle.wait()` accepts the same `timeoutMs` and `pollMs` overrides as
 `video.create`'s input fields. `input.timeoutMs` / `input.pollIntervalMs` are the
@@ -104,18 +228,35 @@ defaults when `wait()` is called without arguments, so the two APIs stay in sync
 
 ### `VIDEO_RESULT_SIGNAL`
 
-The capability-stable signal constant — use it in the static `pause: { signal }`
-declaration on an agent step so the engine knows which signal to listen for:
+The capability-stable signal constant — declare it in the **pausing** step's
+static `pause` edge (`signal` and `resumeStep` are both required) so the engine
+knows which signal to listen for and which step to resume with the result:
 
 ```typescript
-import { VIDEO_RESULT_SIGNAL } from "@sapiom/tools";
+import { defineStep, pauseUntilSignal, terminate } from "@sapiom/agent";
+import { VIDEO_RESULT_SIGNAL, type VideoResultPayload } from "@sapiom/tools";
 
+// The step that pauses declares the edge. `pause` is what gates this `run`'s
+// return type, so it belongs here — not on the step being resumed.
+const renderClip = defineStep({
+  name: "renderClip",
+  pause: { signal: VIDEO_RESULT_SIGNAL, resumeStep: "finalize" },
+  async run(_input: unknown, ctx) {
+    const handle = await ctx.sapiom.contentGeneration.video.launch({
+      prompt: "a calm ocean wave at sunset",
+      storage: { visibility: "private" },
+    });
+    return pauseUntilSignal(handle, { resumeStep: "finalize" });
+  },
+});
+
+// The resume target declares no `pause` — it receives the payload as its input.
 const finalize = defineStep({
   name: "finalize",
-  pause: { signal: VIDEO_RESULT_SIGNAL },
   terminal: true,
   async run(result: VideoResultPayload, ctx) {
-    result.outputs[0]?.fileId; // the persisted file, if storage was requested
+    // `fileId` is the persisted file, if storage was requested.
+    return terminate({ fileId: result.outputs[0]?.fileId });
   },
 });
 ```
