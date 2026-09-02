@@ -96,17 +96,20 @@ values onto its result.
 video, `ImageCreateInput` has no `timeoutMs` / `pollIntervalMs` fields, so those
 are the only defaults and any override goes on the `wait()` call.
 
-On the `wait()` path a terminal provider failure is not currently distinguishable
-from a slow one: a non-OK poll is treated as "still generating", so a failed job
-surfaces as the deadline `Error` (`Image generation did not complete within
-…ms`) rather than a failure-specific error.
+On the `wait()` path a terminal provider failure throws
+`ContentGenerationFailedError` as soon as the job fails, carrying `requestId` and
+the provider's own `providerError` — it does not run out the clock first. The
+deadline `Error` (`Image generation did not complete within …ms`) now means only
+what it says: the job was still running when you stopped waiting.
 
 ### `IMAGE_RESULT_SIGNAL`
 
 The capability-stable signal constant (`"contentGeneration.images.result"`),
-fired when the job reaches a terminal state. Declare it in the **pausing** step's
-static `pause` edge — `signal` and `resumeStep` are both required — so the engine
-knows which signal to listen for and which step to resume with the result:
+fired when the job reaches a terminal state — **either** outcome, ready or failed.
+The payload carries which one it was (`generationError` on a failure), so the
+resumed step always runs and branches. Declare it in the **pausing** step's static
+`pause` edge — `signal` and `resumeStep` are both required — so the engine knows
+which signal to listen for and which step to resume with the result:
 
 ```typescript
 import { defineStep, pauseUntilSignal, terminate } from "@sapiom/agent";
@@ -161,13 +164,19 @@ interface ImageResultPayload {
     downloadUrl?: string; // ready-to-use short-lived URL (may have expired by resume)
     downloadUrlExpiresAt?: string; // ISO expiry of downloadUrl, when present
     downloadUrlUnavailable?: boolean; // fileId is set but no URL could be minted — re-fetch from fileId
-    storageError?: string; // present when storage was requested but failed
+    storageError?: string; // the asset WAS generated, but persisting it failed
+    generationError?: string; // the generation itself failed — no asset ever existed
   }>;
 }
 ```
 
 The per-image `width` / `height` / `url` fields of `images.create` are not on the
 resume payload — `fileId` is the durable handle to re-fetch from.
+
+`storageError` and `generationError` are different failures, and the platform sends
+one or the other, never both — see [the video payload](#videoresultpayload) for the
+branch that reads correctly on both sides of the gateway deploy that starts emitting
+`generationError`.
 
 Import `ImageResultPayload` from `@sapiom/tools` to annotate the resumed step's
 `input` type; import `toImageResumePayload` to map a live `ImageGenerationResult`
@@ -230,7 +239,10 @@ defaults when `wait()` is called without arguments, so the two APIs stay in sync
 
 The capability-stable signal constant — declare it in the **pausing** step's
 static `pause` edge (`signal` and `resumeStep` are both required) so the engine
-knows which signal to listen for and which step to resume with the result:
+knows which signal to listen for and which step to resume with the result. It
+fires on **either** terminal outcome, ready or failed, and the payload carries
+which one it was (`generationError` on a failure), so the resumed step always
+runs and branches:
 
 ```typescript
 import { defineStep, pauseUntilSignal, terminate } from "@sapiom/agent";
@@ -276,14 +288,40 @@ interface VideoResultPayload {
     downloadUrl?: string; // ready-to-use short-lived URL (may have expired by resume)
     downloadUrlExpiresAt?: string; // ISO expiry of downloadUrl, when present
     downloadUrlUnavailable?: boolean; // fileId is set but no URL could be minted — re-fetch from fileId
-    storageError?: string; // present when storage was requested but failed
+    storageError?: string; // the asset WAS generated, but persisting it failed
+    generationError?: string; // the generation itself failed — no asset ever existed
   }>;
 }
 ```
 
+[`ImageResultPayload`](#imageresultpayload) is the same shape — `images.launch` resumes
+through the same rail.
+
+`storageError` and `generationError` are different failures, and the platform sends one or
+the other, never both. Branch on `generationError` for "the model failed" — retrying the
+same prompt will probably fail the same way — and on `storageError` for "the model
+succeeded but we couldn't keep the result".
+
+```typescript
+const out = result.outputs[0];
+if (out?.generationError)
+  throw new Error(`generation failed: ${out.generationError}`);
+if (out?.storageError)
+  throw new Error(`could not persist the output: ${out.storageError}`);
+```
+
+`generationError` is populated by the platform, so it appears once the gateway change that
+emits it is deployed. Until then a terminal generation failure still arrives on
+`storageError`, saying the opposite of what happened — which is the reason for the split.
+Checking `generationError` first and falling back to `storageError`, as above, reads
+correctly on both sides of that deploy.
+
 Import `VideoResultPayload` from `@sapiom/tools` to annotate the resumed step's
 `input` type; import `toVideoResumePayload` to map a live `VideoGenerationResult`
-to this shape when wiring local tests.
+to this shape when wiring local tests. The mappers carry no `generationError`: a live
+`wait()` throws `ContentGenerationFailedError` on a terminal failure rather than
+returning one, so a `VideoGenerationResult` has no failure to map. Build that payload
+literally when you want to exercise the branch.
 
 ## Input params
 
@@ -465,4 +503,9 @@ name the specific `VideoSelect` when you need `requires`.
 
 - **Failed requests throw `ContentGenerationHttpError`** (carries `status` +
   parsed `body`), exported from `@sapiom/tools`.
+- **A failed _generation_ throws `ContentGenerationFailedError`** from `wait()` (and
+  from `video.create`), as soon as the job terminally fails rather than at `timeoutMs`.
+  It carries `requestId` and the provider's own `providerError`. A plain `Error`
+  (`"… did not complete within …ms"`) now means only what it says: the job was still
+  running when you stopped waiting.
 - **`storage` is reserved** — a same-named field in `params` is ignored.
