@@ -6,6 +6,7 @@ import type {
   StudioCurrentWorkspaceResponse,
   StudioWorkspaceSelection,
 } from "@shared/agent-map";
+import { parseMapChangeProposal } from "@shared/agent-map-codec";
 import type { WorkspaceScopeSummary } from "@shared/system-graph";
 
 import { isWithinDir, stripTrailingSep } from "./paths";
@@ -154,12 +155,35 @@ function parseWorkspace(
   return value as unknown as AgentMapWorkspaceState;
 }
 
+function parseProposal(
+  value: unknown,
+  projectId: string,
+  activeProposalId: string | null,
+): AgentMapWorkspaceResponse["proposal"] | undefined {
+  if (value === null) return activeProposalId === null ? null : undefined;
+  if (activeProposalId === null) return undefined;
+  try {
+    return parseMapChangeProposal(value, projectId, activeProposalId);
+  } catch {
+    return undefined;
+  }
+}
+
 /** Strictly validates the path-free Agent Map HTTP boundary. */
 export function parseAgentMapWorkspaceResponse(
   value: unknown,
   expectedProjectId?: string,
 ): AgentMapWorkspaceResponse {
-  if (!isRecord(value) || !hasExactKeys(value, ["project", "workspace"])) {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, [
+      "schemaVersion",
+      "project",
+      "workspace",
+      "proposal",
+    ]) ||
+    value.schemaVersion !== 1
+  ) {
     throw new Error("Invalid Agent Map workspace response");
   }
   const project = parseProject(value.project);
@@ -171,7 +195,14 @@ export function parseAgentMapWorkspaceResponse(
   }
   const workspace = parseWorkspace(value.workspace, project.projectId);
   if (!workspace) throw new Error("Invalid Agent Map workspace response");
-  return { project, workspace };
+  const proposal = parseProposal(
+    value.proposal,
+    project.projectId,
+    workspace.activeProposalId,
+  );
+  if (proposal === undefined)
+    throw new Error("Invalid Agent Map workspace response");
+  return { schemaVersion: 1, project, workspace, proposal };
 }
 
 function parseSelection(
@@ -266,13 +297,12 @@ export function mostSpecificStudioScope(
   const projectIds = new Set(projects.map((project) => project.projectId));
   return (
     scopes
-      .filter(
-        (scope): scope is WorkspaceScopeSummary & { projectId: string } =>
-          Boolean(
-            scope.projectId &&
-              projectIds.has(scope.projectId) &&
-              isWithinDir(scope.cwd, targetPath),
-          ),
+      .filter((scope): scope is WorkspaceScopeSummary & { projectId: string } =>
+        Boolean(
+          scope.projectId &&
+          projectIds.has(scope.projectId) &&
+          isWithinDir(scope.cwd, targetPath),
+        ),
       )
       .map((scope) => ({
         scope,

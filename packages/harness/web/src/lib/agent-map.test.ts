@@ -13,6 +13,7 @@ const timestamp = "2026-09-01T12:00:00.000Z";
 
 function validResponse(): unknown {
   return {
+    schemaVersion: 1,
     project: {
       projectId,
       identityVersion: 1,
@@ -36,6 +37,7 @@ function validResponse(): unknown {
       createdAt: timestamp,
       updatedAt: timestamp,
     },
+    proposal: null,
   };
 }
 
@@ -43,6 +45,58 @@ describe("parseAgentMapWorkspaceResponse", () => {
   it("accepts the strict path-free public shape", () => {
     expect(parseAgentMapWorkspaceResponse(validResponse(), projectId)).toEqual(
       validResponse(),
+    );
+  });
+
+  it("accepts and strictly parses a populated proposal", () => {
+    const value = validResponse() as any;
+    const proposalId = "proposal_00000000-0000-7000-8000-000000000001";
+    const nodeId = "node_00000000-0000-7000-8000-000000000002";
+    const operationId = "operation_00000000-0000-7000-8000-000000000003";
+    const operation = {
+      kind: "add-node",
+      node: {
+        id: nodeId,
+        kind: "agent",
+        name: "Research",
+        purpose: "Research",
+        ownerAgentId: null,
+        contractRefs: [],
+      },
+    };
+    value.workspace.activeProposalId = proposalId;
+    value.workspace.recordVersion = 2;
+    value.proposal = {
+      schemaVersion: 1,
+      id: proposalId,
+      projectId,
+      baseRevisionId: null,
+      version: 1,
+      nodes: [operation.node],
+      relationships: [],
+      history: [
+        {
+          id: operationId,
+          requestId: "request-1",
+          acceptedVersion: 1,
+          operation,
+          actor: {
+            userId: "user-1",
+            sessionId: "session-1",
+            role: "map-planner",
+            assignment: null,
+          },
+          acceptedAt: timestamp,
+        },
+      ],
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
+
+    expect(parseAgentMapWorkspaceResponse(value, projectId)).toEqual(value);
+    value.proposal.history[0].operation.node.privatePath = "/secret";
+    expect(() => parseAgentMapWorkspaceResponse(value, projectId)).toThrow(
+      "Invalid Agent Map workspace response",
     );
   });
 
@@ -132,8 +186,7 @@ describe("resolveStudioWorkspaceSelection", () => {
 
 describe("mostSpecificStudioScope", () => {
   it("chooses the nearest containing durable project, not the first parent", () => {
-    const nestedProjectId =
-      "project_00000000-0000-4000-8000-000000000002";
+    const nestedProjectId = "project_00000000-0000-4000-8000-000000000002";
     expect(
       mostSpecificStudioScope(
         "/work/services/agent",

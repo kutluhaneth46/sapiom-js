@@ -105,6 +105,88 @@ describe("AgentMapWorkspaceStore", () => {
     });
   });
 
+  it("migrates the exact E1 record into the aggregate without changing its public projection", async () => {
+    const root = await fixture();
+    const workspacePath = path.join(
+      root,
+      "projects",
+      projectId,
+      "workspace.json",
+    );
+    const workspace = {
+      projectId,
+      schemaVersion: 1,
+      recordVersion: 1,
+      confirmedRevisionId: null,
+      activeProposalId: null,
+      projectBuildPlanId: null,
+      createdAt: "2026-09-01T12:00:00.000Z",
+      updatedAt: "2026-09-01T12:00:00.000Z",
+    };
+    await fs.mkdir(path.dirname(workspacePath), { recursive: true });
+    await fs.writeFile(workspacePath, `${JSON.stringify(workspace)}\n`);
+
+    await expect(
+      new AgentMapWorkspaceStore(root).readOrCreate(projectId),
+    ).resolves.toEqual(workspace);
+    expect(JSON.parse(await fs.readFile(workspacePath, "utf8"))).toEqual({
+      storageSchemaVersion: 1,
+      workspace,
+      proposal: null,
+      receipts: [],
+    });
+  });
+
+  it("rejects future aggregate schemas without rewriting them", async () => {
+    const root = await fixture();
+    const workspacePath = path.join(
+      root,
+      "projects",
+      projectId,
+      "workspace.json",
+    );
+    const raw = `${JSON.stringify({ storageSchemaVersion: 99, workspace: {}, proposal: null, receipts: [] })}\n`;
+    await fs.mkdir(path.dirname(workspacePath), { recursive: true });
+    await fs.writeFile(workspacePath, raw);
+    await expect(
+      new AgentMapWorkspaceStore(root).readOrCreate(projectId),
+    ).rejects.toMatchObject({
+      code: "unsupported_schema",
+      schemaVersion: 99,
+    });
+    expect(await fs.readFile(workspacePath, "utf8")).toBe(raw);
+  });
+
+  it.each(["write", "file-sync", "rename", "directory-sync"] as const)(
+    "does not expose a partial aggregate when %s fails",
+    async (failedStep) => {
+      const root = await fixture();
+      let fail = false;
+      const store = new AgentMapWorkspaceStore(root, {
+        beforePersistStep: (step) => {
+          if (fail && step === failedStep) throw new Error("injected failure");
+        },
+      });
+      await store.readOrCreate(projectId);
+      fail = true;
+      await expect(
+        store.transact(projectId, async (aggregate) => ({
+          value: undefined,
+          next: {
+            ...aggregate,
+            workspace: { ...aggregate.workspace, recordVersion: 2 },
+          },
+        })),
+      ).rejects.toMatchObject({ code: "storage_unavailable" });
+      const restarted = await new AgentMapWorkspaceStore(root).readOrCreate(
+        projectId,
+      );
+      expect(restarted.recordVersion).toBe(
+        failedStep === "directory-sync" ? 2 : 1,
+      );
+    },
+  );
+
   it.each([
     ["malformed JSON", "{", "malformed_state"],
     [

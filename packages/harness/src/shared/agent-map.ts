@@ -161,14 +161,17 @@ export type ProposalValidationResult<T> =
   | { ok: true; value: T }
   | { ok: false; issues: ProposalValidationIssue[] };
 
-export type ProposalConflictCode = "stale_version" | "request_id_reused";
+export type ProposalConflictCode =
+  | "stale_version"
+  | "request_id_reused"
+  | "request_id_expired";
 
 export interface ProposalConflict {
   code: ProposalConflictCode;
   currentVersion: number;
   affectedNodeIds: PlanNodeId[];
   affectedRelationshipIds: PlanRelationshipId[];
-  recovery: "reread" | "retry";
+  recovery: "reread" | "retry" | "new_request";
 }
 
 export type ProjectRootBindingStatus = "active" | "missing";
@@ -205,10 +208,8 @@ export interface AgentMapWorkspaceState {
   updatedAt: string;
 }
 
-export interface AgentMapWorkspaceResponse {
-  project: StudioProjectSummary;
-  workspace: AgentMapWorkspaceState;
-}
+/** Backwards-compatible route name for the canonical Agent Map read shape. */
+export type AgentMapWorkspaceResponse = AgentMapReadSnapshot;
 
 /** Stable, path-free identity for the workspace currently open in Studio. */
 export type StudioWorkspaceSelection =
@@ -274,7 +275,7 @@ export type PlanningSessionIdentity =
 export interface ProposalActor {
   userId: string;
   sessionId: string;
-  role: PlanningSessionIdentity["role"];
+  role: "map-planner" | "agent-builder";
   assignment:
     | { kind: "planned"; agentId: string }
     | { kind: "unplanned" }
