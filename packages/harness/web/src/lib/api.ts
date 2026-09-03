@@ -2232,17 +2232,19 @@ export class MockApi implements HarnessApi {
       }));
   }
 
-  private studioProjects(): StudioProjectSummary[] {
+  private studioProjects(): StudioProjectSummary[] | undefined {
     // Production authority is determined by the server response and always
     // uses durable Studio project summaries. Mock mode keeps the historical
     // fixtures stable unless a plan-first scenario opts in explicitly; the
-    // dedicated agent-map fixture is also an opt-in. This is test data
-    // selection, not a product feature flag.
+    // dedicated agent-map fixture is also an opt-in. `absent` names the
+    // legacy-server compatibility contract exercised by the remaining direct
+    // creation specs. This is test data selection, not a product feature flag.
     if (typeof window !== "undefined") {
       const params = new URLSearchParams(window.location.search);
       const mode = params.get("mockStudioProjects");
       const fixture = params.get("mockFixtures");
-      if (mode !== "present" && fixture !== "agent-map") return [];
+      if (mode === "absent") return undefined;
+      if (mode !== "present" && fixture !== "agent-map") return undefined;
     }
     const timestamp = "2026-01-01T00:00:00.000Z";
     return this.workspaceScopes().map((scope, index) => ({
@@ -2334,6 +2336,7 @@ export class MockApi implements HarnessApi {
     // necessarily said yes — mirror that in the mock so the chip shows "on".
     const telemetryOptIn =
       mockConsentSource === "prompted" ? true : this.settings.telemetryOptIn;
+    const studioProjects = this.studioProjects();
     return {
       version: "0.0.1-mock",
       authenticated: true,
@@ -2353,7 +2356,7 @@ export class MockApi implements HarnessApi {
       sessions: this.sessions,
       workflows: this.studioWorkflows(),
       workspaceScopes: this.workspaceScopes(),
-      studioProjects: this.studioProjects(),
+      ...(studioProjects ? { studioProjects } : {}),
       macros: MOCK_MACROS,
       launchDir: MOCK_LAUNCH_DIR,
       // Mirrors the Electron host (`<launchDir>/projects`) rather than the CLI
@@ -2374,7 +2377,7 @@ export class MockApi implements HarnessApi {
         ? null
         : new URLSearchParams(window.location.search);
     const failure = query?.get("mockAgentMapWorkspace") ?? null;
-    const project = this.studioProjects().find(
+    const project = this.studioProjects()?.find(
       (candidate) => candidate.projectId === projectId,
     );
     const goldenFixtureEnabled = query?.get("mockAgentMapGolden") === "1";
@@ -2665,7 +2668,7 @@ export class MockApi implements HarnessApi {
     };
     await this.injectInput(sessionId, { text: request.text });
     const accepted = structuredClone(session.planning);
-    const project = this.studioProjects().find(
+    const project = this.studioProjects()?.find(
       (candidate) => candidate.projectId === projectId,
     );
     const goldenFixtureEnabled =
@@ -3814,7 +3817,11 @@ export class MockApi implements HarnessApi {
   ): Promise<{ state: AgentSecret["state"] }> {
     await delay(150);
     if (mockErrorTargets().has("secretWrite")) {
-      throw new ApiError(502, `mock: ${key} refused`, `${key} could not be stored.`);
+      throw new ApiError(
+        502,
+        `mock: ${key} refused`,
+        `${key} could not be stored.`,
+      );
     }
     const state: AgentSecret["state"] = this.mockLinked(workflowPath)
       ? "synced"
