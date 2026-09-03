@@ -673,8 +673,8 @@ input {
   outline-offset: 2px;
 }
 
-/* Mobile's planner-primary layout names the sheet it opens. Desktop keeps the
-   compact icon because the map is already visibly beside the conversation. */
+/* Mobile's CLI-primary layout names the sheet it opens. Desktop keeps the
+   compact icon because the map is already visibly beside the coding-agent CLI. */
 .theme-toggle.right-expand-labeled {
   width: auto;
   min-width: max-content;
@@ -4096,118 +4096,6 @@ button.rail-footer-card:hover {
   text-transform: uppercase;
 }
 
-/* Live Agent Map planning conversation ---------------------------------- */
-
-.planning-conversation {
-  display: flex;
-  flex: 1;
-  min-height: 0;
-  flex-direction: column;
-}
-
-.planner-transcript-scroll {
-  flex: 1;
-  min-height: 0;
-  overflow-y: auto;
-  padding: var(--sp5) var(--pane-pad-x) var(--sp3);
-}
-
-.planner-transcript-turns {
-  max-width: var(--assistant-measure);
-  margin: 0 auto;
-}
-
-.planner-transcript-turn {
-  padding-bottom: var(--sp2);
-}
-
-.planner-inline-status,
-.planner-transcript-error {
-  display: flex;
-  align-items: center;
-  gap: var(--sp2);
-  max-width: var(--assistant-measure);
-  margin: var(--sp3) auto 0;
-  color: var(--text-faint);
-  font-size: var(--type-label);
-  line-height: 1.5;
-}
-
-.planner-inline-status.is-error,
-.planner-transcript-error {
-  color: var(--text-dim);
-}
-
-.planner-inline-status.is-error > svg {
-  flex: 0 0 auto;
-  color: var(--amber-text);
-}
-
-.planner-inline-retry {
-  flex: 0 0 auto;
-  margin-left: auto;
-}
-
-.planner-transcript-error {
-  flex-direction: column;
-  align-items: flex-start;
-}
-
-.planner-tool-calls {
-  align-self: flex-start;
-  color: var(--text-faint);
-  font-family: var(--font-mono);
-  font-size: var(--type-meta);
-}
-
-.planner-tool-calls summary {
-  cursor: pointer;
-}
-
-.planner-tool-calls ul {
-  margin: var(--sp1) 0 0;
-  padding-left: var(--sp4);
-}
-
-.planner-composer {
-  flex: 0 0 auto;
-  padding: var(--sp3) var(--pane-pad-x) var(--sp4);
-}
-
-.planner-composer > .composer-box {
-  max-width: var(--assistant-measure);
-  margin: 0 auto;
-}
-
-.planner-composer-input {
-  min-height: 3em;
-  max-height: 10em;
-}
-
-.planner-composer .composer-box-right {
-  width: auto;
-  margin-left: auto;
-}
-
-.planner-send-error {
-  min-width: 0;
-  overflow: hidden;
-  color: var(--red);
-  font-size: var(--type-meta);
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-@media (max-width: 768px) {
-  .planner-transcript-scroll {
-    padding: var(--sp4) var(--sp3) var(--sp2);
-  }
-
-  .planner-composer {
-    padding: var(--sp2) var(--sp3) var(--sp3);
-  }
-}
-
 /* Canvas pane ---------------------------------------------------------- */
 
 .canvas-pane {
@@ -4219,7 +4107,7 @@ button.rail-footer-card:hover {
 
 /* Workspace dependency map ----------------------------------------------
    The project's altitude of the ONE canvas — it fills the right pane beside
-   the conversation, not the whole shell. It was a full-main destination, which
+   the coding-agent CLI, not the whole shell. It was a full-main destination, which
    made selecting a project a mode switch: your chat vanished to show you a
    picture of it. The field and cards use the design repository's flow geometry
    and existing Studio tokens; there is deliberately no legend, metrics, status
@@ -4537,6 +4425,194 @@ button.system-graph-node.is-navigable:focus-visible {
 .system-graph-state {
   flex: 1;
   min-height: 0;
+}
+
+/* Plan-first Agent Map: the existing graph plane and controls, projected from
+   durable proposal state. Proposed is deliberately one neutral treatment. */
+.agent-map-live,
+.agent-map-live-body,
+.agent-map-canvas,
+.agent-map-viewport {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+}
+
+.agent-map-live {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--surface-base);
+}
+
+.agent-map-live-header {
+  display: flex;
+  align-items: center;
+  gap: var(--sp2);
+  min-height: var(--control-h-sm);
+  padding: 0 var(--sp3);
+  border-bottom: 1px solid var(--ui-line);
+  background: var(--surface-raised);
+}
+
+.agent-map-live-body {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+}
+
+.agent-map-canvas {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+}
+
+.agent-map-viewport {
+  flex: 1;
+  overflow: hidden;
+  touch-action: none;
+  cursor: grab;
+  background-color: var(--surface-base);
+  background-image: radial-gradient(var(--flow-grid-dot) 1px, transparent 1px);
+  background-size: var(--sp4) var(--sp4);
+}
+
+.agent-map-viewport.is-panning {
+  cursor: grabbing;
+  user-select: none;
+}
+
+.agent-map-viewport:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: -2px;
+}
+
+.agent-map-subject {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform-origin: center;
+  will-change: transform;
+}
+
+.agent-map-edges {
+  position: absolute;
+  inset: 0;
+  overflow: visible;
+  pointer-events: none;
+}
+
+.agent-map-edge {
+  fill: none;
+  stroke: var(--text-faint);
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.5;
+  vector-effect: non-scaling-stroke;
+}
+
+.agent-map-arrow {
+  fill: var(--text-faint);
+}
+
+.agent-map-edge-label {
+  pointer-events: none;
+}
+
+.agent-map-node {
+  position: absolute;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  gap: var(--sp1);
+  box-sizing: border-box;
+  padding: var(--sp2) var(--sp3);
+  overflow: hidden;
+  appearance: none;
+  color: var(--text);
+  background: var(--surface-raised);
+  border: 1px dashed var(--ui-line-strong);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-xs);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.agent-map-node[data-node-kind="subagent"] {
+  border-radius: calc(var(--radius) * 2);
+}
+
+.agent-map-node[data-node-kind="resource"] {
+  border-radius: var(--r-sm);
+}
+
+.agent-map-node[data-node-kind="connector"] {
+  border-radius: var(--r-xl);
+}
+
+.agent-map-node[data-node-kind="artifact"] {
+  border-style: double;
+}
+
+.agent-map-node:hover {
+  background: var(--surface-hover);
+}
+
+.agent-map-node.is-selected,
+.agent-map-node:focus-visible {
+  border-color: var(--text);
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.agent-map-node-heading {
+  display: flex;
+  align-items: center;
+  gap: var(--sp2);
+  width: 100%;
+}
+
+.agent-map-inspector {
+  z-index: 1;
+  width: min(var(--col-w), 42%);
+  padding: var(--sp4);
+  overflow: auto;
+  border-left: 1px solid var(--ui-line);
+  background: var(--surface-raised);
+}
+
+.agent-map-inspector-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--sp3);
+}
+
+.agent-map-inspector-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--sp1);
+  flex: 0 0 auto;
+}
+
+.agent-map-inspector h3,
+.agent-map-inspector h4,
+.agent-map-inspector p,
+.agent-map-inspector ul {
+  margin: 0;
+}
+
+.agent-map-inspector section {
+  display: grid;
+  gap: var(--sp1);
+  margin-top: var(--sp4);
+}
+
+.agent-map-inspector ul {
+  padding-left: var(--sp4);
 }
 
 .workflow-actions-header {

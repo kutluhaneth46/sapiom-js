@@ -28,7 +28,7 @@
  *                  session is project-scoped and cannot reach outside it.
  *
  * A project row FILLS the workbench rather than replacing it (SAP-2980): the
- * conversation stays in the centre and the project's map draws on the right.
+ * coding-agent CLI stays in the centre and the project's map draws on the right.
  * The graph used to be a full-main destination, inheriting the pattern from the
  * template gallery by analogy — but browsing a gallery is a detour, and looking
  * at your project's shape while talking to it is not. The centre pane vanishing
@@ -82,7 +82,6 @@ import { Terminal } from "./components/Terminal";
 import { Toast } from "./components/Toast";
 import { TooltipLayer } from "./components/TooltipLayer";
 import { NewSessionComposer } from "./components/NewSessionComposer";
-import { PlanningConversationPane } from "./components/PlanningConversationPane";
 import { HelpOverlay } from "./components/HelpOverlay";
 import { CreateAgentDialog } from "./components/CreateAgentDialog";
 import { OverviewModal } from "./components/OverviewModal";
@@ -176,7 +175,6 @@ import {
   type RunTarget,
 } from "./lib/use-harness-state";
 import { useAgentMapEntry } from "./lib/use-agent-map-entry";
-import { usePlannerTranscript } from "./lib/use-planner-transcript";
 import {
   isWorkflowRunnable,
   workflowDeploymentState,
@@ -325,7 +323,7 @@ export const App = (): JSX.Element => {
       harness.state?.sessions,
     ],
   );
-  const activePlannerForTranscript = harness.state?.sessions.find(
+  const activePlannerForProject = harness.state?.sessions.find(
     (session) =>
       session.id === harness.activeSessionId &&
       session.status !== "exited" &&
@@ -334,19 +332,16 @@ export const App = (): JSX.Element => {
   );
   const agentMapEntry = useAgentMapEntry({
     projectId: plannerProjectId,
-    selectedPlanner: activePlannerForTranscript ?? null,
+    selectedPlanner: activePlannerForProject ?? null,
     api: harness.api,
     harness: () =>
       loadUiPrefs().preferredHarness === "codex" ? "codex" : "claude-code",
     theme: getTheme,
     openPlannerSession: harness.openPlannerSession,
     onPlannerReady: handlePlannerReady,
+    subscribeProposalChanges: harness.subscribeAgentMapProposalChanges,
+    subscribeReconnects: harness.subscribeEventReconnects,
   });
-  const plannerTranscript = usePlannerTranscript(
-    activePlannerForTranscript?.id ?? null,
-    harness.sessionRecord,
-    harness.subscribeSessionRecordChanges,
-  );
 
   // A project visit restores its server-owned preference before choosing an
   // altitude. Once map is chosen, `useAgentMapEntry` owns the independent map
@@ -663,10 +658,14 @@ export const App = (): JSX.Element => {
   const [rightCollapsed, setRightCollapsed] = useState(
     () => isMobileShell() || (loadUiPrefs().rightCollapsed ?? false),
   );
-  // Canvas full-screen expand — lifted here so its control sits next to the
-  // collapse-panel toggle in the right-pane tab bar (the frame itself lives in
-  // CanvasPane, which reads these props).
+  // Right-surface full-screen expand — lifted here so its control sits next to
+  // the collapse-panel toggle in the shared tab bar. The active CanvasPane or
+  // AgentMapPane lifts its own frame without remounting the graph.
   const [canvasExpanded, setCanvasExpanded] = useState(false);
+  const toggleCanvasExpanded = useCallback(
+    () => setCanvasExpanded((value) => !value),
+    [],
+  );
 
   // Back/forward across every screen the shell can show. The stack is fed by
   // the place the shell IS (derived below), not by instrumenting each door, so
@@ -985,7 +984,7 @@ export const App = (): JSX.Element => {
   // agent board closes the pane) would otherwise leave a project selection
   // with nothing on screen but a chat — the mode switch inverted.
   useEffect(() => {
-    // On mobile the planning conversation is primary. Agent Map selection and
+    // On mobile the coding-agent CLI is primary. Agent Map selection and
     // background loading never open the bottom sheet; its explicit button does.
     // Legacy System Graph selection keeps its established auto-open behavior.
     if (
@@ -2811,7 +2810,7 @@ export const App = (): JSX.Element => {
         </div>
       )}
 
-      {!railCollapsed && !isMobile && (
+      {!railCollapsed && !isMobile && !canvasExpanded && (
         <div
           className="pane-resize-handle pane-resize-handle-rail"
           style={{ left: widths.rail }}
@@ -3071,7 +3070,7 @@ export const App = (): JSX.Element => {
                     className="terminal-empty"
                     testId="planner-load-error"
                     icon="TriangleAlert"
-                    title="Planning conversation couldn't open"
+                    title="Planning session couldn't open"
                     body={agentMapEntry.state.planner.message}
                     cta={
                       <button
@@ -3080,7 +3079,7 @@ export const App = (): JSX.Element => {
                         data-testid="planner-retry"
                         onClick={agentMapEntry.retryPlanner}
                       >
-                        Retry conversation
+                        Retry session
                       </button>
                     }
                   />
@@ -3089,28 +3088,26 @@ export const App = (): JSX.Element => {
                     className="terminal-empty"
                     testId="planner-loading"
                     icon="Radio"
-                    title="Opening planning conversation…"
+                    title="Opening planning session…"
                   />
                 ) : activePlannerSession?.planning ? (
-                  <PlanningConversationPane
-                    metadata={activePlannerSession.planning}
-                    transcript={plannerTranscript.state}
-                    onRetryTranscript={plannerTranscript.retry}
-                    onSend={async (text) => {
-                      await harness.sendPlannerMessage(
-                        studioView.projectId,
-                        activePlannerSession.id,
-                        { text },
-                      );
-                    }}
-                    onRetryGreeting={async () => {
-                      await harness.retryPlannerGreeting(
-                        studioView.projectId,
-                        activePlannerSession.id,
-                      );
-                    }}
-                    disabled={activePlannerSession.status === "exited"}
-                  />
+                  /* Agent Map planning is still an ordinary coding-agent
+                     session. Keep the exact same raw CLI surface used for
+                     every agent: trust/auth prompts, slash commands, tool
+                     output, and provider chrome must remain visible rather
+                     than being replaced by a transcript/composer facsimile. */
+                  <div className="agent-view" data-testid="agent-view">
+                    <div
+                      className="agent-view-panel"
+                      id="agent-panel-terminal"
+                    >
+                      <Terminal
+                        sessionId={activePlannerSession.id}
+                        token={harness.bootToken}
+                        cwd={activePlannerSession.cwd}
+                      />
+                    </div>
+                  </div>
                 ) : (
                   <EmptyState
                     className="terminal-empty"
@@ -3239,7 +3236,10 @@ export const App = (): JSX.Element => {
             </div>
           </div>
 
-          {!rightCollapsed && !isMobile && !rightPaneSuppressedByComposer && (
+          {!rightCollapsed &&
+            !isMobile &&
+            !rightPaneSuppressedByComposer &&
+            !canvasExpanded && (
             <div
               className="pane-resize-handle pane-resize-handle-canvas"
               // Track the canvas column's ACTUAL edge, not the requested width.
@@ -3379,21 +3379,28 @@ export const App = (): JSX.Element => {
                             : "linked"}
                     </a>
                   )}
-                {/* Canvas expand / Steps Focus sits beside the panel toggle.
-                    Absent at map altitude: expand is the board's own frame
-                    control, and the map has its own pan/zoom/fit. */}
-                {!atMapAltitude && (
+                {/* Full view belongs to the graph surface currently shown:
+                    Agent Map at project altitude, Canvas / Focus below it. */}
+                {(!atMapAltitude || planningWorkspace) && (
                   <button
                     className="theme-toggle"
                     data-testid="canvas-expand"
                     hidden={canvasExpanded}
                     aria-label={
-                      shownTab === "steps" ? "Open Focus mode" : "Expand canvas"
+                      planningWorkspace
+                        ? "Expand Agent Map"
+                        : shownTab === "steps"
+                          ? "Open Focus mode"
+                          : "Expand canvas"
                     }
                     title={
-                      shownTab === "steps" ? "Open Focus mode" : "Expand canvas"
+                      planningWorkspace
+                        ? "Expand Agent Map"
+                        : shownTab === "steps"
+                          ? "Open Focus mode"
+                          : "Expand canvas"
                     }
-                    onClick={() => setCanvasExpanded((v) => !v)}
+                    onClick={toggleCanvasExpanded}
                   >
                     <Icon name="Maximize2" size={15} />
                   </button>
@@ -3431,6 +3438,8 @@ export const App = (): JSX.Element => {
                 <AgentMapPane
                   state={agentMapEntry.state.workspace}
                   onRetry={agentMapEntry.retryWorkspace}
+                  expanded={canvasExpanded}
+                  onToggleExpanded={toggleCanvasExpanded}
                 />
               ) : legacyView.altitude === "map" ? (
                 <WorkspaceGraphView
@@ -3512,8 +3521,8 @@ export const App = (): JSX.Element => {
                       contract,
                     );
                 }}
-                expanded={canvasExpanded}
-                onToggleExpanded={() => setCanvasExpanded((v) => !v)}
+                expanded={canvasExpanded && !atMapAltitude}
+                onToggleExpanded={toggleCanvasExpanded}
                 macros={state.macros}
                 tasks={harness.tasks}
                 surface={shownTab === "steps" ? "steps" : "board"}

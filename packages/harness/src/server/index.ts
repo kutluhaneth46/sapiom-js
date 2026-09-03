@@ -98,6 +98,7 @@ import {
   sweepGeneratedDirs,
 } from "../core/inject/retention.js";
 import { DEFAULT_SYSTEM_PROMPT } from "../profiles/default.js";
+import { AGENT_MAP_PLANNER_SYSTEM_PROMPT } from "../profiles/agent-map-planner.js";
 import { fetchSystemPromptForActiveEnvironment } from "../profiles/system-prompt-fetch.js";
 import { agentCoreTemplatesDir } from "../core/agent-core-templates.js";
 import { CanvasWatcherManager } from "../core/canvas-watcher.js";
@@ -559,19 +560,32 @@ function createDefaultBuildLaunchOpts(
           ? "dark-ansi"
           : undefined;
 
+    // Reconcile with the shared credential store at the common launch
+    // boundary. Create, resume, and background tasks all await this builder.
+    const apiKey = await apiKeyProvider.refresh();
+
     // The served prompt (SAP-2810): loaded per session start, so a backend deploy
     // reaches an install that never upgraded @sapiom/harness. The default loader
     // resolves to the bundled DEFAULT_SYSTEM_PROMPT on any failure rather than
     // throwing; the `.catch` covers an injected loader that does not, because a
     // session must never fail to start over the text of its prompt.
-    // Reconcile with the shared credential store at the common launch
-    // boundary. Create, resume, and background tasks all await this builder.
-    const apiKey = await apiKeyProvider.refresh();
+    const promptPromise =
+      context?.agentMapIdentity?.role === "map-planner"
+        ? Promise.resolve(AGENT_MAP_PLANNER_SYSTEM_PROMPT)
+        : loadSystemPrompt().catch((err: unknown) => {
+            console.error("[harness] system-prompt load failed:", err);
+            return DEFAULT_SYSTEM_PROMPT;
+          });
     const [settings, mcpConfigFile, prompt, pluginDir] = await Promise.all([
       generateClaudeSettings({
         harnessSessionId,
         generatedRoot,
         ...(claudeTheme ? { claudeTheme } : {}),
+        ...(context?.sessionStartSystemMessage
+          ? {
+              sessionStartSystemMessage: context.sessionStartSystemMessage,
+            }
+          : {}),
       }),
       generateMcpConfig(harnessSessionId, {
         environment: process.env.SAPIOM_ENVIRONMENT,
@@ -581,10 +595,7 @@ function createDefaultBuildLaunchOpts(
         ...(sapiomDevMcp ? { devServer: sapiomDevMcp } : {}),
         ...(context?.agentMapMcp ? { agentMap: context.agentMapMcp } : {}),
       }),
-      loadSystemPrompt().catch((err: unknown) => {
-        console.error("[harness] system-prompt load failed:", err);
-        return DEFAULT_SYSTEM_PROMPT;
-      }),
+      promptPromise,
       generateSkillsPlugin(harnessSessionId, { generatedRoot }),
     ]);
     const appendices = [viaSystemPrompt ? brief : null, context?.promptAppendix]
@@ -1156,8 +1167,11 @@ export const startServer = async (
     sessionsPath: options.sessionsPath ?? statePaths.sessions,
     buildLaunchOpts,
     resolveAgentMapIdentity: async (sessionId, cwd, persisted) => {
-      const userId = planningUserId;
-      if (!userId) return undefined;
+      // Planner ownership already uses a stable machine-local principal when
+      // Studio runs with --no-auth. Capability issuance must use that same
+      // identity; requiring an authenticated user here silently removed the
+      // Agent Map server from every signed-out planner's MCP config.
+      const userId = localPlanningPrincipal(planningUserId, machineId);
       const project = await studioProjectCatalog.resolveIdentityForPath(cwd);
       if (!project) return undefined;
       if (
@@ -2689,6 +2703,13 @@ export const startServer = async (
   );
   const agentMapProposalService = new AgentMapProposalService(
     agentMapWorkspaceStore,
+    {
+      // Persistence is authoritative and completes before this callback. The
+      // shared event socket gives an already-open map the accepted delta; a
+      // disconnected browser recovers from the durable snapshot on reconnect.
+      onAccepted: (delta) =>
+        bus.publish({ type: "agent-map.proposal.changed", delta }),
+    },
   );
   emitAgentMapCapabilityEvent = (event) => {
     const analyticsEvent: AnalyticsEvent = {

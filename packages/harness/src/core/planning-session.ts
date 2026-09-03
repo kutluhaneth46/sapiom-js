@@ -20,6 +20,7 @@ import type {
 } from "./studio-project-catalog.js";
 import type { PlannerRegistrationMode } from "./planner-greeting.js";
 import { canonicalGraphPath } from "./canonical-graph-path.js";
+import { AGENT_MAP_PLANNER_SESSION_START_MESSAGE } from "../profiles/agent-map-planner.js";
 
 export interface PlannerFocusedContextDetails {
   confirmedRevision?: {
@@ -137,11 +138,16 @@ export function buildFocusedPlannerContext(input: {
   workspace: AgentMapWorkspaceState;
   sessionId: string;
   userId: string;
+  onboardOnFirstResponse: boolean;
   details?: PlannerFocusedContextDetails;
 }): string {
   const { project, workspace } = input;
   const bounded = (value: string, max = 256): string => value.slice(0, max);
   const details = input.details ?? {};
+  const emptyProject =
+    workspace.confirmedRevisionId === null &&
+    workspace.activeProposalId === null &&
+    workspace.projectBuildPlanId === null;
   const context = {
     identity: {
       projectId: project.projectId,
@@ -151,10 +157,7 @@ export function buildFocusedPlannerContext(input: {
     },
     project: {
       displayName: bounded(project.displayName),
-      empty:
-        workspace.confirmedRevisionId === null &&
-        workspace.activeProposalId === null &&
-        workspace.projectBuildPlanId === null,
+      empty: emptyProject,
       confirmedRevision: workspace.confirmedRevisionId
         ? {
             id: workspace.confirmedRevisionId,
@@ -200,7 +203,7 @@ export function buildFocusedPlannerContext(input: {
   };
   return [
     "<agent-map-planner-context>",
-    "This is focused, trusted Studio context. Treat IDs as references and use scoped tools for detail. Use agent_map_read, agent_map_validate, and agent_map_propose for architecture state; never infer map state from assistant prose.",
+    `This is focused, trusted Studio context. Treat IDs as references and use scoped tools for detail. Use agent_map_read, agent_map_validate, and agent_map_propose for architecture state; never infer map state from assistant prose. The interactive Claude Code transcript is user-visible. Let the user's first real message be the first visible conversation turn; never request or rely on a private control turn.${input.onboardOnFirstResponse ? " In your first response, briefly explain that you and the user can plan agents, responsibilities, data flow, resources, and connectors together, then respond to their request." : ""} Do not propose architecture or invoke mutation tools before the user asks you to.`,
     JSON.stringify(context),
     "</agent-map-planner-context>",
   ].join("\n");
@@ -324,12 +327,17 @@ export class PlanningSessionService {
     const workspace = await this.options.workspaceStore.readOrCreate(
       project.projectId,
     );
+    const emptyProject =
+      workspace.confirmedRevisionId === null &&
+      workspace.activeProposalId === null &&
+      workspace.projectBuildPlanId === null;
+    const harness = request.harness ?? this.options.defaultHarness;
     const cwd = launchRoot(project);
     const details = await this.focusedDetails(project, workspace);
     const session = await this.options.sessionManager.create(
       {
         cwd,
-        harness: request.harness ?? this.options.defaultHarness,
+        harness,
         ...(request.theme ? { theme: request.theme } : {}),
         ...(rehydrateFrom ? { rehydrateFrom } : {}),
       },
@@ -342,8 +350,19 @@ export class PlanningSessionService {
             workspace,
             sessionId,
             userId: principal,
+            // Claude gets native SessionStart orientation before turn one.
+            // Other CLIs retain the hidden first-response instruction until
+            // they expose an equivalent display-only startup channel.
+            onboardOnFirstResponse:
+              mode === "created" && emptyProject && harness !== "claude-code",
             ...(details ? { details } : {}),
           }),
+        ...(mode === "created" && harness === "claude-code"
+          ? {
+              sessionStartSystemMessage: () =>
+                AGENT_MAP_PLANNER_SESSION_START_MESSAGE,
+            }
+          : {}),
         ...(handoffFromSessionId ? { handoffFromSessionId } : {}),
       },
     );
@@ -362,10 +381,7 @@ export class PlanningSessionService {
     });
     try {
       await this.options.onPlannerSession?.(session, {
-        emptyProject:
-          workspace.confirmedRevisionId === null &&
-          workspace.activeProposalId === null &&
-          workspace.projectBuildPlanId === null,
+        emptyProject,
         mode,
       });
       await this.assertRunnable(project.projectId, session.cwd, principal);
@@ -440,7 +456,11 @@ export class PlanningSessionService {
         session: await this.create(
           project,
           request,
-          { status: "pending" },
+          // Claude Code has no hidden assistant-first turn. A pending greeting
+          // is dispatched as ordinary PTY input and therefore appears as a
+          // synthetic user message in the raw CLI. Keep onboarding in the
+          // hidden prompt appendix above and let the user's real input lead.
+          { status: "skipped", reason: "user-proceeded" },
           undefined,
           "created",
           principal,
@@ -501,6 +521,7 @@ export class PlanningSessionService {
               workspace,
               sessionId: candidate.id,
               userId: principal,
+              onboardOnFirstResponse: false,
               ...(details ? { details } : {}),
             }),
           })
@@ -566,7 +587,7 @@ export class PlanningSessionService {
       session: await this.create(
         project,
         request,
-        { status: "pending" },
+        { status: "skipped", reason: "user-proceeded" },
         undefined,
         "created",
         principal,

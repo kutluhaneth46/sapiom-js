@@ -25,8 +25,6 @@ import type {
   TemplateListResponse,
 } from "@shared/types";
 import type {
-  PlannerMessageRequest,
-  PlannerSessionMetadata,
   PlannerSessionRequest,
   PlannerSessionResponse,
   StudioProjectId,
@@ -58,6 +56,7 @@ import { loadUiPrefs, saveUiPrefs } from "./ui-prefs";
 import { mergeHistory } from "./history-meta";
 import { createToastMessage, type ToastMessage, type ToastTone } from "./toast";
 import { subscribeEvents } from "./events";
+import { agentMapLoader } from "./agent-map-loader";
 import { systemGraphLoader } from "./system-graph-loader";
 import { WorkflowProjectionOrder } from "./workflow-projection-order";
 import {
@@ -191,18 +190,6 @@ export interface HarnessStateHook {
     projectId: StudioProjectId,
     request: PlannerSessionRequest,
   ) => Promise<PlannerSessionResponse>;
-  /** Enqueues an ordinary planner message and applies the coordinator's
-   * authoritative queue/greeting metadata immediately. */
-  sendPlannerMessage: (
-    projectId: StudioProjectId,
-    sessionId: string,
-    request: PlannerMessageRequest,
-  ) => Promise<PlannerSessionMetadata>;
-  /** Retries only the automatic greeting operation. */
-  retryPlannerGreeting: (
-    projectId: StudioProjectId,
-    sessionId: string,
-  ) => Promise<PlannerSessionMetadata>;
   resumeSession: (harnessSessionId: string) => Promise<HarnessSession>;
   /**
    * Portable continue: a fresh session in `cwd`, seeded with our own
@@ -372,6 +359,14 @@ export interface HarnessStateHook {
   subscribeSessionRecordChanges: (
     listener: (sessionId: string) => void,
   ) => () => void;
+  /** Targeted Agent Map deltas over the existing event-bus connection. */
+  subscribeAgentMapProposalChanges: (
+    listener: (
+      delta: import("@shared/agent-map").AcceptedProposalDelta,
+    ) => void,
+  ) => () => void;
+  /** Signals that the shared event socket reconnected after an interruption. */
+  subscribeEventReconnects: (listener: () => void) => () => void;
   /** Latest monotonic graph invalidation per retained Project scope. */
   systemGraphAnnouncements: ReadonlyMap<WorkspaceKey, SystemGraphAnnouncement>;
   /** The run each session's Steps tab is showing (the latest observed by
@@ -432,11 +427,15 @@ export function useHarnessState(): HarnessStateHook {
     const workspaceKeys = new Set(
       (state.workspaceScopes ?? []).map((scope) => scope.workspaceKey),
     );
+    const projectIds = new Set(
+      (state.studioProjects ?? []).map((project) => project.projectId),
+    );
     systemGraphLoader.retain(workspaceKeys);
+    agentMapLoader.retain(projectIds);
     setSystemGraphAnnouncements((current) =>
       retainSystemGraphAnnouncements(current, workspaceKeys),
     );
-  }, [state?.workspaceScopes]);
+  }, [state?.studioProjects, state?.workspaceScopes]);
   const [settings, setSettings] = useState<HarnessSettings | null>(null);
   /**
    * Mirror of `settings` for the one reader that cannot wait for a re-render:
@@ -526,6 +525,30 @@ export function useHarnessState(): HarnessStateHook {
     (listener: (sessionId: string) => void): (() => void) => {
       sessionRecordChangeListeners.current.add(listener);
       return () => sessionRecordChangeListeners.current.delete(listener);
+    },
+    [],
+  );
+  const agentMapProposalChangeListeners = useRef(
+    new Set<
+      (delta: import("@shared/agent-map").AcceptedProposalDelta) => void
+    >(),
+  );
+  const subscribeAgentMapProposalChanges = useCallback(
+    (
+      listener: (
+        delta: import("@shared/agent-map").AcceptedProposalDelta,
+      ) => void,
+    ): (() => void) => {
+      agentMapProposalChangeListeners.current.add(listener);
+      return () => agentMapProposalChangeListeners.current.delete(listener);
+    },
+    [],
+  );
+  const eventReconnectListeners = useRef(new Set<() => void>());
+  const subscribeEventReconnects = useCallback(
+    (listener: () => void): (() => void) => {
+      eventReconnectListeners.current.add(listener);
+      return () => eventReconnectListeners.current.delete(listener);
     },
     [],
   );
@@ -1194,22 +1217,6 @@ export function useHarnessState(): HarnessStateHook {
     });
   }, []);
 
-  const applyPlannerMetadata = useCallback(
-    (sessionId: string, metadata: PlannerSessionMetadata): void => {
-      setState((prev) => {
-        if (!prev) return prev;
-        let changed = false;
-        const sessions = prev.sessions.map((session) => {
-          if (session.id !== sessionId) return session;
-          changed = true;
-          return { ...session, planning: metadata };
-        });
-        return changed ? { ...prev, sessions } : prev;
-      });
-    },
-    [],
-  );
-
   const openPlannerSession = useCallback(
     async (
       projectId: StudioProjectId,
@@ -1234,45 +1241,6 @@ export function useHarnessState(): HarnessStateHook {
       return response;
     },
     [upsertSession],
-  );
-
-  const sendPlannerMessage = useCallback(
-    async (
-      projectId: StudioProjectId,
-      sessionId: string,
-      request: PlannerMessageRequest,
-    ): Promise<PlannerSessionMetadata> => {
-      const statusRevision = sessionStatusRevisions.current.get(sessionId) ?? 0;
-      const { metadata } = await api.sendPlannerMessage(
-        projectId,
-        sessionId,
-        request,
-      );
-      if (
-        (sessionStatusRevisions.current.get(sessionId) ?? 0) === statusRevision
-      ) {
-        applyPlannerMetadata(sessionId, metadata);
-      }
-      return metadata;
-    },
-    [applyPlannerMetadata],
-  );
-
-  const retryPlannerGreeting = useCallback(
-    async (
-      projectId: StudioProjectId,
-      sessionId: string,
-    ): Promise<PlannerSessionMetadata> => {
-      const statusRevision = sessionStatusRevisions.current.get(sessionId) ?? 0;
-      const { metadata } = await api.retryPlannerGreeting(projectId, sessionId);
-      if (
-        (sessionStatusRevisions.current.get(sessionId) ?? 0) === statusRevision
-      ) {
-        applyPlannerMetadata(sessionId, metadata);
-      }
-      return metadata;
-    },
-    [applyPlannerMetadata],
   );
 
   useEffect(() => {
@@ -1356,6 +1324,10 @@ export function useHarnessState(): HarnessStateHook {
         // Invalidate even while its workspace destination is closed. The next
         // open must never resurrect a pre-edit process-lifetime promise.
         systemGraphLoader.invalidate(message.workspaceKey, message.revision);
+      } else if (message.type === "agent-map.proposal.changed") {
+        agentMapProposalChangeListeners.current.forEach((listener) =>
+          listener(message.delta),
+        );
       } else if (message.type === "execution.started") {
         startRunPolling(
           message.harnessSessionId,
@@ -1416,6 +1388,8 @@ export function useHarnessState(): HarnessStateHook {
         // agent and a logout cannot leave tenant metadata pinned in memory.
         void refreshWorkflows().catch(() => undefined);
       }
+    }, () => {
+      eventReconnectListeners.current.forEach((listener) => listener());
     });
   }, [refreshWorkflows, startRunPolling]);
 
@@ -2409,8 +2383,6 @@ export function useHarnessState(): HarnessStateHook {
     getWorkflowInputContract,
     sessionRecord,
     openPlannerSession,
-    sendPlannerMessage,
-    retryPlannerGreeting,
     resumeSession,
     rehydrateSession,
     resumeFromHistory,
@@ -2442,6 +2414,8 @@ export function useHarnessState(): HarnessStateHook {
     listDir,
     lastMessage,
     subscribeSessionRecordChanges,
+    subscribeAgentMapProposalChanges,
+    subscribeEventReconnects,
     systemGraphAnnouncements,
     runsBySession,
     runsByExecution,

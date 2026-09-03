@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
   AgentMapWorkspaceResponse,
+  AcceptedProposalDelta,
   PlannerSessionRequest,
   PlannerSessionResponse,
   StudioProjectId,
@@ -9,11 +10,16 @@ import type { HarnessKind, HarnessSession, UiTheme } from "@shared/types";
 
 import { ApiError, errorMessage, type HarnessApi } from "./api";
 import { track } from "./track";
+import { agentMapLoader } from "./agent-map-loader";
+import { routeAcceptedProposalDelta } from "./agent-map";
 
 export type AgentMapWorkspacePaneState =
   | { status: "idle" }
   | { status: "loading" }
-  | { status: "ready"; value: AgentMapWorkspaceResponse }
+  | {
+      status: "ready";
+      value: AgentMapWorkspaceResponse;
+    }
   | { status: "error"; message: string };
 
 export type AgentMapPlannerPaneState =
@@ -49,6 +55,10 @@ interface AgentMapEntryOptions {
     response: PlannerSessionResponse,
     mode: PlannerSessionRequest["mode"],
   ) => void;
+  subscribeProposalChanges: (
+    listener: (delta: AcceptedProposalDelta) => void,
+  ) => () => void;
+  subscribeReconnects: (listener: () => void) => () => void;
 }
 
 const EMPTY_ENTRY: AgentMapEntryState = {
@@ -95,6 +105,23 @@ function selectedPlannerResponse(
     : null;
 }
 
+/** The shared gate before an accepted delta may mutate state or telemetry. */
+export function shouldCommitAcceptedDelta(
+  currentProjectId: StudioProjectId | null,
+  projectId: StudioProjectId,
+  currentWorkspaceRequest: number,
+  workspaceRequest: number,
+  snapshot: AgentMapWorkspaceResponse,
+  delta: AcceptedProposalDelta,
+): boolean {
+  return (
+    currentProjectId === projectId &&
+    currentWorkspaceRequest === workspaceRequest &&
+    snapshot.proposal?.id === delta.proposalId &&
+    snapshot.proposal.version >= delta.version
+  );
+}
+
 /**
  * Opens the two halves of the first Agent Map experience concurrently.
  *
@@ -113,6 +140,8 @@ export function useAgentMapEntry({
   theme,
   openPlannerSession,
   onPlannerReady,
+  subscribeProposalChanges,
+  subscribeReconnects,
 }: AgentMapEntryOptions): {
   state: AgentMapEntryState;
   retryWorkspace: () => void;
@@ -130,6 +159,10 @@ export function useAgentMapEntry({
   const themeRef = useRef(theme);
   const openPlannerRef = useRef(openPlannerSession);
   const onPlannerReadyRef = useRef(onPlannerReady);
+  const visibleProposalRef = useRef(new Map<StudioProjectId, string>());
+  const visibleDeltaRef = useRef(
+    new Map<StudioProjectId, { proposalId: string; version: number }>(),
+  );
 
   currentProjectRef.current = projectId;
   apiRef.current = api;
@@ -156,13 +189,24 @@ export function useAgentMapEntry({
       projectId: target,
       workspace: { status: "loading" },
     }));
-    void apiRef.current.getAgentMapWorkspace(target).then(
+    void agentMapLoader.load(apiRef.current, target).then(
       (value) => {
         if (
           currentProjectRef.current !== target ||
           workspaceRequestRef.current !== request
         )
           return;
+        if (
+          value.proposal &&
+          visibleProposalRef.current.get(target) !== value.proposal.id
+        ) {
+          visibleProposalRef.current.set(target, value.proposal.id);
+          const latest = value.proposal.history.at(-1);
+          track("agent_map.proposal_created", {
+            author_role: latest?.actor.role ?? "unknown",
+            assignment_kind: latest?.actor.assignment?.kind ?? "none",
+          });
+        }
         setState((current) =>
           current.projectId === target
             ? { ...current, workspace: { status: "ready", value } }
@@ -197,6 +241,96 @@ export function useAgentMapEntry({
       },
     );
   }, []);
+
+  useEffect(() => {
+    if (!projectId) return;
+    const unsubscribeChanges = subscribeProposalChanges((rawDelta) => {
+      // Route before comparing with the active view. A foreign but valid delta
+      // still belongs in that project's cache and must never refetch this one.
+      const routed = routeAcceptedProposalDelta(rawDelta, projectId);
+      if (routed.status === "malformed-active") {
+        agentMapLoader.invalidate(projectId);
+        loadWorkspace(projectId);
+        return;
+      }
+      if (routed.status === "ignored") {
+        return;
+      }
+      const delta = routed.delta;
+      const workspaceRequest = workspaceRequestRef.current;
+      const outcome = agentMapLoader.accept(delta);
+      if (delta.projectId !== projectId) return;
+      const showAcceptedDelta = (snapshot: AgentMapWorkspaceResponse): void => {
+        if (
+          !shouldCommitAcceptedDelta(
+            currentProjectRef.current,
+            projectId,
+            workspaceRequestRef.current,
+            workspaceRequest,
+            snapshot,
+            delta,
+          )
+        )
+          return;
+        const previous = visibleDeltaRef.current.get(projectId);
+        if (
+          previous?.proposalId === delta.proposalId &&
+          previous.version >= delta.version
+        )
+          return;
+        visibleDeltaRef.current.set(projectId, {
+          proposalId: delta.proposalId,
+          version: delta.version,
+        });
+        const visibleLatency = Math.max(
+          0,
+          Math.min(60_000, Date.now() - Date.parse(delta.acceptedAt)),
+        );
+        // State and telemetry share the same request-generation gate: a
+        // superseded arm can neither overwrite the pane nor claim it rendered.
+        setState((current) =>
+          current.projectId === projectId
+            ? {
+                ...current,
+                workspace: {
+                  status: "ready",
+                  value: snapshot,
+                },
+              }
+            : current,
+        );
+        track("agent_map.proposal_visible", {
+          author_role: delta.actor.role,
+          assignment_kind: delta.actor.assignment?.kind ?? "none",
+          visible_latency_ms: visibleLatency,
+        });
+      };
+      if (outcome.status === "applied") {
+        showAcceptedDelta(outcome.snapshot);
+      } else if (outcome.status === "queued") {
+        // A delta can beat the cold GET. The loader replays it before settling
+        // that shared promise; report visibility only after the replayed
+        // snapshot is actually ready, with the same dedupe as the direct path.
+        void agentMapLoader.load(apiRef.current, projectId).then(
+          (snapshot) => {
+            if (agentMapLoader.includesQueuedDelta(snapshot, delta))
+              showAcceptedDelta(snapshot);
+          },
+          () => undefined,
+        );
+      } else if (outcome.status === "needs-refetch") {
+        loadWorkspace(projectId);
+      }
+    });
+    const unsubscribeReconnects = subscribeReconnects(() => {
+      agentMapLoader.invalidate(projectId);
+      loadWorkspace(projectId);
+    });
+    return () => {
+      unsubscribeChanges();
+      unsubscribeReconnects();
+    };
+  }, [loadWorkspace, projectId, subscribeProposalChanges, subscribeReconnects]);
 
   const loadPlanner = useCallback(
     (target: StudioProjectId, mode: PlannerSessionRequest["mode"]): void => {

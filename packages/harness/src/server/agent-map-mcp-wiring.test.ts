@@ -1,25 +1,38 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { afterEach, beforeEach, expect, it } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { WebSocket } from "ws";
 
-import type { HarnessAdapter, LaunchOpts, SpawnSpec } from "../shared/types.js";
+import type {
+  BusMessage,
+  HarnessAdapter,
+  LaunchOpts,
+  SpawnSpec,
+} from "../shared/types.js";
+import { AGENT_MAP_PLANNER_SESSION_START_MESSAGE } from "../profiles/agent-map-planner.js";
 import { StudioProjectCatalog } from "../core/studio-project-catalog.js";
 import { startServer, type HarnessServer } from "./index.js";
 
 let root: string;
 let projectRoot: string;
+let projectId: string;
 let server: HarnessServer | undefined;
 
 beforeEach(async () => {
   root = await fs.mkdtemp(path.join(os.tmpdir(), "agent-map-mcp-wiring-"));
   projectRoot = path.join(root, "project");
   await fs.mkdir(projectRoot);
-  await new StudioProjectCatalog(path.join(root, "studio-projects.json")).reconcile([
-    { workspaceKey: "project", cwd: projectRoot },
-  ]);
+  const reconciled = await new StudioProjectCatalog(
+    path.join(root, "studio-projects.json"),
+  ).reconcile([{ workspaceKey: "project", cwd: projectRoot }]);
+  projectId = reconciled.projects[0]!.projectId;
+  await fs.writeFile(
+    path.join(root, "settings.json"),
+    JSON.stringify({ recentDirs: [projectRoot] }),
+  );
 });
 
 afterEach(async () => {
@@ -68,9 +81,7 @@ it("uses the actual ephemeral port and revokes private MCP launch authority on e
     harness: "claude-code",
   });
   const metadata = launchOpts?.agentMapMcp;
-  expect(metadata?.url).toBe(
-    `http://127.0.0.1:${server.port}/mcp/agent-map`,
-  );
+  expect(metadata?.url).toBe(`http://127.0.0.1:${server.port}/mcp/agent-map`);
   expect(metadata?.url).not.toContain(":0/");
   expect(launchOpts?.mcpConfigFile).toBeDefined();
   const config = JSON.parse(
@@ -125,4 +136,212 @@ it("uses the actual ephemeral port and revokes private MCP launch authority on e
     }),
   });
   expect(rejected.status).toBe(401);
+});
+
+it("gives a signed-out local planner its scoped Agent Map tools", async () => {
+  const codingPrompt =
+    "You are the coding agent running in Agent Studio. Follow the scaffold, run, and deploy authoring loop.";
+  const loadSystemPrompt = vi.fn(async () => codingPrompt);
+  const launches: LaunchOpts[] = [];
+  const launch = (opts: LaunchOpts): SpawnSpec => {
+    launches.push(opts);
+    return { command: "bash", args: [], env: {}, cwd: opts.cwd };
+  };
+  const adapter: HarnessAdapter = {
+    id: "claude-code",
+    eventSource: "hooks",
+    doctor: async () => [],
+    launch,
+    resume: (_id, opts) => launch(opts),
+    listPastSessions: async () => [],
+    canResume: async () => true,
+  };
+  const webDir = path.join(root, "web");
+  await fs.mkdir(webDir);
+  await fs.writeFile(path.join(webDir, "index.html"), "<html></html>");
+  server = await startServer({
+    port: 0,
+    bootToken: "boot-token",
+    telemetryOptIn: false,
+    identity: null,
+    machineId: "machine-1",
+    adapters: { "claude-code": adapter },
+    stateRoot: root,
+    launchDir: projectRoot,
+    webDir,
+    autoCreateSession: false,
+    loadSystemPrompt,
+  });
+
+  const response = await fetch(
+    `http://127.0.0.1:${server.port}/api/projects/${projectId}/planner-sessions`,
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-harness-token": "boot-token",
+      },
+      body: JSON.stringify({ mode: "fresh", harness: "claude-code" }),
+    },
+  );
+  expect(response.status).toBe(201);
+  const created = (await response.json()) as {
+    session: {
+      id: string;
+      planning: {
+        identity: { role: string; userId: string };
+        greeting: { status: string; reason?: string };
+      };
+      agentMapIdentity?: { role: string; userId: string };
+    };
+  };
+  expect(created.session.planning.identity).toMatchObject({
+    role: "map-planner",
+    userId: "local:machine-1",
+  });
+  expect(created.session.agentMapIdentity).toEqual(
+    created.session.planning.identity,
+  );
+  expect(created.session.planning.greeting).toEqual({
+    status: "skipped",
+    reason: "user-proceeded",
+  });
+
+  const launchOpts = launches[0]!;
+  const metadata = launchOpts.agentMapMcp;
+  expect(metadata?.url).toBe(`http://127.0.0.1:${server.port}/mcp/agent-map`);
+  expect(metadata?.url).not.toContain(":0/");
+  const config = JSON.parse(
+    await fs.readFile(launchOpts!.mcpConfigFile!, "utf8"),
+  );
+  expect(config.mcpServers["agent-map"].headers.Authorization).toBe(
+    `Bearer ${metadata!.bearerToken}`,
+  );
+  const systemPrompt = await fs.readFile(launchOpts!.systemPromptFile!, "utf8");
+  expect(systemPrompt).toContain("<agent-map-planner-context>");
+  expect(systemPrompt).toContain(
+    "Do not act as a coding or implementation agent",
+  );
+  expect(systemPrompt).toContain(
+    "Let the user's first real message be the first visible conversation turn",
+  );
+  expect(systemPrompt).not.toContain("In your first response, briefly explain");
+  expect(systemPrompt).not.toContain(codingPrompt);
+  expect(systemPrompt).not.toContain("You are the coding agent");
+  expect(systemPrompt).not.toContain(
+    "This is a private Agent Studio control turn",
+  );
+  expect(loadSystemPrompt).not.toHaveBeenCalled();
+  expect(AGENT_MAP_PLANNER_SESSION_START_MESSAGE).toBe(
+    [
+      "Agent Map planning session",
+      "Use this session to scope what you want to build—not to implement it yet. Your planner will turn your goals into a proposed map of agents, responsibilities, data flow, resources, and connectors for you to review and refine. Once approved, Studio will create focused execution sessions from the plan. Start by describing the outcome you want.",
+    ].join("\n"),
+  );
+  const plannerEmitter = await fs.readFile(
+    path.join(path.dirname(launchOpts.settingsFile!), "emit.cjs"),
+    "utf8",
+  );
+  expect(plannerEmitter).toContain(
+    `const sessionStartSystemMessage = ${JSON.stringify(AGENT_MAP_PLANNER_SESSION_START_MESSAGE)};`,
+  );
+
+  const client = new Client({ name: "signed-out-planner-test", version: "1" });
+  const transport = new StreamableHTTPClientTransport(new URL(metadata!.url), {
+    requestInit: {
+      headers: { Authorization: `Bearer ${metadata!.bearerToken}` },
+    },
+  });
+  await client.connect(transport);
+  const tools = await client.listTools();
+  expect(tools.tools.map(({ name }) => name).sort()).toEqual([
+    "agent_map_propose",
+    "agent_map_read",
+    "agent_map_validate",
+  ]);
+
+  const proposalEvents: BusMessage[] = [];
+  const events = new WebSocket(
+    `ws://127.0.0.1:${server.port}/ws/events?token=boot-token`,
+  );
+  await new Promise<void>((resolve, reject) => {
+    events.once("open", () => resolve());
+    events.once("error", reject);
+  });
+  events.on("message", (data) => {
+    try {
+      proposalEvents.push(JSON.parse(data.toString()) as BusMessage);
+    } catch {
+      // The production browser also ignores malformed event frames.
+    }
+  });
+  try {
+    const proposed = await client.callTool({
+      name: "agent_map_propose",
+      arguments: {
+        schemaVersion: 1,
+        requestId: "request-live-proposal-1",
+        proposalId: null,
+        expectedVersion: 0,
+        operations: [
+          {
+            kind: "add-node",
+            draftRef: "worker",
+            node: {
+              kind: "agent",
+              name: "Worker",
+              purpose: "Own the planned work",
+              ownerAgent: null,
+              contractRefs: [],
+            },
+          },
+        ],
+      },
+    });
+    expect(proposed.isError).not.toBe(true);
+    await vi.waitFor(
+      () => {
+        expect(proposalEvents).toContainEqual({
+          type: "agent-map.proposal.changed",
+          delta: expect.objectContaining({
+            projectId,
+            version: 1,
+          }),
+        });
+      },
+      { timeout: 1_000 },
+    );
+  } finally {
+    events.close();
+    await client.close();
+  }
+  const ordinary = await server.sessionManager.create({
+    cwd: projectRoot,
+    harness: "claude-code",
+  });
+  expect(ordinary.agentMapIdentity).toMatchObject({
+    role: "agent-builder",
+    userId: "local:machine-1",
+    assignment: { kind: "unplanned" },
+  });
+  const ordinaryLaunch = launches[1]!;
+  expect(ordinaryLaunch.agentMapMcp).toBeDefined();
+  expect(await fs.readFile(ordinaryLaunch.systemPromptFile!, "utf8")).toBe(
+    codingPrompt,
+  );
+  const ordinaryEmitter = await fs.readFile(
+    path.join(path.dirname(ordinaryLaunch.settingsFile!), "emit.cjs"),
+    "utf8",
+  );
+  expect(ordinaryEmitter).toContain("const sessionStartSystemMessage = null;");
+  expect(ordinaryEmitter).not.toContain(
+    JSON.stringify(AGENT_MAP_PLANNER_SESSION_START_MESSAGE),
+  );
+  expect(loadSystemPrompt).toHaveBeenCalledOnce();
+  const ordinaryConfig = JSON.parse(
+    await fs.readFile(ordinaryLaunch.mcpConfigFile!, "utf8"),
+  );
+  expect(ordinaryConfig.mcpServers["agent-map"].headers.Authorization).toBe(
+    `Bearer ${ordinaryLaunch.agentMapMcp!.bearerToken}`,
+  );
 });

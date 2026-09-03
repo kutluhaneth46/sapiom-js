@@ -1,4 +1,5 @@
 import type {
+  AcceptedProposalDelta,
   AgentMapWorkspaceResponse,
   AgentMapWorkspaceState,
   StudioProjectBindingSummary,
@@ -6,7 +7,10 @@ import type {
   StudioCurrentWorkspaceResponse,
   StudioWorkspaceSelection,
 } from "@shared/agent-map";
-import { parseMapChangeProposal } from "@shared/agent-map-codec";
+import {
+  parseAcceptedProposalDelta as parseSharedAcceptedProposalDelta,
+  parseMapChangeProposal,
+} from "@shared/agent-map-codec";
 import type { WorkspaceScopeSummary } from "@shared/system-graph";
 
 import { isWithinDir, stripTrailingSep } from "./paths";
@@ -203,6 +207,37 @@ export function parseAgentMapWorkspaceResponse(
   if (proposal === undefined)
     throw new Error("Invalid Agent Map workspace response");
   return { schemaVersion: 1, project, workspace, proposal };
+}
+
+/** Strict browser boundary for one attributed post-commit notification. */
+export function parseAcceptedProposalDelta(
+  value: unknown,
+  expectedProjectId?: string,
+): AcceptedProposalDelta {
+  try {
+    return parseSharedAcceptedProposalDelta(value, expectedProjectId);
+  } catch {
+    throw new Error("Invalid Agent Map proposal delta");
+  }
+}
+
+export type AgentMapDeltaRoute =
+  | { status: "accepted"; delta: AcceptedProposalDelta }
+  | { status: "malformed-active" }
+  | { status: "ignored" };
+
+/** Route by the announced project before deciding whether parse failure is visible. */
+export function routeAcceptedProposalDelta(
+  value: unknown,
+  activeProjectId: string,
+): AgentMapDeltaRoute {
+  try {
+    return { status: "accepted", delta: parseAcceptedProposalDelta(value) };
+  } catch {
+    return isRecord(value) && value.projectId === activeProjectId
+      ? { status: "malformed-active" }
+      : { status: "ignored" };
+  }
 }
 
 function parseSelection(

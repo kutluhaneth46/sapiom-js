@@ -4,6 +4,7 @@ import * as path from "node:path";
 
 import { describe, expect, it, vi } from "vitest";
 
+import { AGENT_MAP_PLANNER_SESSION_START_MESSAGE } from "../profiles/agent-map-planner.js";
 import type { AgentMapWorkspaceState } from "../shared/agent-map.js";
 import type { HarnessSession, SessionRecord } from "../shared/types.js";
 import type { AgentMapWorkspaceStore } from "./agent-map-workspace-store.js";
@@ -79,15 +80,18 @@ function session(
 function fixture(
   existing: HarnessSession[] = [],
   initialProject: StudioProjectIdentity = project,
+  initialWorkspace: AgentMapWorkspaceState = workspace,
 ) {
   let next = 0;
   let resolvedProject = initialProject;
   let currentUserId: string | null = "user-1";
   const contexts: string[] = [];
+  const sessionStartMessages: Array<string | null> = [];
   const created: HarnessSession[] = [];
   const create = vi.fn(async (request, trusted) => {
     const id = `new-${++next}`;
     contexts.push(trusted.promptAppendix(id));
+    sessionStartMessages.push(trusted.sessionStartSystemMessage?.(id) ?? null);
     const value = session(id, {
       harness: request.harness,
       cwd: request.cwd,
@@ -136,7 +140,7 @@ function fixture(
         id === projectId ? resolvedProject : null,
     } as unknown as StudioProjectCatalog,
     workspaceStore: {
-      readOrCreate: async () => workspace,
+      readOrCreate: async () => initialWorkspace,
     } as unknown as AgentMapWorkspaceStore,
     sessionManager: manager,
     readRecord: async () => null,
@@ -151,6 +155,7 @@ function fixture(
     resume,
     kill,
     contexts,
+    sessionStartMessages,
     manager,
     created,
     setProject: (value: StudioProjectIdentity) => {
@@ -174,11 +179,13 @@ describe("planner session context and identity", () => {
       workspace,
       sessionId: "session-1",
       userId: "user-1",
+      onboardOnFirstResponse: true,
     });
     expect(context).toContain(projectId);
     expect(context).toContain(project.rootBindings[0]!.id);
     expect(context).toContain('"role":"map-planner"');
     expect(context).toContain('"empty":true');
+    expect(context).toContain("In your first response, briefly explain");
     expect(context).not.toContain("/Users/private");
     expect(context).not.toContain("private-workspace-key");
     expect(context).not.toContain("localRootRef");
@@ -198,6 +205,7 @@ describe("planner session context and identity", () => {
       workspace: populated,
       sessionId: "session-1",
       userId: "user-1",
+      onboardOnFirstResponse: false,
       details: {
         confirmedRevision: {
           digest: "d".repeat(2_000),
@@ -251,7 +259,7 @@ describe("planner session context and identity", () => {
 
 describe("PlanningSessionService", () => {
   it("always creates a new, server-scoped planner for explicit fresh", async () => {
-    const { service, create, contexts } = fixture();
+    const { service, create, contexts, sessionStartMessages } = fixture();
     const first = await service.open(projectId, { mode: "fresh" });
     const second = await service.open(projectId, { mode: "fresh" });
 
@@ -265,10 +273,51 @@ describe("PlanningSessionService", () => {
         userId: "user-1",
         role: "map-planner",
       },
-      greeting: { status: "pending" },
+      greeting: { status: "skipped", reason: "user-proceeded" },
       queuedInputIds: [],
     });
     expect(contexts.every((value) => !value.includes(project.rootBindings[0]!.localRootRef))).toBe(true);
+    expect(contexts).toEqual([
+      expect.stringContaining(
+        "Let the user's first real message be the first visible conversation turn",
+      ),
+      expect.stringContaining(
+        "Let the user's first real message be the first visible conversation turn",
+      ),
+    ]);
+    expect(contexts.join("\n")).not.toContain(
+      "This is a private Agent Studio control turn",
+    );
+    expect(sessionStartMessages).toEqual([null, null]);
+  });
+
+  it("uses native Claude startup orientation without repeating it in turn one", async () => {
+    const { service, contexts, sessionStartMessages } = fixture();
+
+    await service.open(projectId, {
+      mode: "fresh",
+      harness: "claude-code",
+    });
+
+    expect(sessionStartMessages).toEqual([
+      AGENT_MAP_PLANNER_SESSION_START_MESSAGE,
+    ]);
+    expect(contexts[0]).not.toContain(
+      "In your first response, briefly explain",
+    );
+  });
+
+  it("does not replay first-time onboarding for an already-planned project", async () => {
+    const { service, contexts } = fixture([], project, {
+      ...workspace,
+      confirmedRevisionId: "revision-1",
+    });
+
+    await service.open(projectId, { mode: "fresh" });
+
+    expect(contexts[0]).not.toContain(
+      "In your first response, briefly explain",
+    );
   });
 
   it("serializes concurrent resume-or-create so both callers resolve one planner", async () => {
@@ -451,6 +500,9 @@ describe("PlanningSessionService", () => {
       reason: "user-proceeded",
     });
     expect(contexts[0]).toContain(projectId);
+    expect(contexts[0]).not.toContain(
+      "In your first response, briefly explain",
+    );
     expect(contexts[0]).not.toContain(project.rootBindings[0]!.localRootRef);
   });
 
@@ -459,7 +511,9 @@ describe("PlanningSessionService", () => {
       status: "exited",
       agentSessionId: "stale-vendor-session",
     });
-    const { service, resume, create } = fixture([prior]);
+    const { service, resume, create, contexts, sessionStartMessages } = fixture([
+      prior,
+    ]);
     resume.mockRejectedValueOnce(new Error("not resumable"));
     (service as unknown as { options: { readRecord: () => Promise<SessionRecord> } }).options.readRecord =
       async () => ({ turnCount: 1 } as SessionRecord);
@@ -472,6 +526,10 @@ describe("PlanningSessionService", () => {
       expect.any(Object),
     );
     expect(result.session.planning?.greeting.status).toBe("skipped");
+    expect(contexts[0]).not.toContain(
+      "In your first response, briefly explain",
+    );
+    expect(sessionStartMessages).toEqual([null]);
   });
 
   it("hands a restarted pre-ready FIFO to a rehydrated planner exactly once and retires the old queue", async () => {
