@@ -25,6 +25,8 @@ export interface McpDevServerCommand {
 }
 
 export interface McpConfigOptions {
+  /** Session-scoped embedded Agent Map HTTP MCP authority. */
+  agentMap?: { url: string; bearerToken: string };
   /** Override for the local sapiom-dev server launch — see {@link McpDevServerCommand}. */
   devServer?: McpDevServerCommand;
   /** SAPIOM_ENVIRONMENT to pass through to the sapiom-dev child process. */
@@ -113,6 +115,17 @@ export async function generateMcpConfig(
             args: ["-y", "@sapiom/mcp@latest"],
             ...(devEnv ? { env: devEnv } : {}),
           },
+      ...(options.agentMap
+        ? {
+            "agent-map": {
+              type: "http",
+              url: options.agentMap.url,
+              headers: {
+                Authorization: `Bearer ${options.agentMap.bearerToken}`,
+              },
+            },
+          }
+        : {}),
     },
   };
 

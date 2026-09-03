@@ -103,6 +103,8 @@ describe("SessionManager", () => {
       adapter?: HarnessAdapter;
       spawnPty?: PtySpawnFn;
       buildLaunchOpts?: SessionManagerOptions["buildLaunchOpts"];
+      resolveAgentMapIdentity?: SessionManagerOptions["resolveAgentMapIdentity"];
+      onAgentMapSessionExit?: SessionManagerOptions["onAgentMapSessionExit"];
       writeWorkspaceContext?: SessionManagerOptions["writeWorkspaceContext"];
       prepareWorkspaceContext?: SessionManagerOptions["prepareWorkspaceContext"];
       ensureCanvasTemplate?: SessionManagerOptions["ensureCanvasTemplate"];
@@ -136,6 +138,8 @@ describe("SessionManager", () => {
       sessionsPath,
       spawnPty,
       buildLaunchOpts: opts.buildLaunchOpts,
+      resolveAgentMapIdentity: opts.resolveAgentMapIdentity,
+      onAgentMapSessionExit: opts.onAgentMapSessionExit,
       writeWorkspaceContext: opts.writeWorkspaceContext,
       prepareWorkspaceContext: opts.prepareWorkspaceContext,
       ensureCanvasTemplate: opts.ensureCanvasTemplate,
@@ -1865,6 +1869,44 @@ describe("SessionManager", () => {
     );
   });
 
+  it("derives trusted Agent Map identity for create/resume and revokes it on exit", async () => {
+    const buildLaunchOpts = vi.fn(async () => ({}));
+    const onAgentMapSessionExit = vi.fn();
+    const resolveAgentMapIdentity = vi.fn(async (sessionId: string) => ({
+      projectId: "project-1",
+      userId: "user-1",
+      sessionId,
+      role: "agent-builder" as const,
+      assignment: { kind: "unplanned" as const },
+    }));
+    const { manager, spawns } = makeManager({
+      buildLaunchOpts,
+      resolveAgentMapIdentity,
+      onAgentMapSessionExit,
+    });
+    const session = await manager.create({ cwd: "/tmp/proj", harness: "claude-code" });
+    expect(session.agentMapIdentity).toMatchObject({
+      sessionId: session.id,
+      role: "agent-builder",
+      assignment: { kind: "unplanned" },
+    });
+    expect(buildLaunchOpts).toHaveBeenLastCalledWith(
+      session.id,
+      expect.anything(),
+      expect.objectContaining({ agentMapIdentity: session.agentMapIdentity }),
+    );
+    await manager.setAgentSessionId(session.id, "agent-uuid-map");
+    spawns[0]?.emitExit(0);
+    await manager.flush();
+    expect(onAgentMapSessionExit).toHaveBeenCalledWith(session.id);
+    await manager.resume(session.id);
+    expect(buildLaunchOpts).toHaveBeenLastCalledWith(
+      session.id,
+      expect.anything(),
+      expect.objectContaining({ resume: true, agentMapIdentity: session.agentMapIdentity }),
+    );
+  });
+
   it("registerHistorical() creates an exited placeholder session resumable later", async () => {
     const { manager } = makeManager();
     const session = await manager.registerHistorical({
@@ -2165,6 +2207,51 @@ describe("SessionManager", () => {
   });
 
   describe("ghost-session reconciliation (non-exited records with no live pty)", () => {
+    it("create() preserves its original persist error when exited reconciliation also fails", async () => {
+      const original = new Error("initial create persist failed");
+      const cleanup = new Error("create reconciliation persist failed");
+      let writes = 0;
+      const writeSessionRegistry = vi.fn(async () => {
+        writes += 1;
+        throw writes === 1 ? original : cleanup;
+      });
+      const { manager } = makeManager({ writeSessionRegistry });
+
+      await expect(
+        manager.create({ cwd: "/tmp/proj", harness: "claude-code" }),
+      ).rejects.toBe(original);
+      expect(writeSessionRegistry).toHaveBeenCalledTimes(2);
+      expect(manager.list()[0]?.status).toBe("exited");
+    });
+
+    it("resume() preserves its original persist error when exited reconciliation also fails", async () => {
+      const original = new Error("initial resume persist failed");
+      const cleanup = new Error("resume reconciliation persist failed");
+      let failWrites = false;
+      let failedWriteCount = 0;
+      const writeSessionRegistry = vi.fn(async () => {
+        if (!failWrites) return;
+        failedWriteCount += 1;
+        throw failedWriteCount === 1 ? original : cleanup;
+      });
+      const { manager } = makeManager({ writeSessionRegistry });
+      const session = await manager.registerHistorical({
+        agentSessionId: "agent-uuid-persist-failure",
+        harness: "claude-code",
+        cwd: "/tmp/proj",
+        title: "past session",
+        lastActiveAt: "2026-01-01T00:00:00.000Z",
+      });
+      failWrites = true;
+
+      await expect(manager.resume(session.id)).rejects.toBe(original);
+      expect(failedWriteCount).toBe(2);
+      expect(manager.get(session.id)).toMatchObject({
+        status: "exited",
+        lastActiveAt: "2026-01-01T00:00:00.000Z",
+      });
+    });
+
     it("create() reconciles the record to exited when ensureCanvasTemplate rejects", async () => {
       const ensureCanvasTemplate = vi.fn(async () => {
         throw new Error("read-only fs");
