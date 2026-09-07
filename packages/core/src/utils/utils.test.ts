@@ -97,11 +97,7 @@ describe("Header Utilities", () => {
         "Content-Type": "text/plain",
       };
 
-      const result = setHeader(
-        headers,
-        "X-Sapiom-Transaction-Id",
-        "tx_123",
-      );
+      const result = setHeader(headers, "X-Sapiom-Transaction-Id", "tx_123");
 
       expect(result).toEqual({
         "Content-Type": "text/plain",
