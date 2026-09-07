@@ -57,8 +57,8 @@ export function setHeader(
 
   // Copy all headers except case variants of the one we're setting
   for (const [key, val] of Object.entries(headers)) {
-    if (key.toLowerCase() !== lowerHeaderName) {
-      newHeaders[key] = Array.isArray(val) ? val[0] || "" : val || "";
+    if (key.toLowerCase() !== lowerHeaderName && val !== undefined) {
+      newHeaders[key] = Array.isArray(val) ? val[0] || "" : val;
     }
   }
 
@@ -83,8 +83,8 @@ export function removeHeader(
   const newHeaders: Record<string, string> = {};
 
   for (const [key, val] of Object.entries(headers)) {
-    if (key.toLowerCase() !== lowerHeaderName) {
-      newHeaders[key] = Array.isArray(val) ? val[0] || "" : val || "";
+    if (key.toLowerCase() !== lowerHeaderName && val !== undefined) {
+      newHeaders[key] = Array.isArray(val) ? val[0] || "" : val;
     }
   }
 

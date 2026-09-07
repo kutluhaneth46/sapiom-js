@@ -90,6 +90,25 @@ describe("Header Utilities", () => {
       expect(result["X-Custom"]).toBe("final");
       expect(result["Other"]).toBe("keep");
     });
+
+    it("should omit unrelated headers with undefined values", () => {
+      const headers: Record<string, string | string[] | undefined> = {
+        Authorization: undefined,
+        "Content-Type": "text/plain",
+      };
+
+      const result = setHeader(
+        headers,
+        "X-Sapiom-Transaction-Id",
+        "tx_123",
+      );
+
+      expect(result).toEqual({
+        "Content-Type": "text/plain",
+        "X-Sapiom-Transaction-Id": "tx_123",
+      });
+      expect(result).not.toHaveProperty("Authorization");
+    });
   });
 
   describe("removeHeader", () => {
@@ -116,6 +135,18 @@ describe("Header Utilities", () => {
       expect(result["x-custom"]).toBeUndefined();
       expect(result["X-Custom"]).toBeUndefined();
       expect(result["Other-Header"]).toBe("keep");
+    });
+
+    it("should omit unrelated headers with undefined values", () => {
+      const headers: Record<string, string | string[] | undefined> = {
+        Authorization: undefined,
+        "Content-Type": "text/plain",
+      };
+
+      const result = removeHeader(headers, "Content-Type");
+
+      expect(result).toEqual({});
+      expect(result).not.toHaveProperty("Authorization");
     });
   });
 
